@@ -119,7 +119,7 @@ pub fn init(config_retention_days: Option<u64>) -> Result<TuiLogGuard> {
     let log_path = log_dir.join(format!("tui-{date}-{}.log", std::process::id()));
 
     let file = OpenOptions::new()
-        .create(true)
+        .create(true).write(true)
         .append(true)
         .open(&log_path)
         .with_context(|| format!("failed to open {}", log_path.display()))?;
