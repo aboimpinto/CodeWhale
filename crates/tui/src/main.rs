@@ -2914,11 +2914,9 @@ async fn test_api_connectivity(config: &Config) -> Result<()> {
 }
 
 fn rustc_version() -> String {
-    // Try to get rustc version, fall back to "unknown"
-    std::process::Command::new("rustc")
-        .arg("--version")
-        .output()
-        .ok()
+    crate::dependencies::RustC::command()
+        .map(|mut cmd| cmd.arg("--version"))
+        .and_then(|mut cmd| cmd.output().ok())
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string())
 }
@@ -3331,7 +3329,7 @@ struct GhPullRequest {
 }
 
 fn run_gh_pr_view(number: u32, repo: Option<&str>) -> Result<GhPullRequest> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = crate::dependencies::Gh::command().expect("gh not found");
     cmd.arg("pr").arg("view").arg(number.to_string());
     if let Some(r) = repo {
         cmd.arg("--repo").arg(r);
@@ -3365,7 +3363,7 @@ fn run_gh_pr_view(number: u32, repo: Option<&str>) -> Result<GhPullRequest> {
 }
 
 fn run_gh_pr_diff(number: u32, repo: Option<&str>) -> Result<String> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = crate::dependencies::Gh::command().expect("gh not found");
     cmd.arg("pr").arg("diff").arg(number.to_string());
     if let Some(r) = repo {
         cmd.arg("--repo").arg(r);
@@ -3381,7 +3379,7 @@ fn run_gh_pr_diff(number: u32, repo: Option<&str>) -> Result<String> {
 }
 
 fn run_gh_pr_checkout(number: u32, repo: Option<&str>) -> Result<()> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = crate::dependencies::Gh::command().expect("gh not found");
     cmd.arg("pr").arg("checkout").arg(number.to_string());
     if let Some(r) = repo {
         cmd.arg("--repo").arg(r);
@@ -3455,7 +3453,7 @@ fn format_pr_prompt(number: u32, view: &GhPullRequest, diff: &str) -> String {
 }
 
 fn collect_diff(args: &ReviewArgs) -> Result<String> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::dependencies::Git::command().expect("git not found");
     cmd.arg("diff");
     if args.staged {
         cmd.arg("--cached");
@@ -3496,7 +3494,7 @@ fn run_apply(args: ApplyArgs) -> Result<()> {
     tmp.write_all(patch.as_bytes())?;
     let tmp_path = tmp.path().to_path_buf();
 
-    let output = Command::new("git")
+    let output = crate::dependencies::Git::command().expect("git not found")
         .arg("apply")
         .arg("--whitespace=nowarn")
         .arg(&tmp_path)

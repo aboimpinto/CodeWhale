@@ -324,6 +324,29 @@ impl ExternalTool for Gh {
     }
 }
 
+/// Rust compiler — used for version reporting in diagnostics.
+pub struct RustC;
+
+impl ExternalTool for RustC {
+    fn candidates() -> &'static [&'static str] {
+        &["rustc"]
+    }
+
+    fn resolve() -> Option<String> {
+        static CACHE: OnceLock<Option<String>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                if probe_executable("rustc") {
+                    tracing::info!(target: "tool_dependencies", "Resolved rustc binary");
+                    Some("rustc".to_string())
+                } else {
+                    None
+                }
+            })
+            .clone()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Legacy interpreter helpers (kept for existing callers until migrated)
 // ---------------------------------------------------------------------------
