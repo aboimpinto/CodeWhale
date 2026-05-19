@@ -433,18 +433,7 @@ pub struct HookExecutor {
 
 impl HookExecutor {
     fn build_shell_command(command: &str) -> Command {
-        #[cfg(windows)]
-        {
-            let mut cmd = Command::new("cmd");
-            cmd.arg("/C").arg(command);
-            cmd
-        }
-        #[cfg(not(windows))]
-        {
-            let mut cmd = Command::new("sh");
-            cmd.arg("-c").arg(command);
-            cmd
-        }
+        crate::shell_dispatcher::global_dispatcher().build_command(command)
     }
 
     /// Create a new `HookExecutor` with configuration
