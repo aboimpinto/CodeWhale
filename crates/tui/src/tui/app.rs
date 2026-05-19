@@ -976,6 +976,7 @@ pub struct App {
     pub file_tree: Option<crate::tui::file_tree::FileTreeState>,
     #[allow(dead_code)]
     pub compact_threshold: usize,
+    pub auto_compact_threshold_pct: f64,
     pub max_input_history: usize,
     pub allow_shell: bool,
     pub max_subagents: usize,
@@ -1628,6 +1629,7 @@ impl App {
             context_panel: settings.context_panel,
             file_tree: None,
             compact_threshold,
+            auto_compact_threshold_pct: 70.0,
             max_input_history,
             allow_shell,
             max_subagents,
