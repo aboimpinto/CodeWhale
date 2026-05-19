@@ -799,6 +799,11 @@ async fn run_event_loop(
     event_broker: &EventBroker,
     translation_client: Option<Arc<DeepSeekClient>>,
 ) -> Result<()> {
+    // Fix/1812: start the TUI watchdog thread for Windows console stall
+    // detection.
+    #[cfg(windows)]
+    crate::tui::tui_watchdog::start();
+
     // Track streaming state
     let mut current_streaming_text = String::new();
     let (translation_tx, mut translation_rx) =
@@ -1945,6 +1950,17 @@ async fn run_event_loop(
         }
 
         let now = Instant::now();
+        // Fix/1812: heartbeat for the TUI watchdog thread.  Also check if the
+        // watchdog has flagged a stall and force terminal recovery if so.
+        #[cfg(windows)]
+        {
+            crate::tui::tui_watchdog::heartbeat();
+            if crate::tui::tui_watchdog::recovery_needed() {
+                tracing::warn!("TUI watchdog detected stall, forcing terminal recovery");
+                force_terminal_repaint = true;
+            }
+        }
+        // ... existing code ...
         app.flush_paste_burst_if_enabled(now);
         app.sync_status_message_to_toasts();
         // Drain background-LLM cost (compaction summaries, seam

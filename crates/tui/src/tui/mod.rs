@@ -72,6 +72,8 @@ pub mod views;
 pub mod vim_mode;
 pub mod widgets;
 pub mod workspace_context;
+#[cfg(windows)]
+pub mod tui_watchdog;
 
 // === Re-exports ===
 
