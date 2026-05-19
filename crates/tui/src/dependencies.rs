@@ -198,6 +198,182 @@ pub fn resolve_node() -> Option<String> {
         .clone()
 }
 
+// ---------------------------------------------------------------------------
+// ExternalTool trait — unified subprocess interface
+// ---------------------------------------------------------------------------
+
+/// A tool that DeepSeek-TUI shells out to. Instead of scattering
+/// `Command::new("git")` / `Command::new("gh")` across the codebase,
+/// each external dependency implements this trait once in this module.
+/// Callers ask the tool for a pre-populated [`Command`] and chain their
+/// own args, working directory, and spawn method.
+///
+/// # Example
+///
+/// ```ignore
+/// let output = Git::command()
+///     .expect("git not found")
+///     .args(["diff", "--stat"])
+///     .current_dir(&workspace)
+///     .output()?;
+/// ```
+pub trait ExternalTool {
+    /// Candidate binary names, tried in order until one responds to
+    /// `--version`.  For single-binary tools (git, gh, node) this is a
+    /// one-element slice.
+    fn candidates() -> &'static [&'static str];
+
+    /// Resolve the best candidate once per process (cached). Returns
+    /// the spec string (e.g. `"python3"` or `"py -3"`).
+    fn resolve() -> Option<String>;
+
+    /// Quick availability check — true when the tool was found on PATH.
+    fn available() -> bool {
+        Self::resolve().is_some()
+    }
+
+    /// Build a `std::process::Command` pre-populated with the resolved
+    /// binary (and any fixed arguments from a multi-word candidate like
+    /// `"py -3"`). Returns `None` when the tool isn't installed.
+    ///
+    /// Callers should chain `.args(...)`, `.current_dir(...)`, and then
+    /// call `.output()`, `.status()`, or `.spawn()`.
+    fn command() -> Option<Command> {
+        let spec = Self::resolve()?;
+        let (program, fixed_args) = split_interpreter_spec(&spec);
+        let mut cmd = Command::new(&program);
+        for arg in &fixed_args {
+            cmd.arg(arg);
+        }
+        Some(cmd)
+    }
+
+    /// Convenience: run the tool with arguments in a working directory
+    /// and return the captured output.
+    fn output(args: &[&str], cwd: &std::path::Path) -> std::io::Result<std::process::Output> {
+        let mut cmd = Self::command().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} not found on PATH", std::any::type_name::<Self>()),
+            )
+        })?;
+        cmd.args(args).current_dir(cwd).output()
+    }
+
+    /// Convenience: run the tool with arguments and return only the
+    /// exit status (discards stdout/stderr).
+    fn status(args: &[&str], cwd: &std::path::Path) -> std::io::Result<std::process::ExitStatus> {
+        let mut cmd = Self::command().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("{} not found on PATH", std::any::type_name::<Self>()),
+            )
+        })?;
+        cmd.args(args).current_dir(cwd).status()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Concrete tool implementations
+// ---------------------------------------------------------------------------
+
+/// Git version control.
+pub struct Git;
+
+impl ExternalTool for Git {
+    fn candidates() -> &'static [&'static str] {
+        &["git"]
+    }
+
+    fn resolve() -> Option<String> {
+        static CACHE: OnceLock<Option<String>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                for candidate in Self::candidates() {
+                    if probe_executable(candidate) {
+                        tracing::info!(target: "tool_dependencies", "Resolved git binary");
+                        return Some((*candidate).to_string());
+                    }
+                }
+                None
+            })
+            .clone()
+    }
+}
+
+/// GitHub CLI.
+pub struct Gh;
+
+impl ExternalTool for Gh {
+    fn candidates() -> &'static [&'static str] {
+        &["gh"]
+    }
+
+    fn resolve() -> Option<String> {
+        static CACHE: OnceLock<Option<String>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                if probe_executable("gh") {
+                    tracing::info!(target: "tool_dependencies", "Resolved gh binary");
+                    Some("gh".to_string())
+                } else {
+                    None
+                }
+            })
+            .clone()
+    }
+}
+
+/// Rust compiler — used for version reporting in diagnostics.
+pub struct RustC;
+
+impl ExternalTool for RustC {
+    fn candidates() -> &'static [&'static str] {
+        &["rustc"]
+    }
+
+    fn resolve() -> Option<String> {
+        static CACHE: OnceLock<Option<String>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                if probe_executable("rustc") {
+                    tracing::info!(target: "tool_dependencies", "Resolved rustc binary");
+                    Some("rustc".to_string())
+                } else {
+                    None
+                }
+            })
+            .clone()
+    }
+}
+
+/// Rust build tool — used by the `run_tests` tool.
+pub struct Cargo;
+
+impl ExternalTool for Cargo {
+    fn candidates() -> &'static [&'static str] {
+        &["cargo"]
+    }
+
+    fn resolve() -> Option<String> {
+        static CACHE: OnceLock<Option<String>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                if probe_executable("cargo") {
+                    tracing::info!(target: "tool_dependencies", "Resolved cargo binary");
+                    Some("cargo".to_string())
+                } else {
+                    None
+                }
+            })
+            .clone()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Legacy interpreter helpers (kept for existing callers until migrated)
+// ---------------------------------------------------------------------------
+
 /// Split an interpreter spec like `"py -3"` into the program name
 /// and any initial arguments. Returns `("py", vec!["-3"])` for the
 /// example; returns `("python3", vec![])` for a bare name.
