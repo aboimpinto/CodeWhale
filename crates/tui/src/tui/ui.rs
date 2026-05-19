@@ -4548,7 +4548,7 @@ async fn apply_command_result(
                     {
                         let session = config_ui::start_web_editor(app, config).await?;
                         let url = format!("http://{}", session.addr);
-                        let open_err = config_ui::open_browser(&url).err();
+                        let open_err = crate::utils::open_url(&url).err();
                         if let Some(err) = open_err {
                             app.add_message(HistoryCell::System {
                                 content: format!("Failed to open browser automatically: {err}"),
@@ -4618,7 +4618,7 @@ async fn apply_command_result(
                         .push(crate::tui::theme_picker::ThemePickerView::new(original));
                 }
             }
-            AppAction::OpenExternalUrl { url, label } => match open_external_url(&url) {
+            AppAction::OpenExternalUrl { url, label } => match crate::utils::open_url(&url) {
                 Ok(()) => {
                     app.status_message = Some(format!("Opened {label} in your browser"));
                 }
@@ -4772,10 +4772,6 @@ async fn apply_command_result(
     }
 
     Ok(false)
-}
-
-fn open_external_url(url: &str) -> Result<()> {
-    crate::utils::open_url(url)
 }
 
 fn apply_workspace_runtime_state(app: &mut App, config: &Config, workspace: PathBuf) {
