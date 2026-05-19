@@ -70,7 +70,10 @@ pub(super) fn build_relevance(app: &App) -> FilePickerRelevance {
 }
 
 fn modified_workspace_paths(workspace: &Path) -> Vec<String> {
-    let Ok(output) = Git::command().expect("git not found")
+    let Some(mut cmd) = Git::command() else {
+        return Vec::new();
+    };
+    let Ok(output) = cmd
         .arg("-C")
         .arg(workspace)
         .args(["status", "--short", "--untracked-files=normal"])

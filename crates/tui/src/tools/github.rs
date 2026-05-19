@@ -360,10 +360,7 @@ fn ensure_github_repo(context: &ToolContext) -> Result<(), ToolError> {
 }
 
 fn git_status_porcelain(context: &ToolContext) -> Result<String, ToolError> {
-    let out = Command::new("git")
-        .args(["status", "--porcelain"])
-        .current_dir(&context.workspace)
-        .output()
+    let out = crate::dependencies::Git::output(&["status", "--porcelain"], &context.workspace)
         .map_err(|e| ToolError::execution_failed(format!("failed to run git status: {e}")))?;
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }

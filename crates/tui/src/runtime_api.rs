@@ -1646,11 +1646,7 @@ fn collect_workspace_status(workspace: &std::path::Path) -> WorkspaceStatusRespo
 }
 
 fn run_git(workspace: &std::path::Path, args: &[&str]) -> Option<String> {
-    let output = Command::new("git")
-        .args(args)
-        .current_dir(workspace)
-        .output()
-        .ok()?;
+    let output = crate::dependencies::Git::output(args, workspace).ok()?;
     if !output.status.success() {
         return None;
     }

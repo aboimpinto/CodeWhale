@@ -347,7 +347,7 @@ fn resolve_diff_target(
     staged: bool,
     base: Option<&str>,
 ) -> Result<String, ToolError> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::dependencies::Git::command().ok_or_else(|| ToolError::execution_failed("git not found".into()))?;
     cmd.arg("diff");
     if staged {
         cmd.arg("--cached");
@@ -377,7 +377,7 @@ fn resolve_diff_target(
 }
 
 fn gh_pr_diff(pr: &PullRequestRef, workspace: &Path) -> Result<String, ToolError> {
-    let mut cmd = Command::new("gh");
+    let mut cmd = crate::dependencies::Gh::command().ok_or_else(|| ToolError::execution_failed("gh not found".into()))?;
     cmd.arg("pr")
         .arg("diff")
         .arg(&pr.number)
