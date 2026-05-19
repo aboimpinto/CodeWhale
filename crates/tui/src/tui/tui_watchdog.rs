@@ -52,6 +52,13 @@ pub fn start() {
                     .map(|d| d.as_millis() as u64)
                     .unwrap_or(0);
                 if now.saturating_sub(last_beat) > STALL_SECONDS.saturating_mul(1000) {
+                    tracing::warn!(
+                        target: "tui_freeze",
+                        last_beat_ms = last_beat,
+                        now_ms = now,
+                        stall_secs = STALL_SECONDS,
+                        "TUI watchdog detected event-loop stall, signaling recovery"
+                    );
                     RECOVERY_NEEDED.store(true, Ordering::Release);
                 }
             }
