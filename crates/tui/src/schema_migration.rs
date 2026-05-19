@@ -205,7 +205,9 @@ pub fn backup_before_migrate(path: &Path, domain: &str) -> PathBuf {
 /// 3. Bump `CURRENT_VERSION` to match.
 /// 4. Wire `<Domain>Migration::migrate(...)` into the load function in
 ///    the owning module.
+// Domain registration structs are trait-impl carriers, never constructed.
 pub mod registry {
+    #![allow(dead_code)]
     use super::{MigrationFn, SchemaMigration};
 
     /// Sessions: `~/.deepseek/sessions/<id>.json` and the latest
