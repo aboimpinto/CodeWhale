@@ -2744,6 +2744,15 @@ fn flush_console_input_buffer() {
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
     if handle != -1 && handle != 0 {
         unsafe { FlushConsoleInputBuffer(handle) };
+        tracing::debug!(
+            target: "tui_freeze",
+            "Flushed Windows console input buffer after exec_shell (handle={handle})"
+        );
+    } else {
+        tracing::warn!(
+            target: "tui_freeze",
+            "Could not get valid STD_INPUT_HANDLE for console flush (handle={handle})"
+        );
     }
 }
 
