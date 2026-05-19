@@ -345,10 +345,10 @@ fn run_gh_json(context: &ToolContext, args: &[&str]) -> Result<Value, ToolError>
 }
 
 fn ensure_github_repo(context: &ToolContext) -> Result<(), ToolError> {
-    let out = Command::new("git")
-        .args(["rev-parse", "--is-inside-work-tree"])
-        .current_dir(&context.workspace)
-        .output()
+    let out = crate::dependencies::Git::output(
+        &["rev-parse", "--is-inside-work-tree"],
+        &context.workspace,
+    )
         .map_err(|e| ToolError::execution_failed(format!("failed to run git: {e}")))?;
     if out.status.success() {
         Ok(())

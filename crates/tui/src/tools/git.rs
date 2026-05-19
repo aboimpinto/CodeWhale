@@ -257,7 +257,7 @@ fn pathspec_from(working_dir: &Path, resolved: &Path) -> PathBuf {
 }
 
 fn run_git_command(working_dir: &Path, args: &[String]) -> Result<std::process::Output, ToolError> {
-    let mut cmd = Command::new("git");
+    let mut cmd = crate::dependencies::Git::command().ok_or_else(|| ToolError::not_available("git is not installed or not in PATH"))?;
     cmd.args(args).current_dir(working_dir);
     cmd.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -315,19 +315,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn git_available() -> bool {
-        Command::new("git")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        crate::dependencies::Git::available()
     }
 
     fn init_git_repo(root: &Path) {
         let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .status()
+            let status = crate::dependencies::Git::status(args, root)
                 .expect("git should spawn");
             assert!(status.success(), "git {:?} failed", args);
         };
@@ -339,10 +332,7 @@ mod tests {
 
     fn commit_all(root: &Path, message: &str) {
         let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .status()
+            let status = crate::dependencies::Git::status(args, root)
                 .expect("git should spawn");
             assert!(status.success(), "git {:?} failed", args);
         };
@@ -399,10 +389,7 @@ mod tests {
         assert!(uncached.content.contains("diff --git"));
         assert!(uncached.content.contains("lib.rs"));
 
-        let _ = Command::new("git")
-            .args(["add", "src/lib.rs"])
-            .current_dir(tmp.path())
-            .status()
+        let _ = crate::dependencies::Git::status(&["add", "src/lib.rs"], tmp.path())
             .expect("git add");
 
         let cached = tool
