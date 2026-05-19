@@ -13,7 +13,7 @@
 //   3. Check `tui_watchdog::recovery_needed()` and handle recovery.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
