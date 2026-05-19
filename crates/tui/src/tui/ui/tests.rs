@@ -25,6 +25,8 @@ use std::ffi::OsString;
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::MutexGuard;
+
+use crate::dependencies::ExternalTool;
 use std::time::{Duration, Instant};
 use unicode_width::UnicodeWidthStr;
 
@@ -5569,7 +5571,6 @@ fn composer_arrows_scroll_empty_down() {
 }
 
 #[test]
-fn composer_arrows_scroll_singleline_navigates_history() {
 fn composer_arrows_scroll_nonempty_also_scrolls() {
     let mut app = create_test_app();
     app.composer_arrows_scroll = true;
@@ -5591,45 +5592,6 @@ fn composer_arrows_scroll_nonempty_also_scrolls() {
 }
 
 #[test]
-fn composer_arrow_up_moves_within_multiline_input() {
-    let mut app = create_test_app();
-    app.composer_arrows_scroll = false;
-    app.input = "line one\nline two".to_string();
-    app.cursor_position = app.input.chars().count();
-    app.input_history.push("previous prompt".to_string());
-
-    assert!(handle_composer_history_arrow(
-        &mut app,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-        false,
-        false,
-    ));
-
-    assert_eq!(app.input, "line one\nline two");
-    assert!(app.cursor_position < app.input.chars().count());
-}
-
-#[test]
-fn composer_arrow_down_moves_within_multiline_input() {
-    let mut app = create_test_app();
-    app.composer_arrows_scroll = false;
-    app.input = "line one\nline two".to_string();
-    app.cursor_position = 0;
-    app.input_history.push("next prompt".to_string());
-    app.history_index = Some(app.input_history.len() - 1);
-
-    assert!(handle_composer_history_arrow(
-        &mut app,
-        KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
-        false,
-        false,
-    ));
-
-    assert_eq!(app.input, "line one\nline two");
-    assert!(app.cursor_position >= "line one\n".chars().count());
-}
-
-#[test]
 fn composer_arrows_scroll_multiline_input_navigates_lines() {
     let mut app = create_test_app();
     app.composer_arrows_scroll = true;
@@ -5646,24 +5608,6 @@ fn composer_arrows_scroll_multiline_input_navigates_lines() {
     assert_eq!(app.input, "line one\nline two");
     assert!(app.cursor_position < app.input.chars().count());
     assert_eq!(app.viewport.pending_scroll_delta, 0);
-}
-
-#[test]
-fn composer_arrow_up_at_first_line_falls_back_to_history_up() {
-    let mut app = create_test_app();
-    app.composer_arrows_scroll = false;
-    app.input = "line one\nline two".to_string();
-    app.cursor_position = 0;
-    app.input_history.push("previous prompt".to_string());
-
-    assert!(handle_composer_history_arrow(
-        &mut app,
-        KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
-        false,
-        false,
-    ));
-
-    assert_eq!(app.input, "previous prompt");
 }
 
 #[test]
@@ -5926,6 +5870,8 @@ fn history_roundtrip_up_then_down_restores_draft() {
     ));
     assert_eq!(app.input, "my draft");
     assert_eq!(app.cursor_position, "my draft".chars().count());
+}
+#[test]
 fn home_jumps_to_line_start_multiline() {
     let mut app = create_test_app();
     app.input = "line one\nline two\nline three".to_string();

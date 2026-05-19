@@ -2,8 +2,7 @@
 
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-use std::process::{Command, Stdio};
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -31,6 +30,7 @@ use ratatui::{
     widgets::Block,
 };
 use tracing;
+use crate::logging;
 
 use crate::audit::log_sensitive_event;
 use crate::automation_manager::{AutomationManager, AutomationSchedulerConfig, spawn_scheduler};
@@ -836,7 +836,14 @@ async fn run_event_loop(
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
 
+    let mut loop_ticks: u64 = 0;
+
     loop {
+        loop_ticks += 1;
+        if loop_ticks % 100 == 0 {
+            logging::info(format!("[FREEZE-DEBUG] event_loop tick={loop_ticks}, mode={:?}, streaming={}", app.mode, app.streaming_state.is_active));
+        }
+
         if !drain_web_config_events(&mut web_config_session, app, config, &engine_handle).await {
             web_config_session = None;
         }
@@ -939,11 +946,17 @@ async fn run_event_loop(
         let mut transcript_batch_updated = false;
         let mut queued_to_send: Option<QueuedMessage> = None;
         {
+            if loop_ticks % 100 == 0 {
+                logging::info(format!("[FREEZE-DEBUG] engine_poll_enter tick={loop_ticks}"));
+            }
             let mut rx = engine_handle.rx_event.write().await;
+            let poll_start = Instant::now();
             while let Ok(event) = rx.try_recv() {
                 received_engine_event = true;
+                logging::info(format!("[FREEZE-DEBUG] engine_event_rcvd tick={loop_ticks}"));
                 match event {
                     EngineEvent::MessageStarted { .. } => {
+                        logging::info("[FREEZE-DEBUG] EngineEvent::MessageStarted");
                         // Assistant text starting after parallel tool work
                         // means the tool group is done. Flush the active
                         // cell first so the message lands BELOW the
@@ -976,6 +989,7 @@ async fn run_event_loop(
                         }
                     }
                     EngineEvent::MessageComplete { .. } => {
+                        let complete_char_count = current_streaming_text.len();
                         // #861 RC3: defensive drain of a still-active thinking
                         // entry. Normally `ThinkingComplete` arrives first and
                         // populates `last_reasoning` before we get here, but
@@ -1065,6 +1079,8 @@ async fn run_event_loop(
                                 tool_uses,
                             );
                         }
+                        logging::info(format!(
+                            "[FREEZE-DEBUG] EngineEvent::MessageComplete chars={complete_char_count}"));
                     }
                     EngineEvent::ThinkingStarted { .. } => {
                         // P2.3: thinking lives in the active cell so it groups
@@ -4745,49 +4761,8 @@ async fn apply_command_result(
     Ok(false)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn open_external_url(url: &str) -> Result<()> {
-    let mut command = external_url_command(url);
-
-    let status = command
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|err| anyhow::anyhow!("failed to launch browser command: {err}"))?;
-    if !status.success() {
-        return Err(anyhow::anyhow!(
-            "browser command exited with status {status}"
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn open_external_url(_url: &str) -> Result<()> {
-    Err(anyhow::anyhow!(
-        "browser opening is unsupported on this platform"
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn external_url_command(url: &str) -> Command {
-    let mut command = Command::new("open");
-    command.arg(url);
-    command
-}
-
-#[cfg(target_os = "linux")]
-fn external_url_command(url: &str) -> Command {
-    let mut command = Command::new("xdg-open");
-    command.arg(url);
-    command
-}
-
-#[cfg(target_os = "windows")]
-fn external_url_command(url: &str) -> Command {
-    let mut command = Command::new("cmd");
-    command.args(["/C", "start", "", url]);
-    command
+    crate::utils::open_url(url)
 }
 
 fn apply_workspace_runtime_state(app: &mut App, config: &Config, workspace: PathBuf) {
@@ -5366,6 +5341,18 @@ fn build_pending_input_preview(app: &App) -> PendingInputPreview {
 }
 
 fn render(f: &mut Frame, app: &mut App) {
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % 100 == 0 || app.needs_redraw {
+            logging::info(format!(
+                "[FREEZE-DEBUG] render #{n} cells={} needs_redraw={}",
+                app.history.len(),
+                app.needs_redraw
+            ));
+        }
+    }
     let size = f.area();
 
     // Clear entire area with the configured app background.

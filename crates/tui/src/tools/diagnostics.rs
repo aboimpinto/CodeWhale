@@ -190,6 +190,7 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::Path;
+    use crate::dependencies::ExternalTool;
     use std::process::Command;
     use tempfile::tempdir;
 
