@@ -836,8 +836,8 @@ async fn run_event_loop(
 
     loop {
         loop_ticks += 1;
-        if loop_ticks % 1000 == 0 {
-            logging::info(format!("[FREEZE-DEBUG] event_loop tick={loop_ticks}, mode={:?}", app.mode));
+        if loop_ticks % 100 == 0 {
+            logging::info(format!("[FREEZE-DEBUG] event_loop tick={loop_ticks}, mode={:?}, streaming={}", app.mode, app.streaming_state.is_active()));
         }
 
         if !drain_web_config_events(&mut web_config_session, app, config, &engine_handle).await {
@@ -942,9 +942,14 @@ async fn run_event_loop(
         let mut transcript_batch_updated = false;
         let mut queued_to_send: Option<QueuedMessage> = None;
         {
+            if loop_ticks % 100 == 0 {
+                logging::info(format!("[FREEZE-DEBUG] engine_poll_enter tick={loop_ticks}"));
+            }
             let mut rx = engine_handle.rx_event.write().await;
+            let poll_start = Instant::now();
             while let Ok(event) = rx.try_recv() {
                 received_engine_event = true;
+                logging::info(format!("[FREEZE-DEBUG] engine_event_rcvd tick={loop_ticks}"));
                 match event {
                     EngineEvent::MessageStarted { .. } => {
                         logging::info("[FREEZE-DEBUG] EngineEvent::MessageStarted");
