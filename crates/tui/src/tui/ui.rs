@@ -31,6 +31,7 @@ use ratatui::{
     widgets::Block,
 };
 use tracing;
+use crate::logging;
 
 use crate::audit::log_sensitive_event;
 use crate::automation_manager::{AutomationManager, AutomationSchedulerConfig, spawn_scheduler};
@@ -831,7 +832,14 @@ async fn run_event_loop(
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
 
+    let mut loop_ticks: u64 = 0;
+
     loop {
+        loop_ticks += 1;
+        if loop_ticks % 1000 == 0 {
+            logging::info(format!("[FREEZE-DEBUG] event_loop tick={loop_ticks}, mode={:?}", app.mode));
+        }
+
         if !drain_web_config_events(&mut web_config_session, app, config, &engine_handle).await {
             web_config_session = None;
         }
@@ -939,6 +947,7 @@ async fn run_event_loop(
                 received_engine_event = true;
                 match event {
                     EngineEvent::MessageStarted { .. } => {
+                        logging::info("[FREEZE-DEBUG] EngineEvent::MessageStarted");
                         // Assistant text starting after parallel tool work
                         // means the tool group is done. Flush the active
                         // cell first so the message lands BELOW the
@@ -971,6 +980,7 @@ async fn run_event_loop(
                         }
                     }
                     EngineEvent::MessageComplete { .. } => {
+                        let complete_char_count = current_streaming_text.len();
                         // #861 RC3: defensive drain of a still-active thinking
                         // entry. Normally `ThinkingComplete` arrives first and
                         // populates `last_reasoning` before we get here, but
@@ -1060,6 +1070,8 @@ async fn run_event_loop(
                                 tool_uses,
                             );
                         }
+                        logging::info(format!(
+                            "[FREEZE-DEBUG] EngineEvent::MessageComplete chars={complete_char_count}"));
                     }
                     EngineEvent::ThinkingStarted { .. } => {
                         // P2.3: thinking lives in the active cell so it groups
@@ -5361,6 +5373,18 @@ fn build_pending_input_preview(app: &App) -> PendingInputPreview {
 }
 
 fn render(f: &mut Frame, app: &mut App) {
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n % 100 == 0 || app.needs_redraw {
+            logging::info(format!(
+                "[FREEZE-DEBUG] render #{n} cells={} needs_redraw={}",
+                app.history.len(),
+                app.needs_redraw
+            ));
+        }
+    }
     let size = f.area();
 
     // Clear entire area with the configured app background.
