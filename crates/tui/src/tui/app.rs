@@ -842,6 +842,11 @@ pub struct App {
     pub auto_compact: bool,
     pub calm_mode: bool,
     pub low_motion: bool,
+    /// Fix/1812: accumulated milliseconds of consecutive empty event polls
+    /// while the engine has pending work.  When this exceeds the stall
+    /// threshold the event loop forces a terminal-mode recovery to re-arm
+    /// the Windows console input handle.
+    pub tui_freeze_consecutive_empty_polls_ms: u64,
     /// Pending #61 (animated working strip). Set from config but not read
     /// until the footer widget consumes it.
     #[allow(dead_code)]
@@ -1497,6 +1502,7 @@ impl App {
             use_bracketed_paste,
             use_paste_burst_detection,
             bracketed_paste_seen: false,
+            tui_freeze_consecutive_empty_polls_ms: 0,
             system_prompt: None,
             auto_compact,
             calm_mode,

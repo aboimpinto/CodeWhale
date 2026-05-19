@@ -138,6 +138,12 @@ const CONTEXT_CRITICAL_THRESHOLD_PERCENT: f64 = 95.0;
 const UI_IDLE_POLL_MS: u64 = 48;
 const UI_ACTIVE_POLL_MS: u64 = 24;
 const WEB_CONFIG_POLL_MS: u64 = 16;
+/// Fix/1812: when the event poll returns `false` (no events) for this many
+/// milliseconds while the engine has pending work, force a terminal-mode
+/// recovery.  On Windows this re-arms the console input handle after a child
+/// process exit has left it in a non-signalling state.
+#[cfg(windows)]
+const STALL_THRESHOLD_MS: u64 = 5_000;
 const DISPATCH_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
 // Forced repaint cadence while a turn is live (model loading, compacting,
 // sub-agents running). Drives the footer water-spout animation as well as
@@ -2033,7 +2039,38 @@ async fn run_event_loop(
         // `working.` with no network activity.
         tokio::task::yield_now().await;
 
-        if event::poll(poll_timeout)? {
+        // === Fix/1812: bounded poll timeout with stall detection ===
+        // On Windows, rapid child process (exec_shell) exits can leave the
+        // console input handle in a state where WaitForSingleObject never
+        // signals, causing crossterm::event::poll() to hang despite the
+        // timeout.  When we detect consecutive empty polls exceeding
+        // STALL_THRESHOLD while the engine has pending work, force a
+        // terminal-mode recovery to re-arm the input handle.
+        let poll_had_event = event::poll(poll_timeout)?;
+        #[cfg(windows)]
+        {
+            let engine_busy = app.is_loading || has_running_agents || app.is_compacting;
+            if poll_had_event {
+                app.tui_freeze_consecutive_empty_polls_ms = 0u64;
+            } else if engine_busy {
+                app.tui_freeze_consecutive_empty_polls_ms =
+                    app.tui_freeze_consecutive_empty_polls_ms
+                        .saturating_add(poll_timeout.as_millis() as u64);
+                if app.tui_freeze_consecutive_empty_polls_ms >= STALL_THRESHOLD_MS {
+                    tracing::warn!(
+                        "TUI event poll stall detected ({}ms empty), forcing terminal recovery",
+                        app.tui_freeze_consecutive_empty_polls_ms,
+                    );
+                    force_terminal_repaint = true;
+                    app.tui_freeze_consecutive_empty_polls_ms = 0u64;
+                    // Fall through — poll_had_event was false, so the
+                    // `if poll_had_event` block below is skipped and we
+                    // go straight to terminal recovery on the next
+                    // iteration via force_terminal_repaint.
+                }
+            }
+        }
+        if poll_had_event {
             let evt = event::read()?;
             app.needs_redraw = true;
 
