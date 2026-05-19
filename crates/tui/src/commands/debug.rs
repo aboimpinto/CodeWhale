@@ -10,7 +10,7 @@ use crate::compaction::estimate_input_tokens_conservative;
 use crate::localization::{Locale, MessageId, tr};
 use crate::models::{ContentBlock, MessageRequest, SystemPrompt, context_window_for_model};
 use crate::tui::app::{App, AppAction, TurnCacheRecord};
-use crate::dependencies::Git;
+use crate::dependencies::{ExternalTool, Git};
 use crate::tui::history::HistoryCell;
 
 fn token_count(value: Option<u32>, locale: Locale) -> String {

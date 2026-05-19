@@ -5,15 +5,16 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use async_trait::async_trait;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use super::spec::{
-    ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
-    optional_bool, optional_str, optional_u64, required_str,
+    optional_bool, optional_str, optional_u64, required_str, ApprovalRequirement, ToolCapability,
+    ToolContext, ToolError, ToolResult, ToolSpec,
 };
+use crate::dependencies::ExternalTool;
 
 const MAX_OUTPUT_CHARS: usize = 40_000;
 const DEFAULT_LOG_MAX_COUNT: u64 = 20;
@@ -445,7 +446,11 @@ fn pathspec_from(working_dir: &Path, resolved: &Path) -> PathBuf {
 }
 
 fn run_git_command(working_dir: &Path, args: &[String]) -> Result<Output, ToolError> {
-    let mut cmd = crate::dependencies::Git::command().ok_or_else(|| ToolError::not_available("git is not installed or not in PATH"))?;
+    let Some(mut cmd) = crate::dependencies::Git::command() else {
+        return Err(ToolError::not_available(
+            "git is not installed or not in PATH",
+        ));
+    };
     cmd.args(args).current_dir(working_dir);
     cmd.output().map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
@@ -508,8 +513,7 @@ mod tests {
     }
 
     fn run_git(root: &Path, args: &[&str]) {
-        let status = crate::dependencies::Git::status(args, root)
-            .expect("git should spawn");
+        let status = crate::dependencies::Git::status(args, root).expect("git should spawn");
         assert!(status.success(), "git {:?} failed", args);
     }
 

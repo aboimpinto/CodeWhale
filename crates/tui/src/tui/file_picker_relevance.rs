@@ -16,7 +16,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use crate::dependencies::Git;
+use crate::dependencies::{ExternalTool, Git};
 
 use crate::tui::app::App;
 use crate::tui::app::ToolDetailRecord;

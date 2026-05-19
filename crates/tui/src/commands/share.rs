@@ -12,6 +12,7 @@ use std::io::Write;
 use std::path::Path;
 
 use super::CommandResult;
+use crate::dependencies::ExternalTool;
 use crate::tui::app::{App, AppAction};
 
 /// Share the current session as a web URL.

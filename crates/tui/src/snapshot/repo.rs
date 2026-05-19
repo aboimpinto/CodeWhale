@@ -15,8 +15,10 @@
 use std::collections::HashSet;
 use std::io;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use crate::dependencies::ExternalTool;
 
 use super::paths::{ensure_snapshot_dir, snapshot_git_dir};
 

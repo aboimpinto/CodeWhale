@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use crate::dependencies::ExternalTool;
 use async_trait::async_trait;
 use chrono::Utc;
 use serde_json::{Value, json};

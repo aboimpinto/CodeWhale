@@ -5,7 +5,6 @@ use std::convert::Infallible;
 use std::fs;
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,6 +24,8 @@ use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tower_http::cors::{Any, CorsLayer};
+
+use crate::dependencies::ExternalTool;
 
 use crate::automation_manager::{
     AutomationManager, AutomationRecord, AutomationRunRecord, AutomationSchedulerConfig,

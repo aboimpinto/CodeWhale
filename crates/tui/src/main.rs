@@ -12,6 +12,8 @@ use dotenvy::dotenv;
 use tempfile::NamedTempFile;
 use wait_timeout::ChildExt;
 
+use crate::dependencies::ExternalTool;
+
 mod acp_server;
 mod artifacts;
 mod audit;
@@ -2914,12 +2916,16 @@ async fn test_api_connectivity(config: &Config) -> Result<()> {
 }
 
 fn rustc_version() -> String {
-    crate::dependencies::RustC::command()
-        .map(|mut cmd| cmd.arg("--version"))
-        .and_then(|mut cmd| cmd.output().ok())
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string())
+    let Some(mut cmd) = crate::dependencies::RustC::command() else {
+        return "unknown".to_string();
+    };
+    let Ok(output) = cmd.arg("--version").output() else {
+        return "unknown".to_string();
+    };
+    String::from_utf8(output.stdout).map(|s| s.trim().to_string()).unwrap_or_else(|_| "unknown".to_string())
 }
+
+
 
 /// List saved sessions
 fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {

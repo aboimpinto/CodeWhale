@@ -8,7 +8,7 @@
 //! a synchronous call.
 
 use std::path::Path;
-use crate::dependencies::Git;
+use crate::dependencies::{ExternalTool, Git};
 use std::time::{Duration, Instant};
 
 use crate::tui::app::App;
