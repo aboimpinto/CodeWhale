@@ -249,7 +249,8 @@ impl SnapshotRepo {
             // and stores metadata in `.git`. We then continue to use
             // explicit `--git-dir` / `--work-tree` flags for every other
             // command so behaviour is invariant of cwd.
-            let init = Command::new("git")
+            let init = crate::dependencies::Git::command()
+                .ok_or_else(|| io_other("git not found on PATH"))?
                 .arg("init")
                 .arg("--quiet")
                 .arg(parent)
@@ -815,7 +816,8 @@ fn cleanup_stale_pack_temps_in(
 }
 
 fn run_git(git_dir: &Path, work_tree: &Path, args: &[&str]) -> io::Result<Output> {
-    Command::new("git")
+    crate::dependencies::Git::command()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "git not found on PATH"))?
         .arg("--git-dir")
         .arg(git_dir)
         .arg("--work-tree")
@@ -1049,22 +1051,20 @@ mod tests {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
-        Command::new("git")
-            .arg("-C")
-            .arg(&workspace)
-            .arg("init")
-            .arg("--quiet")
+        crate::dependencies::Git::command().expect("git not found")
+            .arg("-C").arg(&workspace)
+            .arg("init").arg("--quiet")
             .status()
             .unwrap();
         std::fs::write(workspace.join("tracked.txt"), b"committed").unwrap();
-        Command::new("git")
+        crate::dependencies::Git::command().expect("git not found")
             .arg("-C")
             .arg(&workspace)
             .arg("add")
             .arg("tracked.txt")
             .status()
             .unwrap();
-        Command::new("git")
+        crate::dependencies::Git::command().expect("git not found")
             .arg("-C")
             .arg(&workspace)
             .arg("-c")
@@ -1077,7 +1077,7 @@ mod tests {
             .arg("init")
             .status()
             .unwrap();
-        let user_head_before = Command::new("git")
+        let user_head_before = crate::dependencies::Git::command().expect("git not found")
             .arg("-C")
             .arg(&workspace)
             .args(["rev-parse", "HEAD"])
@@ -1093,7 +1093,7 @@ mod tests {
         repo.snapshot("post-turn:1").unwrap();
         repo.restore(&id).unwrap();
 
-        let user_head_after = Command::new("git")
+        let user_head_after = crate::dependencies::Git::command().expect("git not found")
             .arg("-C")
             .arg(&workspace)
             .args(["rev-parse", "HEAD"])
