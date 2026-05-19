@@ -2736,7 +2736,7 @@ impl ToolSpec for NoteTool {
 #[cfg(windows)]
 fn flush_console_input_buffer() {
     // Use raw FFI to avoid pulling in windows-sys as a new dependency.
-    extern "system" {
+    unsafe extern "system" {
         fn GetStdHandle(nStdHandle: u32) -> isize;
         fn FlushConsoleInputBuffer(hConsoleInput: isize) -> i32;
     }
