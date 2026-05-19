@@ -443,6 +443,64 @@ impl ExternalTool for DotNet {
 }
 
 // ---------------------------------------------------------------------------
+/// Go toolchain — used by the `go_execution` tool.
+///
+/// `go run file.go` compiles and executes in one step.
+pub struct Go;
+
+impl ExternalTool for Go {
+    fn candidates() -> &'static [&'static str] {
+        &["go"]
+    }
+
+    fn resolve() -> Option<String> {
+        static CACHE: OnceLock<Option<String>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                if probe_executable("go") {
+                    tracing::info!(target: "tool_dependencies", "Resolved go binary");
+                    Some("go".to_string())
+                } else {
+                    None
+                }
+            })
+            .clone()
+    }
+}
+
+/// TypeScript runtime — used by the `ts_execution` tool.
+///
+/// Tries `ts-node` first (most common), then `deno` (built-in TS),
+/// then `npx tsx` (lightweight).  The multi-candidate ladder is
+/// similar to Python's `python3`/`python`/`py -3`.
+pub struct TypeScript;
+
+const TS_CANDIDATES: &[&str] = &["ts-node", "deno", "npx tsx"];
+
+impl ExternalTool for TypeScript {
+    fn candidates() -> &'static [&'static str] {
+        TS_CANDIDATES
+    }
+
+    fn resolve() -> Option<String> {
+        static CACHE: OnceLock<Option<String>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                for candidate in Self::candidates() {
+                    if probe_executable(candidate) {
+                        tracing::info!(
+                            target: "tool_dependencies",
+                            "Resolved TypeScript runtime: {candidate}"
+                        );
+                        return Some(candidate.to_string());
+                    }
+                }
+                None
+            })
+            .clone()
+    }
+}
+
 // Legacy interpreter helpers (kept for existing callers until migrated)
 // ---------------------------------------------------------------------------
 

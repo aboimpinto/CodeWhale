@@ -23,6 +23,15 @@ pub(super) const CODE_EXECUTION_TOOL_NAME: &str = "code_execution";
 const CODE_EXECUTION_TOOL_TYPE: &str = "code_execution_20250825";
 pub(super) use crate::tools::dotnet_execution::DOTNET_EXECUTION_TOOL_NAME;
 pub(super) use crate::tools::js_execution::JS_EXECUTION_TOOL_NAME;
+
+// RuntimeTool-based tool names — new runtimes added via the unified trait.
+pub(super) const GO_EXECUTION_TOOL_NAME: &str = "go_execution";
+const GO_EXECUTION_TOOL_TYPE: &str = "code_execution_20250825";
+pub(super) const TS_EXECUTION_TOOL_NAME: &str = "ts_execution";
+const TS_EXECUTION_TOOL_TYPE: &str = "code_execution_20250825";
+pub(super) const RUST_EXECUTION_TOOL_NAME: &str = "rust_execution";
+const RUST_EXECUTION_TOOL_TYPE: &str = "code_execution_20250825";
+
 const TOOL_SEARCH_REGEX_NAME: &str = "tool_search_tool_regex";
 const TOOL_SEARCH_REGEX_TYPE: &str = "tool_search_tool_regex_20251119";
 pub(super) const TOOL_SEARCH_BM25_NAME: &str = "tool_search_tool_bm25";
@@ -176,6 +185,13 @@ pub(super) fn ensure_advanced_tooling(catalog: &mut Vec<Tool>, mode: AppMode) {
         && crate::dependencies::DotNet::available()
     {
         catalog.push(crate::tools::dotnet_execution::dotnet_execution_tool_definition());
+    }
+
+    // RuntimeTool-based registrations — new runtimes use the unified trait.
+    if mode != AppMode::Plan {
+        crate::tools::runtime_tool::ensure_runtime_tool::<crate::dependencies::Go>(catalog);
+        crate::tools::runtime_tool::ensure_runtime_tool::<crate::dependencies::TypeScript>(catalog);
+        crate::tools::runtime_tool::ensure_runtime_tool::<crate::dependencies::RustC>(catalog);
     }
 
     if !catalog.iter().any(|t| t.name == TOOL_SEARCH_REGEX_NAME) {
@@ -738,4 +754,41 @@ pub(super) async fn execute_code_execution_tool(
         success,
         metadata: Some(payload),
     })
+}
+
+/// Generic dispatch for RuntimeTool-based code execution tools
+/// (go_execution, ts_execution, rust_execution).
+///
+/// Existing Python/Node/dotnet tools use their dedicated execute
+/// functions for now; they'll migrate to this path in a follow-up.
+pub(super) async fn execute_runtime_tool(
+    tool_name: &str,
+    input: &Value,
+    workspace: &Path,
+) -> Result<ToolResult, ToolError> {
+    let code = required_str(input, "code")?;
+
+    match tool_name {
+        GO_EXECUTION_TOOL_NAME => {
+            crate::tools::runtime_tool::RuntimeTool::execute::<crate::dependencies::Go>(
+                code, workspace,
+            )
+            .await
+        }
+        TS_EXECUTION_TOOL_NAME => {
+            crate::tools::runtime_tool::RuntimeTool::execute::<crate::dependencies::TypeScript>(
+                code, workspace,
+            )
+            .await
+        }
+        RUST_EXECUTION_TOOL_NAME => {
+            crate::tools::runtime_tool::RuntimeTool::execute::<crate::dependencies::RustC>(
+                code, workspace,
+            )
+            .await
+        }
+        other => Err(ToolError::execution_failed(format!(
+            "Unknown runtime tool: {other}"
+        ))),
+    }
 }
