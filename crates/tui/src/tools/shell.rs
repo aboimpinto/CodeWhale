@@ -824,6 +824,9 @@ impl ShellManager {
 
         // Wait with timeout
         if let Some(status) = child.wait_timeout(timeout)? {
+            // Fix/1812: clear stale console input state after child exit.
+            #[cfg(windows)]
+            flush_console_input_buffer();
             let stdout = stdout_thread.join().unwrap_or_default();
             let stderr = stderr_thread.join().unwrap_or_default();
             let stdout_str = String::from_utf8_lossy(&stdout).to_string();
@@ -867,6 +870,9 @@ impl ShellManager {
             #[cfg(not(unix))]
             let _ = child.kill();
             let status = child.wait().ok();
+            // Fix/1812: clear stale console input state after child exit.
+            #[cfg(windows)]
+            flush_console_input_buffer();
             let stdout = stdout_thread.join().unwrap_or_default();
             let stderr = stderr_thread.join().unwrap_or_default();
             let stdout_str = String::from_utf8_lossy(&stdout).to_string();
@@ -2719,6 +2725,25 @@ impl ToolSpec for NoteTool {
             "Note appended to {}",
             context.notes_path.display()
         )))
+    }
+}
+
+// Fix/1812: On Windows, rapid child process exits (exec_shell) can leave
+// the console input buffer in a state where the parent's
+// WaitForSingleObject(console_input_handle) never signals, freezing the
+// crossterm event loop.  Call this after every child process wait to clear
+// any stale state from the input buffer.
+#[cfg(windows)]
+fn flush_console_input_buffer() {
+    // Use raw FFI to avoid pulling in windows-sys as a new dependency.
+    extern "system" {
+        fn GetStdHandle(nStdHandle: u32) -> isize;
+        fn FlushConsoleInputBuffer(hConsoleInput: isize) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = 0xFFFFFFF6u32;
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle != -1 && handle != 0 {
+        unsafe { FlushConsoleInputBuffer(handle) };
     }
 }
 
