@@ -347,6 +347,29 @@ impl ExternalTool for RustC {
     }
 }
 
+/// Rust build tool — used by the `run_tests` tool.
+pub struct Cargo;
+
+impl ExternalTool for Cargo {
+    fn candidates() -> &'static [&'static str] {
+        &["cargo"]
+    }
+
+    fn resolve() -> Option<String> {
+        static CACHE: OnceLock<Option<String>> = OnceLock::new();
+        CACHE
+            .get_or_init(|| {
+                if probe_executable("cargo") {
+                    tracing::info!(target: "tool_dependencies", "Resolved cargo binary");
+                    Some("cargo".to_string())
+                } else {
+                    None
+                }
+            })
+            .clone()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Legacy interpreter helpers (kept for existing callers until migrated)
 // ---------------------------------------------------------------------------
