@@ -348,7 +348,7 @@ fn resolve_diff_target(
     base: Option<&str>,
 ) -> Result<String, ToolError> {
     let Some(mut cmd) = crate::dependencies::Git::command() else {
-        return Err(ToolError::execution_failed("git not found".into()));
+        return Err(ToolError::execution_failed("git not found"));
     };
     cmd.arg("diff");
     if staged {
@@ -380,7 +380,7 @@ fn resolve_diff_target(
 
 fn gh_pr_diff(pr: &PullRequestRef, workspace: &Path) -> Result<String, ToolError> {
     let Some(mut cmd) = crate::dependencies::Gh::command() else {
-        return Err(ToolError::execution_failed("gh not found".into()));
+        return Err(ToolError::execution_failed("gh not found"));
     };
     cmd.arg("pr")
         .arg("diff")
