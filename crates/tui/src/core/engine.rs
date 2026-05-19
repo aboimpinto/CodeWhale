@@ -1972,9 +1972,11 @@ use self::streaming::{
 };
 use self::tool_catalog::{
     CODE_EXECUTION_TOOL_NAME, DOTNET_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME,
-    MULTI_TOOL_PARALLEL_NAME,
+    GO_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
+    RUST_EXECUTION_TOOL_NAME, TS_EXECUTION_TOOL_NAME,
     REQUEST_USER_INPUT_NAME, active_tools_for_step, build_model_tool_catalog,
-    ensure_advanced_tooling, execute_code_execution_tool, execute_tool_search,
+    ensure_advanced_tooling, execute_code_execution_tool, execute_runtime_tool,
+    execute_tool_search,
     initial_active_tools, is_tool_search_tool, maybe_hydrate_requested_deferred_tool,
     missing_tool_error_message,
 };
