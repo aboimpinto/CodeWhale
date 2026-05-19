@@ -194,19 +194,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn git_available() -> bool {
-        Command::new("git")
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
+        crate::dependencies::Git::available()
     }
 
     fn init_git_repo(root: &Path) {
         let run = |args: &[&str]| {
-            let status = Command::new("git")
-                .args(args)
-                .current_dir(root)
-                .status()
+            let status = crate::dependencies::Git::status(args, root)
                 .expect("git should spawn");
             assert!(status.success(), "git {:?} failed", args);
         };
