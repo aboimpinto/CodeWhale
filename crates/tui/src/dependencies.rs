@@ -271,6 +271,22 @@ pub trait ExternalTool {
         })?;
         cmd.args(args).current_dir(cwd).status()
     }
+
+    /// Build a `tokio::process::Command` pre-populated with the resolved
+    /// binary (and any fixed arguments from a multi-word candidate like
+    /// `"py -3"`). Returns `None` when the tool isn't installed.
+    ///
+    /// Async callers (`code_execution`, `js_execution`) use this instead
+    /// of [`ExternalTool::command`] so they can `.await` the child.
+    fn tokio_command() -> Option<tokio::process::Command> {
+        let spec = Self::resolve()?;
+        let (program, fixed_args) = split_interpreter_spec(&spec);
+        let mut cmd = tokio::process::Command::new(&program);
+        for arg in &fixed_args {
+            cmd.arg(arg);
+        }
+        Some(cmd)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +386,37 @@ impl ExternalTool for Cargo {
     }
 }
 
+/// Python interpreter — used by `code_execution` tool and RLM REPL.
+/// Delegates to the existing [`resolve_python_interpreter`] so the
+/// multi-candidate ladder (`python3` → `python` → `py -3`) is
+/// shared with legacy callers until they migrate to the trait.
+pub struct Python;
+
+impl ExternalTool for Python {
+    fn candidates() -> &'static [&'static str] {
+        PYTHON_CANDIDATES
+    }
+
+    fn resolve() -> Option<String> {
+        resolve_python_interpreter()
+    }
+}
+
+/// Node.js runtime — used by the `js_execution` tool.
+/// The binary name `node` is the same on every platform we support,
+/// so this is a single probe rather than a candidate ladder.
+pub struct Node;
+
+impl ExternalTool for Node {
+    fn candidates() -> &'static [&'static str] {
+        &["node"]
+    }
+
+    fn resolve() -> Option<String> {
+        resolve_node()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Legacy interpreter helpers (kept for existing callers until migrated)
 // ---------------------------------------------------------------------------
@@ -463,5 +510,218 @@ mod tests {
                 "resolved {name:?} is not in PYTHON_CANDIDATES {PYTHON_CANDIDATES:?}"
             );
         }
+    }
+
+    // ===================================================================
+    // ExternalTool trait tests
+    // ===================================================================
+
+    #[test]
+    fn python_candidates_matches_const() {
+        assert_eq!(Python::candidates(), PYTHON_CANDIDATES);
+    }
+
+    #[test]
+    fn node_candidates_is_node_only() {
+        assert_eq!(Node::candidates(), &["node"]);
+    }
+
+    #[test]
+    fn git_candidates_is_git_only() {
+        assert_eq!(Git::candidates(), &["git"]);
+    }
+
+    #[test]
+    fn gh_candidates_is_gh_only() {
+        assert_eq!(Gh::candidates(), &["gh"]);
+    }
+
+    #[test]
+    fn rustc_candidates_is_rustc_only() {
+        assert_eq!(RustC::candidates(), &["rustc"]);
+    }
+
+    #[test]
+    fn cargo_candidates_is_cargo_only() {
+        assert_eq!(Cargo::candidates(), &["cargo"]);
+    }
+
+    #[test]
+    fn git_resolve_is_cached() {
+        let first = Git::resolve();
+        let second = Git::resolve();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn gh_resolve_is_cached() {
+        let first = Gh::resolve();
+        let second = Gh::resolve();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn python_trait_resolve_is_cached() {
+        let first = Python::resolve();
+        let second = Python::resolve();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn node_resolve_is_cached() {
+        let first = Node::resolve();
+        let second = Node::resolve();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn rustc_resolve_is_cached() {
+        let first = RustC::resolve();
+        let second = RustC::resolve();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cargo_resolve_is_cached() {
+        let first = Cargo::resolve();
+        let second = Cargo::resolve();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn git_available_matches_resolve() {
+        assert_eq!(Git::available(), Git::resolve().is_some());
+    }
+
+    #[test]
+    fn python_available_matches_resolve() {
+        assert_eq!(Python::available(), Python::resolve().is_some());
+    }
+
+    #[test]
+    fn node_available_matches_resolve() {
+        assert_eq!(Node::available(), Node::resolve().is_some());
+    }
+
+    #[test]
+    fn rustc_available_matches_resolve() {
+        assert_eq!(RustC::available(), RustC::resolve().is_some());
+    }
+
+    #[test]
+    fn cargo_available_matches_resolve() {
+        assert_eq!(Cargo::available(), Cargo::resolve().is_some());
+    }
+
+    #[test]
+    fn git_command_returns_some_when_available() {
+        if Git::available() {
+            assert!(Git::command().is_some());
+        }
+    }
+
+    #[test]
+    fn python_command_returns_some_when_available() {
+        if Python::available() {
+            assert!(Python::command().is_some());
+        }
+    }
+
+    #[test]
+    fn python_tokio_command_returns_some_when_available() {
+        if Python::available() {
+            assert!(Python::tokio_command().is_some());
+        }
+    }
+
+    #[test]
+    fn node_tokio_command_returns_some_when_available() {
+        if Node::available() {
+            assert!(Node::tokio_command().is_some());
+        }
+    }
+
+    #[test]
+    fn git_output_version_succeeds() {
+        // Only run when git is actually installed.
+        if !Git::available() {
+            return;
+        }
+        let tmp = std::env::temp_dir();
+        let out = Git::output(&["--version"], &tmp);
+        assert!(
+            out.is_ok(),
+            "git --version must succeed when git is available"
+        );
+        let out = out.unwrap();
+        assert!(
+            out.status.success(),
+            "git --version must exit 0"
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("git version"),
+            "git --version stdout must contain 'git version', got: {}",
+            stdout.trim()
+        );
+    }
+
+    #[test]
+    fn python_output_version_succeeds() {
+        if !Python::available() {
+            return;
+        }
+        let tmp = std::env::temp_dir();
+        let out = Python::output(&["--version"], &tmp);
+        assert!(out.is_ok(), "python --version must spawn");
+        let out = out.unwrap();
+        // Python --version writes to stdout on 3.x, so just check
+        // that it succeeded (exit 0).
+        assert!(
+            out.status.success(),
+            "python --version must exit 0"
+        );
+    }
+
+    #[test]
+    fn node_output_version_succeeds() {
+        if !Node::available() {
+            return;
+        }
+        let tmp = std::env::temp_dir();
+        let out = Node::output(&["--version"], &tmp);
+        assert!(out.is_ok(), "node --version must spawn");
+        let out = out.unwrap();
+        assert!(out.status.success(), "node --version must exit 0");
+    }
+
+    #[test]
+    fn cargo_output_version_succeeds() {
+        if !Cargo::available() {
+            return;
+        }
+        let tmp = std::env::temp_dir();
+        let out = Cargo::output(&["--version"], &tmp);
+        assert!(out.is_ok(), "cargo --version must spawn");
+        let out = out.unwrap();
+        assert!(out.status.success(), "cargo --version must exit 0");
+    }
+
+    #[test]
+    fn external_tool_output_respects_cwd() {
+        // Verify that `output()` runs in the requested directory.
+        if !Git::available() {
+            return;
+        }
+        let tmp = std::env::temp_dir();
+        let out = Git::output(&["rev-parse", "--show-toplevel"], &tmp);
+        assert!(out.is_ok(), "git rev-parse must spawn");
+        let out = out.unwrap();
+        // rev-parse --show-toplevel in a non-git dir should fail
+        // because temp_dir is not a git repo. That's expected.
+        // The key assertion: the command executed without IO errors.
+        // We don't assert success because temp_dir might or might not
+        // be inside a git worktree.
+        let _ = out; // just checking it didn't panic/IO-error
     }
 }

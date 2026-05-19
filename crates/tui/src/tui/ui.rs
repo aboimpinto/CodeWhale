@@ -2,8 +2,7 @@
 
 use std::io::{self, Stdout, Write};
 use std::path::PathBuf;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-use std::process::{Command, Stdio};
+
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -842,7 +841,7 @@ async fn run_event_loop(
     loop {
         loop_ticks += 1;
         if loop_ticks % 100 == 0 {
-            logging::info(format!("[FREEZE-DEBUG] event_loop tick={loop_ticks}, mode={:?}, streaming={}", app.mode, app.streaming_state.is_active()));
+            logging::info(format!("[FREEZE-DEBUG] event_loop tick={loop_ticks}, mode={:?}, streaming={}", app.mode, app.streaming_state.is_active));
         }
 
         if !drain_web_config_events(&mut web_config_session, app, config, &engine_handle).await {
@@ -4762,49 +4761,8 @@ async fn apply_command_result(
     Ok(false)
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn open_external_url(url: &str) -> Result<()> {
-    let mut command = external_url_command(url);
-
-    let status = command
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|err| anyhow::anyhow!("failed to launch browser command: {err}"))?;
-    if !status.success() {
-        return Err(anyhow::anyhow!(
-            "browser command exited with status {status}"
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-fn open_external_url(_url: &str) -> Result<()> {
-    Err(anyhow::anyhow!(
-        "browser opening is unsupported on this platform"
-    ))
-}
-
-#[cfg(target_os = "macos")]
-fn external_url_command(url: &str) -> Command {
-    let mut command = Command::new("open");
-    command.arg(url);
-    command
-}
-
-#[cfg(target_os = "linux")]
-fn external_url_command(url: &str) -> Command {
-    let mut command = Command::new("xdg-open");
-    command.arg(url);
-    command
-}
-
-#[cfg(target_os = "windows")]
-fn external_url_command(url: &str) -> Command {
-    let mut command = Command::new("cmd");
-    command.args(["/C", "start", "", url]);
-    command
+    crate::utils::open_url(url)
 }
 
 fn apply_workspace_runtime_state(app: &mut App, config: &Config, workspace: PathBuf) {
