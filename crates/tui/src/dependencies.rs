@@ -450,19 +450,23 @@ pub struct Go;
 
 impl ExternalTool for Go {
     fn candidates() -> &'static [&'static str] {
-        &["go"]
+        &["go", "go.cmd"]
     }
 
     fn resolve() -> Option<String> {
         static CACHE: OnceLock<Option<String>> = OnceLock::new();
         CACHE
             .get_or_init(|| {
-                if probe_executable("go") {
-                    tracing::info!(target: "tool_dependencies", "Resolved go binary");
-                    Some("go".to_string())
-                } else {
-                    None
+                for candidate in Self::candidates() {
+                    if probe_executable(candidate) {
+                        tracing::info!(
+                            target: "tool_dependencies",
+                            "Resolved go binary: {candidate}"
+                        );
+                        return Some((*candidate).to_string());
+                    }
                 }
+                None
             })
             .clone()
     }
@@ -476,7 +480,13 @@ impl ExternalTool for Go {
 /// `python3`/`python`/`py -3`.
 pub struct TypeScript;
 
-const TS_CANDIDATES: &[&str] = &["tsx", "ts-node", "deno", "npx tsx"];
+const TS_CANDIDATES: &[&str] = &[
+    "tsx",
+    "tsx.cmd",
+    "ts-node",
+    "deno",
+    "npx tsx",
+];
 
 impl ExternalTool for TypeScript {
     fn candidates() -> &'static [&'static str] {
