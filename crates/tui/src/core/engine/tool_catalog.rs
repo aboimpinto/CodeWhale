@@ -770,19 +770,19 @@ pub(super) async fn execute_runtime_tool(
 
     match tool_name {
         GO_EXECUTION_TOOL_NAME => {
-            crate::tools::runtime_tool::RuntimeTool::execute::<crate::dependencies::Go>(
+            <crate::dependencies::Go as crate::tools::runtime_tool::RuntimeTool>::execute(
                 code, workspace,
             )
             .await
         }
         TS_EXECUTION_TOOL_NAME => {
-            crate::tools::runtime_tool::RuntimeTool::execute::<crate::dependencies::TypeScript>(
+            <crate::dependencies::TypeScript as crate::tools::runtime_tool::RuntimeTool>::execute(
                 code, workspace,
             )
             .await
         }
         RUST_EXECUTION_TOOL_NAME => {
-            crate::tools::runtime_tool::RuntimeTool::execute::<crate::dependencies::RustC>(
+            <crate::dependencies::RustC as crate::tools::runtime_tool::RuntimeTool>::execute(
                 code, workspace,
             )
             .await
