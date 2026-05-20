@@ -479,12 +479,13 @@ impl ExternalTool for Go {
 
 /// TypeScript runtime — used by the `ts_execution` tool.
 ///
-/// Tries `ts-node` first (most common), then `deno` (built-in TS),
-/// then `npx tsx` (lightweight).  The multi-candidate ladder is
-/// similar to Python's `python3`/`python`/`py -3`.
+/// Tries `tsx` first (lightning-fast ESM, Node 24 compatible),
+/// then `ts-node` (most common historically), then `deno` (built-in
+/// TS).  The multi-candidate ladder is similar to Python's
+/// `python3`/`python`/`py -3`.
 pub struct TypeScript;
 
-const TS_CANDIDATES: &[&str] = &["ts-node", "deno", "npx tsx"];
+const TS_CANDIDATES: &[&str] = &["tsx", "ts-node", "deno", "npx tsx"];
 
 impl ExternalTool for TypeScript {
     fn candidates() -> &'static [&'static str] {
