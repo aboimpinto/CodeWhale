@@ -242,7 +242,9 @@ pub fn clear_taskbar_progress() {
 }
 
 /// Animation frame characters for the terminal title.
-const TITLE_FRAMES: &[&str] = &["▸", "▹", "▸", "◂"];
+/// Uses the DeepSeek whale emoji (🐳 spouting, 🐋 resting) to match the
+/// existing header status indicator in the TUI.
+const TITLE_FRAMES: &[&str] = &["🐳", "🐋", "🐳", "🐋"];
 const TITLE_ANIMATION_INTERVAL: Duration = Duration::from_millis(800);
 
 /// Shared flag controlling the title animation loop.
@@ -258,9 +260,10 @@ fn set_terminal_title(title: &str) {
 
 /// Start an animated terminal title spinner.
 ///
-/// Cycles the terminal title between frames (▸/▹/▸/◂) every 800ms while
-/// processing, so alt-tabbed users can see activity. The title is restored
-/// to `original` when [`stop_title_animation`] is called.
+/// Cycles the terminal title between 🐳→🐋 every 800ms while processing,
+/// matching the whale status indicator in the TUI header, so alt-tabbed
+/// users can see activity. The title is restored to `original` when
+/// [`stop_title_animation`] is called.
 ///
 /// The animation runs in a background tokio task that checks an atomic flag.
 /// This function is safe to call multiple times — subsequent calls update
