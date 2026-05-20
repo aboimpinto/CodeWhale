@@ -39,6 +39,7 @@ pub mod remember;
 pub mod revert_turn;
 pub mod review;
 pub mod rlm;
+pub mod runtime_tool;
 pub mod schema_sanitize;
 pub mod search;
 pub mod shell;
