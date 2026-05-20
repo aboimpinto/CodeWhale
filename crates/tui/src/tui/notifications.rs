@@ -17,6 +17,8 @@ use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE;
 
 use std::io::{self, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// Notification delivery method.
@@ -237,6 +239,55 @@ pub fn set_taskbar_progress_busy() {
 /// Clear taskbar progress — call at turn end.
 pub fn clear_taskbar_progress() {
     set_taskbar_progress(0, None);
+}
+
+/// Animation frame characters for the terminal title.
+const TITLE_FRAMES: &[&str] = &["▸", "▹", "▸", "◂"];
+const TITLE_ANIMATION_INTERVAL: Duration = Duration::from_millis(800);
+
+/// Shared flag controlling the title animation loop.
+static TITLE_ANIMATION_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Write OSC 0 (set window title) sequence.
+fn set_terminal_title(title: &str) {
+    let seq = format!("\x1b]0;{title}\x07");
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(seq.as_bytes());
+    let _ = stdout.flush();
+}
+
+/// Start an animated terminal title spinner.
+///
+/// Cycles the terminal title between frames (▸/▹/▸/◂) every 800ms while
+/// processing, so alt-tabbed users can see activity. The title is restored
+/// to `original` when [`stop_title_animation`] is called.
+///
+/// The animation runs in a background tokio task that checks an atomic flag.
+/// This function is safe to call multiple times — subsequent calls update
+/// the base title without spawning extra tasks.
+pub fn start_title_animation(original: &str) {
+    // If already running, just return — the animation continues.
+    if TITLE_ANIMATION_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+
+    let base = original.to_string();
+    tokio::spawn(async move {
+        let mut frame = 0usize;
+        while TITLE_ANIMATION_RUNNING.load(Ordering::SeqCst) {
+            let spinner = TITLE_FRAMES[frame % TITLE_FRAMES.len()];
+            set_terminal_title(&format!("{base} {spinner}"));
+            frame += 1;
+            tokio::time::sleep(TITLE_ANIMATION_INTERVAL).await;
+        }
+        // Restore original title.
+        set_terminal_title(&base);
+    });
+}
+
+/// Stop the title animation and restore the original title.
+pub fn stop_title_animation() {
+    TITLE_ANIMATION_RUNNING.store(false, Ordering::SeqCst);
 }
 
 /// Return a human-readable duration string, capped at two units so

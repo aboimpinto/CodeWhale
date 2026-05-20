@@ -1423,6 +1423,7 @@ async fn run_event_loop(
                                 turn_elapsed,
                             );
                             crate::tui::notifications::clear_taskbar_progress();
+                            crate::tui::notifications::stop_title_animation();
                         }
 
                         // Auto-save completed turn and clear crash checkpoint.
