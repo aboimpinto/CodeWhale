@@ -293,11 +293,15 @@ fn parse_shebang(path: &Path) -> Option<(String, Vec<String>)> {
 fn resolve_interpreter(path: &Path) -> (String, Vec<String>) {
     // 1. Try shebang
     if let Some((interp, shebang_args)) = parse_shebang(path) {
-        // `env` is a special case: `#!/usr/bin/env node` → `node`
         let bin_name = interp
             .rsplit('/')
             .next()
             .unwrap_or(&interp);
+        // `env` is a special case: `#!/usr/bin/env node` → `node`
+        // On Windows, `env` is not available, so extract the intended binary.
+        if bin_name == "env" && !shebang_args.is_empty() {
+            return (shebang_args[0].clone(), shebang_args[1..].to_vec());
+        }
         return (bin_name.to_string(), shebang_args);
     }
 
