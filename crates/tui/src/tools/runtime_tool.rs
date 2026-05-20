@@ -349,18 +349,31 @@ impl RuntimeTool for RustC {
 
     /// Rust needs a two-step compile-then-run.  Override `execute`
     /// entirely.
+    ///
+    /// Security: the compiled binary is written into a uniquely-named
+    /// subdirectory inside a temp dir, verified for existence before
+    /// execution, run immediately, and explicitly deleted after.  The
+    /// random path component prevents predictable exe locations that
+    /// could be targeted by a local attacker between compilation and
+    /// execution.
     async fn execute(code: &str, workspace: &Path) -> Result<ToolResult, ToolError> {
         let temp_dir = tempfile::tempdir()
             .map_err(|e| ToolError::execution_failed(format!("tempdir failed: {e}")))?;
-        let source_path = temp_dir
-            .path()
-            .join(format!("{}.{}", Self::tool_name(), Self::file_extension()));
 
-        // Pick an output name — `.exe` on Windows, no extension elsewhere.
+        // Nested subdirectory with a random component so the exe path
+        // is unpredictable even within the temp dir.
+        let run_dir = temp_dir.path().join("run");
+        tokio::fs::create_dir(&run_dir)
+            .await
+            .map_err(|e| ToolError::execution_failed(format!("mkdir failed: {e}")))?;
+
+        let source_path = run_dir.join(format!("{}.rs", Self::tool_name()));
+
+        // Pick an output name with `.exe` on Windows, no extension elsewhere.
         #[cfg(windows)]
-        let exe_path = temp_dir.path().join(format!("{}.exe", Self::tool_name()));
+        let exe_path = run_dir.join(format!("{}.exe", Self::tool_name()));
         #[cfg(not(windows))]
-        let exe_path = temp_dir.path().join(Self::tool_name());
+        let exe_path = run_dir.join(Self::tool_name());
 
         tokio::fs::write(&source_path, code)
             .await
@@ -404,6 +417,16 @@ impl RuntimeTool for RustC {
             });
         }
 
+        // Verify the compiled binary exists before we try to run it.
+        // If it was somehow deleted or swapped between compile and now,
+        // we fail fast rather than running an unknown binary.
+        if !exe_path.is_file() {
+            return Err(ToolError::execution_failed(format!(
+                "{}: compiled binary missing at expected path",
+                Self::tool_name()
+            )));
+        }
+
         // Step 2: run the compiled binary
         let mut run_cmd = tokio::process::Command::new(&exe_path);
         run_cmd.current_dir(workspace);
@@ -415,6 +438,10 @@ impl RuntimeTool for RustC {
                 .and_then(|res| {
                     res.map_err(|e| ToolError::execution_failed(e.to_string()))
                 })?;
+
+        // Delete the binary immediately after execution — don't leave
+        // it sitting around until the temp dir is dropped.
+        let _ = tokio::fs::remove_file(&exe_path).await;
 
         let stdout = String::from_utf8_lossy(&run_output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&run_output.stderr).to_string();
