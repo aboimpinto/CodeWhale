@@ -101,8 +101,13 @@ impl ToolSpec for ScriptPluginTool {
         let input_bytes = serde_json::to_vec(&input)
             .map_err(|e| ToolError::invalid_input(format!("failed to serialize input: {e}")))?;
 
-        let mut cmd = tokio::process::Command::new(&self.script_path);
-        cmd.args(&self.args);
+        // Resolve the interpreter: parse shebang, then fall back to extension.
+        let (interpreter, mut script_args) = resolve_interpreter(&self.script_path);
+        script_args.push(self.script_path.to_str().unwrap().to_string());
+        script_args.extend(self.args.iter().cloned());
+
+        let mut cmd = tokio::process::Command::new(&interpreter);
+        cmd.args(&script_args);
         cmd.stdin(std::process::Stdio::piped());
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
@@ -254,6 +259,69 @@ impl ToolSpec for CommandPluginTool {
             let combined = if stderr.is_empty() { stdout } else if stdout.is_empty() { stderr } else { format!("{stdout}\n{stderr}") };
             Err(ToolError::execution_failed(combined))
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Script interpreter resolution
+// ---------------------------------------------------------------------------
+
+/// Parse a shebang line (`#!/usr/bin/env node`) to extract the interpreter.
+fn parse_shebang(path: &Path) -> Option<(String, Vec<String>)> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path).ok()?;
+    let mut buf = [0u8; 256];
+    let n = file.read(&mut buf).ok()?;
+    let content = String::from_utf8_lossy(&buf[..n]);
+    let first_line = content.lines().next()?;
+    let rest = first_line.strip_prefix("#!")?;
+    let parts: Vec<&str> = rest.split_whitespace().collect();
+    if parts.is_empty() {
+        return None;
+    }
+    let interpreter = parts[0].to_string();
+    let args: Vec<String> = parts[1..].iter().map(|s| s.to_string()).collect();
+    Some((interpreter, args))
+}
+
+/// Resolve the interpreter binary and pre-args for a script file.
+///
+/// Priority:
+/// 1. Shebang line from the script itself (`#!/usr/bin/env node`)
+/// 2. Extension-based fallback for known script types
+/// 3. Direct execution (assumes the OS knows how to run it)
+fn resolve_interpreter(path: &Path) -> (String, Vec<String>) {
+    // 1. Try shebang
+    if let Some((interp, shebang_args)) = parse_shebang(path) {
+        // `env` is a special case: `#!/usr/bin/env node` → `node`
+        let bin_name = interp
+            .rsplit('/')
+            .next()
+            .unwrap_or(&interp);
+        return (bin_name.to_string(), shebang_args);
+    }
+
+    // 2. Extension-based fallback for common script types
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_lowercase();
+    match ext.as_str() {
+        "ps1" => ("powershell".into(), vec!["-File".into()]),
+        "py" => ("python".into(), vec![]),
+        "js" | "mjs" => ("node".into(), vec![]),
+        "ts" => ("npx".into(), vec!["tsx".into()]),
+        "rb" => ("ruby".into(), vec![]),
+        "sh" | "bash" | "zsh" => {
+            // On Windows, route shell scripts through sh if available
+            if cfg!(windows) {
+                ("sh".into(), vec![])
+            } else {
+                (path.to_str().unwrap().into(), vec![])
+            }
+        }
+        _ => (path.to_str().unwrap().into(), vec![]),
     }
 }
 
