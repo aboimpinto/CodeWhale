@@ -459,7 +459,7 @@ pub struct Go;
 
 impl ExternalTool for Go {
     fn candidates() -> &'static [&'static str] {
-        &["go"]
+        &["go", "go.cmd"]
     }
 
     fn resolve() -> Option<String> {
@@ -485,7 +485,13 @@ impl ExternalTool for Go {
 /// `python3`/`python`/`py -3`.
 pub struct TypeScript;
 
-const TS_CANDIDATES: &[&str] = &["tsx", "ts-node", "deno", "npx tsx"];
+const TS_CANDIDATES: &[&str] = &[
+    "tsx",
+    "tsx.cmd",
+    "ts-node",
+    "deno",
+    "npx tsx",
+];
 
 impl ExternalTool for TypeScript {
     fn candidates() -> &'static [&'static str] {
