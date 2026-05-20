@@ -1422,6 +1422,7 @@ async fn run_event_loop(
                                 threshold,
                                 turn_elapsed,
                             );
+                            crate::tui::notifications::clear_taskbar_progress();
                         }
 
                         // Auto-save completed turn and clear crash checkpoint.

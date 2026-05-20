@@ -207,6 +207,38 @@ pub fn notify_done(
     notify_done_to(method, in_tmux, msg, threshold, elapsed, &mut io::stdout());
 }
 
+/// Set the terminal taskbar progress state via OSC 9 ; 4.
+///
+/// Windows Terminal supports this to show progress on the taskbar icon:
+/// - `state = 0` — no progress (clear)
+/// - `state = 1` — indeterminate (cycling green)
+/// - `state = 2` — normal (0-100, requires progress param)
+/// - `state = 3` — error (red)
+/// - `state = 4` — paused (yellow)
+///
+/// Other terminals (iTerm2, WezTerm) ignore the sequence silently.
+/// Best-effort — write failures are ignored.
+pub fn set_taskbar_progress(state: u8, progress: Option<u8>) {
+    let seq = if let Some(pct) = progress {
+        format!("\x1b]9;4;{state};{pct}\x07")
+    } else {
+        format!("\x1b]9;4;{state}\x07")
+    };
+    let mut stdout = io::stdout();
+    let _ = stdout.write_all(seq.as_bytes());
+    let _ = stdout.flush();
+}
+
+/// Set taskbar progress to indeterminate (cycling) — call at turn start.
+pub fn set_taskbar_progress_busy() {
+    set_taskbar_progress(1, None);
+}
+
+/// Clear taskbar progress — call at turn end.
+pub fn clear_taskbar_progress() {
+    set_taskbar_progress(0, None);
+}
+
 /// Return a human-readable duration string, capped at two units so
 /// it stays compact in headers and notifications.
 ///
