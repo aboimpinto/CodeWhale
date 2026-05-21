@@ -288,9 +288,14 @@ pub fn start_title_animation(original: &str) {
     });
 }
 
-/// Stop the title animation and restore the original title.
+/// Stop the title animation and show a completion marker.
+///
+/// Sets the title to `✅ <base>` so alt-tabbed users see at a glance
+/// that processing finished. The marker is overwritten on the next turn
+/// by [`start_title_animation`].
 pub fn stop_title_animation() {
     TITLE_ANIMATION_RUNNING.store(false, Ordering::SeqCst);
+    set_terminal_title("✅ DeepSeek TUI");
 }
 
 /// Return a human-readable duration string, capped at two units so
