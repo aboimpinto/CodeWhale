@@ -17,6 +17,7 @@ use windows::Win32::System::Diagnostics::Debug::MessageBeep;
 use windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE;
 
 use std::io::{self, Write};
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -307,16 +308,43 @@ pub fn reset_title_on_interaction() {
     set_terminal_title("DeepSeek TUI");
 }
 
+/// Completion sound mode (0 = off, 1 = beep, 2 = bell).
+static COMPLETION_SOUND_MODE: AtomicU8 = AtomicU8::new(1);
+
+/// Set the completion sound mode from config.
+/// Call once at startup or on `/settings` change.
+pub fn set_completion_sound_mode(mode: crate::config::CompletionSound) {
+    let val = match mode {
+        crate::config::CompletionSound::Off => 0u8,
+        crate::config::CompletionSound::Beep => 1u8,
+        crate::config::CompletionSound::Bell => 2u8,
+    };
+    COMPLETION_SOUND_MODE.store(val, Ordering::SeqCst);
+}
+
+/// Play the configured completion sound (if not `Off`).
+pub fn play_completion_sound() {
+    match COMPLETION_SOUND_MODE.load(Ordering::SeqCst) {
+        0 => {} // Off
+        1 => { beep_sound(); }
+        2 => { bell_sound(); }
+        _ => {}
+    }
+}
+
 /// Play a short completion sound via the system beep.
 ///
 /// On Windows uses `MessageBeep(MB_OK)` which plays the default system
 /// notification sound. On other platforms writes `BEL` (`\x07`) to stdout.
 #[cfg(target_os = "windows")]
-pub fn play_completion_sound() { windows_bell(); }
+fn beep_sound() { windows_bell(); }
 
 /// Non-Windows: write BEL to stdout for the terminal bell.
 #[cfg(not(target_os = "windows"))]
-pub fn play_completion_sound() { let _ = io::stdout().write_all(b"\x07"); }
+fn beep_sound() { let _ = io::stdout().write_all(b"\x07"); }
+
+/// Pure terminal BEL character.
+fn bell_sound() { let _ = io::stdout().write_all(b"\x07"); }
 
 /// Return a human-readable duration string, capped at two units so
 /// it stays compact in headers and notifications.
@@ -400,6 +428,8 @@ use crate::tui::app::App;
 /// `Off`).
 pub fn settings(config: &crate::config::Config) -> Option<(Method, Duration, bool)> {
     let notif = config.notifications_config();
+    // Initialize completion sound mode from config.
+    set_completion_sound_mode(notif.completion_sound);
     let method = match notif.method {
         crate::config::NotificationMethod::Auto => Method::Auto,
         crate::config::NotificationMethod::Osc9 => Method::Osc9,
