@@ -296,7 +296,12 @@ pub fn start_title_animation(original: &str) {
 /// by [`start_title_animation`].
 pub fn stop_title_animation() {
     TITLE_ANIMATION_RUNNING.store(false, Ordering::SeqCst);
-    set_terminal_title("✅ DeepSeek TUI");
+    // Show ✅ marker only for beep (system sound has no visual component).
+    // Bell mode already has its own terminal-level visual indicator.
+    let mode = COMPLETION_SOUND_MODE.load(Ordering::SeqCst);
+    if mode == 1 {
+        set_terminal_title("✅ DeepSeek TUI");
+    }
     play_completion_sound();
 }
 
