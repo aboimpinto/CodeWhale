@@ -279,7 +279,7 @@ pub fn start_title_animation(original: &str) {
         let mut frame = 0usize;
         while TITLE_ANIMATION_RUNNING.load(Ordering::SeqCst) {
             let spinner = TITLE_FRAMES[frame % TITLE_FRAMES.len()];
-            set_terminal_title(&format!("{base} {spinner}"));
+            set_terminal_title(&format!("{spinner} {base}"));
             frame += 1;
             tokio::time::sleep(TITLE_ANIMATION_INTERVAL).await;
         }
