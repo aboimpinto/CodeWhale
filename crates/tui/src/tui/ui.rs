@@ -843,7 +843,7 @@ async fn run_event_loop(
     loop {
         loop_ticks += 1;
         if loop_ticks % 100 == 0 {
-            logging::info(format!("[FREEZE-DEBUG] event_loop tick={loop_ticks}, mode={:?}, streaming={}", app.mode, app.streaming_state.is_active));
+            logging::info(format!("[FREEZE-DEBUG] pid={} event_loop tick={loop_ticks}, mode={:?}, streaming={}", std::process::id(), app.mode, app.streaming_state.is_active));
         }
 
         if !drain_web_config_events(&mut web_config_session, app, config, &engine_handle).await {
@@ -949,13 +949,13 @@ async fn run_event_loop(
         let mut queued_to_send: Option<QueuedMessage> = None;
         {
             if loop_ticks % 100 == 0 {
-                logging::info(format!("[FREEZE-DEBUG] engine_poll_enter tick={loop_ticks}"));
+                logging::info(format!("[FREEZE-DEBUG] pid={} engine_poll_enter tick={loop_ticks}", std::process::id()));
             }
             let mut rx = engine_handle.rx_event.write().await;
             let _poll_start = Instant::now();
             while let Ok(event) = rx.try_recv() {
                 received_engine_event = true;
-                logging::info(format!("[FREEZE-DEBUG] engine_event_rcvd tick={loop_ticks}"));
+                logging::info(format!("[FREEZE-DEBUG] pid={} engine_event_rcvd tick={loop_ticks}", std::process::id()));
                 if app.suppress_stream_events_until_turn_complete {
                     if matches!(event, EngineEvent::TurnStarted { .. }) {
                         // Ctrl+C can race with the engine's per-turn token
@@ -974,7 +974,7 @@ async fn run_event_loop(
                 }
                 match event {
                     EngineEvent::MessageStarted { .. } => {
-                        logging::info("[FREEZE-DEBUG] EngineEvent::MessageStarted");
+                        logging::info(format!("[FREEZE-DEBUG] pid={} EngineEvent::MessageStarted", std::process::id()));
                         // Assistant text starting after parallel tool work
                         // means the tool group is done. Flush the active
                         // cell first so the message lands BELOW the
@@ -1098,7 +1098,7 @@ async fn run_event_loop(
                             );
                         }
                         logging::info(format!(
-                            "[FREEZE-DEBUG] EngineEvent::MessageComplete chars={complete_char_count}"));
+                            "[FREEZE-DEBUG] pid={} EngineEvent::MessageComplete chars={complete_char_count}", std::process::id()));
                     }
                     EngineEvent::ThinkingStarted { .. } => {
                         // P2.3: thinking lives in the active cell so it groups
@@ -5358,7 +5358,8 @@ fn render(f: &mut Frame, app: &mut App) {
         let n = RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
         if n % 100 == 0 || app.needs_redraw {
             logging::info(format!(
-                "[FREEZE-DEBUG] render #{n} cells={} needs_redraw={}",
+                "[FREEZE-DEBUG] pid={} render #{n} cells={} needs_redraw={}",
+                std::process::id(),
                 app.history.len(),
                 app.needs_redraw
             ));
