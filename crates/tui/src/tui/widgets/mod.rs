@@ -2084,7 +2084,8 @@ pub(crate) fn slash_completion_hints(
                     };
                     (desc, hint)
                 } else {
-                    (String::from("User-defined command"), None)
+                    (commands::user_commands::get_user_command_description(command_key, workspace)
+                        .unwrap_or_else(|| String::from("User-defined command")), None)
                 };
             entries.push(SlashMenuEntry {
                 name,

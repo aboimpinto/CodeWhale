@@ -30,7 +30,7 @@ mod skills;
 mod stash;
 mod status;
 mod task;
-mod user_commands;
+pub mod user_commands;
 
 use std::fmt::Write as _;
 
