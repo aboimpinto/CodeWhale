@@ -298,6 +298,14 @@ pub fn stop_title_animation() {
     set_terminal_title("✅ DeepSeek TUI");
 }
 
+/// Clear the ✅ completion marker from the title when the user interacts.
+///
+/// Call this on every user input event (key press, mouse click) so the
+/// marker doesn't persist once the user is back at the terminal.
+pub fn reset_title_on_interaction() {
+    set_terminal_title("DeepSeek TUI");
+}
+
 /// Return a human-readable duration string, capped at two units so
 /// it stays compact in headers and notifications.
 ///
