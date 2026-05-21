@@ -22,6 +22,7 @@
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use crate::tui::app::{App, AppAction};
 
@@ -173,7 +174,15 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
     for (name, content) in &user_commands {
         if name == command {
             // Strip frontmatter if present before substituting args
-            let (_, body) = parse_frontmatter(content);
+            let (meta, body) = parse_frontmatter(content);
+            // If the command has a description, show it in the Work panel
+            for (key, value) in &meta {
+                if key == "description" {
+                    app.goal.goal_objective = Some(value.clone());
+                    app.goal.goal_started_at = Some(Instant::now());
+                    break;
+                }
+            }
             let message = apply_template(body, args);
             return Some(CommandResult::action(AppAction::SendMessage(message)));
         }
