@@ -283,8 +283,8 @@ pub fn start_title_animation(original: &str) {
             frame += 1;
             tokio::time::sleep(TITLE_ANIMATION_INTERVAL).await;
         }
-        // Restore original title.
-        set_terminal_title(&base);
+        // Don't restore title here — stop_title_animation() handles
+        // what to show on completion (e.g. ✅ marker).
     });
 }
 
