@@ -480,9 +480,7 @@ impl Settings {
                         "Failed to parse auto_compact_threshold '{value}': expected a number (e.g. 70)"
                     ))?;
                 if pct < 10.0 || pct > 100.0 {
-                    anyhow::bail!(
-                        "auto_compact_threshold must be between 10 and 100 (got {pct})"
-                    );
+                    anyhow::bail!("auto_compact_threshold must be between 10 and 100 (got {pct})");
                 }
                 self.auto_compact_threshold_percent = pct;
             }

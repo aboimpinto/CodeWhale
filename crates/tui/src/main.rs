@@ -63,9 +63,9 @@ mod runtime_threads;
 mod sandbox;
 mod schema_migration;
 mod seam_manager;
-mod shell_dispatcher;
 mod session_manager;
 mod settings;
+mod shell_dispatcher;
 mod skill_state;
 mod skills;
 mod snapshot;
@@ -2930,10 +2930,10 @@ fn rustc_version() -> String {
     let Ok(output) = cmd.arg("--version").output() else {
         return "unknown".to_string();
     };
-    String::from_utf8(output.stdout).map(|s| s.trim().to_string()).unwrap_or_else(|_| "unknown".to_string())
+    String::from_utf8(output.stdout)
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "unknown".to_string())
 }
-
-
 
 /// List saved sessions
 fn list_sessions(limit: usize, search: Option<String>) -> Result<()> {
@@ -3508,7 +3508,8 @@ fn run_apply(args: ApplyArgs) -> Result<()> {
     tmp.write_all(patch.as_bytes())?;
     let tmp_path = tmp.path().to_path_buf();
 
-    let output = crate::dependencies::Git::command().expect("git not found")
+    let output = crate::dependencies::Git::command()
+        .expect("git not found")
         .arg("apply")
         .arg("--whitespace=nowarn")
         .arg(&tmp_path)

@@ -18,6 +18,7 @@ pub mod file;
 pub mod file_search;
 pub mod finance;
 
+pub mod dotnet_execution;
 pub mod fetch_url;
 pub mod fim;
 pub mod git;
@@ -25,7 +26,6 @@ pub mod git_history;
 pub mod github;
 pub mod handle;
 pub mod image_ocr;
-pub mod dotnet_execution;
 pub mod js_execution;
 pub mod large_output_router;
 pub mod notify;

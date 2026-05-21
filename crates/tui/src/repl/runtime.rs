@@ -208,8 +208,7 @@ impl PythonRuntime {
              Install Python 3 and restart deepseek-tui."
                 .to_string()
         })?;
-        cmd
-            .arg("-u")
+        cmd.arg("-u")
             .arg("-c")
             .arg(&bootstrap)
             .stdin(Stdio::piped())
@@ -262,9 +261,7 @@ impl PythonRuntime {
             Ok(Ok(())) => Ok(rt),
             Ok(Err(e)) => {
                 let _ = rt.child.kill().await;
-                Err(format!(
-                    "Python interpreter bootstrap failed: {e}"
-                ))
+                Err(format!("Python interpreter bootstrap failed: {e}"))
             }
             Err(_) => {
                 let _ = rt.child.kill().await;

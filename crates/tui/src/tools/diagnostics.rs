@@ -188,9 +188,9 @@ fn run_command(program: &str, args: &[&str], cwd: &Path) -> CommandProbe {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dependencies::ExternalTool;
     use std::fs;
     use std::path::Path;
-    use crate::dependencies::ExternalTool;
     use std::process::Command;
     use tempfile::tempdir;
 
@@ -200,8 +200,7 @@ mod tests {
 
     fn init_git_repo(root: &Path) {
         let run = |args: &[&str]| {
-            let status = crate::dependencies::Git::status(args, root)
-                .expect("git should spawn");
+            let status = crate::dependencies::Git::status(args, root).expect("git should spawn");
             assert!(status.success(), "git {:?} failed", args);
         };
         run(&["init", "-q"]);

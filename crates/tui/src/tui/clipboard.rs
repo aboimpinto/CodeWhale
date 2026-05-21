@@ -150,7 +150,11 @@ fn write_text_with_pbcopy(text: &str) -> Result<()> {
 fn write_text_with_set_clipboard(text: &str) -> Result<()> {
     use crate::shell_dispatcher::ShellKind;
     let mut child = Command::new(ShellKind::WindowsPowerShell.binary())
-        .args([ShellKind::WindowsPowerShell.command_flag(), "-Command", "Set-Clipboard -Value $input"])
+        .args([
+            ShellKind::WindowsPowerShell.command_flag(),
+            "-Command",
+            "Set-Clipboard -Value $input",
+        ])
         .stdin(Stdio::piped())
         .spawn()
         .map_err(|e| anyhow::anyhow!("Failed to run Set-Clipboard: {e}"))?;

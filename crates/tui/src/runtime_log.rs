@@ -104,7 +104,10 @@ pub fn init() -> Result<TuiLogGuard> {
 
     // Prune logs older than retention (default 7 days, configurable via env).
     let retention_days = retention_days_from_env();
-    prune_old_logs(&log_dir, Duration::from_secs(retention_days.saturating_mul(86_400)));
+    prune_old_logs(
+        &log_dir,
+        Duration::from_secs(retention_days.saturating_mul(86_400)),
+    );
 
     let date = chrono::Local::now().format("%Y-%m-%d");
     let log_path = log_dir.join(format!("tui-{date}.log"));
@@ -181,17 +184,25 @@ fn retention_days_from_env() -> u64 {
 /// `max_age`. Only files matching `tui-*.log` are considered.
 fn prune_old_logs(log_dir: &std::path::Path, max_age: Duration) {
     let now = SystemTime::now();
-    let Ok(entries) = fs::read_dir(log_dir) else { return };
+    let Ok(entries) = fs::read_dir(log_dir) else {
+        return;
+    };
 
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(name) = path.file_name().and_then(|n| n.to_str()) else { continue };
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
         if !name.starts_with("tui-") || !name.ends_with(".log") {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue };
-        let Ok(modified) = meta.modified() else { continue };
-        let Ok(age) = now.duration_since(modified) else { continue };
+        let Ok(modified) = meta.modified() else {
+            continue;
+        };
+        let Ok(age) = now.duration_since(modified) else {
+            continue;
+        };
         if age > max_age {
             let _ = fs::remove_file(&path);
         }

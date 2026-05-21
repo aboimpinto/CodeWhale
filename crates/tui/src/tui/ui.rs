@@ -18,6 +18,7 @@ use crossterm::{
 // On Windows the push/pop helpers write the escapes directly; crossterm's
 // PushKeyboardEnhancementFlags / PopKeyboardEnhancementFlags commands are
 // never referenced, so the imports are gated to avoid -D warnings failures.
+use crate::logging;
 #[cfg(not(windows))]
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -30,7 +31,6 @@ use ratatui::{
     widgets::Block,
 };
 use tracing;
-use crate::logging;
 
 use crate::audit::log_sensitive_event;
 use crate::automation_manager::{AutomationManager, AutomationSchedulerConfig, spawn_scheduler};
@@ -842,7 +842,10 @@ async fn run_event_loop(
     loop {
         loop_ticks += 1;
         if loop_ticks % 100 == 0 {
-            logging::info(format!("[FREEZE-DEBUG] event_loop tick={loop_ticks}, mode={:?}, streaming={}", app.mode, app.streaming_state.is_active));
+            logging::info(format!(
+                "[FREEZE-DEBUG] event_loop tick={loop_ticks}, mode={:?}, streaming={}",
+                app.mode, app.streaming_state.is_active
+            ));
         }
 
         if !drain_web_config_events(&mut web_config_session, app, config, &engine_handle).await {
@@ -948,13 +951,17 @@ async fn run_event_loop(
         let mut queued_to_send: Option<QueuedMessage> = None;
         {
             if loop_ticks % 100 == 0 {
-                logging::info(format!("[FREEZE-DEBUG] engine_poll_enter tick={loop_ticks}"));
+                logging::info(format!(
+                    "[FREEZE-DEBUG] engine_poll_enter tick={loop_ticks}"
+                ));
             }
             let mut rx = engine_handle.rx_event.write().await;
             let poll_start = Instant::now();
             while let Ok(event) = rx.try_recv() {
                 received_engine_event = true;
-                logging::info(format!("[FREEZE-DEBUG] engine_event_rcvd tick={loop_ticks}"));
+                logging::info(format!(
+                    "[FREEZE-DEBUG] engine_event_rcvd tick={loop_ticks}"
+                ));
                 match event {
                     EngineEvent::MessageStarted { .. } => {
                         logging::info("[FREEZE-DEBUG] EngineEvent::MessageStarted");
@@ -1081,7 +1088,8 @@ async fn run_event_loop(
                             );
                         }
                         logging::info(format!(
-                            "[FREEZE-DEBUG] EngineEvent::MessageComplete chars={complete_char_count}"));
+                            "[FREEZE-DEBUG] EngineEvent::MessageComplete chars={complete_char_count}"
+                        ));
                     }
                     EngineEvent::ThinkingStarted { .. } => {
                         // P2.3: thinking lives in the active cell so it groups
@@ -6806,8 +6814,7 @@ fn maybe_warn_context_pressure(app: &mut App) {
         && app.status_message.is_none()
     {
         let hint = if app.auto_compact {
-            let below_floor =
-                (used as usize) < crate::compaction::MINIMUM_AUTO_COMPACTION_TOKENS;
+            let below_floor = (used as usize) < crate::compaction::MINIMUM_AUTO_COMPACTION_TOKENS;
             let below_threshold = percent < app.auto_compact_threshold_pct;
 
             if below_floor && below_threshold {
@@ -6816,16 +6823,14 @@ fn maybe_warn_context_pressure(app: &mut App) {
                     app.auto_compact_threshold_pct
                 )
             } else if below_floor {
-                "Auto-compact enabled but below 500K token floor; won't fire yet."
-                    .to_string()
+                "Auto-compact enabled but below 500K token floor; won't fire yet.".to_string()
             } else if below_threshold {
                 format!(
                     "Auto-compact will fire at {:.0}% (currently {:.0}%).",
                     app.auto_compact_threshold_pct, percent
                 )
             } else {
-                "Auto-compaction would fire now; it will run before the next send."
-                    .to_string()
+                "Auto-compaction would fire now; it will run before the next send.".to_string()
             }
         } else {
             "Consider enabling auto_compact or use /compact.".to_string()

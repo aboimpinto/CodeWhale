@@ -8,11 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process::Output;
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::spec::{
-    optional_bool, optional_str, optional_u64, required_str, ApprovalRequirement, ToolCapability,
-    ToolContext, ToolError, ToolResult, ToolSpec,
+    ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+    optional_bool, optional_str, optional_u64, required_str,
 };
 use crate::dependencies::ExternalTool;
 

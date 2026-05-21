@@ -112,9 +112,12 @@ impl ToolSpec for ScriptPluginTool {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ToolError::execution_failed(format!("failed to spawn {}: {e}", self.script_path.display())))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            ToolError::execution_failed(format!(
+                "failed to spawn {}: {e}",
+                self.script_path.display()
+            ))
+        })?;
 
         // Write input to stdin, then close it.
         if let Some(ref mut stdin) = child.stdin {
@@ -222,11 +225,9 @@ impl ToolSpec for CommandPluginTool {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ToolError::execution_failed(format!(
-                "failed to spawn command '{}': {e}", self.command
-            )))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            ToolError::execution_failed(format!("failed to spawn command '{}': {e}", self.command))
+        })?;
 
         if let Some(ref mut stdin) = child.stdin {
             stdin
@@ -256,7 +257,13 @@ impl ToolSpec for CommandPluginTool {
         } else {
             let stderr = String::from_utf8_lossy(&output.stderr).to_string();
             let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let combined = if stderr.is_empty() { stdout } else if stdout.is_empty() { stderr } else { format!("{stdout}\n{stderr}") };
+            let combined = if stderr.is_empty() {
+                stdout
+            } else if stdout.is_empty() {
+                stderr
+            } else {
+                format!("{stdout}\n{stderr}")
+            };
             Err(ToolError::execution_failed(combined))
         }
     }
@@ -293,10 +300,7 @@ fn parse_shebang(path: &Path) -> Option<(String, Vec<String>)> {
 fn resolve_interpreter(path: &Path) -> (String, Vec<String>) {
     // 1. Try shebang
     if let Some((interp, shebang_args)) = parse_shebang(path) {
-        let bin_name = interp
-            .rsplit('/')
-            .next()
-            .unwrap_or(&interp);
+        let bin_name = interp.rsplit('/').next().unwrap_or(&interp);
         // `env` is a special case: `#!/usr/bin/env node` → `node`
         // On Windows, `env` is not available, so extract the intended binary.
         if bin_name == "env" && !shebang_args.is_empty() {
@@ -353,30 +357,29 @@ pub fn parse_frontmatter(content: &str) -> PluginMetadata {
     for line in content.lines().take(20) {
         let line = line.trim();
         // Strip leading comment markers: `# `, `// `, `-- `
-        let rest = line.strip_prefix("# ")
+        let rest = line
+            .strip_prefix("# ")
             .or_else(|| line.strip_prefix("// "))
             .or_else(|| line.strip_prefix("-- "));
         let Some(rest) = rest else { continue };
         if let Some((key, value)) = rest.split_once(": ") {
-                let key = key.trim().to_lowercase();
-                let value = value.trim();
-                match key.as_str() {
-                    "name" => name = value.to_string(),
-                    "description" => description = value.to_string(),
-                    "schema" => schema_str = value.to_string(),
-                    "approval" => approval_str = value.to_string(),
-                    _ => {}
-                }
+            let key = key.trim().to_lowercase();
+            let value = value.trim();
+            match key.as_str() {
+                "name" => name = value.to_string(),
+                "description" => description = value.to_string(),
+                "schema" => schema_str = value.to_string(),
+                "approval" => approval_str = value.to_string(),
+                _ => {}
             }
+        }
     }
 
     let input_schema = if schema_str.is_empty() {
         // Default: accept any object payload
         serde_json::json!({"type": "object"})
     } else {
-        serde_json::from_str(&schema_str).unwrap_or_else(|_| {
-            serde_json::json!({"type": "object"})
-        })
+        serde_json::from_str(&schema_str).unwrap_or_else(|_| serde_json::json!({"type": "object"}))
     };
 
     let approval = match approval_str.to_lowercase().as_str() {
@@ -386,8 +389,16 @@ pub fn parse_frontmatter(content: &str) -> PluginMetadata {
     };
 
     PluginMetadata {
-        name: if name.is_empty() { "unnamed-plugin".to_string() } else { name },
-        description: if description.is_empty() { "User-provided plugin tool".to_string() } else { description },
+        name: if name.is_empty() {
+            "unnamed-plugin".to_string()
+        } else {
+            name
+        },
+        description: if description.is_empty() {
+            "User-provided plugin tool".to_string()
+        } else {
+            description
+        },
         input_schema,
         approval,
     }
@@ -684,9 +695,18 @@ echo hello
         };
 
         check("# name: x\n# approval: auto", ApprovalRequirement::Auto);
-        check("# name: x\n# approval: required", ApprovalRequirement::Required);
-        check("# name: x\n# approval: suggest", ApprovalRequirement::Suggest);
-        check("# name: x\n# approval: unknown", ApprovalRequirement::Suggest);
+        check(
+            "# name: x\n# approval: required",
+            ApprovalRequirement::Required,
+        );
+        check(
+            "# name: x\n# approval: suggest",
+            ApprovalRequirement::Suggest,
+        );
+        check(
+            "# name: x\n# approval: unknown",
+            ApprovalRequirement::Suggest,
+        );
         check("# name: x", ApprovalRequirement::Suggest);
     }
 }

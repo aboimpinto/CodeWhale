@@ -1538,11 +1538,19 @@ impl Engine {
 
                         if tool_name == DOTNET_EXECUTION_TOOL_NAME {
                             let started_at = Instant::now();
-                            let result = execute_dotnet_execution_tool(
-                                &tool_input, &self.session.workspace,
-                            ).await;
-                            self.emit_tool_outcome(started_at, tool_id, tool_name,
-                                tool_input, result, &mut outcomes, plan.index).await;
+                            let result =
+                                execute_dotnet_execution_tool(&tool_input, &self.session.workspace)
+                                    .await;
+                            self.emit_tool_outcome(
+                                started_at,
+                                tool_id,
+                                tool_name,
+                                tool_input,
+                                result,
+                                &mut outcomes,
+                                plan.index,
+                            )
+                            .await;
                             continue;
                         }
 
@@ -1553,10 +1561,21 @@ impl Engine {
                         {
                             let started_at = Instant::now();
                             let result = execute_runtime_tool(
-                                &tool_name, &tool_input, &self.session.workspace,
-                            ).await;
-                            self.emit_tool_outcome(started_at, tool_id, tool_name,
-                                tool_input, result, &mut outcomes, plan.index).await;
+                                &tool_name,
+                                &tool_input,
+                                &self.session.workspace,
+                            )
+                            .await;
+                            self.emit_tool_outcome(
+                                started_at,
+                                tool_id,
+                                tool_name,
+                                tool_input,
+                                result,
+                                &mut outcomes,
+                                plan.index,
+                            )
+                            .await;
                             continue;
                         }
 
@@ -2118,7 +2137,6 @@ fn resolve_auto_effort(reasoning_effort: Option<&str>, messages: &[Message]) -> 
         Some(other) => Some(other.to_string()),
         None => None,
     }
-
 }
 
 fn is_turn_metadata_text(text: &str) -> bool {

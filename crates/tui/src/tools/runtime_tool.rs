@@ -87,11 +87,7 @@ pub trait RuntimeTool: ExternalTool + Send + Sync {
     /// argument and sets the current directory to the workspace.
     /// Backends that need extra flags (e.g. `dotnet run`) override
     /// this.
-    fn prepare_command(
-        cmd: &mut tokio::process::Command,
-        script_path: &Path,
-        _temp_dir: &Path,
-    ) {
+    fn prepare_command(cmd: &mut tokio::process::Command, script_path: &Path, _temp_dir: &Path) {
         cmd.arg(script_path);
     }
 
@@ -112,9 +108,10 @@ pub trait RuntimeTool: ExternalTool + Send + Sync {
     async fn execute(code: &str, workspace: &Path) -> Result<ToolResult, ToolError> {
         let temp_dir = tempfile::tempdir()
             .map_err(|e| ToolError::execution_failed(format!("tempdir failed: {e}")))?;
-        let script_path = temp_dir
-            .path()
-            .join(format!("{}.{}", Self::tool_name(), Self::file_extension()));
+        let script_path =
+            temp_dir
+                .path()
+                .join(format!("{}.{}", Self::tool_name(), Self::file_extension()));
         tokio::fs::write(&script_path, code)
             .await
             .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
@@ -129,13 +126,10 @@ pub trait RuntimeTool: ExternalTool + Send + Sync {
         Self::prepare_command(&mut cmd, &script_path, temp_dir.path());
         cmd.current_dir(workspace);
 
-        let output =
-            tokio::time::timeout(Duration::from_secs(120), cmd.output())
-                .await
-                .map_err(|_| ToolError::Timeout { seconds: 120 })
-                .and_then(|res| {
-                    res.map_err(|e| ToolError::execution_failed(e.to_string()))
-                })?;
+        let output = tokio::time::timeout(Duration::from_secs(120), cmd.output())
+            .await
+            .map_err(|_| ToolError::Timeout { seconds: 120 })
+            .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -150,8 +144,7 @@ pub trait RuntimeTool: ExternalTool + Send + Sync {
         });
 
         Ok(ToolResult {
-            content: serde_json::to_string(&payload)
-                .unwrap_or_else(|_| payload.to_string()),
+            content: serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string()),
             success,
             metadata: Some(payload),
         })
@@ -178,9 +171,15 @@ use crate::dependencies::{DotNet, Go, Node, Python, RustC, TypeScript};
 
 #[async_trait::async_trait]
 impl RuntimeTool for Python {
-    fn runtime_name() -> &'static str { "Python" }
-    fn file_extension() -> &'static str { "py" }
-    fn tool_name() -> &'static str { "code_execution" }
+    fn runtime_name() -> &'static str {
+        "Python"
+    }
+    fn file_extension() -> &'static str {
+        "py"
+    }
+    fn tool_name() -> &'static str {
+        "code_execution"
+    }
     fn tool_description() -> &'static str {
         "Execute Python code in a local sandboxed runtime and return stdout/stderr/return_code as JSON."
     }
@@ -193,9 +192,15 @@ impl RuntimeTool for Python {
 
 #[async_trait::async_trait]
 impl RuntimeTool for Node {
-    fn runtime_name() -> &'static str { "Node.js" }
-    fn file_extension() -> &'static str { "js" }
-    fn tool_name() -> &'static str { "js_execution" }
+    fn runtime_name() -> &'static str {
+        "Node.js"
+    }
+    fn file_extension() -> &'static str {
+        "js"
+    }
+    fn tool_name() -> &'static str {
+        "js_execution"
+    }
     fn tool_description() -> &'static str {
         "Execute JavaScript code in a local sandboxed Node.js runtime and return stdout/stderr/return_code as JSON."
     }
@@ -208,9 +213,15 @@ impl RuntimeTool for Node {
 
 #[async_trait::async_trait]
 impl RuntimeTool for DotNet {
-    fn runtime_name() -> &'static str { ".NET" }
-    fn file_extension() -> &'static str { "cs" }
-    fn tool_name() -> &'static str { "dotnet_execution" }
+    fn runtime_name() -> &'static str {
+        ".NET"
+    }
+    fn file_extension() -> &'static str {
+        "cs"
+    }
+    fn tool_name() -> &'static str {
+        "dotnet_execution"
+    }
     fn tool_description() -> &'static str {
         "Execute C# code in a local .NET SDK sandbox and return stdout/stderr/return_code as JSON. \
          Requires `dotnet` (NET 6+ SDK) on PATH. Code runs as a single-file top-level-statements \
@@ -221,11 +232,7 @@ impl RuntimeTool for DotNet {
     }
 
     /// dotnet needs `run` before the file path.
-    fn prepare_command(
-        cmd: &mut tokio::process::Command,
-        script_path: &Path,
-        _temp_dir: &Path,
-    ) {
+    fn prepare_command(cmd: &mut tokio::process::Command, script_path: &Path, _temp_dir: &Path) {
         cmd.arg("run").arg(script_path);
     }
 }
@@ -234,9 +241,15 @@ impl RuntimeTool for DotNet {
 
 #[async_trait::async_trait]
 impl RuntimeTool for Go {
-    fn runtime_name() -> &'static str { "Go" }
-    fn file_extension() -> &'static str { "go" }
-    fn tool_name() -> &'static str { "go_execution" }
+    fn runtime_name() -> &'static str {
+        "Go"
+    }
+    fn file_extension() -> &'static str {
+        "go"
+    }
+    fn tool_name() -> &'static str {
+        "go_execution"
+    }
     fn tool_description() -> &'static str {
         "Execute Go code in a local Go toolchain sandbox and return stdout/stderr/return_code as \
          JSON. Requires `go` on PATH. Code runs via `go run file.go` — no module or package \
@@ -247,11 +260,7 @@ impl RuntimeTool for Go {
     }
 
     /// `go run file.go` needs the `run` subcommand.
-    fn prepare_command(
-        cmd: &mut tokio::process::Command,
-        script_path: &Path,
-        _temp_dir: &Path,
-    ) {
+    fn prepare_command(cmd: &mut tokio::process::Command, script_path: &Path, _temp_dir: &Path) {
         cmd.arg("run").arg(script_path);
     }
 }
@@ -260,9 +269,15 @@ impl RuntimeTool for Go {
 
 #[async_trait::async_trait]
 impl RuntimeTool for TypeScript {
-    fn runtime_name() -> &'static str { "TypeScript" }
-    fn file_extension() -> &'static str { "ts" }
-    fn tool_name() -> &'static str { "ts_execution" }
+    fn runtime_name() -> &'static str {
+        "TypeScript"
+    }
+    fn file_extension() -> &'static str {
+        "ts"
+    }
+    fn tool_name() -> &'static str {
+        "ts_execution"
+    }
     fn tool_description() -> &'static str {
         "Execute TypeScript code in a local sandbox and return stdout/stderr/return_code as JSON. \
          Requires `ts-node`, `deno`, or `npx tsx` on PATH."
@@ -281,9 +296,10 @@ impl RuntimeTool for TypeScript {
     async fn execute(code: &str, workspace: &Path) -> Result<ToolResult, ToolError> {
         let temp_dir = tempfile::tempdir()
             .map_err(|e| ToolError::execution_failed(format!("tempdir failed: {e}")))?;
-        let script_path = temp_dir
-            .path()
-            .join(format!("{}.{}", Self::tool_name(), Self::file_extension()));
+        let script_path =
+            temp_dir
+                .path()
+                .join(format!("{}.{}", Self::tool_name(), Self::file_extension()));
         tokio::fs::write(&script_path, code)
             .await
             .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
@@ -303,13 +319,10 @@ impl RuntimeTool for TypeScript {
         }
         cmd.arg(&script_path).current_dir(workspace);
 
-        let output =
-            tokio::time::timeout(Duration::from_secs(120), cmd.output())
-                .await
-                .map_err(|_| ToolError::Timeout { seconds: 120 })
-                .and_then(|res| {
-                    res.map_err(|e| ToolError::execution_failed(e.to_string()))
-                })?;
+        let output = tokio::time::timeout(Duration::from_secs(120), cmd.output())
+            .await
+            .map_err(|_| ToolError::Timeout { seconds: 120 })
+            .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
@@ -324,8 +337,7 @@ impl RuntimeTool for TypeScript {
         });
 
         Ok(ToolResult {
-            content: serde_json::to_string(&payload)
-                .unwrap_or_else(|_| payload.to_string()),
+            content: serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string()),
             success,
             metadata: Some(payload),
         })
@@ -336,9 +348,15 @@ impl RuntimeTool for TypeScript {
 
 #[async_trait::async_trait]
 impl RuntimeTool for RustC {
-    fn runtime_name() -> &'static str { "Rust" }
-    fn file_extension() -> &'static str { "rs" }
-    fn tool_name() -> &'static str { "rust_execution" }
+    fn runtime_name() -> &'static str {
+        "Rust"
+    }
+    fn file_extension() -> &'static str {
+        "rs"
+    }
+    fn tool_name() -> &'static str {
+        "rust_execution"
+    }
     fn tool_description() -> &'static str {
         "Compile and execute Rust code in a local sandbox and return stdout/stderr/return_code as \
          JSON. Requires `rustc` on PATH. Code must be a valid Rust program with a `fn main()`."
@@ -392,13 +410,10 @@ impl RuntimeTool for RustC {
             .arg(&exe_path)
             .current_dir(workspace);
 
-        let compile_output =
-            tokio::time::timeout(Duration::from_secs(60), compile_cmd.output())
-                .await
-                .map_err(|_| ToolError::Timeout { seconds: 60 })
-                .and_then(|res| {
-                    res.map_err(|e| ToolError::execution_failed(e.to_string()))
-                })?;
+        let compile_output = tokio::time::timeout(Duration::from_secs(60), compile_cmd.output())
+            .await
+            .map_err(|_| ToolError::Timeout { seconds: 60 })
+            .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
 
         if !compile_output.status.success() {
             let stderr = String::from_utf8_lossy(&compile_output.stderr).to_string();
@@ -410,8 +425,7 @@ impl RuntimeTool for RustC {
                 "content": [],
             });
             return Ok(ToolResult {
-                content: serde_json::to_string(&payload)
-                    .unwrap_or_else(|_| payload.to_string()),
+                content: serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string()),
                 success: false,
                 metadata: Some(payload),
             });
@@ -431,13 +445,10 @@ impl RuntimeTool for RustC {
         let mut run_cmd = tokio::process::Command::new(&exe_path);
         run_cmd.current_dir(workspace);
 
-        let run_output =
-            tokio::time::timeout(Duration::from_secs(120), run_cmd.output())
-                .await
-                .map_err(|_| ToolError::Timeout { seconds: 120 })
-                .and_then(|res| {
-                    res.map_err(|e| ToolError::execution_failed(e.to_string()))
-                })?;
+        let run_output = tokio::time::timeout(Duration::from_secs(120), run_cmd.output())
+            .await
+            .map_err(|_| ToolError::Timeout { seconds: 120 })
+            .and_then(|res| res.map_err(|e| ToolError::execution_failed(e.to_string())))?;
 
         // Delete the binary immediately after execution — don't leave
         // it sitting around until the temp dir is dropped.
@@ -456,8 +467,7 @@ impl RuntimeTool for RustC {
         });
 
         Ok(ToolResult {
-            content: serde_json::to_string(&payload)
-                .unwrap_or_else(|_| payload.to_string()),
+            content: serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string()),
             success,
             metadata: Some(payload),
         })

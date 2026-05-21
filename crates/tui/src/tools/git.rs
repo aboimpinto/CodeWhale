@@ -7,13 +7,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::dependencies::ExternalTool;
 
 use super::spec::{
-    optional_bool, optional_str, optional_u64, ApprovalRequirement, ToolCapability, ToolContext,
-    ToolError, ToolResult, ToolSpec,
+    ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+    optional_bool, optional_str, optional_u64,
 };
 
 const MAX_OUTPUT_CHARS: usize = 40_000;
@@ -401,12 +401,14 @@ mod tests {
             .expect("diff cached");
         assert!(cached.success);
         assert!(cached.content.contains("diff --git"));
-        assert!(cached
-            .metadata
-            .as_ref()
-            .and_then(|m| m.get("cached"))
-            .and_then(Value::as_bool)
-            .unwrap_or(false));
+        assert!(
+            cached
+                .metadata
+                .as_ref()
+                .and_then(|m| m.get("cached"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        );
     }
 
     #[test]

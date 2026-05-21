@@ -1106,8 +1106,11 @@ impl Engine {
         // the default `~/.deepseek/tools/` directory is always checked.
         if let Some(ref mut tool_registry) = tool_registry {
             // Snapshot built-in tool names before any modifications.
-            let names_before: std::collections::HashSet<String> =
-                tool_registry.names().into_iter().map(|s| s.to_string()).collect();
+            let names_before: std::collections::HashSet<String> = tool_registry
+                .names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
 
             // Resolve the plugin directory. Defaults to `~/.deepseek/tools/`.
             let default_dir = {
@@ -1145,8 +1148,11 @@ impl Engine {
 
             // Diff: any tool name that didn't exist before overrides/plugins
             // is a user-registered tool. These should never be deferred.
-            let names_after: std::collections::HashSet<String> =
-                tool_registry.names().into_iter().map(|s| s.to_string()).collect();
+            let names_after: std::collections::HashSet<String> = tool_registry
+                .names()
+                .into_iter()
+                .map(|s| s.to_string())
+                .collect();
             plugin_tool_names = &names_after - &names_before;
         }
 
@@ -2041,14 +2047,12 @@ use self::streaming::{
     should_transparently_retry_stream, stream_chunk_timeout_secs,
 };
 use self::tool_catalog::{
-    CODE_EXECUTION_TOOL_NAME, DOTNET_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME,
-    GO_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
-    RUST_EXECUTION_TOOL_NAME, TS_EXECUTION_TOOL_NAME,
-    REQUEST_USER_INPUT_NAME, active_tools_for_step, build_model_tool_catalog,
-    ensure_advanced_tooling, execute_code_execution_tool, execute_runtime_tool,
-    execute_tool_search,
-    initial_active_tools, is_tool_search_tool, maybe_hydrate_requested_deferred_tool,
-    missing_tool_error_message,
+    CODE_EXECUTION_TOOL_NAME, DOTNET_EXECUTION_TOOL_NAME, GO_EXECUTION_TOOL_NAME,
+    JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME, REQUEST_USER_INPUT_NAME,
+    RUST_EXECUTION_TOOL_NAME, TS_EXECUTION_TOOL_NAME, active_tools_for_step,
+    build_model_tool_catalog, ensure_advanced_tooling, execute_code_execution_tool,
+    execute_runtime_tool, execute_tool_search, initial_active_tools, is_tool_search_tool,
+    maybe_hydrate_requested_deferred_tool, missing_tool_error_message,
 };
 #[cfg(test)]
 use self::tool_catalog::{

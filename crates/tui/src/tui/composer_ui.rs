@@ -66,8 +66,7 @@ pub(crate) fn handle_composer_history_arrow(
     // column position.  At the first or last line they fall back to
     // input-history navigation (#1117).
     let scroll_on_empty = app.composer_arrows_scroll
-        && (app.input.is_empty()
-            || (!app.input.contains('\n') && app.input.trim().is_empty()));
+        && (app.input.is_empty() || (!app.input.contains('\n') && app.input.trim().is_empty()));
 
     match key.code {
         KeyCode::Up => {

@@ -343,8 +343,12 @@ pub fn set_completion_sound_mode(mode: crate::config::CompletionSound) {
 pub fn play_completion_sound() {
     match COMPLETION_SOUND_MODE.load(Ordering::SeqCst) {
         0 => {} // Off
-        1 => { beep_sound(); }
-        2 => { bell_sound(); }
+        1 => {
+            beep_sound();
+        }
+        2 => {
+            bell_sound();
+        }
         _ => {}
     }
 }
@@ -354,14 +358,20 @@ pub fn play_completion_sound() {
 /// On Windows uses `MessageBeep(MB_OK)` which plays the default system
 /// notification sound. On other platforms writes `BEL` (`\x07`) to stdout.
 #[cfg(target_os = "windows")]
-fn beep_sound() { windows_bell(); }
+fn beep_sound() {
+    windows_bell();
+}
 
 /// Non-Windows: write BEL to stdout for the terminal bell.
 #[cfg(not(target_os = "windows"))]
-fn beep_sound() { let _ = io::stdout().write_all(b"\x07"); }
+fn beep_sound() {
+    let _ = io::stdout().write_all(b"\x07");
+}
 
 /// Pure terminal BEL character.
-fn bell_sound() { let _ = io::stdout().write_all(b"\x07"); }
+fn bell_sound() {
+    let _ = io::stdout().write_all(b"\x07");
+}
 
 /// Return a human-readable duration string, capped at two units so
 /// it stays compact in headers and notifications.

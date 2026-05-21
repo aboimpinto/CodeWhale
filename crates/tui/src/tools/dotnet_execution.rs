@@ -75,9 +75,7 @@ pub async fn execute_dotnet_execution_tool(
         .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
     let mut cmd = crate::dependencies::DotNet::tokio_command().ok_or_else(|| {
-        ToolError::execution_failed(
-            "dotnet_execution: .NET SDK became unavailable".to_string()
-        )
+        ToolError::execution_failed("dotnet_execution: .NET SDK became unavailable".to_string())
     })?;
     cmd.arg("run")
         .arg(&script_path)
@@ -165,10 +163,7 @@ mod tests {
         )
         .await
         .expect("execute should not Err — runtime errors land in stderr/exit code");
-        assert!(
-            !result.success,
-            "non-zero exit must report success=false"
-        );
+        assert!(!result.success, "non-zero exit must report success=false");
         assert!(
             result.content.contains("intentional fail"),
             "stderr payload must surface the error message; got {}",

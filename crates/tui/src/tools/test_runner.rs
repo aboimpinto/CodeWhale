@@ -7,11 +7,11 @@ use std::path::Path;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::spec::{
-    optional_bool, optional_str, ApprovalRequirement, ToolCapability, ToolContext, ToolError,
-    ToolResult, ToolSpec,
+    ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+    optional_bool, optional_str,
 };
 
 use crate::dependencies::ExternalTool;

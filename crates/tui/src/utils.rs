@@ -231,7 +231,9 @@ pub fn open_url(url: &str) -> Result<()> {
         cmd.args(["/C", "start", "", url]);
         return match cmd.status() {
             Ok(status) if status.success() => Ok(()),
-            Ok(status) => Err(anyhow::anyhow!("browser command exited with status {status}")),
+            Ok(status) => Err(anyhow::anyhow!(
+                "browser command exited with status {status}"
+            )),
             Err(e) => Err(anyhow::anyhow!("failed to launch browser command: {e}")),
         };
     };
@@ -246,13 +248,17 @@ pub fn open_url(url: &str) -> Result<()> {
             .status()
             .map_err(|e| anyhow::anyhow!("failed to launch browser command: {e}"))?;
         if !status.success() {
-            return Err(anyhow::anyhow!("browser command exited with status {status}"));
+            return Err(anyhow::anyhow!(
+                "browser command exited with status {status}"
+            ));
         }
         Ok(())
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-    Err(anyhow::anyhow!("browser opening is unsupported on this platform"))
+    Err(anyhow::anyhow!(
+        "browser opening is unsupported on this platform"
+    ))
 }
 
 /// Spawn a tokio task with panic supervision.

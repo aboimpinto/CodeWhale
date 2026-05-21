@@ -727,10 +727,11 @@ pub(super) async fn execute_code_execution_tool(
         .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
     let mut cmd = crate::dependencies::Python::tokio_command().ok_or_else(|| {
-        ToolError::execution_failed("code_execution: Python interpreter became unavailable".to_string())
+        ToolError::execution_failed(
+            "code_execution: Python interpreter became unavailable".to_string(),
+        )
     })?;
-    cmd.arg(&script_path)
-        .current_dir(workspace);
+    cmd.arg(&script_path).current_dir(workspace);
 
     let output = tokio::time::timeout(Duration::from_secs(120), cmd.output())
         .await

@@ -350,7 +350,7 @@ fn ensure_github_repo(context: &ToolContext) -> Result<(), ToolError> {
         &["rev-parse", "--is-inside-work-tree"],
         &context.workspace,
     )
-        .map_err(|e| ToolError::execution_failed(format!("failed to run git: {e}")))?;
+    .map_err(|e| ToolError::execution_failed(format!("failed to run git: {e}")))?;
     if out.status.success() {
         Ok(())
     } else {

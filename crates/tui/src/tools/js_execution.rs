@@ -85,12 +85,9 @@ pub async fn execute_js_execution_tool(
         .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
     let mut cmd = crate::dependencies::Node::tokio_command().ok_or_else(|| {
-        ToolError::execution_failed(
-            "js_execution: Node.js runtime became unavailable".to_string()
-        )
+        ToolError::execution_failed("js_execution: Node.js runtime became unavailable".to_string())
     })?;
-    cmd.arg(&script_path)
-        .current_dir(workspace);
+    cmd.arg(&script_path).current_dir(workspace);
 
     let output = tokio::time::timeout(Duration::from_secs(120), cmd.output())
         .await
