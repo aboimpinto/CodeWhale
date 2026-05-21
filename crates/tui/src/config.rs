@@ -1136,7 +1136,6 @@ impl Default for LogsConfig {
         }
     }
 }
-}
 
 /// Vision model configuration for the `image_analyze` tool.
 /// Uses an OpenAI-compatible vision model API.
