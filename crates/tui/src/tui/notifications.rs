@@ -19,7 +19,6 @@ use windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE;
 use std::io::{self, Write};
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 use std::time::Duration;
 
 /// Notification delivery method.
