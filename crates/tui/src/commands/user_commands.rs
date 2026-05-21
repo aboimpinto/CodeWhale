@@ -111,13 +111,28 @@ fn parse_frontmatter(content: &str) -> (Vec<(String, String)>, &str) {
     if !content.starts_with("---") {
         return (Vec::new(), content);
     }
+    // Find the closing delimiter (\n followed by 3+ dashes) after the
+    // opening ---. Works for ---, ----, -----, or any dash sequence.
     let rest = &content[3..];
-    let end = match rest.find("\n---") {
-        Some(pos) => pos + 1,
+    let closing = match rest.find("\n---") {
+        Some(pos) => pos,
         None => return (Vec::new(), content),
     };
-    let frontmatter_text = &content[3..=end].trim();
-    let body = content[end + 5..].trim();
+    // `closing` is the position of \n in rest-space (0 = first byte after ---).
+    // Convert to content-space.
+    let delim_start = 3 + closing;
+    let frontmatter_text = &content[3..delim_start].trim();
+    // Skip past the closing delimiter line (\n followed by any number of dashes)
+    // so body starts after all delimiter characters.
+    let bytes = content.as_bytes();
+    let mut body_start = delim_start;
+    while body_start < content.len() && bytes[body_start] == b'\n' {
+        body_start += 1;
+    }
+    while body_start < content.len() && bytes[body_start] == b'-' {
+        body_start += 1;
+    }
+    let body = content[body_start..].trim();
     let mut pairs = Vec::new();
     for line in frontmatter_text.lines() {
         if let Some((key, value)) = line.split_once(':') {
@@ -342,6 +357,15 @@ mod tests {
         assert_eq!(body, "Body text here");
         assert!(meta.iter().any(|(k, _)| k == "description"));
         assert!(meta.iter().any(|(k, _)| k == "allowed-tools"));
+    }
+
+    #[test]
+    fn test_flexible_dash_count_accepted() {
+        // More than 3 dashes (-----, ---------, etc.) should work
+        let content = "-----\ndescription: test\n-----\n\nBody";
+        let (meta, body) = parse_frontmatter(content);
+        assert_eq!(body, "Body");
+        assert!(meta.iter().any(|(k, _)| k == "description"));
     }
 
     #[test]
