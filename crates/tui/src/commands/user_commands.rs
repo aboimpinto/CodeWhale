@@ -182,6 +182,28 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
     None
 }
 
+/// Look up a user-defined command by name and return its description
+/// from frontmatter (if available).
+pub fn get_user_command_description(
+    name: &str,
+    workspace: Option<&Path>,
+) -> Option<String> {
+    let name = name.to_lowercase();
+    let name = name.strip_prefix('/').unwrap_or(&name);
+    for (cmd_name, content) in load_user_commands(workspace) {
+        if cmd_name == name {
+            let (meta, _) = parse_frontmatter(&content);
+            for (key, value) in &meta {
+                if key == "description" {
+                    return Some(value.clone());
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
 /// Get user command names that match a given prefix (for autocomplete).
 ///
 /// The prefix should be the command name portion only (after `/`).
