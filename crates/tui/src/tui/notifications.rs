@@ -296,6 +296,7 @@ pub fn start_title_animation(original: &str) {
 pub fn stop_title_animation() {
     TITLE_ANIMATION_RUNNING.store(false, Ordering::SeqCst);
     set_terminal_title("✅ DeepSeek TUI");
+    play_completion_sound();
 }
 
 /// Clear the ✅ completion marker from the title when the user interacts.
@@ -305,6 +306,17 @@ pub fn stop_title_animation() {
 pub fn reset_title_on_interaction() {
     set_terminal_title("DeepSeek TUI");
 }
+
+/// Play a short completion sound via the system beep.
+///
+/// On Windows uses `MessageBeep(MB_OK)` which plays the default system
+/// notification sound. On other platforms writes `BEL` (`\x07`) to stdout.
+#[cfg(target_os = "windows")]
+pub fn play_completion_sound() { windows_bell(); }
+
+/// Non-Windows: write BEL to stdout for the terminal bell.
+#[cfg(not(target_os = "windows"))]
+pub fn play_completion_sound() { let _ = io::stdout().write_all(b"\x07"); }
 
 /// Return a human-readable duration string, capped at two units so
 /// it stays compact in headers and notifications.
