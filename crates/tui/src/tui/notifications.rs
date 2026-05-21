@@ -247,7 +247,8 @@ pub fn clear_taskbar_progress() {
 const TITLE_FRAMES: &[&str] = &["🐳", "🐋", "🐳", "🐋"];
 const TITLE_ANIMATION_INTERVAL: Duration = Duration::from_millis(800);
 
-/// Shared flag controlling the title animation loop.
+/// Shared flag controlling the title animation loop. Set to `true` by
+/// `start_title_animation()`, cleared by `stop_title_animation()`.
 static TITLE_ANIMATION_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// Write OSC 0 (set window title) sequence.
@@ -258,26 +259,35 @@ fn set_terminal_title(title: &str) {
     let _ = stdout.flush();
 }
 
+/// Tracks whether the ✅ completion marker was set, so
+/// `reset_title_on_interaction()` can skip redundant writes.
+static COMPLETION_MARKER_SHOWN: AtomicBool = AtomicBool::new(false);
+
 /// Start an animated terminal title spinner.
 ///
 /// Cycles the terminal title between 🐳→🐋 every 800ms while processing,
 /// matching the whale status indicator in the TUI header, so alt-tabbed
-/// users can see activity. The title is restored to `original` when
-/// [`stop_title_animation`] is called.
+/// users can see activity.
 ///
-/// The animation runs in a background tokio task that checks an atomic flag.
-/// This function is safe to call multiple times — subsequent calls update
-/// the base title without spawning extra tasks.
+/// The animation runs in a background tokio task that checks
+/// `TITLE_ANIMATION_RUNNING`. Each call restarts the animation with the
+/// given `original` base title — safe to call on every turn start.
 pub fn start_title_animation(original: &str) {
-    // If already running, just return — the animation continues.
-    if TITLE_ANIMATION_RUNNING.swap(true, Ordering::SeqCst) {
-        return;
-    }
-
+    // Signal any existing animation loop to exit, then start fresh.
+    TITLE_ANIMATION_RUNNING.store(true, Ordering::SeqCst);
     let base = original.to_string();
     tokio::spawn(async move {
         let mut frame = 0usize;
         while TITLE_ANIMATION_RUNNING.load(Ordering::SeqCst) {
+            // Yield once per frame so a racing stop_title_animation()
+            // can observe the cleared flag and apply the completion
+            // marker before the next frame write. Without this yield
+            // the background task could overwrite the ✅ marker with
+            // the next whale frame.
+            tokio::task::yield_now().await;
+            if !TITLE_ANIMATION_RUNNING.load(Ordering::SeqCst) {
+                break;
+            }
             let spinner = TITLE_FRAMES[frame % TITLE_FRAMES.len()];
             set_terminal_title(&format!("{spinner} {base}"));
             frame += 1;
@@ -295,8 +305,9 @@ pub fn start_title_animation(original: &str) {
 /// by [`start_title_animation`].
 pub fn stop_title_animation() {
     TITLE_ANIMATION_RUNNING.store(false, Ordering::SeqCst);
-    // Show ✅ marker only for beep (system sound has no visual component).
-    // Bell mode already has its own terminal-level visual indicator.
+    COMPLETION_MARKER_SHOWN.store(false, Ordering::SeqCst);
+    // Show ✅ marker only for beep mode. Bell mode already has its own
+    // terminal-level visual indicator (flash/icon).
     let mode = COMPLETION_SOUND_MODE.load(Ordering::SeqCst);
     if mode == 1 {
         set_terminal_title("✅ DeepSeek TUI");
@@ -309,7 +320,9 @@ pub fn stop_title_animation() {
 /// Call this on every user input event (key press, mouse click) so the
 /// marker doesn't persist once the user is back at the terminal.
 pub fn reset_title_on_interaction() {
-    set_terminal_title("DeepSeek TUI");
+    if COMPLETION_MARKER_SHOWN.swap(false, Ordering::SeqCst) {
+        set_terminal_title("DeepSeek TUI");
+    }
 }
 
 /// Completion sound mode (0 = off, 1 = beep, 2 = bell).
