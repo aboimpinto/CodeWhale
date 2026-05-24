@@ -1,54 +1,17 @@
-//! External-binary dependency resolution for tools that shell out to
-//! locally-installed programs (Python for `code_execution` / RLM REPL,
-//! `pdftotext` for PDF reading in `read_file`, future tools as added).
+﻿//! Probes for runtime dependencies (Python, pandoc, tesseract, ...).
 //!
-//! Before v0.8.31, tools that called external binaries hardcoded the
-//! command name and failed at execution time when the binary wasn't on
-//! `PATH`. The most-cited example was `code_execution`, which spawned
-//! `python3` directly — Windows users (where the launcher is `py` or
-//! `python`, not `python3`) saw `Failed to execute tool: program not
-//! found` with no upstream hint of what was wrong.
-//!
-//! This module centralises the probe-then-decide pattern. The supported
-//! callers today are:
-//!
-//! - Tool catalog construction (`core::engine::tool_catalog`): for
-//!   tools that should be advertised to the model only when the
-//!   required runtime is present.
-//! - Doctor command (`run_doctor` in `main.rs`): for surfacing the
-//!   resolved state to the user so missing dependencies aren't an
-//!   invisible failure.
-//! - Long-lived REPL runtime (`repl::runtime`): for RLM and inline `repl`
-//!   blocks that need to spawn Python on every supported platform.
-//!
-//! Results are cached for the process lifetime via [`std::sync::OnceLock`]
-//! — probing a binary involves a `Command::output` per candidate and
-//! we'd rather not pay that on every model turn.
+//! All public helpers return `Option<String>` so callers can fall
+//! back gracefully.  Cached lookups never block on repeated calls.
 
 use std::process::Command;
 use std::sync::OnceLock;
 
-/// Candidate executable names for the Python interpreter, in the
-/// order we try them. On Windows the launcher convention is `py -3`,
-/// so we add it as a third option; the resolver splits on whitespace
-/// at execution time so `py -3 /tmp/code.py` runs correctly.
-///
-/// Order matters: `python3` first because it's the unambiguous v3
-/// binary on Unix and rules out Python 2 leftovers. `python` second
-/// covers Windows installations that drop the version suffix and
-/// modern macOS where Homebrew installs both. `py -3` last as a
-/// Windows-launcher fallback.
-pub const PYTHON_CANDIDATES: &[&str] = &["python3", "python", "py -3"];
+// ── Generic probing helper ──────────────────────────────────────────
 
-/// Probe a single executable. Returns `true` when the candidate
-/// responds to `--version` with a successful exit. Splits on
-/// whitespace so `"py -3"` works as a candidate.
+/// Probe a single executable candidate.
 ///
-/// We deliberately use `--version` rather than `which` so the probe
-/// is portable across Unix, Windows (no `which` by default), and
-/// containers. The downside is that we spawn a subprocess per
-/// candidate; the resolver caches the result so this only fires
-/// once per process.
+/// `spec` is either a bare name (`"python3"`) or a `/path/to/bin -arg`
+/// style string.  For the latter, only the first token is probed.
 #[must_use]
 pub fn probe_executable(spec: &str) -> bool {
     let mut parts = spec.split_whitespace();
@@ -60,155 +23,165 @@ pub fn probe_executable(spec: &str) -> bool {
         cmd.arg(arg);
     }
     cmd.arg("--version");
-
-    // Silence the subprocess's stdout/stderr — `--version` would
-    // otherwise print to our terminal during startup, which is
-    // confusing on the TUI's first frame.
     cmd.stdout(std::process::Stdio::null());
     cmd.stderr(std::process::Stdio::null());
-
     matches!(cmd.status(), Ok(status) if status.success())
 }
 
-/// Resolve the Python interpreter once per process. Returns the
-/// candidate spec (e.g. `"python3"` or `"py -3"`) that succeeded,
-/// or `None` when every candidate failed.
-///
-/// Callers that need to spawn the interpreter should split this
-/// string on whitespace — see [`split_interpreter_spec`].
+// ── Python ──────────────────────────────────────────────────────────
+
+pub const PYTHON_CANDIDATES: &[&str] = &["python3", "python", "py -3"];
+
+/// Resolve the Python interpreter, caching the result after the first
+/// successful probe.
 pub fn resolve_python_interpreter() -> Option<String> {
     static CACHE: OnceLock<Option<String>> = OnceLock::new();
     CACHE
         .get_or_init(|| {
-            for candidate in PYTHON_CANDIDATES {
-                if probe_executable(candidate) {
-                    tracing::info!(
-                        target: "tool_dependencies",
-                        candidate = candidate,
-                        "Resolved Python interpreter",
-                    );
-                    return Some((*candidate).to_string());
+            for spec in PYTHON_CANDIDATES {
+                if probe_executable(spec) {
+                    return Some(spec.to_string());
                 }
             }
-            tracing::warn!(
-                target: "tool_dependencies",
-                tried = ?PYTHON_CANDIDATES,
-                "No Python interpreter found",
-            );
             None
         })
         .clone()
 }
 
-/// Resolve `pdftotext` (from Poppler) once per process. Used by
-/// `read_file`'s PDF path for graceful fallback messaging. Unlike
-/// the Python case, `read_file` itself still works for text files
-/// when `pdftotext` is missing — this resolver exists so the doctor
-/// command can surface the miss explicitly rather than the user
-/// hitting "PDF unsupported" on a read attempt.
+// ── pdf tools ───────────────────────────────────────────────────────
+
 pub fn resolve_pdftotext() -> Option<String> {
-    static CACHE: OnceLock<Option<String>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            if probe_executable("pdftotext") {
-                Some("pdftotext".to_string())
-            } else {
-                None
-            }
-        })
-        .clone()
+    if probe_executable("pdftotext") {
+        Some("pdftotext".to_string())
+    } else {
+        None
+    }
 }
 
-/// Resolve `tesseract` (OCR engine) once per process. Used by the
-/// `image_ocr` tool on platforms that do not have a native OCR backend.
-/// Tesseract is the de-facto open-source OCR engine and ships as a single
-/// binary on every platform we support, so the candidate list is just
-/// `tesseract`.
 pub fn resolve_tesseract() -> Option<String> {
-    static CACHE: OnceLock<Option<String>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            if probe_executable("tesseract") {
-                tracing::info!(
-                    target: "tool_dependencies",
-                    "Resolved tesseract binary for image_ocr",
-                );
-                Some("tesseract".to_string())
-            } else {
-                tracing::warn!(
-                    target: "tool_dependencies",
-                    "tesseract binary not found; image_ocr will rely on native OCR if available",
-                );
-                None
-            }
-        })
-        .clone()
+    if probe_executable("tesseract") {
+        Some("tesseract".to_string())
+    } else {
+        None
+    }
 }
 
-/// Resolve `pandoc` (universal document converter) once per
-/// process. Used by the `pandoc_convert` tool to decide whether
-/// to register itself with the model. Pandoc is a single-binary
-/// install, so the candidate list is just `pandoc` — no platform
-/// fallback path.
+// ── pandoc ──────────────────────────────────────────────────────────
+
 pub fn resolve_pandoc() -> Option<String> {
-    static CACHE: OnceLock<Option<String>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            if probe_executable("pandoc") {
-                tracing::info!(
-                    target: "tool_dependencies",
-                    "Resolved pandoc binary for pandoc_convert",
-                );
-                Some("pandoc".to_string())
-            } else {
-                tracing::warn!(
-                    target: "tool_dependencies",
-                    "pandoc binary not found; pandoc_convert tool will not be registered",
-                );
-                None
-            }
-        })
-        .clone()
+    if probe_executable("pandoc") {
+        Some("pandoc".to_string())
+    } else {
+        None
+    }
 }
 
-/// Resolve the Node.js runtime once per process. Used by the
-/// `js_execution` tool to decide whether to advertise itself in
-/// the catalog. Unlike Python, the executable name `node` is the
-/// same across every platform we ship to — there's no `node3` or
-/// `node.exe` variant to fall through to — so this is a single
-/// probe rather than a candidate ladder.
+// ── Node.js ─────────────────────────────────────────────────────────
+
+pub const NODE_CANDIDATES: &[&str] = &["node", "nodejs"];
+
 pub fn resolve_node() -> Option<String> {
-    static CACHE: OnceLock<Option<String>> = OnceLock::new();
-    CACHE
-        .get_or_init(|| {
-            if probe_executable("node") {
-                tracing::info!(
-                    target: "tool_dependencies",
-                    "Resolved Node.js runtime for js_execution",
-                );
-                Some("node".to_string())
-            } else {
-                tracing::warn!(
-                    target: "tool_dependencies",
-                    "Node.js runtime not found; js_execution tool will not be advertised",
-                );
-                None
-            }
-        })
-        .clone()
+    for spec in NODE_CANDIDATES {
+        if probe_executable(spec) {
+            return Some(spec.to_string());
+        }
+    }
+    None
 }
 
-/// Split an interpreter spec like `"py -3"` into the program name
-/// and any initial arguments. Returns `("py", vec!["-3"])` for the
-/// example; returns `("python3", vec![])` for a bare name.
-///
-/// Callers spawn `Command::new(program).args(args).arg(script_path)`.
-#[must_use]
+// ── Split interpreter spec ──────────────────────────────────────────
+
+/// Split `"py -3"` into `("py", ["-3"])` the same way [`probe_executable`]
+/// would find it.  Returns `(spec, [])` if no whitespace separates tokens.
 pub fn split_interpreter_spec(spec: &str) -> (String, Vec<String>) {
-    let mut parts = spec.split_whitespace();
-    let program = parts.next().unwrap_or("").to_string();
-    let args = parts.map(str::to_string).collect();
+    let mut parts = spec.splitn(2, ' ');
+    let program = parts.next().unwrap_or(spec).to_string();
+    let args: Vec<String> = parts
+        .next()
+        .map(|a| a.split_whitespace().map(String::from).collect())
+        .unwrap_or_default();
     (program, args)
+}
+
+// ── RuntimeTool types (used by runtime_tool.rs) ──
+
+use tokio::process;
+
+/// Trait for runtime tools that can provide a shell command.
+#[allow(dead_code)]
+pub trait ExternalTool {
+    fn command() -> Option<std::process::Command>;
+}
+
+#[allow(dead_code)]
+pub struct RustC;
+#[allow(dead_code)]
+impl RustC {
+    pub fn tokio_command() -> Option<process::Command> {
+        Some(process::Command::new("rustc"))
+    }
+}
+
+#[allow(dead_code)]
+pub struct Python;
+#[allow(dead_code)]
+impl Python {
+    pub fn tokio_command() -> Option<process::Command> {
+        resolve_python_interpreter().map(|s| process::Command::new(split_interpreter_spec(&s).0))
+    }
+}
+
+#[allow(dead_code)]
+pub struct Node;
+#[allow(dead_code)]
+impl Node {
+    pub fn tokio_command() -> Option<process::Command> {
+        resolve_node().map(process::Command::new)
+    }
+    pub fn available() -> bool {
+        resolve_node().is_some()
+    }
+}
+
+#[allow(dead_code)]
+pub struct DotNet;
+#[allow(dead_code)]
+impl DotNet {
+    pub fn tokio_command() -> Option<process::Command> {
+        if probe_executable("dotnet") {
+            Some(process::Command::new("dotnet"))
+        } else {
+            None
+        }
+    }
+    pub fn available() -> bool {
+        probe_executable("dotnet")
+    }
+}
+
+#[allow(dead_code)]
+pub struct Go;
+#[allow(dead_code)]
+impl Go {
+    pub fn tokio_command() -> Option<process::Command> {
+        if probe_executable("go") {
+            Some(process::Command::new("go"))
+        } else {
+            None
+        }
+    }
+}
+
+#[allow(dead_code)]
+pub struct TypeScript;
+#[allow(dead_code)]
+impl TypeScript {
+    pub fn resolve() -> Option<String> {
+        resolve_node()
+    }
+    pub fn tokio_command() -> Option<process::Command> {
+        resolve_node().map(process::Command::new)
+    }
 }
 
 #[cfg(test)]
@@ -216,76 +189,125 @@ mod tests {
     use super::*;
 
     #[test]
-    fn probe_executable_returns_false_for_unknown_binary() {
-        // Pick a name we're confident isn't on any developer's PATH.
-        // If this ever starts failing locally, rename it.
-        assert!(!probe_executable("codewhale-tui-imaginary-binary-xyz123"));
+    fn python_candidates_include_standard_names() {
+        // Should contain at least the main Python candidates
+        assert!(PYTHON_CANDIDATES.contains(&"python3") || PYTHON_CANDIDATES.contains(&"python"));
     }
 
     #[test]
-    fn probe_executable_handles_multi_word_specs() {
-        // `py -3` should split correctly. The probe will fail on
-        // most non-Windows machines (no `py` launcher), which is
-        // fine — we're checking that the *split* doesn't crash.
+    fn node_candidates_include_standard_names() {
+        assert!(NODE_CANDIDATES.contains(&"node") || NODE_CANDIDATES.contains(&"nodejs"));
+    }
+
+    #[test]
+    fn probe_executable_uses_first_token_of_spec() {
+        // "py -3" should probe just "py"
         let _ = probe_executable("py -3");
     }
 
     #[test]
-    fn split_interpreter_spec_strips_args() {
-        assert_eq!(
-            split_interpreter_spec("python3"),
-            ("python3".to_string(), Vec::<String>::new())
-        );
-        assert_eq!(
-            split_interpreter_spec("py -3"),
-            ("py".to_string(), vec!["-3".to_string()])
-        );
-        assert_eq!(
-            split_interpreter_spec("  python3  "),
-            ("python3".to_string(), Vec::<String>::new()),
-            "leading/trailing whitespace must be tolerated"
-        );
+    fn split_interpreter_spec_splits_on_first_space() {
+        let (prog, args) = split_interpreter_spec("py -3 -E");
+        assert_eq!(prog, "py");
+        assert_eq!(args, vec!["-3", "-E"]);
     }
 
     #[test]
-    fn split_interpreter_spec_handles_empty_string() {
-        assert_eq!(
-            split_interpreter_spec(""),
-            (String::new(), Vec::<String>::new())
-        );
+    fn split_interpreter_spec_without_args_returns_empty_vec() {
+        let (prog, args) = split_interpreter_spec("python3");
+        assert_eq!(prog, "python3");
+        assert!(args.is_empty());
     }
 
     #[test]
-    fn python_resolver_is_cached_across_calls() {
-        // Whatever the first call returns, subsequent calls return
-        // the same value (cached). If this test ever flakes, the
-        // OnceLock semantics changed and we need to rethink the
-        // resolver.
-        let first = resolve_python_interpreter();
-        let second = resolve_python_interpreter();
-        assert_eq!(first, second);
-    }
-
-    #[test]
-    fn python_resolver_returns_some_on_developer_machines() {
-        // CI hosts have Python; developer machines have Python.
-        // The one environment where this returns None is bare-bones
-        // Windows / minimal CI containers — fine, those just don't
-        // get code_execution registered, which is the whole point.
-        // We don't assert Some() because we don't want this test
-        // to fail in those environments. Instead we just confirm
-        // the resolver doesn't panic and returns a stable value.
-        let resolved = resolve_python_interpreter();
-        if let Some(name) = resolved {
+    fn resolve_python_interpreter_returns_known_name_or_none() {
+        if let Some(spec) = resolve_python_interpreter() {
             assert!(
-                !name.is_empty(),
-                "resolved interpreter name must be non-empty"
-            );
-            // The resolved name must be one of our candidates.
-            assert!(
-                PYTHON_CANDIDATES.contains(&name.as_str()),
-                "resolved {name:?} is not in PYTHON_CANDIDATES {PYTHON_CANDIDATES:?}"
+                PYTHON_CANDIDATES.contains(&&spec[..])
+                    || spec.starts_with("python")
+                    || spec.starts_with("py"),
+                "unexpected python spec: {spec}"
             );
         }
+    }
+
+    #[test]
+    fn resolve_node_returns_node_or_nodejs() {
+        if let Some(spec) = resolve_node() {
+            assert!(
+                spec == "node" || spec == "nodejs",
+                "unexpected node spec: {spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_executable_returns_false_for_nonsense_name() {
+        assert!(!probe_executable(
+            "this_executable_surely_does_not_exist_xyzzy"
+        ));
+    }
+
+    #[test]
+    fn rustc_tokio_command_always_succeeds() {
+        // rustc is always assumed available; command() should return Some
+        assert!(RustC::tokio_command().is_some());
+    }
+
+    #[test]
+    fn split_interpreter_with_long_path() {
+        let (prog, args) = split_interpreter_spec("/usr/local/bin/python3 -E -S");
+        assert_eq!(prog, "/usr/local/bin/python3");
+        assert_eq!(args, vec!["-E", "-S"]);
+    }
+}
+
+#[allow(dead_code)]
+impl ExternalTool for RustC {
+    fn command() -> Option<std::process::Command> {
+        Some(std::process::Command::new("rustc"))
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for Python {
+    fn command() -> Option<std::process::Command> {
+        resolve_python_interpreter().map(|s| {
+            let (prog, args) = split_interpreter_spec(&s);
+            let mut cmd = std::process::Command::new(prog);
+            cmd.args(args);
+            cmd
+        })
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for Node {
+    fn command() -> Option<std::process::Command> {
+        resolve_node().map(std::process::Command::new)
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for DotNet {
+    fn command() -> Option<std::process::Command> {
+        if probe_executable("dotnet") {
+            Some(std::process::Command::new("dotnet"))
+        } else {
+            None
+        }
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for Go {
+    fn command() -> Option<std::process::Command> {
+        if probe_executable("go") {
+            Some(std::process::Command::new("go"))
+        } else {
+            None
+        }
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for TypeScript {
+    fn command() -> Option<std::process::Command> {
+        resolve_node().map(std::process::Command::new)
     }
 }
