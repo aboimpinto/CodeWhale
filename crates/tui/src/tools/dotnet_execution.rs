@@ -1,4 +1,5 @@
-﻿//! `dotnet_execution` tool — execute model-provided C# code via a local
+﻿#![allow(dead_code)]
+//! `dotnet_execution` tool — execute model-provided C# code via a local
 //! .NET SDK, returning stdout / stderr / exit code as JSON.
 //!
 //! Starting with .NET 6, `dotnet run file.cs` can run a single C# file

@@ -39,6 +39,7 @@ use crate::tools::spec::{ToolError, ToolResult};
 /// arguments built by [`prepare_command`](RuntimeTool::prepare_command),
 /// and collects the output with a 120-second timeout.
 #[async_trait::async_trait]
+#[allow(dead_code)]
 pub trait RuntimeTool: ExternalTool + Send + Sync {
     /// Human-readable runtime name, e.g. `"Python"`, `"Node.js"`.
     fn runtime_name() -> &'static str;
@@ -156,6 +157,7 @@ pub trait RuntimeTool: ExternalTool + Send + Sync {
 /// Helper: register a runtime tool in the catalog if the runtime is
 /// available and not already present.  Call from
 /// `ensure_advanced_tooling`.
+#[allow(dead_code)]
 pub fn ensure_runtime_tool<T: RuntimeTool>(catalog: &mut Vec<Tool>) {
     let name = T::tool_name();
     if !catalog.iter().any(|t| t.name == name) && <T as ExternalTool>::command().is_some() {
