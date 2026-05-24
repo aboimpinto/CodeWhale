@@ -289,3 +289,75 @@ mod tests {
         }
     }
 }
+
+// ── RuntimeTool types (used by runtime_tool.rs) ──
+#[allow(dead_code)]
+pub trait ExternalTool {
+    fn command() -> Option<std::process::Command>;
+}
+
+#[allow(dead_code)]
+pub struct RustC;
+#[allow(dead_code)]
+pub struct Python;
+#[allow(dead_code)]
+pub struct Node;
+#[allow(dead_code)]
+pub struct DotNet;
+#[allow(dead_code)]
+pub struct Go;
+#[allow(dead_code)]
+pub struct TypeScript;
+
+#[allow(dead_code)]
+impl ExternalTool for RustC {
+    fn command() -> Option<std::process::Command> {
+        Some(std::process::Command::new("rustc"))
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for Python {
+    fn command() -> Option<std::process::Command> {
+        std::env::var("PYTHON_INTERPRETER")
+            .ok()
+            .or_else(|| resolve_python_interpreter())
+            .map(|s| {
+                let (prog, args) = split_interpreter_spec(&s);
+                let mut cmd = std::process::Command::new(prog);
+                cmd.args(args);
+                cmd
+            })
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for Node {
+    fn command() -> Option<std::process::Command> {
+        resolve_node().map(std::process::Command::new)
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for DotNet {
+    fn command() -> Option<std::process::Command> {
+        if probe_executable("dotnet") {
+            Some(std::process::Command::new("dotnet"))
+        } else {
+            None
+        }
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for Go {
+    fn command() -> Option<std::process::Command> {
+        if probe_executable("go") {
+            Some(std::process::Command::new("go"))
+        } else {
+            None
+        }
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for TypeScript {
+    fn command() -> Option<std::process::Command> {
+        resolve_node().map(std::process::Command::new)
+    }
+}
