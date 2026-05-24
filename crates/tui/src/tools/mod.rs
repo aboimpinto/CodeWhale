@@ -16,6 +16,7 @@ pub mod diagnostics;
 pub mod diff_format;
 pub mod file;
 pub mod file_search;
+pub mod dotnet_execution;
 pub mod finance;
 
 pub mod fetch_url;
@@ -38,6 +39,7 @@ pub mod remember;
 pub mod revert_turn;
 pub mod review;
 pub mod rlm;
+pub mod runtime_tool;
 pub mod schema_sanitize;
 pub mod search;
 pub mod shell;
