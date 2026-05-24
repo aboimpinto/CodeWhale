@@ -1,4 +1,4 @@
-//! Probes for runtime dependencies (Python, pandoc, tesseract, ...).
+﻿//! Probes for runtime dependencies (Python, pandoc, tesseract, ...).
 //!
 //! All public helpers return `Option<String>` so callers can fall
 //! back gracefully.  Cached lookups never block on repeated calls.
@@ -176,6 +176,9 @@ impl Go {
 pub struct TypeScript;
 #[allow(dead_code)]
 impl TypeScript {
+    pub fn resolve() -> Option<String> {
+        resolve_node()
+    }
     pub fn tokio_command() -> Option<process::Command> {
         resolve_node().map(process::Command::new)
     }
