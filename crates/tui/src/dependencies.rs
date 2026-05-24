@@ -25,15 +25,16 @@ pub const PYTHON_CANDIDATES: &[&str] = &["python3", "python", "py -3"];
 /// successful probe.
 pub fn resolve_python_interpreter() -> Option<String> {
     static CACHE: OnceLock<Option<String>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        for spec in PYTHON_CANDIDATES {
-            if probe_executable(spec) {
-                return Some(spec.to_string());
+    CACHE
+        .get_or_init(|| {
+            for spec in PYTHON_CANDIDATES {
+                if probe_executable(spec) {
+                    return Some(spec.to_string());
+                }
             }
-        }
-        None
-    })
-    .clone()
+            None
+        })
+        .clone()
 }
 
 // ── pdf tools ───────────────────────────────────────────────────────
@@ -109,8 +110,7 @@ pub struct Python;
 #[allow(dead_code)]
 impl Python {
     pub fn tokio_command() -> Option<process::Command> {
-        resolve_python_interpreter()
-            .map(|s| process::Command::new(split_interpreter_spec(&s).0))
+        resolve_python_interpreter().map(|s| process::Command::new(split_interpreter_spec(&s).0))
     }
 }
 
@@ -171,18 +171,12 @@ mod tests {
     #[test]
     fn python_candidates_include_standard_names() {
         // Should contain at least the main Python candidates
-        assert!(
-            PYTHON_CANDIDATES.contains(&"python3")
-                || PYTHON_CANDIDATES.contains(&"python")
-        );
+        assert!(PYTHON_CANDIDATES.contains(&"python3") || PYTHON_CANDIDATES.contains(&"python"));
     }
 
     #[test]
     fn node_candidates_include_standard_names() {
-        assert!(
-            NODE_CANDIDATES.contains(&"node")
-                || NODE_CANDIDATES.contains(&"nodejs")
-        );
+        assert!(NODE_CANDIDATES.contains(&"node") || NODE_CANDIDATES.contains(&"nodejs"));
     }
 
     #[test]
@@ -229,7 +223,9 @@ mod tests {
 
     #[test]
     fn probe_executable_returns_false_for_nonsense_name() {
-        assert!(!probe_executable("this_executable_surely_does_not_exist_xyzzy"));
+        assert!(!probe_executable(
+            "this_executable_surely_does_not_exist_xyzzy"
+        ));
     }
 
     #[test]
