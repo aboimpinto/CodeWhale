@@ -258,3 +258,53 @@ mod tests {
         assert_eq!(args, vec!["-E", "-S"]);
     }
 }
+
+#[allow(dead_code)]
+impl ExternalTool for RustC {
+    fn command() -> Option<std::process::Command> {
+        Some(std::process::Command::new("rustc"))
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for Python {
+    fn command() -> Option<std::process::Command> {
+        resolve_python_interpreter().map(|s| {
+            let (prog, args) = split_interpreter_spec(&s);
+            let mut cmd = std::process::Command::new(prog);
+            cmd.args(args);
+            cmd
+        })
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for Node {
+    fn command() -> Option<std::process::Command> {
+        resolve_node().map(std::process::Command::new)
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for DotNet {
+    fn command() -> Option<std::process::Command> {
+        if probe_executable("dotnet") {
+            Some(std::process::Command::new("dotnet"))
+        } else {
+            None
+        }
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for Go {
+    fn command() -> Option<std::process::Command> {
+        if probe_executable("go") {
+            Some(std::process::Command::new("go"))
+        } else {
+            None
+        }
+    }
+}
+#[allow(dead_code)]
+impl ExternalTool for TypeScript {
+    fn command() -> Option<std::process::Command> {
+        resolve_node().map(std::process::Command::new)
+    }
+}
