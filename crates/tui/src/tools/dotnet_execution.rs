@@ -74,9 +74,11 @@ pub async fn execute_dotnet_execution_tool(
         .await
         .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
-    let mut cmd = crate::dependencies::DotNet::tokio_command().ok_or_else(|| {
-        ToolError::execution_failed("dotnet_execution: .NET SDK became unavailable".to_string())
-    })?;
+    let mut cmd = <crate::dependencies::DotNet as ExternalTool>::command()
+        .map(tokio::process::Command::from_std)
+        .ok_or_else(|| {
+            ToolError::execution_failed("dotnet_execution: .NET SDK became unavailable".to_string())
+        })?;
     cmd.arg("run")
         .arg(&script_path)
         .current_dir(temp_dir.path());
@@ -112,7 +114,7 @@ mod tests {
 
     /// Skip helper — `dotnet_execution` is a no-op on hosts without .NET SDK.
     fn dotnet_present() -> bool {
-        crate::dependencies::DotNet::available()
+        <crate::dependencies::DotNet as ExternalTool>::command().is_some()
     }
 
     #[test]

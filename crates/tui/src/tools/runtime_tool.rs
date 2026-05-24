@@ -116,13 +116,15 @@ pub trait RuntimeTool: ExternalTool + Send + Sync {
             .await
             .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
-        let mut cmd = Self::tokio_command().ok_or_else(|| {
-            ToolError::execution_failed(format!(
-                "{}: {} runtime became unavailable",
-                Self::tool_name(),
-                Self::runtime_name()
-            ))
-        })?;
+        let mut cmd = <Self as ExternalTool>::command()
+            .map(tokio::process::Command::from_std)
+            .ok_or_else(|| {
+                ToolError::execution_failed(format!(
+                    "{}: {} runtime became unavailable",
+                    Self::tool_name(),
+                    Self::runtime_name()
+                ))
+            })?;
         Self::prepare_command(&mut cmd, &script_path, temp_dir.path());
         cmd.current_dir(workspace);
 
@@ -156,7 +158,7 @@ pub trait RuntimeTool: ExternalTool + Send + Sync {
 /// `ensure_advanced_tooling`.
 pub fn ensure_runtime_tool<T: RuntimeTool>(catalog: &mut Vec<Tool>) {
     let name = T::tool_name();
-    if !catalog.iter().any(|t| t.name == name) && T::available() {
+    if !catalog.iter().any(|t| t.name == name) && <T as ExternalTool>::command().is_some() {
         catalog.push(T::tool_definition());
     }
 }
@@ -304,12 +306,14 @@ impl RuntimeTool for TypeScript {
             .await
             .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
-        let mut cmd = Self::tokio_command().ok_or_else(|| {
-            ToolError::execution_failed(format!(
-                "{}: TypeScript runtime became unavailable",
-                Self::tool_name()
-            ))
-        })?;
+        let mut cmd = <Self as ExternalTool>::command()
+            .map(tokio::process::Command::from_std)
+            .ok_or_else(|| {
+                ToolError::execution_failed(format!(
+                    "{}: TypeScript runtime became unavailable",
+                    Self::tool_name()
+                ))
+            })?;
 
         // Check which binary resolved to decide args.
         let spec = Self::resolve().unwrap_or_default();
@@ -653,7 +657,10 @@ mod tests {
         // If available: catalog should have exactly 1 entry.
         // If not: catalog should be empty.
         if catalog.is_empty() {
-            assert!(Node::available() == false, "expected Node unavailable");
+            assert!(
+                <Node as ExternalTool>::command().is_none(),
+                "expected Node unavailable"
+            );
         } else {
             assert_eq!(catalog.len(), 1);
             assert_eq!(catalog[0].name, "js_execution");
