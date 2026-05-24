@@ -1,4 +1,4 @@
-//! `RuntimeTool` trait — pluggable code-execution backends.
+﻿//! `RuntimeTool` trait — pluggable code-execution backends.
 //!
 //! Each code-execution runtime (Python, Node.js, dotnet, Go, Rust,
 //! TypeScript) implements this trait.  The trait extends
@@ -117,7 +117,7 @@ pub trait RuntimeTool: ExternalTool + Send + Sync {
             .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
         let mut cmd = <Self as ExternalTool>::command()
-            .map(tokio::process::Command::from_std)
+            .map(Into::into)
             .ok_or_else(|| {
                 ToolError::execution_failed(format!(
                     "{}: {} runtime became unavailable",
@@ -307,7 +307,7 @@ impl RuntimeTool for TypeScript {
             .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
         let mut cmd = <Self as ExternalTool>::command()
-            .map(tokio::process::Command::from_std)
+            .map(Into::into)
             .ok_or_else(|| {
                 ToolError::execution_failed(format!(
                     "{}: TypeScript runtime became unavailable",

@@ -1,4 +1,4 @@
-//! `dotnet_execution` tool — execute model-provided C# code via a local
+﻿//! `dotnet_execution` tool — execute model-provided C# code via a local
 //! .NET SDK, returning stdout / stderr / exit code as JSON.
 //!
 //! Starting with .NET 6, `dotnet run file.cs` can run a single C# file
@@ -75,7 +75,7 @@ pub async fn execute_dotnet_execution_tool(
         .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
     let mut cmd = <crate::dependencies::DotNet as ExternalTool>::command()
-        .map(tokio::process::Command::from_std)
+        .map(Into::into)
         .ok_or_else(|| {
             ToolError::execution_failed("dotnet_execution: .NET SDK became unavailable".to_string())
         })?;
