@@ -12,9 +12,20 @@ use std::sync::OnceLock;
 ///
 /// `spec` is either a bare name (`"python3"`) or a `/path/to/bin -arg`
 /// style string.  For the latter, only the first token is probed.
+#[must_use]
 pub fn probe_executable(spec: &str) -> bool {
-    let p = spec.split_whitespace().next().unwrap_or(spec);
-    which::which(p).is_ok()
+    let mut parts = spec.split_whitespace();
+    let Some(program) = parts.next() else {
+        return false;
+    };
+    let mut cmd = Command::new(program);
+    for arg in parts {
+        cmd.arg(arg);
+    }
+    cmd.arg("--version");
+    cmd.stdout(std::process::Stdio::null());
+    cmd.stderr(std::process::Stdio::null());
+    matches!(cmd.status(), Ok(status) if status.success())
 }
 
 // ── Python ──────────────────────────────────────────────────────────
@@ -95,6 +106,12 @@ pub fn split_interpreter_spec(spec: &str) -> (String, Vec<String>) {
 // ── RuntimeTool types (used by runtime_tool.rs) ──
 
 use tokio::process;
+
+/// Trait for runtime tools that can provide a shell command.
+#[allow(dead_code)]
+pub trait ExternalTool {
+    fn command() -> Option<std::process::Command>;
+}
 
 #[allow(dead_code)]
 pub struct RustC;
