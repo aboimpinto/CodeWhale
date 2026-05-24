@@ -75,7 +75,7 @@ pub async fn execute_dotnet_execution_tool(
         .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
     let mut cmd = <crate::dependencies::DotNet as ExternalTool>::command()
-        .map(Into::into)
+        .map(|cmd| Into::<tokio::process::Command>::into(cmd))
         .ok_or_else(|| {
             ToolError::execution_failed("dotnet_execution: .NET SDK became unavailable".to_string())
         })?;

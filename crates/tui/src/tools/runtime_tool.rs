@@ -117,7 +117,7 @@ pub trait RuntimeTool: ExternalTool + Send + Sync {
             .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
         let mut cmd = <Self as ExternalTool>::command()
-            .map(Into::into)
+            .map(|cmd| Into::<tokio::process::Command>::into(cmd))
             .ok_or_else(|| {
                 ToolError::execution_failed(format!(
                     "{}: {} runtime became unavailable",
@@ -307,7 +307,7 @@ impl RuntimeTool for TypeScript {
             .map_err(|e| ToolError::execution_failed(format!("tempfile write failed: {e}")))?;
 
         let mut cmd = <Self as ExternalTool>::command()
-            .map(Into::into)
+            .map(|cmd| Into::<tokio::process::Command>::into(cmd))
             .ok_or_else(|| {
                 ToolError::execution_failed(format!(
                     "{}: TypeScript runtime became unavailable",
