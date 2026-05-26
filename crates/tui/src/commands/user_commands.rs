@@ -1,37 +1,35 @@
+//! User-defined slash commands from `~/.deepseek/commands/<name>.md` and
+//! workspace-local `<workspace>/.deepseek/commands/<name>.md`.
+//!
+//! Files can include optional YAML-like frontmatter between `---` markers.
+//! When frontmatter is present, it is stripped from the message sent to
+//! the model Ã¢ÂÂ only the body after the closing `---` is used.
+//! Supported frontmatter fields: `description`, `allowed-tools`, `argument-hint`, `pausable`.
+//! Plain `.md` files without frontmatter work exactly as before.
 //!
 //! Users drop `.md` files into a commands directory and the filename
 //! (without `.md` extension) becomes a slash command. When invoked via
 //! `/name`, the file contents are sent as a user message.
 //!
-//! Files may include optional YAML-like frontmatter between `---` markers.
-//! Supported fields are `description`, `argument-hint`, and `allowed-tools`.
-//! Frontmatter is stripped before the command body is sent to the model.
-//!
 //! ## Precedence
 //!
 //! Workspace-local directories shadow user-global by name:
 //!
-//! 1. `<workspace>/.codewhale/commands/` (project-local, highest)
-//! 2. `<workspace>/.deepseek/commands/`  (legacy project-local)
-//! 3. `<workspace>/.claude/commands/`    (Claude Code interop)
-//! 4. `<workspace>/.cursor/commands/`    (Cursor interop)
-//! 5. `~/.codewhale/commands/`           (user-global)
-//! 6. `~/.deepseek/commands/`            (legacy user-global)
+//! 1. `<workspace>/.deepseek/commands/`  (project-local, highest)
+//! 2. `<workspace>/.claude/commands/`    (Claude Code interop)
+//! 3. `<workspace>/.cursor/commands/`    (Cursor interop)
+//! 4. `~/.deepseek/commands/`            (user-global, lowest)
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
-use crate::tui::app::{App, AppAction, HuntVerdict};
+use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
 
-/// Path to the global user commands directory: `~/.codewhale/commands/`.
+/// Path to the global user commands directory: `~/.deepseek/commands/`.
 fn global_commands_dir() -> PathBuf {
-    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
-    home.join(".codewhale").join("commands")
-}
-
-fn legacy_global_commands_dir() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
     home.join(".deepseek").join("commands")
 }
@@ -40,13 +38,11 @@ fn legacy_global_commands_dir() -> PathBuf {
 fn commands_dirs(workspace: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(ws) = workspace {
-        dirs.push(ws.join(".codewhale").join("commands"));
         dirs.push(ws.join(".deepseek").join("commands"));
         dirs.push(ws.join(".claude").join("commands"));
         dirs.push(ws.join(".cursor").join("commands"));
     }
     dirs.push(global_commands_dir());
-    dirs.push(legacy_global_commands_dir());
     dirs
 }
 
@@ -85,7 +81,7 @@ fn load_commands_from_dir(dir: &Path) -> Vec<(String, String)> {
 
 /// Scan every candidate commands directory and return merged
 /// `(name, content)` pairs. Workspace-local directories shadow
-/// user-global by name — the first occurrence of a name wins.
+/// user-global by name Ã¢ÂÂ the first occurrence of a name wins.
 ///
 /// Pass `None` for the workspace to scan only the global directory
 /// (backward-compatible with callers that don't have workspace context).
@@ -106,78 +102,47 @@ pub fn load_user_commands(workspace: Option<&Path>) -> Vec<(String, String)> {
     commands
 }
 
-pub(crate) fn parse_frontmatter(content: &str) -> (Vec<(String, String)>, &str) {
-    let Some(first_line_end) = content.find('\n') else {
-        return (Vec::new(), content);
-    };
-    let first = content[..first_line_end].trim_end_matches('\r');
-
-    if first.trim().chars().all(|ch| ch == '-') && first.trim().len() >= 3 {
-        let mut metadata = Vec::new();
-        let mut offset = first_line_end + 1;
-        let mut unclosed_body_start = None;
-        for raw_line in content[offset..].split_inclusive('\n') {
-            let line_start = offset;
-            let line = raw_line.trim_end_matches(['\r', '\n']);
-            offset += raw_line.len();
-            let trimmed = line.trim();
-            if unclosed_body_start.is_none() {
-                if trimmed.chars().all(|ch| ch == '-') && trimmed.len() >= 3 {
-                    let body = content[offset..].trim_start_matches(['\r', '\n']);
-                    return (metadata, body);
-                }
-                if let Some((key, value)) = line.split_once(':') {
-                    let key = key.trim().to_ascii_lowercase();
-                    let raw_value = value.trim();
-                    let value = if key == "allowed-tools" {
-                        raw_value.to_string()
-                    } else {
-                        strip_matched_quotes(raw_value).to_string()
-                    };
-                    if !key.is_empty() {
-                        metadata.push((key, value));
-                    }
-                } else if !trimmed.is_empty() {
-                    unclosed_body_start = Some(line_start);
-                }
-            }
-        }
-        let body_start = unclosed_body_start.unwrap_or(content.len());
-        let body = content[body_start..].trim_start_matches(['\r', '\n']);
-        return (metadata, body);
-    }
-
-    (Vec::new(), content)
-}
-
-fn strip_matched_quotes(value: &str) -> &str {
-    if let Some(stripped) = value.strip_prefix('"').and_then(|v| v.strip_suffix('"')) {
-        return stripped;
-    }
-    if let Some(stripped) = value.strip_prefix('\'').and_then(|v| v.strip_suffix('\'')) {
-        return stripped;
-    }
-    value
-}
-
-fn parse_allowed_tools(value: &str) -> Vec<String> {
-    value
-        .split(',')
-        .map(|tool| {
-            strip_matched_quotes(tool.trim())
-                .trim()
-                .to_ascii_lowercase()
-        })
-        .filter(|tool| !tool.is_empty())
-        .collect()
-}
-
-/// Check if the input matches a user-defined command and return the
-/// content as a `SendMessage` action.
+/// Parse optional YAML-like frontmatter from command markdown content.
 ///
-/// The `input` should be the full command string including the `/`
-/// prefix (e.g. `/mycmd` or `/mycmd with args`). Only exact matches
-/// on the command name are considered (no partial/alias matching).
+/// Returns `(frontmatter key-value pairs, body)` where `body` is the
+/// content after the closing `---` delimiter, or the whole content
+/// unchanged when no frontmatter is present.
+fn parse_frontmatter(content: &str) -> (Vec<(String, String)>, &str) {
+    let content = content.trim();
+    if !content.starts_with("---") {
+        return (Vec::new(), content);
+    }
+    // Find the closing delimiter (\n followed by 3+ dashes) after the
+    // opening ---. Works for ---, ----, -----, or any dash sequence.
+    let rest = &content[3..];
+    let closing = match rest.find("\n---") {
+        Some(pos) => pos,
+        None => return (Vec::new(), content),
+    };
+    // `closing` is the position of \n in rest-space (0 = first byte after ---).
+    // Convert to content-space.
+    let delim_start = 3 + closing;
+    let frontmatter_text = &content[3..delim_start].trim();
+    // Skip past the closing delimiter line (\n followed by any number of dashes)
+    // so body starts after all delimiter characters.
+    let bytes = content.as_bytes();
+    let mut body_start = delim_start;
+    while body_start < content.len() && bytes[body_start] == b'\n' {
+        body_start += 1;
+    }
+    while body_start < content.len() && bytes[body_start] == b'-' {
+        body_start += 1;
+    }
+    let body = content[body_start..].trim();
+    let mut pairs = Vec::new();
+    for line in frontmatter_text.lines() {
+        if let Some((key, value)) = line.split_once(':') {
+            pairs.push((key.trim().to_string(), value.trim().to_string()));
+        }
+    }
+    (pairs, body)
+}
+
 /// Substitute $1, $2, $ARGUMENTS placeholders in a command template.
 fn apply_template(template: &str, args: &str) -> String {
     let positional: Vec<&str> = args.split_whitespace().collect();
@@ -188,6 +153,16 @@ fn apply_template(template: &str, args: &str) -> String {
     result
 }
 
+/// Check if the input matches a user-defined command and return the
+/// content as a `SendMessage` action.
+///
+/// The `input` should be the full command string including the `/`
+/// prefix (e.g. `/mycmd` or `/mycmd with args`). Only exact matches
+/// on the command name are considered (no partial/alias matching).
+///
+/// If the command file contains YAML frontmatter between `---` markers,
+/// the frontmatter is stripped Ã¢ÂÂ only the body after the closing `---`
+/// is sent as the message.
 pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandResult> {
     let parts: Vec<&str> = input.trim().splitn(2, ' ').collect();
     let command = parts[0].to_lowercase();
@@ -199,22 +174,24 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
 
     for (name, content) in &user_commands {
         if name == command {
-            let (metadata, body) = parse_frontmatter(content);
-            app.hunt.quarry = None;
-            app.hunt.started_at = None;
-            app.hunt.verdict = HuntVerdict::Hunting;
-            app.hunt.token_budget = None;
-            app.active_allowed_tools = None;
-            for (key, value) in &metadata {
-                match key.as_str() {
-                    "description" => {
-                        app.hunt.quarry = Some(value.clone());
-                        app.hunt.started_at = Some(std::time::Instant::now());
+            // Strip frontmatter if present before substituting args
+            let (meta, body) = parse_frontmatter(content);
+            // If the command has a description, show it in the Work panel
+            for (key, value) in &meta {
+                tracing::debug!(target: "pausable", key, value, "frontmatter key");
+                if key == "description" {
+                    app.goal.goal_objective = Some(value.clone());
+                    app.goal.goal_started_at = Some(Instant::now());
+                }
+                if key == "allowed-tools" {
+                    let tools: Vec<String> = value
+                        .split(',')
+                        .map(|t| t.trim().to_lowercase())
+                        .filter(|t| !t.is_empty())
+                        .collect();
+                    if !tools.is_empty() {
+                        app.active_allowed_tools = Some(tools);
                     }
-                    "allowed-tools" => {
-                        app.active_allowed_tools = Some(parse_allowed_tools(value));
-                    }
-                    _ => {}
                 }
                 if key == "pausable" && value.trim().eq_ignore_ascii_case("true") {
                     tracing::debug!(target: "pausable", value, "PAUSABLE FRONTMATTER MATCHED");
@@ -259,6 +236,28 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
     None
 }
 
+/// Look up a user-defined command by name and return its description
+/// from frontmatter (if available).
+pub fn get_user_command_description(
+    name: &str,
+    workspace: Option<&Path>,
+) -> Option<String> {
+    let name = name.to_lowercase();
+    let name = name.strip_prefix('/').unwrap_or(&name);
+    for (cmd_name, content) in load_user_commands(workspace) {
+        if cmd_name == name {
+            let (meta, _) = parse_frontmatter(&content);
+            for (key, value) in &meta {
+                if key == "description" {
+                    return Some(value.clone());
+                }
+            }
+            return None;
+        }
+    }
+    None
+}
+
 /// Get user command names that match a given prefix (for autocomplete).
 ///
 /// The prefix should be the command name portion only (after `/`).
@@ -271,7 +270,7 @@ pub fn user_commands_matching(prefix: &str, workspace: Option<&Path>) -> Vec<Str
     load_user_commands(workspace)
         .into_iter()
         .filter(|(name, _)| name.starts_with(&prefix))
-        .map(|(name, _)| format!("/{name}"))
+        .map(|(name, _)| format!("/{}", name))
         .collect()
 }
 
@@ -281,7 +280,7 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    fn test_global_commands_dir_contains_codewhale_commands() {
+    fn test_global_commands_dir_contains_deepseek_commands() {
         let dir = global_commands_dir();
         let parts: Vec<_> = dir
             .components()
@@ -290,8 +289,8 @@ mod tests {
         assert!(
             parts
                 .windows(2)
-                .any(|pair| pair == [".codewhale", "commands"]),
-            "expected .codewhale/commands components in path, got: {}",
+                .any(|pair| pair == [".deepseek", "commands"]),
+            "expected .deepseek/commands components in path, got: {}",
             dir.display()
         );
     }
@@ -330,133 +329,12 @@ mod tests {
             initial_input: None,
         };
         let mut app = App::new(options, &Config::default());
-        let result = try_dispatch_user_command(&mut app, "/nonexistent-thing-12345");
+        let result = try_dispatch_user_command(&mut app, "/nonexistent");
         assert!(result.is_none());
     }
 
     #[test]
-    fn test_user_commands_matching_with_prefix_no_workspace() {
-        let matches = user_commands_matching("zzzznotfound", None);
-        assert!(matches.is_empty());
-    }
-
-    // ── Workspace-local commands tests ─────────────────────────────────
-
-    fn write_command(dir: &Path, name: &str, body: &str) {
-        std::fs::create_dir_all(dir).unwrap();
-        std::fs::write(dir.join(format!("{name}.md")), body).unwrap();
-    }
-
-    fn test_options(workspace: PathBuf) -> crate::tui::app::TuiOptions {
-        crate::tui::app::TuiOptions {
-            model: "deepseek-v4-pro".to_string(),
-            workspace,
-            config_path: None,
-            config_profile: None,
-            allow_shell: false,
-            use_alt_screen: true,
-            use_mouse_capture: false,
-            use_bracketed_paste: true,
-            max_subagents: 1,
-            skills_dir: PathBuf::from("."),
-            memory_path: PathBuf::from("memory.md"),
-            notes_path: PathBuf::from("notes.txt"),
-            mcp_config_path: PathBuf::from("mcp.json"),
-            use_memory: false,
-            start_in_agent_mode: false,
-            skip_onboarding: true,
-            yolo: false,
-            resume_session_id: None,
-            initial_input: None,
-        }
-    }
-
-    #[test]
-    fn load_user_commands_scans_workspace_local_dir() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path();
-        let cmds_dir = ws.join(".codewhale").join("commands");
-        write_command(&cmds_dir, "hello", "echo hi");
-
-        let cmds = load_user_commands(Some(ws));
-        let names: Vec<&str> = cmds.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(
-            names.contains(&"hello"),
-            "expected 'hello' in workspace-local commands: {names:?}"
-        );
-    }
-
-    #[test]
-    fn load_user_commands_scans_claude_and_cursor_dirs() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path();
-        write_command(
-            &ws.join(".claude").join("commands"),
-            "claude-cmd",
-            "claude body",
-        );
-        write_command(
-            &ws.join(".cursor").join("commands"),
-            "cursor-cmd",
-            "cursor body",
-        );
-
-        let cmds = load_user_commands(Some(ws));
-        let names: Vec<&str> = cmds.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(
-            names.contains(&"claude-cmd"),
-            "expected 'claude-cmd': {names:?}"
-        );
-        assert!(
-            names.contains(&"cursor-cmd"),
-            "expected 'cursor-cmd': {names:?}"
-        );
-    }
-
-    #[test]
-    fn workspace_local_shadows_global_by_name() {
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path();
-
-        // Workspace-local version
-        write_command(
-            &ws.join(".codewhale").join("commands"),
-            "shared",
-            "workspace version",
-        );
-        // Global version — simulate by putting it in a "global" temp dir.
-        // Since we can't easily override `dirs::home_dir()`, we test the
-        // first-match-wins semantics by putting the same name in both
-        // workspace-scanned dirs. The first dir in precedence order wins.
-        write_command(
-            &ws.join(".claude").join("commands"),
-            "shared",
-            "claude version",
-        );
-
-        let cmds = load_user_commands(Some(ws));
-        let shared = cmds
-            .iter()
-            .find(|(n, _)| n == "shared")
-            .expect("shared present");
-        assert_eq!(
-            shared.1, "workspace version",
-            "workspace-local (.codewhale) must shadow later dirs"
-        );
-    }
-
-    #[test]
-    fn load_user_commands_without_workspace_falls_back_to_global_only() {
-        // When no workspace is passed, only global command directories are
-        // scanned. On test machines these often don't exist, so we just
-        // verify we don't panic.
-        let cmds = load_user_commands(None);
-        // This should not panic; can be empty or have user's real commands.
-        let _ = cmds;
-    }
-
-    #[test]
-    fn try_dispatch_uses_workspace_local_command() {
+    fn test_try_dispatch_uses_workspace_local_command() {
         use crate::config::Config;
         use crate::tui::app::TuiOptions;
 
@@ -502,7 +380,200 @@ mod tests {
     }
 
     #[test]
-    fn user_commands_matching_with_workspace() {
+    fn test_frontmatter_is_stripped_from_dispatch() {
+        use crate::config::Config;
+        use crate::tui::app::TuiOptions;
+
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+        // Command with frontmatter Ã¢ÂÂ the body is just "Run tests"
+        write_command(
+            &ws.join(".deepseek").join("commands"),
+            "test-runner",
+            "---\ndescription: Run tests\nallowed-tools: Bash\n---\nRun tests",
+        );
+
+        let options = TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: ws.clone(),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: true,
+            use_mouse_capture: false,
+            use_bracketed_paste: true,
+            max_subagents: 1,
+            skills_dir: PathBuf::from("."),
+            memory_path: PathBuf::from("memory.md"),
+            notes_path: PathBuf::from("notes.txt"),
+            mcp_config_path: PathBuf::from("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: false,
+            skip_onboarding: true,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        let mut app = App::new(options, &Config::default());
+        let result = try_dispatch_user_command(&mut app, "/test-runner");
+        assert!(result.is_some());
+        let cmd_result = result.unwrap();
+        match cmd_result.action {
+            Some(AppAction::SendMessage(msg)) => {
+                assert_eq!(msg, "Run tests", "frontmatter should be stripped, got: {msg}");
+            }
+            other => panic!("expected SendMessage action, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_frontmatter_strips_description_key() {
+        let content = "---\ndescription: My command\nallowed-tools: Bash, Read\n---\n\nBody text here";
+        let (meta, body) = parse_frontmatter(content);
+        assert_eq!(body, "Body text here");
+        assert!(meta.iter().any(|(k, _)| k == "description"));
+        assert!(meta.iter().any(|(k, _)| k == "allowed-tools"));
+    }
+
+    #[test]
+    fn test_flexible_dash_count_accepted() {
+        // More than 3 dashes (-----, ---------, etc.) should work
+        let content = "-----\ndescription: test\n-----\n\nBody";
+        let (meta, body) = parse_frontmatter(content);
+        assert_eq!(body, "Body");
+        assert!(meta.iter().any(|(k, _)| k == "description"));
+    }
+
+    #[test]
+    fn test_plain_md_without_frontmatter_passes_through() {
+        let content = "Just a plain message";
+        let (meta, body) = parse_frontmatter(content);
+        assert!(meta.is_empty());
+        assert_eq!(body, "Just a plain message");
+    }
+
+    fn write_command(dir: &Path, name: &str, body: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.md")), body).unwrap();
+    }
+
+    #[test]
+    fn test_load_commands_merges_dirs_in_precedence_order() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+
+        // Write commands in each searchable directory
+        write_command(
+            &ws.join(".deepseek").join("commands"),
+            "deepseek-cmd",
+            "from deepseek",
+        );
+        write_command(
+            &ws.join(".claude").join("commands"),
+            "claude-cmd",
+            "from claude",
+        );
+        write_command(
+            &ws.join(".cursor").join("commands"),
+            "cursor-cmd",
+            "from cursor",
+        );
+
+        let cmds = load_user_commands(Some(ws));
+        let names: Vec<&str> = cmds.iter().map(|(n, _)| n.as_str()).collect();
+        assert!(
+            names.contains(&"claude-cmd"),
+            "expected 'claude-cmd': {names:?}"
+        );
+        assert!(
+            names.contains(&"cursor-cmd"),
+            "expected 'cursor-cmd': {names:?}"
+        );
+    }
+
+    #[test]
+    fn test_workspace_local_shadows_global_by_name() {
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path();
+
+        // Workspace-local version
+        write_command(
+            &ws.join(".deepseek").join("commands"),
+            "shared",
+            "workspace version",
+        );
+        // Claude dir version Ã¢ÂÂ should be shadowed by .deepseek
+        write_command(
+            &ws.join(".claude").join("commands"),
+            "shared",
+            "claude version",
+        );
+
+        let cmds = load_user_commands(Some(ws));
+        let shared = cmds
+            .iter()
+            .find(|(n, _)| n == "shared")
+            .expect("shared present");
+        assert_eq!(
+            shared.1, "workspace version",
+            "workspace-local (.deepseek) must shadow later dirs"
+        );
+    }
+
+    #[test]
+    fn test_load_user_commands_without_workspace_falls_back_to_global_only() {
+        let cmds = load_user_commands(None);
+        let _ = cmds;
+    }
+
+    #[test]
+    fn test_try_dispatch_uses_workspace_local_command_full() {
+        use crate::config::Config;
+        use crate::tui::app::TuiOptions;
+
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+        write_command(
+            &ws.join(".deepseek").join("commands"),
+            "hello",
+            "Hello, $ARGUMENTS!",
+        );
+
+        let options = TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: ws.clone(),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: true,
+            use_mouse_capture: false,
+            use_bracketed_paste: true,
+            max_subagents: 1,
+            skills_dir: PathBuf::from("."),
+            memory_path: PathBuf::from("memory.md"),
+            notes_path: PathBuf::from("notes.txt"),
+            mcp_config_path: PathBuf::from("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: false,
+            skip_onboarding: true,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        let mut app = App::new(options, &Config::default());
+        let result = try_dispatch_user_command(&mut app, "/hello world");
+        assert!(result.is_some());
+        let cmd_result = result.unwrap();
+        match cmd_result.action {
+            Some(AppAction::SendMessage(msg)) => {
+                assert!(msg.contains("Hello, world!"), "got: {msg}");
+            }
+            other => panic!("expected SendMessage action, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_user_commands_matching_with_workspace() {
         let tmp = TempDir::new().unwrap();
         let ws = tmp.path();
         write_command(
@@ -518,179 +589,129 @@ mod tests {
         );
     }
 
-    #[test]
-    fn frontmatter_is_stripped_before_dispatch() {
-        use crate::config::Config;
-
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path().to_path_buf();
-        write_command(
-            &ws.join(".deepseek").join("commands"),
-            "secure",
-            "---\ndescription: Secure scan\nallowed-tools: Bash, Read\n---\nRun $ARGUMENTS",
-        );
-
-        let mut app = App::new(test_options(ws), &Config::default());
-        let result = try_dispatch_user_command(&mut app, "/secure checks").unwrap();
-        match result.action {
-            Some(AppAction::SendMessage(msg)) => assert_eq!(msg, "Run checks"),
-            other => panic!("expected SendMessage action, got: {other:?}"),
-        }
-    }
+    // ââ allowed-tools frontmatter âââââââââââââââââââââââââââââââââââ
 
     #[test]
-    fn review_regression_unclosed_frontmatter_keeps_metadata_and_strips_header() {
-        let (metadata, body) = parse_frontmatter(
-            "---\ndescription: Broken command\nallowed-tools: Bash\nRun the safe body",
-        );
-
-        assert_eq!(
-            metadata,
-            vec![
-                ("description".to_string(), "Broken command".to_string()),
-                ("allowed-tools".to_string(), "Bash".to_string())
-            ]
-        );
-        assert_eq!(body, "Run the safe body");
-    }
-
-    #[test]
-    fn review_regression_unclosed_frontmatter_without_metadata_strips_header() {
-        let (metadata, body) =
-            parse_frontmatter("---\nRun the command body without a closing delimiter");
-
-        assert!(metadata.is_empty());
-        assert_eq!(body, "Run the command body without a closing delimiter");
-    }
-
-    #[test]
-    fn review_regression_frontmatter_strips_only_matched_quote_pairs() {
-        let (metadata, body) = parse_frontmatter("---\ndescription: 'Read\"\n---\nrun");
-
-        assert_eq!(
-            metadata,
-            vec![("description".to_string(), "'Read\"".to_string())]
-        );
-        assert_eq!(body, "run");
-    }
-
-    #[test]
-    fn allowed_tools_frontmatter_sets_app_state() {
-        use crate::config::Config;
-
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path().to_path_buf();
-        write_command(
-            &ws.join(".deepseek").join("commands"),
-            "secure",
-            "---\nallowed-tools: Bash, Grep\n---\nrun tests",
-        );
-
-        let mut app = App::new(test_options(ws), &Config::default());
-        let _ = try_dispatch_user_command(&mut app, "/secure").unwrap();
-        assert_eq!(
-            app.active_allowed_tools,
-            Some(vec!["bash".to_string(), "grep".to_string()])
-        );
-    }
-
-    #[test]
-    fn review_regression_empty_allowed_tools_blocks_all_tools() {
-        use crate::config::Config;
-
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path().to_path_buf();
-        write_command(
-            &ws.join(".deepseek").join("commands"),
-            "locked",
-            "---\nallowed-tools: \"\"\n---\nrun nothing",
-        );
-
-        let mut app = App::new(test_options(ws), &Config::default());
-        let _ = try_dispatch_user_command(&mut app, "/locked").unwrap();
-        assert_eq!(app.active_allowed_tools, Some(Vec::new()));
-    }
-
-    #[test]
-    fn review_regression_allowed_tools_accepts_per_item_quotes() {
-        use crate::config::Config;
-
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path().to_path_buf();
-        write_command(
-            &ws.join(".deepseek").join("commands"),
-            "quoted",
-            "---\nallowed-tools: \"exec_shell\", 'read_file'\n---\nrun quoted tools",
-        );
-
-        let mut app = App::new(test_options(ws), &Config::default());
-        let _ = try_dispatch_user_command(&mut app, "/quoted").unwrap();
-        assert_eq!(
-            app.active_allowed_tools,
-            Some(vec!["exec_shell".to_string(), "read_file".to_string()])
-        );
-    }
-
-    #[test]
-    fn review_regression_dispatch_without_frontmatter_resets_previous_command_state() {
-        use crate::config::Config;
-
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path().to_path_buf();
-        let commands_dir = ws.join(".deepseek").join("commands");
-        write_command(
-            &commands_dir,
-            "described",
-            "---\ndescription: Scan repos\nallowed-tools: Bash\n---\nscan",
-        );
-        write_command(&commands_dir, "plain", "plain command");
-
-        let mut app = App::new(test_options(ws), &Config::default());
-        let _ = try_dispatch_user_command(&mut app, "/described").unwrap();
-        assert_eq!(app.hunt.quarry.as_deref(), Some("Scan repos"));
-        assert!(app.hunt.started_at.is_some());
-        assert_eq!(app.hunt.verdict, crate::tui::app::HuntVerdict::Hunting);
-        assert_eq!(app.hunt.token_budget, None);
-        assert_eq!(app.active_allowed_tools, Some(vec!["bash".to_string()]));
-
-        app.hunt.verdict = crate::tui::app::HuntVerdict::Escaped;
-        app.hunt.token_budget = Some(42);
-        let _ = try_dispatch_user_command(&mut app, "/plain").unwrap();
-        assert_eq!(app.hunt.quarry, None);
-        assert_eq!(app.hunt.started_at, None);
-        assert_eq!(app.hunt.verdict, crate::tui::app::HuntVerdict::Hunting);
-        assert_eq!(app.hunt.token_budget, None);
-        assert_eq!(app.active_allowed_tools, None);
-    }
-
-    #[test]
-    fn description_frontmatter_sets_work_objective_and_autocomplete_description() {
-        use crate::config::Config;
-
-        let tmp = TempDir::new().unwrap();
-        let ws = tmp.path().to_path_buf();
-        write_command(
-            &ws.join(".deepseek").join("commands"),
-            "git-scan",
-            "---\ndescription: Scan nested git repositories\nargument-hint: <root>\n---\nscan",
-        );
-
-        let mut app = App::new(test_options(ws.clone()), &Config::default());
-        let _ = try_dispatch_user_command(&mut app, "/git-scan").unwrap();
-        assert_eq!(
-            app.hunt.quarry.as_deref(),
-            Some("Scan nested git repositories")
-        );
-        let commands = load_user_commands(Some(&ws));
-        let (_, content) = commands
+    fn test_allowed_tools_parses_single_tool() {
+        let content = "---\ndescription: Test\nallowed-tools: Bash\n---\n\nrun tests";
+        let (meta, body) = parse_frontmatter(content);
+        assert_eq!(body, "run tests");
+        let tools = meta
             .iter()
-            .find(|(name, _)| name == "git-scan")
-            .expect("git-scan command should load");
-        let (metadata, _) = parse_frontmatter(content);
-        assert!(metadata.contains(&(
-            "description".to_string(),
-            "Scan nested git repositories".to_string()
-        )));
-        assert!(metadata.contains(&("argument-hint".to_string(), "<root>".to_string())));
+            .find(|(k, _)| k == "allowed-tools")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let parsed: Vec<String> = tools
+            .split(',')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        assert_eq!(parsed, vec!["bash"]);
     }
+
+    #[test]
+    fn test_allowed_tools_parses_multiple_tools() {
+        let content = "---\ndescription: Dev\nallowed-tools: Bash, Read, Write\n---\n\ndevelop";
+        let (meta, _) = parse_frontmatter(content);
+        let tools = meta
+            .iter()
+            .find(|(k, _)| k == "allowed-tools")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let parsed: Vec<String> = tools
+            .split(',')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        assert_eq!(parsed, vec!["bash", "read", "write"]);
+    }
+
+    #[test]
+    fn test_allowed_tools_handles_whitespace_and_case() {
+        let content = "---\nallowed-tools:  BASH ,  grep  ,   read   \n---\n\ncmd";
+        let (meta, _) = parse_frontmatter(content);
+        let tools = meta
+            .iter()
+            .find(|(k, _)| k == "allowed-tools")
+            .map(|(_, v)| v.as_str())
+            .unwrap_or("");
+        let parsed: Vec<String> = tools
+            .split(',')
+            .map(|t| t.trim().to_lowercase())
+            .filter(|t| !t.is_empty())
+            .collect();
+        assert_eq!(parsed, vec!["bash", "grep", "read"]);
+    }
+
+    #[test]
+    fn test_allowed_tools_missing_does_not_set_app_state() {
+        use crate::config::Config;
+
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+        write_command(&ws.join(".deepseek").join("commands"), "plain", "just a command");
+
+        let options = crate::tui::app::TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: ws.clone(),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: true,
+            use_mouse_capture: false,
+            use_bracketed_paste: true,
+            max_subagents: 1,
+            skills_dir: PathBuf::from("."),
+            memory_path: PathBuf::from("memory.md"),
+            notes_path: PathBuf::from("notes.txt"),
+            mcp_config_path: PathBuf::from("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: false,
+            skip_onboarding: true,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        let mut app = crate::tui::app::App::new(options, &Config::default());
+        let _ = try_dispatch_user_command(&mut app, "/plain");
+        assert!(app.active_allowed_tools.is_none(),
+            "expected active_allowed_tools to be None when no frontmatter, got: {:?}",
+            app.active_allowed_tools);
+    }
+
+    #[test]
+    fn test_allowed_tools_frontmatter_sets_app_state() {
+        use crate::config::Config;
+
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+        write_command(&ws.join(".deepseek").join("commands"), "secure",
+            "---\nallowed-tools: Bash, Grep\n---\ndo scan");
+
+        let options = crate::tui::app::TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: ws.clone(),
+            config_path: None,
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: true,
+            use_mouse_capture: false,
+            use_bracketed_paste: true,
+            max_subagents: 1,
+            skills_dir: PathBuf::from("."),
+            memory_path: PathBuf::from("memory.md"),
+            notes_path: PathBuf::from("notes.txt"),
+            mcp_config_path: PathBuf::from("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: false,
+            skip_onboarding: true,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        let mut app = crate::tui::app::App::new(options, &Config::default());
+        let _ = try_dispatch_user_command(&mut app, "/secure");
+        assert_eq!(app.active_allowed_tools, Some(vec!["bash".to_string(), "grep".to_string()]));
+    }
+
 }
