@@ -3445,8 +3445,8 @@ async fn run_event_loop(
                         EscapeAction::PauseCommand => {
                             app.backtrack.reset();
                             app.paused = true;
-                            engine_handle.cancel();
-                            mark_active_turn_cancelled_locally(app);
+                            let _ = engine_handle.send(crate::core::ops::Op::SetPaused { paused: true }).await;
+                            current_streaming_text.clear();
                             current_streaming_text.clear();
                             app.status_message = Some("Command paused. Press Esc again to cancel.".to_string());
                         }

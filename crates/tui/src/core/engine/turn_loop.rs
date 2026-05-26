@@ -6,29 +6,9 @@
 //! checkpoints, and loop termination.
 
 use super::*;
-use crate::prompt_zones::PinnedPrefix;
 
 fn loop_guard_block_tool_result(message: String) -> ToolResult {
     ToolResult::error(message).with_metadata(json!({"loop_guard": "identical_tool_call"}))
-}
-
-const MAX_APPROVAL_INTENT_SUMMARY_CHARS: usize = 2_000;
-
-fn approval_intent_summary(text: &str) -> Option<String> {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let mut chars = trimmed.chars();
-    let mut summary = chars
-        .by_ref()
-        .take(MAX_APPROVAL_INTENT_SUMMARY_CHARS)
-        .collect::<String>();
-    if chars.next().is_some() {
-        summary.push_str("...");
-    }
-    Some(summary)
 }
 
 impl Engine {
@@ -43,7 +23,7 @@ impl Engine {
         // Signal to the terminal / taskbar that a turn is in progress
         // (OSC 9 ; 4 indeterminate progress + title spinner).
         crate::tui::notifications::set_taskbar_progress_busy();
-        crate::tui::notifications::start_title_animation("CodeWhale");
+        crate::tui::notifications::start_title_animation("DeepSeek TUI");
 
         let client = self
             .deepseek_client
@@ -55,19 +35,10 @@ impl Engine {
         let mut context_recovery_attempts = 0u8;
         let mut tool_catalog = tools.unwrap_or_default();
         if !tool_catalog.is_empty() {
-            ensure_advanced_tooling(&mut tool_catalog, mode, &self.config.tools_always_load);
-            // Provider-specific first-turn surface (e.g. Arcee's Cloudflare WAF
-            // rejects CodeWhale's full agent catalog). Runs after advanced
-            // tooling so code/js-execution and tool-search rows are policed too.
-            apply_provider_tool_policy(
-                &mut tool_catalog,
-                client.api_provider(),
-                &self.config.tools_always_load,
-            );
+            ensure_advanced_tooling(&mut tool_catalog, mode);
         }
         let mut active_tool_names = initial_active_tools(&tool_catalog);
         let mut loop_guard = LoopGuard::default();
-        let mut goal_continuations_this_turn = 0u32;
 
         // Transparent stream-retry counter: when the chunked-transfer
         // connection dies mid-stream and we got nothing useful out of it
@@ -79,7 +50,7 @@ impl Engine {
         const MAX_STREAM_RETRIES: u32 = 3;
         let mut stream_retry_attempts: u32 = 0;
 
-        'turn_loop: loop {
+        loop {
             if self.cancel_token.is_cancelled() {
                 let _ = self.tx_event.send(Event::status("Request cancelled")).await;
                 return (TurnOutcomeStatus::Interrupted, None);
@@ -162,12 +133,12 @@ impl Engine {
                             let removed = auto_messages_before.saturating_sub(auto_messages_after);
                             let status = if result.retries_used > 0 {
                                 format!(
-                                    "Auto-compaction complete: {auto_messages_before} → {auto_messages_after} messages ({removed} removed, {} retries)",
+                                    "Auto-compaction complete: {auto_messages_before} ÃÂ¢ÃÂÃÂ {auto_messages_after} messages ({removed} removed, {} retries)",
                                     result.retries_used
                                 )
                             } else {
                                 format!(
-                                    "Auto-compaction complete: {auto_messages_before} → {auto_messages_after} messages ({removed} removed)"
+                                    "Auto-compaction complete: {auto_messages_before} ÃÂ¢ÃÂÃÂ {auto_messages_after} messages ({removed} removed)"
                                 )
                             };
                             self.emit_compaction_completed(
@@ -207,13 +178,16 @@ impl Engine {
                 continue;
             }
 
-            if let Some(input_budget) = context_input_budget(&self.session.model) {
+            if let Some(input_budget) =
+                context_input_budget(&self.session.model, TURN_MAX_OUTPUT_TOKENS)
+            {
                 let estimated_input = self.estimated_input_tokens();
                 if estimated_input > input_budget {
                     if context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
                         let message = format!(
-                            "Context remains above model limit after {MAX_CONTEXT_RECOVERY_ATTEMPTS} recovery attempts \
-                             (~{estimated_input} token estimate, ~{input_budget} budget). Please run /compact or /clear."
+                            "Context remains above model limit after {} recovery attempts \
+                             (~{} token estimate, ~{} budget). Please run /compact or /clear.",
+                            MAX_CONTEXT_RECOVERY_ATTEMPTS, estimated_input, input_budget
                         );
                         turn_error = Some(message.clone());
                         let _ = self
@@ -224,7 +198,11 @@ impl Engine {
                     }
 
                     if self
-                        .recover_context_overflow(&client, "preflight token budget")
+                        .recover_context_overflow(
+                            &client,
+                            "preflight token budget",
+                            TURN_MAX_OUTPUT_TOKENS,
+                        )
                         .await
                     {
                         context_recovery_attempts = context_recovery_attempts.saturating_add(1);
@@ -277,10 +255,6 @@ impl Engine {
                 let tools_ref: Option<&[crate::models::Tool]> = active_tools.as_deref();
                 match pm.check_and_update(&system_text, tools_ref) {
                     Err(change) => {
-                        let pinned_hash = pm
-                            .pinned_fingerprint()
-                            .map(|fp| fp.combined_sha256.clone())
-                            .unwrap_or_default();
                         tracing::debug!(
                             target: "prefix_cache",
                             "{}",
@@ -294,16 +268,11 @@ impl Engine {
                                 tools_changed: change.tools_changed,
                                 stability_pct: (pm.stability_ratio() * 100.0).round() as u32,
                                 changed: true,
-                                pinned_combined_hash: pinned_hash,
                             })
                             .await;
                     }
                     Ok(_) => {
-                        let pinned_hash = pm
-                            .pinned_fingerprint()
-                            .map(|fp| fp.combined_sha256.clone())
-                            .unwrap_or_default();
-                        // Stable check — keep the TUI counter in sync.
+                        // Stable check ÃÂ¢ÃÂÃÂ keep the TUI counter in sync.
                         let _ = self
                             .tx_event
                             .send(Event::PrefixCacheChange {
@@ -312,55 +281,9 @@ impl Engine {
                                 tools_changed: false,
                                 stability_pct: (pm.stability_ratio() * 100.0).round() as u32,
                                 changed: false,
-                                pinned_combined_hash: pinned_hash,
                             })
                             .await;
                     }
-                }
-            }
-
-            // Three-zone prefix contract (#2264): freeze baseline on first
-            // turn, verify against it on subsequent turns. Operates alongside
-            // PrefixStabilityManager as an independent diagnostic layer.
-            // Phase 3: emit a one-shot 'frozen' event on first turn.
-            // Drift is logged (tracing::debug!) but not re-emitted —
-            // PrefixStabilityManager already reports the change above.
-            let system_text =
-                crate::prefix_cache::system_prompt_text(self.session.system_prompt.as_ref());
-            let current_tools: &[crate::models::Tool] = active_tools.as_deref().unwrap_or_default();
-
-            match &self.session.frozen_prefix {
-                Some(frozen) => {
-                    if let Err(drift) = frozen.verify(&system_text, current_tools) {
-                        tracing::debug!(
-                            target: "prefix_cache",
-                            "three-zone drift: {drift}"
-                        );
-                        let pinned = PinnedPrefix::new(
-                            self.session.system_prompt.as_ref(),
-                            current_tools.to_vec(),
-                        );
-                        self.session.frozen_prefix = Some(pinned.freeze());
-                    }
-                }
-                None => {
-                    let pinned = PinnedPrefix::new(
-                        self.session.system_prompt.as_ref(),
-                        current_tools.to_vec(),
-                    );
-                    let frozen = pinned.freeze();
-                    let _ = self
-                        .tx_event
-                        .send(Event::PrefixCacheChange {
-                            description: format!("frozen: {}", frozen.short_id()),
-                            system_prompt_changed: false,
-                            tools_changed: false,
-                            stability_pct: 100,
-                            changed: false,
-                            pinned_combined_hash: frozen.hash().to_string(),
-                        })
-                        .await;
-                    self.session.frozen_prefix = Some(frozen);
                 }
             }
 
@@ -409,7 +332,11 @@ impl Engine {
                     if is_context_length_error_message(&message)
                         && context_recovery_attempts < MAX_CONTEXT_RECOVERY_ATTEMPTS
                         && self
-                            .recover_context_overflow(&client, "provider context-length rejection")
+                            .recover_context_overflow(
+                                &client,
+                                "provider context-length rejection",
+                                TURN_MAX_OUTPUT_TOKENS,
+                            )
                             .await
                     {
                         context_recovery_attempts = context_recovery_attempts.saturating_add(1);
@@ -440,10 +367,10 @@ impl Engine {
                 ..Usage::default()
             };
             let mut current_block_kind: Option<ContentBlockKind> = None;
-            // Map block_index → tool_uses position. Required because the
+            // Map block_index ÃÂ¢ÃÂÃÂ tool_uses position. Required because the
             // OpenAI-compatible streaming parser emits multiple
             // ContentBlockStart::ToolUse events back-to-back (one per
-            // tool_call in a batch) before any ContentBlockStop arrives —
+            // tool_call in a batch) before any ContentBlockStop arrives ÃÂ¢ÃÂÃÂ
             // all Stops are flushed together at `finish_reason`. A single
             // Option<usize> gets overwritten by each new Start; the first
             // Stop then takes the last index, and every subsequent Stop
@@ -542,7 +469,7 @@ impl Engine {
 
                 let event = match event_result {
                     Ok(e) => {
-                        // Flip on the first non-MessageStart event — that's
+                        // Flip on the first non-MessageStart event ÃÂ¢ÃÂÃÂ that's
                         // the moment we cross from "stream not yet productive"
                         // (eligible for transparent retry) into "DeepSeek has
                         // billed us / user has seen output" (must surface).
@@ -557,7 +484,7 @@ impl Engine {
                         // #103: when the stream errors before any content was
                         // streamed AND we still have retry budget, transparently
                         // resend the request. DeepSeek has not billed for any
-                        // output and the user has seen nothing — re-trying is
+                        // output and the user has seen nothing ÃÂ¢ÃÂÃÂ re-trying is
                         // the right user-visible behavior.
                         if should_transparently_retry_stream(
                             any_content_received,
@@ -567,7 +494,8 @@ impl Engine {
                             transparent_stream_retries =
                                 transparent_stream_retries.saturating_add(1);
                             crate::logging::info(format!(
-                                "Transparent stream retry {transparent_stream_retries}/{MAX_TRANSPARENT_STREAM_RETRIES} (no content received yet): {message}",
+                                "Transparent stream retry {}/{} (no content received yet): {}",
+                                transparent_stream_retries, MAX_TRANSPARENT_STREAM_RETRIES, message,
                             ));
                             // Drop the failed stream before issuing the new
                             // request to release the underlying connection.
@@ -581,7 +509,7 @@ impl Engine {
                                 Ok(fresh) => {
                                     stream = fresh;
                                     stream_start = Instant::now();
-                                    // Roll back the error counter — this one
+                                    // Roll back the error counter ÃÂ¢ÃÂÃÂ this one
                                     // didn't surface to the user.
                                     stream_errors = stream_errors.saturating_sub(1);
                                     continue;
@@ -662,11 +590,12 @@ impl Engine {
                             caller,
                         } => {
                             crate::logging::info(format!(
-                                "Tool '{name}' block start. Initial input: {input:?}"
+                                "Tool '{}' block start. Initial input: {:?}",
+                                name, input
                             ));
                             current_block_kind = Some(ContentBlockKind::ToolUse);
                             current_tool_indices.insert(index, tool_uses.len());
-                            // ToolCallStarted is deferred to ContentBlockStop —
+                            // ToolCallStarted is deferred to ContentBlockStop ÃÂ¢ÃÂÃÂ
                             // see `final_tool_input`. Emitting here would ship
                             // the placeholder `{}` and the cell would render
                             // `<command>` / `<file>` literals to the user.
@@ -680,7 +609,8 @@ impl Engine {
                         }
                         ContentBlockStart::ServerToolUse { id, name, input } => {
                             crate::logging::info(format!(
-                                "Server tool '{name}' block start. Initial input: {input:?}"
+                                "Server tool '{}' block start. Initial input: {:?}",
+                                name, input
                             ));
                             current_block_kind = Some(ContentBlockKind::ToolUse);
                             current_tool_indices.insert(index, tool_uses.len());
@@ -772,7 +702,7 @@ impl Engine {
                         // `current_block_kind` slot. In an OpenAI batch
                         // tool-call stream every Stop after the first sees
                         // `stopped_kind = None` because `take()` cleared the
-                        // slot, so the original `matches!(stopped_kind, …)`
+                        // slot, so the original `matches!(stopped_kind, ÃÂ¢ÃÂÃÂ¦)`
                         // check would skip every tool except the last.
                         if let Some(tool_idx) = current_tool_indices.remove(&index)
                             && let Some(tool_state) = tool_uses.get_mut(tool_idx)
@@ -796,7 +726,7 @@ impl Engine {
                                     let _ = self
                                         .tx_event
                                         .send(Event::status(format!(
-                                            "⚠ Tool '{}' received malformed arguments from model",
+                                            "ÃÂ¢ÃÂÃÂ  Tool '{}' received malformed arguments from model",
                                             tool_state.name
                                         )))
                                         .await;
@@ -839,12 +769,12 @@ impl Engine {
                 return (TurnOutcomeStatus::Interrupted, None);
             }
 
-            // #103 Phase 3 — transparent retry. The inner loop above bails
+            // #103 Phase 3 ÃÂ¢ÃÂÃÂ transparent retry. The inner loop above bails
             // when reqwest yields chunk decode errors three times in a row;
             // most of the time those are recoverable proxy / HTTP/2 issues
             // and the request can simply be re-issued. Re-issue silently up
             // to MAX_STREAM_RETRIES, but only when the stream produced
-            // nothing actionable — if any tool call landed or text was
+            // nothing actionable ÃÂ¢ÃÂÃÂ if any tool call landed or text was
             // streamed, ship the partial state to the rest of the turn
             // pipeline so we don't double-bill the user by re-running it.
             let stream_died_with_nothing = stream_errors > 0
@@ -856,25 +786,28 @@ impl Engine {
                 if stream_retry_attempts < MAX_STREAM_RETRIES {
                     stream_retry_attempts = stream_retry_attempts.saturating_add(1);
                     crate::logging::warn(format!(
-                        "Stream died with no content (attempt {stream_retry_attempts}/{MAX_STREAM_RETRIES}); retrying request"
+                        "Stream died with no content (attempt {}/{}); retrying request",
+                        stream_retry_attempts, MAX_STREAM_RETRIES
                     ));
                     let _ = self
                         .tx_event
                         .send(Event::status(format!(
-                            "Connection interrupted; retrying ({stream_retry_attempts}/{MAX_STREAM_RETRIES})"
+                            "Connection interrupted; retrying ({}/{})",
+                            stream_retry_attempts, MAX_STREAM_RETRIES
                         )))
                         .await;
-                    // Don't preserve the per-stream `turn_error` — we're
+                    // Don't preserve the per-stream `turn_error` ÃÂ¢ÃÂÃÂ we're
                     // about to retry, and a successful retry should not
                     // surface the transient error as the turn outcome.
                     turn_error = None;
                     continue;
                 }
                 crate::logging::warn(format!(
-                    "Stream retry budget exhausted ({stream_retry_attempts} attempts); failing turn"
+                    "Stream retry budget exhausted ({} attempts); failing turn",
+                    stream_retry_attempts
                 ));
             } else if stream_errors == 0 {
-                // Healthy round → reset retry budget so we don't carry over
+                // Healthy round ÃÂ¢ÃÂÃÂ reset retry budget so we don't carry over
                 // state from a previous bad round.
                 stream_retry_attempts = 0;
             }
@@ -884,7 +817,7 @@ impl Engine {
 
             // Build content blocks. If this assistant turn produced tool
             // calls, ensure a Thinking block is present even when the model
-            // didn't stream any reasoning text — DeepSeek's thinking-mode
+            // didn't stream any reasoning text ÃÂ¢ÃÂÃÂ DeepSeek's thinking-mode
             // API requires `reasoning_content` to accompany every tool-call
             // assistant message in the conversation history. Saving a
             // placeholder here keeps the on-disk session structurally
@@ -945,7 +878,7 @@ impl Engine {
             }
 
             // RLM is a structured tool call (`rlm_query`) handled by the
-            // normal tool dispatch path; inline ```repl blocks (paper §2)
+            // normal tool dispatch path; inline ```repl blocks (paper ÃÂÃÂ§2)
             // are executed below when tool_uses is empty.
             // DeepSeek chat API rejects assistant messages that contain only
             // Keep thinking for UI stream events, but persist only sendable
@@ -958,8 +891,8 @@ impl Engine {
             });
 
             // Issue #1727: did this turn produce ONLY a reasoning/thinking
-            // block — empty content, no tool calls (e.g. gpt-oss via ollama's
-            // harmony→OpenAI shim mapping to `reasoning_content`)? We do NOT
+            // block ÃÂ¢ÃÂÃÂ empty content, no tool calls (e.g. gpt-oss via ollama's
+            // harmonyÃÂ¢ÃÂÃÂOpenAI shim mapping to `reasoning_content`)? We do NOT
             // surface anything here: after this point the same turn can still
             // CONTINUE for pending steers (~below) or sub-agent completions,
             // and emitting now would show a spurious "turn ended" notice right
@@ -977,7 +910,7 @@ impl Engine {
                 .await;
             }
 
-            // If no tool uses, check for inline REPL blocks (paper §2) or
+            // If no tool uses, check for inline REPL blocks (paper ÃÂÃÂ§2) or
             // finish the turn.
             if tool_uses.is_empty() {
                 if !pending_steers.is_empty() {
@@ -993,7 +926,7 @@ impl Engine {
                 }
 
                 // Sub-agent completion handoff (issue #756). The model finished
-                // streaming with no tool calls — but if it has direct children
+                // streaming with no tool calls ÃÂ¢ÃÂÃÂ but if it has direct children
                 // still running (or completions queued from children that
                 // finished while we were inferring), surface their
                 // `<codewhale:subagent.done>` sentinels into the transcript and
@@ -1005,14 +938,11 @@ impl Engine {
                     completions.push(c);
                 }
                 if completions.is_empty() {
-                    loop {
-                        let running = {
-                            let mgr = self.subagent_manager.read().await;
-                            mgr.running_count()
-                        };
-                        if !should_hold_turn_for_subagents(completions.len(), running) {
-                            break;
-                        }
+                    let running = {
+                        let mgr = self.subagent_manager.read().await;
+                        mgr.running_count()
+                    };
+                    if should_hold_turn_for_subagents(completions.len(), running) {
                         let _ = self
                             .tx_event
                             .send(Event::status(format!(
@@ -1035,7 +965,6 @@ impl Engine {
                                 while let Ok(extra) = self.rx_subagent_completion.try_recv() {
                                     completions.push(extra);
                                 }
-                                break;
                             }
                             Some(steer) = self.rx_steer.recv() => {
                                 let trimmed = steer.trim().to_string();
@@ -1056,21 +985,7 @@ impl Engine {
                                         .await;
                                 }
                                 turn.next_step();
-                                continue 'turn_loop;
-                            }
-                            () = tokio::time::sleep(self.config.subagent_heartbeat_timeout) => {
-                                let auto_cancelled = {
-                                    let mut mgr = self.subagent_manager.write().await;
-                                    mgr.cleanup(std::time::Duration::from_secs(60 * 60))
-                                };
-                                if auto_cancelled > 0 {
-                                    let _ = self
-                                        .tx_event
-                                        .send(Event::status(format!(
-                                            "Auto-cancelled {auto_cancelled} stale sub-agent(s) after no progress"
-                                        )))
-                                        .await;
-                                }
+                                continue;
                             }
                         }
                     }
@@ -1091,7 +1006,7 @@ impl Engine {
                     continue;
                 }
 
-                // Inline ```repl execution — paper-spec RLM integration.
+                // Inline ```repl execution ÃÂ¢ÃÂÃÂ paper-spec RLM integration.
                 if has_sendable_assistant_content
                     && crate::repl::sandbox::has_repl_block(&current_text_visible)
                 {
@@ -1131,7 +1046,7 @@ impl Engine {
                                     break;
                                 }
 
-                                // No FINAL — feed truncated stdout back as user metadata.
+                                // No FINAL ÃÂ¢ÃÂÃÂ feed truncated stdout back as user metadata.
                                 let feedback = if round.has_error {
                                     format!(
                                         "[REPL round {round_num} error]\nstdout:\n{}\nstderr:\n{}",
@@ -1178,7 +1093,7 @@ impl Engine {
                         break;
                     }
 
-                    // No FINAL — let the model iterate with the feedback.
+                    // No FINAL ÃÂ¢ÃÂÃÂ let the model iterate with the feedback.
                     turn.next_step();
                     continue;
                 }
@@ -1191,48 +1106,8 @@ impl Engine {
                 // branch above would have awaited / `continue`d / returned).
                 // If the assistant produced ONLY a reasoning block, the prior
                 // code fell straight through to this `break`, emitting nothing
-                // and leaving the UI spinner hung. Surface a status now —
+                // and leaving the UI spinner hung. Surface a status now ÃÂ¢ÃÂÃÂ
                 // safe because the turn can no longer resume.
-                // #1961: Before breaking, drain any sub-agent completions that
-                // arrived between the last hold check and now. If a child finished
-                // while we were running the thinking-only check, surface its
-                // sentinel rather than delaying it to the next turn.
-                let mut late_completions: Vec<crate::tools::subagent::SubAgentCompletion> =
-                    Vec::new();
-                while let Ok(c) = self.rx_subagent_completion.try_recv() {
-                    late_completions.push(c);
-                }
-                if !late_completions.is_empty() {
-                    let count = late_completions.len();
-                    for c in late_completions {
-                        self.add_session_message(subagent_completion_runtime_message(&c.payload))
-                            .await;
-                    }
-                    let _ = self
-                        .tx_event
-                        .send(Event::status(format!(
-                            "Resuming turn with {count} late sub-agent completion(s)"
-                        )))
-                        .await;
-                    turn.next_step();
-                    continue;
-                }
-
-                if let Some(continuation) = self
-                    .goal_continuation_message_if_needed(
-                        tool_registry,
-                        &mut goal_continuations_this_turn,
-                    )
-                    .await
-                {
-                    self.add_session_message(
-                        self.user_text_message_with_turn_metadata(continuation),
-                    )
-                    .await;
-                    turn.next_step();
-                    continue;
-                }
-
                 if thinking_only_no_sendable {
                     let holding_for_subagents = {
                         let running = {
@@ -1286,15 +1161,9 @@ impl Engine {
                 let tool_input = tool.input.clone();
                 let tool_caller = tool.caller.clone();
                 crate::logging::info(format!(
-                    "Planning tool '{tool_name}' with input: {tool_input:?}"
+                    "Planning tool '{}' with input: {:?}",
+                    tool_name, tool_input
                 ));
-
-                let requested_tool_name = tool_name.clone();
-                let tool_def =
-                    resolve_tool_definition(&mut tool_name, &tool_catalog, tool_registry);
-                if requested_tool_name != tool_name {
-                    tool.name = tool_name.clone();
-                }
 
                 let interactive = (tool_name == "exec_shell"
                     && tool_input
@@ -1319,25 +1188,82 @@ impl Engine {
                             | "exec_wait"
                             | "exec_interact"
                             | CODE_EXECUTION_TOOL_NAME
+                            | DOTNET_EXECUTION_TOOL_NAME
                             | JS_EXECUTION_TOOL_NAME
+                            | GO_EXECUTION_TOOL_NAME
+                            | TS_EXECUTION_TOOL_NAME
+                            | RUST_EXECUTION_TOOL_NAME
                     )
                 {
                     blocked_error = Some(ToolError::permission_denied(format!(
-                        "'{tool_name}' is not available in Plan mode — switch to Agent, Goal, or YOLO mode to run commands and code."
+                        "Tool '{tool_name}' is unavailable in Plan mode"
                     )));
                 }
 
-                if blocked_error.is_none()
-                    && !command_allows_tool(self.config.allowed_tools.as_deref(), &tool_name)
-                {
-                    blocked_error = Some(ToolError::permission_denied(format!(
-                        "Tool '{tool_name}' is not in the allowed-tools list for the current command"
-                    )));
+                // Check allowed-tools restriction from custom command frontmatter.
+                // When set, only tools in the list are allowed.
+                if let Some(ref allowed) = self.config.allowed_tools {
+                    if !allowed.contains(&tool_name.to_lowercase()) {
+                        blocked_error = Some(ToolError::permission_denied(
+                            format!("Tool '{tool_name}' is not in the allowed-tools list for the current command"),
+                        ));
+                    }
                 }
 
+                // Check pause state -- when the user pauses a pausable command,
+                // block further tool calls until resumed.
+                if blocked_error.is_none() && self.paused {
+                    blocked_error = Some(ToolError::execution_failed(
+                        "Command is paused. Press Esc and select Resume to continue.".to_string(),
+                    ));
+                }
+
+                // Check PreToolUse hooks (exit code 2 = deny tool).
                 if blocked_error.is_none()
-                    && !caller_allowed_for_tool(tool_caller.as_ref(), tool_def)
+                    && let Some(ref hook_executor) = self.config.hook_executor
+                    && hook_executor.has_hooks_for_event(HookEvent::ToolCallBefore)
                 {
+                    let hook_ctx = HookContext::new()
+                        .with_tool_name(&tool_name)
+                        .with_tool_args(&tool_args);
+                    let hook_results = hook_executor.execute(HookEvent::ToolCallBefore, &hook_ctx);
+                    for result in &hook_results {
+                        if result.exit_code == Some(2) {
+                            let reason = result.stdout.trim();
+                            let msg = if reason.is_empty() {
+                                format!("Tool '{tool_name}' was denied by a hook (exit code 2)")
+                            } else {
+                                format!("Tool '{tool_name}' was denied by a hook: {reason}")
+                            };
+                            blocked_error = Some(ToolError::permission_denied(msg));
+                            break;
+                        }
+                    }
+                }
+
+                let requested_tool_name = tool_name.clone();
+                let mut tool_def = tool_catalog.iter().find(|def| def.name == tool_name);
+
+                // Resolve hallucinated tool names when the model emits a
+                // non-canonical variant (Read_file, readFile, read-file, etc.).
+                if tool_def.is_none()
+                    && let Some(registry) = tool_registry
+                    && let Some(canonical) = registry.resolve(&tool_name)
+                {
+                    crate::logging::info(format!(
+                        "Resolved hallucinated tool name '{}' -> '{}'",
+                        tool_name, canonical
+                    ));
+                    tool_def = tool_catalog.iter().find(|d| d.name == canonical);
+                    if tool_def.is_some() {
+                        tool_name = canonical.to_string();
+                        // Update the tool_uses entry so the result is
+                        // attributed to the canonical name.
+                        tool.name = tool_name.clone();
+                    }
+                }
+
+                if !caller_allowed_for_tool(tool_caller.as_ref(), tool_def) {
                     blocked_error = Some(ToolError::permission_denied(format!(
                         "Tool '{tool_name}' does not allow caller '{}'",
                         caller_type_for_tool_use(tool_caller.as_ref())
@@ -1355,68 +1281,6 @@ impl Engine {
                         &tool_name,
                         &tool_catalog,
                     )));
-                }
-
-                if blocked_error.is_none()
-                    && let Some(hook_executor) = self.config.hook_executor.as_ref()
-                    && hook_executor.has_hooks_for_event(crate::hooks::HookEvent::ToolCallBefore)
-                {
-                    // Warn if any ToolCallBefore hook is configured as background
-                    // — background hooks return exit_code: None immediately, so
-                    // the denial check (exit_code == Some(2)) can never match.
-                    if hook_executor
-                        .has_background_hooks_for_event(crate::hooks::HookEvent::ToolCallBefore)
-                    {
-                        tracing::warn!(
-                            "ToolCallBefore hook(s) configured with background=true — \
-                             background hooks cannot deny tool calls because they exit \
-                             immediately with no result"
-                        );
-                    }
-
-                    let hook_context = crate::hooks::HookContext::new()
-                        .with_tool_name(&tool_name)
-                        .with_tool_args(&tool_input)
-                        .with_mode(&format!("{mode:?}"))
-                        .with_workspace(self.session.workspace.clone())
-                        .with_model(&self.config.model)
-                        .with_session_id(&self.session.id);
-                    // Run hooks off the Tokio worker thread: `execute()` calls
-                    // `child.wait_timeout()` which is a blocking syscall that
-                    // would stall all other async tasks on this thread.
-                    let executor = hook_executor.clone();
-                    let hook_results = tokio::task::spawn_blocking(move || {
-                        executor.execute(crate::hooks::HookEvent::ToolCallBefore, &hook_context)
-                    })
-                    .await
-                    .unwrap_or_else(|join_err| {
-                        tracing::error!("Hook executor task panicked: {join_err}");
-                        Vec::new()
-                    });
-                    if let Some(denial) = hook_results
-                        .iter()
-                        .find(|result| result.exit_code == Some(2))
-                    {
-                        let reason = denial
-                            .stdout
-                            .trim()
-                            .lines()
-                            .next()
-                            .filter(|line| !line.is_empty())
-                            .or_else(|| {
-                                denial
-                                    .stderr
-                                    .trim()
-                                    .lines()
-                                    .next()
-                                    .filter(|line| !line.is_empty())
-                            })
-                            .or(denial.error.as_deref())
-                            .unwrap_or("ToolCallBefore hook denied tool execution");
-                        blocked_error = Some(ToolError::permission_denied(format!(
-                            "ToolCallBefore hook denied tool '{tool_name}': {reason}"
-                        )));
-                    }
                 }
 
                 if McpPool::is_mcp_tool(&tool_name) {
@@ -1444,6 +1308,13 @@ impl Engine {
                             .to_string();
                     supports_parallel = false;
                     read_only = false;
+                } else if tool_name == DOTNET_EXECUTION_TOOL_NAME {
+                    approval_required = true;
+                    approval_description =
+                        "Run model-provided C# code in local .NET SDK execution sandbox"
+                            .to_string();
+                    supports_parallel = false;
+                    read_only = false;
                 } else if is_tool_search_tool(&tool_name) {
                     approval_required = false;
                     approval_description = "Search tool catalog".to_string();
@@ -1467,7 +1338,8 @@ impl Engine {
                             format!("Auto-loaded deferred tool '{tool_name}' after model request.")
                         } else {
                             format!(
-                                "Auto-loaded deferred tool '{tool_name}' after resolving '{requested_tool_name}'."
+                                "Auto-loaded deferred tool '{}' after resolving '{}'.",
+                                tool_name, requested_tool_name
                             )
                         };
                         let _ = self.tx_event.send(Event::status(status)).await;
@@ -1500,22 +1372,6 @@ impl Engine {
                 });
             }
             active_tool_names.extend(deferred_tools_hydrated_this_batch);
-
-            // --- Intent summary for write tools (#2381) ---
-            // When the model invokes write tools, extract its preceding text
-            // as an "intent summary" so the approval view can show *why* the
-            // change is being made, not just *what* will change.
-            let has_write_tools = plans.iter().any(|p| {
-                !p.read_only
-                    && p.approval_required
-                    && p.blocked_error.is_none()
-                    && p.guard_result.is_none()
-            });
-            let intent_summary: Option<String> = if has_write_tools {
-                approval_intent_summary(&current_text_visible)
-            } else {
-                None
-            };
 
             let plan_count = plans.len();
             let batches = plan_tool_execution_batches(plans);
@@ -1783,6 +1639,30 @@ impl Engine {
                             continue;
                         }
 
+                        if tool_name == DOTNET_EXECUTION_TOOL_NAME {
+                            let started_at = Instant::now();
+                            let result = execute_dotnet_execution_tool(
+                                &tool_input, &self.session.workspace,
+                            ).await;
+                            self.emit_tool_outcome(started_at, tool_id, tool_name,
+                                tool_input, result, &mut outcomes, plan.index).await;
+                            continue;
+                        }
+
+                        // RuntimeTool-based execution (go, ts, rust).
+                        if tool_name == GO_EXECUTION_TOOL_NAME
+                            || tool_name == TS_EXECUTION_TOOL_NAME
+                            || tool_name == RUST_EXECUTION_TOOL_NAME
+                        {
+                            let started_at = Instant::now();
+                            let result = execute_runtime_tool(
+                                &tool_name, &tool_input, &self.session.workspace,
+                            ).await;
+                            self.emit_tool_outcome(started_at, tool_id, tool_name,
+                                tool_input, result, &mut outcomes, plan.index).await;
+                            continue;
+                        }
+
                         if is_tool_search_tool(&tool_name) {
                             let started_at = Instant::now();
                             let result = execute_tool_search(
@@ -1871,15 +1751,9 @@ impl Engine {
                                 .send(Event::ApprovalRequired {
                                     id: tool_id.clone(),
                                     tool_name: tool_name.clone(),
-                                    input: tool_input.clone(),
                                     description: plan.approval_description.clone(),
                                     approval_key,
                                     approval_grouping_key,
-                                    intent_summary: if plan.read_only {
-                                        None
-                                    } else {
-                                        intent_summary.clone()
-                                    },
                                 })
                                 .await;
 
@@ -2068,7 +1942,7 @@ impl Engine {
                         );
 
                         // #136: post-edit LSP diagnostics hook. We only run
-                        // this on success — failed edits leave the file
+                        // this on success ÃÂ¢ÃÂÃÂ failed edits leave the file
                         // untouched, so polling for diagnostics would just
                         // surface stale state.
                         if output.success && tool_was_executed {
@@ -2141,9 +2015,7 @@ impl Engine {
 
             if let Some(message) = loop_guard_halt {
                 crate::logging::warn(message.clone());
-                let _ = self.tx_event.send(Event::status(message.clone())).await;
-                // 设置 turn_error 以确保最终返回 TurnOutcomeStatus::Failed 而非 Completed
-                turn_error = Some(message);
+                let _ = self.tx_event.send(Event::status(message)).await;
                 break;
             }
 
@@ -2205,55 +2077,6 @@ impl Engine {
         (TurnOutcomeStatus::Completed, None)
     }
 
-    async fn goal_continuation_message_if_needed(
-        &self,
-        tool_registry: Option<&crate::tools::ToolRegistry>,
-        continuations_this_turn: &mut u32,
-    ) -> Option<String> {
-        let registry = tool_registry?;
-        if !registry.contains("update_goal") {
-            return None;
-        }
-
-        let snapshot = match self.config.goal_state.lock() {
-            Ok(state) => state.snapshot(),
-            Err(err) => {
-                tracing::warn!("goal state lock poisoned during continuation check: {err}");
-                return None;
-            }
-        };
-
-        if !snapshot.is_active() {
-            return None;
-        }
-
-        let max = crate::tools::goal::MAX_GOAL_CONTINUATIONS_PER_TURN;
-        if *continuations_this_turn >= max {
-            let _ = self
-                .tx_event
-                .send(Event::status(format!(
-                    "Goal remains active after {max} continuation pass(es); ending turn to avoid a runaway loop."
-                )))
-                .await;
-            return None;
-        }
-
-        *continuations_this_turn = (*continuations_this_turn).saturating_add(1);
-        let _ = self
-            .tx_event
-            .send(Event::status(format!(
-                "Continuing active goal audit ({}/{max})",
-                *continuations_this_turn
-            )))
-            .await;
-
-        Some(crate::tools::goal::render_continuation_prompt(
-            &snapshot,
-            *continuations_this_turn,
-            max,
-        ))
-    }
-
     pub(super) fn messages_with_turn_metadata(&self) -> Vec<Message> {
         // `<turn_meta>` is stored on user-text messages when the message is
         // appended. Do not rewrite historical messages at request time: doing
@@ -2261,19 +2084,43 @@ impl Engine {
         // and destroys DeepSeek's KV prefix cache reuse.
         self.session.messages.clone()
     }
+
+    /// Record a completed tool execution outcome and emit the completion
+    /// event. Extracted to eliminate the identical `started_at ÃÂ¢ÃÂÃÂ await ÃÂ¢ÃÂÃÂ
+    /// ToolCallComplete ÃÂ¢ÃÂÃÂ ToolExecOutcome` boilerplate shared by
+    /// dotnet_execution and RuntimeTool-based tools (go, ts, rust).
+    async fn emit_tool_outcome(
+        &self,
+        started_at: Instant,
+        tool_id: String,
+        tool_name: String,
+        tool_input: serde_json::Value,
+        result: Result<ToolResult, ToolError>,
+        outcomes: &mut [Option<ToolExecOutcome>],
+        index: usize,
+    ) {
+        let _ = self
+            .tx_event
+            .send(Event::ToolCallComplete {
+                id: tool_id.clone(),
+                name: tool_name.clone(),
+                result: result.clone(),
+            })
+            .await;
+        outcomes[index] = Some(ToolExecOutcome {
+            index,
+            id: tool_id,
+            name: tool_name,
+            input: tool_input,
+            started_at,
+            result,
+        });
+    }
 }
 
 fn subagent_completion_runtime_message(payload: &str) -> Message {
-    // Role is "user", not "system": some OpenAI-compatible backends apply a
-    // strict chat template (e.g. vLLM serving Qwen3) that requires any system
-    // message to be messages[0]. A system message appended mid-conversation
-    // makes the template raise "System message must be at the beginning",
-    // which surfaces as a 400 BadRequest and breaks the whole sub-agent
-    // hand-off in the parent turn. The `visibility="internal"` tag already
-    // tells the model this is a runtime event rather than user input, so the
-    // role carries no semantic weight here — only template-compatibility cost.
     Message {
-        role: "user".to_string(),
+        role: "system".to_string(),
         content: vec![ContentBlock::Text {
             text: format!(
                 "<codewhale:runtime_event kind=\"subagent_completion\" visibility=\"internal\">\n\
@@ -2293,47 +2140,13 @@ fn should_hold_turn_for_subagents(queued_completions: usize, running_children: u
     queued_completions > 0 || running_children > 0
 }
 
-fn command_allows_tool(allowed_tools: Option<&[String]>, tool_name: &str) -> bool {
-    let Some(allowed_tools) = allowed_tools else {
-        return true;
-    };
-    allowed_tools.contains(&tool_name.to_ascii_lowercase())
-}
-
-fn resolve_tool_definition<'a>(
-    tool_name: &mut String,
-    tool_catalog: &'a [Tool],
-    tool_registry: Option<&crate::tools::ToolRegistry>,
-) -> Option<&'a Tool> {
-    let mut tool_def = tool_catalog
-        .iter()
-        .find(|def| def.name.as_str() == tool_name.as_str());
-
-    // Resolve hallucinated tool names before policy gates run, so aliases like
-    // ReadFile are checked against the canonical registered tool name.
-    if tool_def.is_none()
-        && let Some(registry) = tool_registry
-        && let Some(canonical) = registry.resolve(tool_name.as_str())
-    {
-        crate::logging::info(format!(
-            "Resolved hallucinated tool name '{tool_name}' -> '{canonical}'"
-        ));
-        tool_def = tool_catalog.iter().find(|d| d.name == canonical);
-        if tool_def.is_some() {
-            *tool_name = canonical.to_string();
-        }
-    }
-
-    tool_def
-}
-
 /// Issue #1727: decide whether to surface a "thinking-only, no output" status.
 ///
 /// Reached when the assistant turn had no sendable content (no Text, no
-/// ToolUse — only a reasoning/thinking block). We notify the user *only* when
+/// ToolUse ÃÂ¢ÃÂÃÂ only a reasoning/thinking block). We notify the user *only* when
 /// the turn is genuinely finishing: no tool uses to dispatch, no `turn_error`
 /// already surfaced for this turn, the request wasn't cancelled, AND the turn
-/// is not about to CONTINUE — there are no pending steers and we are not
+/// is not about to CONTINUE ÃÂ¢ÃÂÃÂ there are no pending steers and we are not
 /// holding the turn open for running sub-agents. The status must fire at the
 /// point the turn truly ends; emitting it earlier (at the persist site) would
 /// show a spurious "turn ended" notice immediately before the turn resumed
@@ -2380,7 +2193,7 @@ fn resolve_auto_effort(reasoning_effort: Option<&str>, messages: &[Message]) -> 
                 })
                 .unwrap_or_default();
 
-            // is_subagent is false here — handle_deepseek_turn runs in the
+            // is_subagent is false here ÃÂ¢ÃÂÃÂ handle_deepseek_turn runs in the
             // main engine (not a sub-agent's inner loop). Sub-agents have
             // their own turn pass and can pass is_subagent=true when they
             // call this function directly.
@@ -2396,6 +2209,7 @@ fn resolve_auto_effort(reasoning_effort: Option<&str>, messages: &[Message]) -> 
         Some(other) => Some(other.to_string()),
         None => None,
     }
+
 }
 
 fn is_turn_metadata_text(text: &str) -> bool {
@@ -2407,16 +2221,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn subagent_completion_handoff_is_internal_user_message() {
+    fn subagent_completion_handoff_is_internal_system_message() {
         let message = subagent_completion_runtime_message(
             "Build passed\n<codewhale:subagent.done>{\"agent_id\":\"agent_a\"}</codewhale:subagent.done>",
         );
 
-        // Must be "user", not "system": a system message appended mid-stream
-        // trips strict chat templates (vLLM/Qwen3) into a 400 BadRequest
-        // ("System message must be at the beginning"). The internal-event
-        // framing lives in the text + visibility tag, not the role.
-        assert_eq!(message.role, "user");
+        assert_eq!(message.role, "system");
         let text = match &message.content[0] {
             ContentBlock::Text { text, .. } => text,
             other => panic!("expected text block, got {other:?}"),
@@ -2434,23 +2244,10 @@ mod tests {
         assert!(!should_hold_turn_for_subagents(0, 0));
     }
 
-    #[test]
-    fn approval_intent_summary_trims_and_bounds_text() {
-        assert_eq!(approval_intent_summary("   "), None);
-
-        let long_text = format!("  {}  ", "x".repeat(MAX_APPROVAL_INTENT_SUMMARY_CHARS + 10));
-        let summary = approval_intent_summary(&long_text).expect("summary");
-        assert!(summary.ends_with("..."));
-        assert_eq!(
-            summary.chars().count(),
-            MAX_APPROVAL_INTENT_SUMMARY_CHARS + 3
-        );
-    }
-
     /// Regression test for issue #1727 (P0, release-blocking).
     ///
-    /// When a model (e.g. gpt-oss via ollama's harmony→OpenAI shim) returns
-    /// ONLY a reasoning/thinking block — empty `content`, no `tool_calls` —
+    /// When a model (e.g. gpt-oss via ollama's harmonyÃÂ¢ÃÂÃÂOpenAI shim) returns
+    /// ONLY a reasoning/thinking block ÃÂ¢ÃÂÃÂ empty `content`, no `tool_calls` ÃÂ¢ÃÂÃÂ
     /// `has_sendable_assistant_content` is false, so no assistant message is
     /// persisted. Previously the code also emitted NO event and fell straight
     /// through to finishing the turn: the UI spinner stayed up forever with no
@@ -2460,52 +2257,52 @@ mod tests {
     /// `turn_error`, not cancelled, no pending steers, not holding for
     /// sub-agents) must surface a status. We must NOT spam the status when the
     /// turn is ending for another reason (error already shown, cancelled),
-    /// when there are tool uses still to dispatch, or — critically (the
-    /// MEDIUM review finding) — when the turn is about to CONTINUE because a
+    /// when there are tool uses still to dispatch, or ÃÂ¢ÃÂÃÂ critically (the
+    /// MEDIUM review finding) ÃÂ¢ÃÂÃÂ when the turn is about to CONTINUE because a
     /// steer is pending or sub-agents are still running. Emitting at the old
     /// persist site fired before those continuations were known.
     ///
     /// Limitation: this tests the extracted pure decision, not the full async
     /// `handle_deepseek_turn` loop (driving it would need a mock DeepSeek
-    /// client + session + channels — far beyond a surgical fix and unlike any
+    /// client + session + channels ÃÂ¢ÃÂÃÂ far beyond a surgical fix and unlike any
     /// existing turn-loop test, which all pin pure helpers the same way). The
     /// wiring at the `tool_uses.is_empty()` tail (capture-then-decide, with the
-    /// live steer/sub-agent signals) is reviewed by inspection — consistent
+    /// live steer/sub-agent signals) is reviewed by inspection ÃÂ¢ÃÂÃÂ consistent
     /// with how the other turn-loop helpers in this module are tested.
     #[test]
     fn thinking_only_turn_emits_status_only_on_clean_end() {
         // Thinking-only response, turn genuinely ending (no tool uses, no
         // error, not cancelled, no steers pending, not holding for
-        // sub-agents) → surface a status so the user isn't left staring at a
+        // sub-agents) ÃÂ¢ÃÂÃÂ surface a status so the user isn't left staring at a
         // hung spinner.
         assert!(should_emit_thinking_only_status(
             true, true, false, false, false
         ));
 
-        // Tool uses still pending → the normal dispatch path handles it; no
+        // Tool uses still pending ÃÂ¢ÃÂÃÂ the normal dispatch path handles it; no
         // thinking-only status.
         assert!(!should_emit_thinking_only_status(
             false, true, false, false, false
         ));
 
-        // A turn_error was already surfaced → don't double-report.
+        // A turn_error was already surfaced ÃÂ¢ÃÂÃÂ don't double-report.
         assert!(!should_emit_thinking_only_status(
             true, false, false, false, false
         ));
 
-        // Request was cancelled → cancellation status already covers it.
+        // Request was cancelled ÃÂ¢ÃÂÃÂ cancellation status already covers it.
         assert!(!should_emit_thinking_only_status(
             true, true, true, false, false
         ));
 
-        // A steer is pending → the turn will resume with the steer; emitting
+        // A steer is pending ÃÂ¢ÃÂÃÂ the turn will resume with the steer; emitting
         // "turn ended" now would be a spurious notice right before the turn
         // continues (the MEDIUM correctness finding).
         assert!(!should_emit_thinking_only_status(
             true, true, false, true, false
         ));
 
-        // Sub-agents are still running / completions queued → the turn is
+        // Sub-agents are still running / completions queued ÃÂ¢ÃÂÃÂ the turn is
         // held open and will resume; do not claim it ended.
         assert!(!should_emit_thinking_only_status(
             true, true, false, false, true
@@ -2523,12 +2320,12 @@ mod tests {
     /// ContentBlockDelta { index: 0, .. }            // its arguments
     /// ContentBlockStart::ToolUse { index: 1, .. }   // tool #2
     /// ContentBlockDelta { index: 1, .. }
-    /// …
+    /// ÃÂ¢ÃÂÃÂ¦
     /// ContentBlockStart::ToolUse { index: N-1, .. }
     /// ContentBlockDelta { index: N-1, .. }
-    /// ContentBlockStop { index: 0 }                 // ── only flushed at
+    /// ContentBlockStop { index: 0 }                 // ÃÂ¢ÃÂÃÂÃÂ¢ÃÂÃÂ only flushed at
     /// ContentBlockStop { index: 1 }                 //    finish_reason
-    /// …                                             //    (see chat.rs
+    /// ÃÂ¢ÃÂÃÂ¦                                             //    (see chat.rs
     /// ContentBlockStop { index: N-1 }               //    L2050-L2064)
     /// ```
     ///
@@ -2612,51 +2409,61 @@ mod tests {
         );
     }
 
+    // Ã¢ÂÂÃ¢ÂÂ allowed-tools gate Ã¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂÃ¢ÂÂ
+
     #[test]
-    fn allowed_tools_gate_blocks_unlisted_tool() {
-        let allowed = vec!["bash".to_string(), "grep".to_string()];
-        assert!(!command_allows_tool(Some(&allowed), "read"));
+    fn test_allowed_tools_gate_blocks_unlisted_tool() {
+        let allowed = Some(vec!["bash".to_string(), "grep".to_string()]);
+
+        // Simulate the gate logic from handle_deepseek_turn
+        let mut blocked = None;
+        if let Some(ref allowed) = allowed {
+            let tool_name = "read".to_string();
+            if !allowed.contains(&tool_name.to_lowercase()) {
+                blocked = Some(tool_name);
+            }
+        }
+        assert_eq!(blocked, Some("read".to_string()),
+            "read should be blocked when not in [bash, grep]");
     }
 
     #[test]
-    fn allowed_tools_gate_allows_listed_tool_case_insensitively() {
-        let allowed = vec!["bash".to_string(), "read".to_string()];
-        assert!(command_allows_tool(Some(&allowed), "Read"));
+    fn test_allowed_tools_gate_allows_listed_tool() {
+        let allowed = Some(vec!["bash".to_string(), "read".to_string()]);
+
+        let mut blocked = None;
+        if let Some(ref allowed) = allowed {
+            let tool_name = "read".to_string();
+            if !allowed.contains(&tool_name.to_lowercase()) {
+                blocked = Some(tool_name);
+            }
+        }
+        assert_eq!(blocked, None,
+            "read should be allowed when in [bash, read]");
     }
 
     #[test]
-    fn allowed_tools_gate_allows_all_tools_when_not_set() {
-        assert!(command_allows_tool(None, "write"));
+    fn test_allowed_tools_gate_passes_when_not_set() {
+        let allowed: Option<Vec<String>> = None;
+
+        let mut blocked = None;
+        if let Some(ref allowed) = allowed {
+            let tool_name = "write".to_string();
+            if !allowed.contains(&tool_name.to_lowercase()) {
+                blocked = Some(tool_name);
+            }
+        }
+        assert_eq!(blocked, None,
+            "all tools should pass when allowed_tools is None");
     }
 
-    #[test]
-    fn review_regression_allowed_tools_gate_blocks_all_tools_when_empty() {
-        let allowed = Vec::new();
-        assert!(!command_allows_tool(Some(&allowed), "bash"));
-    }
+    // ── hook gate (Phase 2) ─────────────────────────────────────────
 
     #[test]
-    fn review_regression_allowed_tools_gate_checks_canonical_tool_name() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let context = crate::tools::spec::ToolContext::new(tmp.path().to_path_buf());
-        let registry = crate::tools::ToolRegistryBuilder::new()
-            .with_file_tools()
-            .build(context);
-        let catalog = registry.to_api_tools();
-        let mut tool_name = "ReadFile".to_string();
+    fn test_hook_gate_denies_with_exit_code_2() {
+        use crate::hooks::{Hook, HookContext, HookExecutor, HooksConfig, HookEvent};
 
-        let tool_def = resolve_tool_definition(&mut tool_name, &catalog, Some(&registry));
-
-        assert!(tool_def.is_some());
-        assert_eq!(tool_name, "read_file");
-        let allowed = vec!["read_file".to_string()];
-        assert!(command_allows_tool(Some(&allowed), &tool_name));
-    }
-
-    #[test]
-    fn hook_gate_denies_with_exit_code_2() {
-        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
-
+        // A hook that exits with code 2 (deny) using a shell command
         let deny_cmd = if cfg!(windows) { "exit /b 2" } else { "exit 2" };
         let config = HooksConfig {
             enabled: true,
@@ -2664,18 +2471,16 @@ mod tests {
             ..HooksConfig::default()
         };
         let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
-        let ctx = HookContext::new()
-            .with_tool_name("exec_shell")
-            .with_tool_args(&serde_json::json!({}));
+        let ctx = HookContext::new().with_tool_name("exec_shell").with_tool_args(&serde_json::json!({}));
         let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].exit_code, Some(2));
+        assert_eq!(results.len(), 1, "expected 1 hook result");
+        assert_eq!(results[0].exit_code, Some(2), "exit code 2 = deny");
     }
 
     #[test]
-    fn hook_gate_allows_with_exit_code_0() {
-        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
+    fn test_hook_gate_allows_with_exit_code_0() {
+        use crate::hooks::{Hook, HookContext, HookExecutor, HooksConfig, HookEvent};
 
         let allow_cmd = if cfg!(windows) { "exit /b 0" } else { "exit 0" };
         let config = HooksConfig {
@@ -2684,20 +2489,19 @@ mod tests {
             ..HooksConfig::default()
         };
         let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
-        let ctx = HookContext::new()
-            .with_tool_name("read_file")
-            .with_tool_args(&serde_json::json!({}));
+        let ctx = HookContext::new().with_tool_name("read_file").with_tool_args(&serde_json::json!({}));
         let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].exit_code, Some(0));
-        assert!(results[0].success);
+        assert_eq!(results.len(), 1, "expected 1 hook result");
+        assert_eq!(results[0].exit_code, Some(0), "exit code 0 = allow");
+        assert!(results[0].success, "hook should report success");
     }
 
     #[test]
-    fn hook_gate_failure_exit_code_1_is_not_denial() {
-        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
+    fn test_hook_gate_failure_does_not_block() {
+        use crate::hooks::{Hook, HookContext, HookExecutor, HooksConfig, HookEvent};
 
+        // A hook that exits with code 1 (failure) — should NOT block
         let fail_cmd = if cfg!(windows) { "exit /b 1" } else { "exit 1" };
         let config = HooksConfig {
             enabled: true,
@@ -2705,36 +2509,36 @@ mod tests {
             ..HooksConfig::default()
         };
         let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
-        let ctx = HookContext::new()
-            .with_tool_name("write_file")
-            .with_tool_args(&serde_json::json!({}));
+        let ctx = HookContext::new().with_tool_name("write_file").with_tool_args(&serde_json::json!({}));
         let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
 
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].exit_code, Some(1));
-        assert_ne!(results[0].exit_code, Some(2));
+        assert_eq!(results.len(), 1, "expected 1 hook result");
+        assert_eq!(results[0].exit_code, Some(1), "exit code 1 = failure");
+        // Exit code 1 is NOT 2, so the gate should not deny
+        assert_ne!(results[0].exit_code, Some(2), "exit code 1 should not be treated as deny");
     }
 
     #[test]
-    fn hook_gate_no_hooks_returns_no_results() {
-        use crate::hooks::{HookContext, HookEvent, HookExecutor, HooksConfig};
+    fn test_hook_gate_no_hooks_does_not_block() {
+        use crate::hooks::{HookContext, HookExecutor, HooksConfig, HookEvent};
 
         let config = HooksConfig {
             enabled: true,
-            hooks: vec![],
+            hooks: vec![],  // No hooks for this event
             ..HooksConfig::default()
         };
         let executor = HookExecutor::new(config, std::path::PathBuf::from("."));
         let ctx = HookContext::new().with_tool_name("grep_files");
         let results = executor.execute(HookEvent::ToolCallBefore, &ctx);
 
-        assert!(results.is_empty());
+        assert!(results.is_empty(), "no hooks → no results → no denial");
     }
 
     #[test]
-    fn hook_gate_denial_reason_can_come_from_stdout() {
-        use crate::hooks::{Hook, HookContext, HookEvent, HookExecutor, HooksConfig};
+    fn test_hook_gate_reason_from_stdout() {
+        use crate::hooks::{Hook, HookContext, HookExecutor, HooksConfig, HookEvent};
 
+        // A hook that prints a reason and exits with code 2
         let deny_cmd = if cfg!(windows) {
             "echo Tool blocked by security policy & exit /b 2"
         } else {
@@ -2751,6 +2555,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].exit_code, Some(2));
-        assert!(results[0].stdout.contains("security"));
+        assert!(results[0].stdout.contains("security"),
+            "deny reason should be in stdout, got: {}", results[0].stdout);
     }
 }

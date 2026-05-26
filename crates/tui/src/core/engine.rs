@@ -7,12 +7,12 @@
 //! - Proper cancellation support
 //! - Tool execution orchestration
 
+use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
-use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures_util::StreamExt;
@@ -26,6 +26,10 @@ use crate::compaction::{
     CompactionConfig, compact_messages_safe, merge_system_prompts, should_compact,
 };
 use crate::config::{ApiProvider, Config, DEFAULT_MAX_SUBAGENTS, DEFAULT_TEXT_MODEL};
+use crate::cycle_manager::{
+    CycleBriefing, CycleConfig, StructuredState, archive_cycle, build_seed_messages,
+    estimate_briefing_tokens, produce_briefing, should_advance_cycle,
+};
 use crate::error_taxonomy::{ErrorCategory, ErrorEnvelope, StreamError};
 use crate::features::{Feature, Features};
 use crate::llm_client::LlmClient;
@@ -37,24 +41,20 @@ use crate::models::{
     MessageRequest, StreamEvent, SystemPrompt, Tool, Usage,
 };
 use crate::prompts;
-use crate::purge::{emit_purge_completed, emit_purge_failed, emit_purge_started, run_purge};
 use crate::seam_manager::{SeamConfig, SeamManager};
-use crate::tools::goal::{SharedGoalState, new_shared_goal_state};
-use crate::tools::plan::{PlanSnapshot, SharedPlanState, new_shared_plan_state};
+use crate::tools::plan::{SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
 use crate::tools::spec::RuntimeToolServices;
 use crate::tools::spec::{ApprovalRequirement, ToolError, ToolResult};
 use crate::tools::subagent::{
-    Mailbox, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext, SubAgentResult,
-    SubAgentRuntime, SubAgentStatus, SubAgentType, new_shared_subagent_manager_with_timeout,
-    resolve_subagent_assignment_route,
+    Mailbox, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext, SubAgentRuntime,
+    SubAgentType, new_shared_subagent_manager, resolve_subagent_assignment_route,
 };
-use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
+use crate::tools::todo::{SharedTodoList, new_shared_todo_list};
 use crate::tools::user_input::{UserInputRequest, UserInputResponse};
 use crate::tools::{ToolContext, ToolRegistryBuilder};
 use crate::tui::app::AppMode;
 use crate::utils::spawn_supervised;
-use crate::working_set::WorkingSet;
 
 use super::capacity::{
     CapacityController, CapacityControllerConfig, CapacityDecision, CapacityObservationInput,
@@ -66,143 +66,10 @@ use super::capacity_memory::{
 };
 use super::coherence::{CoherenceSignal, CoherenceState, next_coherence_state};
 use super::events::{Event, TurnOutcomeStatus};
-use super::ops::{Op, USER_SHELL_TOOL_ID_PREFIX};
+use super::ops::Op;
 use super::session::Session;
 use super::tool_parser;
 use super::turn::{TurnContext, TurnToolCall, post_turn_snapshot, pre_turn_snapshot};
-
-/// Snapshot of parent state that can be passed to forked sub-agents without
-/// rewriting the parent transcript.
-#[derive(Debug, Clone, Default)]
-struct StructuredState {
-    mode_label: String,
-    workspace: PathBuf,
-    cwd: Option<PathBuf>,
-    working_set_summary: Option<String>,
-    todo_snapshot: Option<TodoListSnapshot>,
-    plan_snapshot: Option<PlanSnapshot>,
-    subagent_snapshots: Vec<SubAgentResult>,
-}
-
-impl StructuredState {
-    async fn capture(
-        mode_label: impl Into<String>,
-        workspace: PathBuf,
-        cwd: Option<PathBuf>,
-        working_set: &WorkingSet,
-        todos: &SharedTodoList,
-        plan_state: &SharedPlanState,
-        subagents: Option<&SharedSubAgentManager>,
-    ) -> Self {
-        let working_set_summary = working_set.summary_block(&workspace);
-
-        let todo_snapshot = {
-            let guard = todos.lock().await;
-            let snap = guard.snapshot();
-            if snap.items.is_empty() {
-                None
-            } else {
-                Some(snap)
-            }
-        };
-
-        let plan_snapshot = {
-            let guard = plan_state.lock().await;
-            if guard.is_empty() {
-                None
-            } else {
-                Some(guard.snapshot())
-            }
-        };
-
-        let subagent_snapshots = if let Some(handle) = subagents {
-            let guard = handle.read().await;
-            guard
-                .list()
-                .into_iter()
-                .filter(|s| matches!(s.status, SubAgentStatus::Running))
-                .collect()
-        } else {
-            Vec::new()
-        };
-
-        Self {
-            mode_label: mode_label.into(),
-            workspace,
-            cwd,
-            working_set_summary,
-            todo_snapshot,
-            plan_snapshot,
-            subagent_snapshots,
-        }
-    }
-
-    #[must_use]
-    fn to_system_block(&self) -> Option<String> {
-        let mut out = String::new();
-        out.push_str("## Fork State\n\n");
-        out.push_str(&format!("- Mode: `{}`\n", self.mode_label));
-        out.push_str(&format!("- Workspace: `{}`\n", self.workspace.display()));
-        if let Some(cwd) = self.cwd.as_ref() {
-            out.push_str(&format!("- Cwd: `{}`\n", cwd.display()));
-        }
-
-        if self.todo_snapshot.is_some() || self.plan_snapshot.is_some() {
-            out.push_str("\n### Work\n");
-        }
-
-        if let Some(todos) = self.todo_snapshot.as_ref() {
-            out.push_str(&format!(
-                "\nChecklist ({}% complete)\n",
-                todos.completion_pct
-            ));
-            for item in &todos.items {
-                let marker = match item.status {
-                    crate::tools::todo::TodoStatus::Pending => "[ ]",
-                    crate::tools::todo::TodoStatus::InProgress => "[~]",
-                    crate::tools::todo::TodoStatus::Completed => "[x]",
-                };
-                out.push_str(&format!("- {marker} {}\n", item.content));
-            }
-        }
-
-        if let Some(plan) = self.plan_snapshot.as_ref() {
-            out.push_str("\nStrategy metadata\n");
-            if let Some(explanation) = plan.explanation.as_ref() {
-                out.push_str(&format!("{explanation}\n\n"));
-            }
-            for item in &plan.items {
-                let marker = match item.status {
-                    crate::tools::plan::StepStatus::Pending => "[ ]",
-                    crate::tools::plan::StepStatus::InProgress => "[~]",
-                    crate::tools::plan::StepStatus::Completed => "[x]",
-                };
-                out.push_str(&format!("- {marker} {}\n", item.step));
-            }
-        }
-
-        if !self.subagent_snapshots.is_empty() {
-            out.push_str("\n### Open Sub-Agents\n");
-            for s in &self.subagent_snapshots {
-                let role = s.assignment.role.as_deref().unwrap_or("-");
-                let goal = if s.assignment.objective.is_empty() {
-                    "(no objective set)"
-                } else {
-                    s.assignment.objective.as_str()
-                };
-                out.push_str(&format!("- `{}` (role: {}) - {}\n", s.agent_id, role, goal));
-            }
-        }
-
-        if let Some(working_set) = self.working_set_summary.as_deref() {
-            out.push('\n');
-            out.push_str(working_set);
-            out.push('\n');
-        }
-
-        Some(out)
-    }
-}
 
 // === Types ===
 
@@ -223,22 +90,15 @@ pub struct EngineConfig {
     pub mcp_config_path: PathBuf,
     /// Directory containing discoverable skills.
     pub skills_dir: PathBuf,
-    /// Sources injected as `<instructions source="…">` blocks in the system
-    /// prompt (#454). Each entry is either a disk path (read at render time)
-    /// or an inline string. Loaded in declared order from the user's
-    /// `instructions = [...]` config or constructed by embedders.
-    ///
-    /// Generalized from `Vec<PathBuf>` so embedders can inject inline content
-    /// without staging a disk file. `From<PathBuf>` impl keeps existing callers
-    /// working with `.into()` at the call site.
-    pub instructions: Vec<crate::prompts::InstructionSource>,
+    /// Additional instruction files concatenated into the system
+    /// prompt (#454). Loaded in declared order from the user's
+    /// `instructions = [...]` config (or the per-project override).
+    /// Resolved via `expand_path` so `~` works.
+    pub instructions: Vec<PathBuf>,
     pub project_context_pack_enabled: bool,
     /// When true, the model is instructed to respond in the current locale
     /// and a post-hoc translation layer replaces remaining English output.
     pub translation_enabled: bool,
-    /// Whether user-visible transcript rendering shows thinking blocks.
-    /// Prompt assembly uses this to avoid localizing hidden reasoning.
-    pub show_thinking: bool,
     /// Maximum number of assistant steps before stopping.
     pub max_steps: u32,
     /// Maximum number of concurrently active subagents.
@@ -246,15 +106,22 @@ pub struct EngineConfig {
     /// Feature flags controlling tool availability.
     pub features: Features,
     /// Auto-compaction settings for long conversations.
+    ///
+    /// As of v0.6.6 the high-level summarization compaction (`compact_messages_safe`)
+    /// is **disabled by default**; the checkpoint-restart cycle architecture
+    /// (`cycle_manager`) replaces it. The compaction config is still wired through
+    /// for the per-tool-result truncation path (`compact_tool_result_for_context`)
+    /// and for users who explicitly opt back in through the `auto_compact`
+    /// setting or a direct engine config.
     pub compaction: CompactionConfig,
+    /// Checkpoint-restart cycle settings (issue #124).
+    pub cycle: CycleConfig,
     /// Capacity-controller settings.
     pub capacity: CapacityControllerConfig,
     /// Shared Todo list state.
     pub todos: SharedTodoList,
     /// Shared Plan state.
     pub plan_state: SharedPlanState,
-    /// Shared runtime goal state for model-visible goal tools.
-    pub goal_state: SharedGoalState,
     /// Maximum sub-agent recursion depth (default 3). See
     /// `SubAgentRuntime::max_spawn_depth`. Override via
     /// `[runtime] max_spawn_depth = N` in `~/.deepseek/config.toml`.
@@ -283,15 +150,13 @@ pub struct EngineConfig {
     /// Path to the user memory file (#489). Always populated; only
     /// consulted when `memory_enabled` is `true`.
     pub memory_path: PathBuf,
-    /// Default directory for Xiaomi MiMo speech/TTS tool outputs.
-    pub speech_output_dir: Option<PathBuf>,
     pub vision_config: Option<crate::config::VisionModelConfig>,
     pub goal_objective: Option<String>,
-    /// Tool restriction from custom slash command frontmatter.
-    /// `None` means the current turn may use the normal tool set.
+    /// Tool restriction: when set, only these tools are allowed.
     pub allowed_tools: Option<Vec<String>>,
-    /// Hook executor for control-plane hooks.
-    /// `ToolCallBefore` hooks may deny a tool call with exit code 2.
+    /// Hook executor for control-plane hooks (PreToolUse / PostToolUse).
+    /// When set, the turn loop runs `ToolCallBefore` hooks before each
+    /// tool execution; exit code 2 from a hook denies the tool.
     pub hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
     /// Resolved BCP-47 locale tag (e.g. `"en"`, `"zh-Hans"`, `"ja"`)
     /// for the `## Environment` block in the system prompt. The
@@ -303,28 +168,16 @@ pub struct EngineConfig {
     pub strict_tool_mode: bool,
     /// Workshop / large-tool-output routing (#548). `None` disables routing.
     pub workshop: Option<crate::tools::large_output_router::WorkshopConfig>,
-    /// Which search backend `web_search` should use. Default: DuckDuckGo.
+    /// Which search backend `web_search` should use. Default: Bing.
     pub search_provider: crate::config::SearchProvider,
-    /// API key for Tavily, Bocha, Metaso, or Baidu. `None` for Bing or DuckDuckGo.
-    /// Metaso also falls back to `METASO_API_KEY` env var, then a built-in key.
-    /// Baidu also falls back to `BAIDU_SEARCH_API_KEY`.
+    /// API key for Tavily or Bocha. `None` for Bing or DuckDuckGo.
     pub search_api_key: Option<String>,
     /// Per-step DeepSeek API timeout for sub-agent `create_message` requests.
     /// Resolved from `[subagents] api_timeout_secs` (clamped to 1..=1800)
     /// once at engine construction, then threaded onto every
     /// `SubAgentRuntime` the engine builds (#1806, #1808).
     pub subagent_api_timeout: Duration,
-    /// No-progress heartbeat timeout for live sub-agents. Used by the manager
-    /// and parent wait loop to auto-cancel stuck children before they exhaust
-    /// the sub-agent slot pool indefinitely (#2614).
-    pub subagent_heartbeat_timeout: Duration,
-    /// Native tools that should stay in the model-visible catalog even when
-    /// they are outside the small default core surface (#2076).
-    pub tools_always_load: HashSet<String>,
-    /// When true and `/usr/bin/bwrap` is present on Linux, route exec_shell
-    /// through bubblewrap instead of relying solely on Landlock (#2184).
-    #[allow(dead_code)] // Wired through ShellManager in follow-up PR
-    pub prefer_bwrap: bool,
+
     /// Tool override and plugin configuration (`[tools]` table in config.toml).
     /// Applied to the per-turn tool registry after built-in tools are registered.
     /// When `None`, no overrides or plugin loading occurs.
@@ -344,15 +197,14 @@ impl Default for EngineConfig {
             instructions: Vec::new(),
             project_context_pack_enabled: true,
             translation_enabled: false,
-            show_thinking: true,
             max_steps: 100,
             max_subagents: DEFAULT_MAX_SUBAGENTS,
             features: Features::with_defaults(),
             compaction: CompactionConfig::default(),
+            cycle: CycleConfig::default(),
             capacity: CapacityControllerConfig::default(),
             todos: new_shared_todo_list(),
             plan_state: new_shared_plan_state(),
-            goal_state: new_shared_goal_state(),
             max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
             network_policy: None,
             snapshots_enabled: true,
@@ -363,7 +215,6 @@ impl Default for EngineConfig {
             subagent_model_overrides: HashMap::new(),
             memory_enabled: false,
             memory_path: PathBuf::from("./memory.md"),
-            speech_output_dir: None,
             vision_config: None,
             strict_tool_mode: false,
             goal_objective: None,
@@ -376,11 +227,6 @@ impl Default for EngineConfig {
             subagent_api_timeout: Duration::from_secs(
                 crate::config::DEFAULT_SUBAGENT_API_TIMEOUT_SECS,
             ),
-            subagent_heartbeat_timeout: Duration::from_secs(
-                crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS,
-            ),
-            tools_always_load: HashSet::new(),
-            prefer_bwrap: false,
             tools: None,
         }
     }
@@ -499,12 +345,6 @@ pub struct Engine {
     /// Diagnostics collected during the current step's tool calls. Drained
     /// and forwarded as a synthetic user message before the next API call.
     pending_lsp_blocks: Vec<crate::lsp::DiagnosticBlock>,
-    /// Cached SlopLedger gate block keyed by the ledger file's modified time.
-    /// This keeps prompt refreshes cheap while still noticing append/update
-    /// writes from slop ledger tools during the same session.
-    slop_ledger_gate_cache: Option<(Option<SystemTime>, Option<String>)>,
-    /// Current operating mode. Updated on `ChangeMode` and `SendMessage`.
-    current_mode: AppMode,
 }
 
 // === Internal tool helpers ===
@@ -542,14 +382,9 @@ impl Engine {
             ApiProvider::Openai => "OPENAI_API_KEY",
             ApiProvider::Atlascloud => "ATLASCLOUD_API_KEY",
             ApiProvider::WanjieArk => "WANJIE_ARK_API_KEY/WANJIE_API_KEY/WANJIE_MAAS_API_KEY",
-            ApiProvider::Volcengine => "VOLCENGINE_API_KEY/VOLCENGINE_ARK_API_KEY/ARK_API_KEY",
             ApiProvider::Openrouter => "OPENROUTER_API_KEY",
-            ApiProvider::XiaomiMimo => "XIAOMI_MIMO_API_KEY/XIAOMI_API_KEY/MIMO_API_KEY",
             ApiProvider::Novita => "NOVITA_API_KEY",
             ApiProvider::Fireworks => "FIREWORKS_API_KEY",
-            ApiProvider::Siliconflow | ApiProvider::SiliconflowCn => "SILICONFLOW_API_KEY",
-            ApiProvider::Arcee => "ARCEE_API_KEY",
-            ApiProvider::Moonshot => "MOONSHOT_API_KEY/KIMI_API_KEY",
             ApiProvider::Sglang => "SGLANG_API_KEY",
             ApiProvider::Vllm => "VLLM_API_KEY",
             ApiProvider::Ollama => "OLLAMA_API_KEY",
@@ -558,7 +393,7 @@ impl Engine {
         Some(format!(
             "The rejected key came from {env_var}; no saved config key is present.\n\
              Run `codewhale auth status` to inspect credential sources, then \
-             `codewhale auth set --provider {provider}` to save a valid key in ~/.codewhale/config.toml, \
+             `codewhale auth set --provider {provider}` to save a valid key in ~/.deepseek/config.toml, \
              or remove the stale export and open a fresh shell.",
             provider = provider.as_str()
         ))
@@ -578,10 +413,6 @@ impl Engine {
 
     /// Create a new engine with the given configuration
     pub fn new(config: EngineConfig, api_config: &Config) -> (Self, EngineHandle) {
-        if let Some(objective) = normalized_goal_objective(config.goal_objective.as_deref()) {
-            sync_goal_state_from_host(&config.goal_state, Some(&objective), None, false);
-        }
-
         let (tx_op, rx_op) = mpsc::channel(32);
         let (tx_event, rx_event) = mpsc::channel(256);
         let (tx_approval, rx_approval) = mpsc::channel(64);
@@ -613,8 +444,6 @@ impl Engine {
         // message at request time so file churn does not rewrite this prefix.
         let user_memory_block =
             crate::memory::compose_block(config.memory_enabled, &config.memory_path);
-        let prompt_goal_objective =
-            goal_objective_for_prompt(config.goal_objective.as_deref(), &config.goal_state);
         let system_prompt =
             prompts::system_prompt_for_mode_with_context_skills_session_and_approval(
                 AppMode::Agent,
@@ -624,12 +453,10 @@ impl Engine {
                 Some(&config.instructions),
                 prompts::PromptSessionContext {
                     user_memory_block: user_memory_block.as_deref(),
-                    goal_objective: prompt_goal_objective.as_deref(),
+                    goal_objective: config.goal_objective.as_deref(),
                     project_context_pack_enabled: config.project_context_pack_enabled,
                     locale_tag: &config.locale_tag,
                     translation_enabled: config.translation_enabled,
-                    model_id: &config.model,
-                    show_thinking: config.show_thinking,
                 },
                 session.approval_mode,
             );
@@ -649,11 +476,8 @@ impl Engine {
             crate::prefix_cache::PrefixStabilityManager::new_unpinned()
         });
 
-        let subagent_manager = new_shared_subagent_manager_with_timeout(
-            config.workspace.clone(),
-            config.max_subagents,
-            config.subagent_heartbeat_timeout,
-        );
+        let subagent_manager =
+            new_shared_subagent_manager(config.workspace.clone(), config.max_subagents);
         let shell_manager = config
             .runtime_services
             .shell_manager
@@ -683,6 +507,10 @@ impl Engine {
                     .context
                     .l3_threshold
                     .unwrap_or(crate::seam_manager::DEFAULT_L3_THRESHOLD),
+                cycle_threshold: api_config
+                    .context
+                    .cycle_threshold
+                    .unwrap_or(crate::seam_manager::DEFAULT_CYCLE_THRESHOLD),
                 seam_model: api_config
                     .context
                     .seam_model
@@ -748,10 +576,8 @@ impl Engine {
             turn_counter: 0,
             lsp_manager,
             pending_lsp_blocks: Vec::new(),
-            slop_ledger_gate_cache: None,
             workshop_vars,
             sandbox_backend,
-            current_mode: AppMode::Agent,
         };
         engine.rehydrate_latest_canonical_state();
 
@@ -766,248 +592,6 @@ impl Engine {
         };
 
         (engine, handle)
-    }
-
-    async fn handle_run_shell_command(
-        &mut self,
-        command: String,
-        mode: AppMode,
-        trust_mode: bool,
-        auto_approve: bool,
-        approval_mode: crate::tui::approval::ApprovalMode,
-    ) {
-        self.reset_cancel_token();
-        self.turn_counter = self.turn_counter.saturating_add(1);
-        self.capacity_controller.mark_turn_start(self.turn_counter);
-
-        let turn_id = format!(
-            "{}{seq}",
-            USER_SHELL_TOOL_ID_PREFIX,
-            seq = self.turn_counter
-        );
-        let tool_id = turn_id.clone();
-        let tool_name = "exec_shell".to_string();
-        let tool_input = json!({ "command": command, "source": "user" });
-        let snapshot_prompt = tool_input["command"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-
-        self.session.trust_mode = trust_mode;
-        self.config.trust_mode = trust_mode;
-        self.session.auto_approve = auto_approve;
-        self.session.approval_mode = if auto_approve {
-            crate::tui::approval::ApprovalMode::Auto
-        } else {
-            approval_mode
-        };
-
-        let _ = self
-            .tx_event
-            .send(Event::TurnStarted {
-                turn_id: turn_id.clone(),
-            })
-            .await;
-
-        if self.config.snapshots_enabled {
-            let pre_workspace = self.session.workspace.clone();
-            let pre_seq = self.turn_counter;
-            let pre_cap = self.config.snapshots_max_workspace_bytes;
-            let pre_prompt = snapshot_prompt.clone();
-            let _ = tokio::task::spawn_blocking(move || {
-                pre_turn_snapshot(&pre_workspace, pre_seq, pre_cap, Some(&pre_prompt))
-            })
-            .await;
-        }
-
-        let _ = self
-            .tx_event
-            .send(Event::ToolCallStarted {
-                id: tool_id.clone(),
-                name: tool_name.clone(),
-                input: tool_input.clone(),
-            })
-            .await;
-
-        let tool_context = self.build_tool_context(mode, auto_approve);
-        let registry = ToolRegistryBuilder::new()
-            .with_shell_tools()
-            .build(tool_context);
-
-        let result = if mode == AppMode::Plan {
-            Err(ToolError::permission_denied(
-                "Tool 'exec_shell' is unavailable in Plan mode".to_string(),
-            ))
-        } else if !self.config.features.enabled(Feature::ShellTool) {
-            Err(ToolError::not_available(
-                "Tool 'exec_shell' is disabled by feature flag".to_string(),
-            ))
-        } else if let Some(spec) = registry.get(&tool_name) {
-            let approval_required = spec.approval_requirement() != ApprovalRequirement::Auto
-                && !registry.context().auto_approve;
-            if approval_required {
-                emit_tool_audit(json!({
-                    "event": "tool.approval_required",
-                    "tool_id": tool_id.clone(),
-                    "tool_name": tool_name.clone(),
-                    "source": "composer_bang",
-                }));
-                let approval_key =
-                    crate::tools::approval_cache::build_approval_key(&tool_name, &tool_input).0;
-                let approval_grouping_key =
-                    crate::tools::approval_cache::build_approval_grouping_key(
-                        &tool_name,
-                        &tool_input,
-                    )
-                    .0;
-                let _ = self
-                    .tx_event
-                    .send(Event::ApprovalRequired {
-                        id: tool_id.clone(),
-                        tool_name: tool_name.clone(),
-                        input: tool_input.clone(),
-                        description: spec.description().to_string(),
-                        approval_key,
-                        approval_grouping_key,
-                        intent_summary: None,
-                    })
-                    .await;
-
-                match self.await_tool_approval(&tool_id).await {
-                    Ok(ApprovalResult::Approved) => {
-                        emit_tool_audit(json!({
-                            "event": "tool.approval_decision",
-                            "tool_id": tool_id.clone(),
-                            "tool_name": tool_name.clone(),
-                            "decision": "approved",
-                            "source": "composer_bang",
-                        }));
-                        Self::execute_tool_with_lock(
-                            self.tool_exec_lock.clone(),
-                            spec.supports_parallel(),
-                            false,
-                            self.tx_event.clone(),
-                            tool_name.clone(),
-                            tool_input.clone(),
-                            Some(&registry),
-                            None,
-                            None,
-                        )
-                        .await
-                    }
-                    Ok(ApprovalResult::Denied) => {
-                        emit_tool_audit(json!({
-                            "event": "tool.approval_decision",
-                            "tool_id": tool_id.clone(),
-                            "tool_name": tool_name.clone(),
-                            "decision": "denied",
-                            "source": "composer_bang",
-                        }));
-                        Err(ToolError::permission_denied(format!(
-                            "Tool '{tool_name}' denied by user"
-                        )))
-                    }
-                    Ok(ApprovalResult::RetryWithPolicy(policy)) => {
-                        emit_tool_audit(json!({
-                            "event": "tool.approval_decision",
-                            "tool_id": tool_id.clone(),
-                            "tool_name": tool_name.clone(),
-                            "decision": "retry_with_policy",
-                            "policy": format!("{policy:?}"),
-                            "source": "composer_bang",
-                        }));
-                        let elevated_context = registry
-                            .context()
-                            .clone()
-                            .with_elevated_sandbox_policy(policy);
-                        Self::execute_tool_with_lock(
-                            self.tool_exec_lock.clone(),
-                            spec.supports_parallel(),
-                            false,
-                            self.tx_event.clone(),
-                            tool_name.clone(),
-                            tool_input.clone(),
-                            Some(&registry),
-                            None,
-                            Some(elevated_context),
-                        )
-                        .await
-                    }
-                    Err(err) => Err(err),
-                }
-            } else {
-                Self::execute_tool_with_lock(
-                    self.tool_exec_lock.clone(),
-                    spec.supports_parallel(),
-                    false,
-                    self.tx_event.clone(),
-                    tool_name.clone(),
-                    tool_input.clone(),
-                    Some(&registry),
-                    None,
-                    None,
-                )
-                .await
-            }
-        } else {
-            Err(ToolError::not_available(
-                "tool 'exec_shell' is not registered".to_string(),
-            ))
-        };
-
-        let mut result = result;
-        if let Ok(tool_result) = result.as_mut()
-            && let Some(path) = crate::tools::truncate::apply_spillover_with_artifact(
-                tool_result,
-                &tool_id,
-                &tool_name,
-                &self.session.id,
-            )
-        {
-            emit_tool_audit(json!({
-                "event": "tool.spillover",
-                "tool_id": tool_id.clone(),
-                "tool_name": tool_name.clone(),
-                "path": path.display().to_string(),
-                "source": "composer_bang",
-            }));
-        }
-
-        let status = if result.is_err() {
-            TurnOutcomeStatus::Failed
-        } else {
-            TurnOutcomeStatus::Completed
-        };
-        let error = result.as_ref().err().map(ToString::to_string);
-
-        let _ = self
-            .tx_event
-            .send(Event::ToolCallComplete {
-                id: tool_id,
-                name: tool_name,
-                result,
-            })
-            .await;
-
-        let _ = self
-            .tx_event
-            .send(Event::TurnComplete {
-                usage: Usage::default(),
-                status,
-                error,
-                tool_catalog: None,
-                base_url: None,
-            })
-            .await;
-
-        if self.config.snapshots_enabled {
-            let post_workspace = self.session.workspace.clone();
-            let post_seq = self.turn_counter;
-            let post_cap = self.config.snapshots_max_workspace_bytes;
-            crate::utils::spawn_blocking_supervised("post-shell-turn-snapshot", move || {
-                post_turn_snapshot(&post_workspace, post_seq, post_cap, Some(&snapshot_prompt));
-            });
-        }
     }
 
     /// Run the engine event loop
@@ -1028,7 +612,6 @@ impl Engine {
                     auto_approve,
                     approval_mode,
                     translation_enabled,
-                    show_thinking,
                     allowed_tools,
                     hook_executor,
                 } => {
@@ -1045,27 +628,42 @@ impl Engine {
                         auto_approve,
                         approval_mode,
                         translation_enabled,
-                        show_thinking,
                         allowed_tools,
                         hook_executor,
                     )
                     .await;
                 }
-                Op::RunShellCommand {
-                    command,
-                    mode,
-                    trust_mode,
-                    auto_approve,
-                    approval_mode,
-                } => {
-                    self.handle_run_shell_command(
-                        command,
-                        mode,
-                        trust_mode,
-                        auto_approve,
-                        approval_mode,
-                    )
-                    .await;
+                Op::SetPaused { paused } => {
+                    self.paused = paused;
+                    if paused {
+                        self.cancel_token.cancel();
+                    } else {
+                        // Re-create cancel token when resuming so tool calls
+                        // can proceed.
+                        self.reset_cancel_token();
+                    }
+                    let _ = self.tx_event.send(Event::Status {
+                        message: if paused {
+                            "Command paused".to_string()
+                        } else {
+                            "Command resumed".to_string()
+                        },
+                    }).await;
+                }
+                Op::SetPaused { paused } => {
+                    self.paused = paused;
+                    if paused {
+                        self.cancel_token.cancel();
+                    } else {
+                        self.reset_cancel_token();
+                    }
+                    let _ = self.tx_event.send(crate::core::events::Event::Status {
+                        message: if paused {
+                            "Command paused".to_string()
+                        } else {
+                            "Command resumed".to_string()
+                        },
+                    }).await;
                 }
                 Op::CancelRequest => {
                     self.cancel_token.cancel();
@@ -1100,12 +698,6 @@ impl Engine {
                         continue;
                     };
 
-                    let mcp_pool = if self.config.features.enabled(Feature::Mcp) {
-                        self.ensure_mcp_pool().await.ok()
-                    } else {
-                        None
-                    };
-
                     let mut runtime = SubAgentRuntime::new(
                         client,
                         self.session.model.clone(),
@@ -1123,8 +715,6 @@ impl Engine {
                     )
                     .with_max_spawn_depth(self.config.max_spawn_depth)
                     .with_step_api_timeout(self.config.subagent_api_timeout)
-                    .with_speech_output_dir(self.config.speech_output_dir.clone())
-                    .with_mcp_pool(mcp_pool)
                     .background_runtime();
                     let route = resolve_subagent_assignment_route(
                         &runtime,
@@ -1177,31 +767,15 @@ impl Engine {
                     let _ = self.tx_event.send(Event::AgentList { agents }).await;
                 }
                 Op::ChangeMode { mode } => {
-                    let previous_mode = self.current_mode;
-                    self.current_mode = mode;
-                    self.refresh_system_prompt(mode);
-                    self.emit_session_updated().await;
-                    // Notify the agent that the mode has changed so it can re-evaluate
-                    // any operations that were blocked by the previous mode's policy.
-                    if previous_mode != mode {
-                        let msg = Self::mode_change_runtime_message(previous_mode, mode);
-                        self.session.add_message(msg);
-                        self.emit_session_updated().await;
-                    }
                     let _ = self
                         .tx_event
-                        .send(Event::status(format!(
-                            "Mode changed to: {}",
-                            mode.description()
-                        )))
+                        .send(Event::status(format!("Mode changed to: {mode:?}")))
                         .await;
                 }
-                Op::SetModel { model, mode } => {
+                Op::SetModel { model } => {
                     self.session.auto_model = model.trim().eq_ignore_ascii_case("auto");
                     self.session.model = model;
                     self.config.model.clone_from(&self.session.model);
-                    self.refresh_system_prompt(mode);
-                    self.emit_session_updated().await;
                     let _ = self
                         .tx_event
                         .send(Event::status(format!(
@@ -1262,9 +836,6 @@ impl Engine {
                 Op::CompactContext => {
                     self.handle_manual_compaction().await;
                 }
-                Op::PurgeContext => {
-                    self.handle_purge().await;
-                }
                 Op::EditLastTurn { new_message } => {
                     // #383: /edit — remove the last user+assistant exchange
                     // from the session, then re-send with the new content.
@@ -1297,7 +868,6 @@ impl Engine {
                         self.session.auto_approve,
                         self.session.approval_mode,
                         self.config.translation_enabled,
-                        self.config.show_thinking,
                         self.config.allowed_tools.clone(),
                         self.config.hook_executor.clone(),
                     )
@@ -1333,62 +903,13 @@ impl Engine {
             .await;
     }
 
-    /// Build a runtime event message notifying the agent that the operating mode has changed.
-    /// This lets the agent re-evaluate any operations that were blocked by the previous mode.
-    fn mode_change_runtime_message(previous_mode: AppMode, new_mode: AppMode) -> Message {
-        let (policy_note, re_eval_hint) = match new_mode {
-            AppMode::Yolo => (
-                "all operations run automatically without requiring user approval",
-                "Re-evaluate any previously blocked write, patch, or shell operations \
-                 — they are now auto-approved.",
-            ),
-            AppMode::Agent => (
-                "read-only operations run silently; writes, patches, and shell \
-                 commands require user approval",
-                "Any operations you ran automatically under YOLO mode now require \
-                 explicit user approval before executing.",
-            ),
-            AppMode::Plan => (
-                "all writes and patches are blocked; shell and code execution are unavailable",
-                "Any previously planned operations that require writes or shell access \
-                 must wait until the mode changes back to Agent or YOLO.",
-            ),
-        };
-        Message {
-            role: "user".to_string(),
-            content: vec![ContentBlock::Text {
-                text: format!(
-                    "<codewhale:runtime_event kind=\"mode_change\" visibility=\"internal\">\n\
-This is an internal runtime event, not user input. The operating mode has changed \
-from {previous} mode to {new} mode.\n\n\
-In {new} mode: {policy}\n\n\
-{re_eval}\n\
-</codewhale:runtime_event>",
-                    previous = previous_mode.description(),
-                    new = new_mode.description(),
-                    policy = policy_note,
-                    re_eval = re_eval_hint,
-                ),
-                cache_control: None,
-            }],
-        }
-    }
-
     async fn add_session_message(&mut self, message: Message) {
         self.session.add_message(message);
         self.emit_session_updated().await;
     }
 
-    fn turn_metadata_block(
-        &self,
-        routed_model: &str,
-        mode: AppMode,
-        auto_model: bool,
-        reasoning_effort: Option<&str>,
-        reasoning_effort_auto: bool,
-    ) -> ContentBlock {
+    fn turn_metadata_block(&self) -> ContentBlock {
         let today = chrono::Local::now().format("%Y-%m-%d").to_string();
-        let mode_label = mode.description();
         let working_set_summary = self
             .session
             .working_set
@@ -1396,21 +917,11 @@ In {new} mode: {policy}\n\n\
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let mut lines = vec![
-            format!("Current local date: {today}"),
-            format!("Current mode: {mode_label}"),
-            format!("Current model: {routed_model}"),
-        ];
-        if auto_model {
-            lines.push(format!("Auto model route: {routed_model}"));
-        }
-        if reasoning_effort_auto && let Some(reasoning_effort) = reasoning_effort {
-            lines.push(format!("Auto reasoning effort: {reasoning_effort}"));
-        }
-        if let Some(working_set_summary) = working_set_summary {
-            lines.push(working_set_summary);
-        }
-        let summary = lines.join("\n");
+        let summary = if let Some(working_set_summary) = working_set_summary {
+            format!("Current local date: {today}\n{working_set_summary}")
+        } else {
+            format!("Current local date: {today}")
+        };
 
         ContentBlock::Text {
             text: format!("<turn_meta>\n{summary}\n</turn_meta>"),
@@ -1419,35 +930,10 @@ In {new} mode: {policy}\n\n\
     }
 
     fn user_text_message_with_turn_metadata(&self, text: String) -> Message {
-        self.user_text_message_with_turn_metadata_for_route(
-            text,
-            self.current_mode,
-            &self.session.model,
-            self.session.auto_model,
-            self.session.reasoning_effort.as_deref(),
-            self.session.reasoning_effort_auto,
-        )
-    }
-
-    fn user_text_message_with_turn_metadata_for_route(
-        &self,
-        text: String,
-        mode: AppMode,
-        routed_model: &str,
-        auto_model: bool,
-        reasoning_effort: Option<&str>,
-        reasoning_effort_auto: bool,
-    ) -> Message {
         Message {
             role: "user".to_string(),
             content: vec![
-                self.turn_metadata_block(
-                    routed_model,
-                    mode,
-                    auto_model,
-                    reasoning_effort,
-                    reasoning_effort_auto,
-                ),
+                self.turn_metadata_block(),
                 ContentBlock::Text {
                     text,
                     cache_control: None,
@@ -1472,15 +958,11 @@ In {new} mode: {policy}\n\n\
         auto_approve: bool,
         approval_mode: crate::tui::approval::ApprovalMode,
         translation_enabled: bool,
-        show_thinking: bool,
         allowed_tools: Option<Vec<String>>,
         hook_executor: Option<std::sync::Arc<crate::hooks::HookExecutor>>,
     ) {
         // Reset cancel token for fresh turn (in case previous was cancelled)
         self.reset_cancel_token();
-
-        // Track current mode so mid-turn messages include the right mode in turn metadata.
-        self.current_mode = mode;
 
         // Drain stale steer messages from previous turns.
         while self.rx_steer.try_recv().is_ok() {}
@@ -1504,17 +986,11 @@ In {new} mode: {policy}\n\n\
         // work on the blocking pool so the async runtime stays responsive;
         // failure is non-fatal (the helper logs at WARN).
         if self.config.snapshots_enabled {
-            // Clone the user prompt now — `content` is moved into
-            // `user_text_message_with_turn_metadata_for_route` below, so we need
-            // a copy for both pre- and post-turn snapshot labels. The
-            // label carries a truncated first line so `/restore`
-            // listings are human-readable.
-            let snapshot_prompt = content.clone();
             let pre_workspace = self.session.workspace.clone();
             let pre_seq = self.turn_counter;
             let pre_cap = self.config.snapshots_max_workspace_bytes;
             let _ = tokio::task::spawn_blocking(move || {
-                pre_turn_snapshot(&pre_workspace, pre_seq, pre_cap, Some(&snapshot_prompt))
+                pre_turn_snapshot(&pre_workspace, pre_seq, pre_cap)
             })
             .await;
         }
@@ -1524,10 +1000,6 @@ In {new} mode: {policy}\n\n\
         // so the footer doesn't display a stale failure row across
         // turns (#499).
         crate::retry_status::clear();
-
-        // Clone user prompt for post-turn snapshot label before `content`
-        // is moved into `user_text_message_with_turn_metadata_for_route` below.
-        let snapshot_prompt_post = content.clone();
 
         // Check if we have the appropriate client
         if self.deepseek_client.is_none() {
@@ -1546,8 +1018,6 @@ In {new} mode: {policy}\n\n\
                     usage: turn.usage.clone(),
                     status: TurnOutcomeStatus::Failed,
                     error: Some(message),
-                    tool_catalog: None,
-                    base_url: None,
                 })
                 .await;
             return;
@@ -1559,32 +1029,14 @@ In {new} mode: {policy}\n\n\
         let force_update_plan_first = should_force_update_plan_first(mode, &content);
 
         // Add user message to session
-        let user_msg = self.user_text_message_with_turn_metadata_for_route(
-            content,
-            mode,
-            &model,
-            auto_model,
-            reasoning_effort.as_deref(),
-            reasoning_effort_auto,
-        );
+        let user_msg = self.user_text_message_with_turn_metadata(content);
         self.session.add_message(user_msg);
-
-        let previous_goal_objective = self.config.goal_objective.clone();
 
         self.session.model = model;
         self.config.model.clone_from(&self.session.model);
-        self.config.goal_objective = goal_objective.clone();
-        if normalized_goal_objective(previous_goal_objective.as_deref())
-            != normalized_goal_objective(goal_objective.as_deref())
-        {
-            sync_goal_state_from_host(
-                &self.config.goal_state,
-                normalized_goal_objective(goal_objective.as_deref()).as_deref(),
-                None,
-                false,
-            );
-        }
-        self.config.allowed_tools = allowed_tools;
+        self.config.goal_objective = goal_objective;
+        self.config.allowed_tools = allowed_tools.clone();
+        self.paused = false;
         self.config.hook_executor = hook_executor;
         self.session.reasoning_effort = reasoning_effort;
         self.session.reasoning_effort_auto = reasoning_effort_auto;
@@ -1594,7 +1046,6 @@ In {new} mode: {policy}\n\n\
         self.session.trust_mode = trust_mode;
         self.config.trust_mode = trust_mode;
         self.config.translation_enabled = translation_enabled;
-        self.config.show_thinking = show_thinking;
         self.session.auto_approve = auto_approve;
         self.session.approval_mode = if auto_approve {
             crate::tui::approval::ApprovalMode::Auto
@@ -1665,12 +1116,6 @@ In {new} mode: {policy}\n\n\
             None
         };
 
-        let mcp_pool = if self.config.features.enabled(Feature::Mcp) {
-            self.ensure_mcp_pool().await.ok()
-        } else {
-            None
-        };
-
         let mut tool_registry = match mode {
             AppMode::Agent | AppMode::Yolo => {
                 if self.config.features.enabled(Feature::Subagents) {
@@ -1691,8 +1136,6 @@ In {new} mode: {policy}\n\n\
                         )
                         .with_max_spawn_depth(self.config.max_spawn_depth)
                         .with_step_api_timeout(self.config.subagent_api_timeout)
-                        .with_speech_output_dir(self.config.speech_output_dir.clone())
-                        .with_mcp_pool(mcp_pool.clone())
                         .with_parent_completion_tx(self.tx_subagent_completion.clone());
                         if let Some(context) = fork_context_for_runtime.clone() {
                             rt = rt.with_fork_context(context);
@@ -1721,13 +1164,58 @@ In {new} mode: {policy}\n\n\
             _ => Some(builder.build(tool_context)),
         };
 
-        // Load plugin tools from the user's tools directory and apply any
-        // config.toml overrides. Explicit overrides win over auto-discovered
-        // scripts with the same tool name.
+        // Track names added by plugin loading so we never defer them.
         let mut plugin_tool_names: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+
+        // Load plugin tools from the user's tools directory and apply any
+        // config.toml overrides. Plugin scripts are auto-discovered and
+        // registered without requiring a `[tools]` config section —
+        // the default `~/.deepseek/tools/` directory is always checked.
         if let Some(ref mut tool_registry) = tool_registry {
-            plugin_tool_names = configure_plugin_tools(tool_registry, self.config.tools.as_ref());
+            // Snapshot built-in tool names before any modifications.
+            let names_before: std::collections::HashSet<String> =
+                tool_registry.names().into_iter().map(|s| s.to_string()).collect();
+
+            // Resolve the plugin directory. Defaults to `~/.deepseek/tools/`.
+            let default_dir = {
+                let home = dirs::home_dir()
+                    .map(|h| h.join(".deepseek").join("tools"))
+                    .unwrap_or_else(|| PathBuf::from(".deepseek/tools"));
+                home
+            };
+            let plugin_dir = if let Some(ref tools_config) = self.config.tools
+                && let Some(ref custom_dir) = tools_config.plugin_dir
+            {
+                let p = PathBuf::from(shellexpand::tilde(custom_dir).as_ref());
+                if !p.exists() {
+                    tracing::warn!(
+                        "Configured plugin directory {} does not exist, falling back to default",
+                        p.display()
+                    );
+                    default_dir
+                } else {
+                    p
+                }
+            } else {
+                default_dir
+            };
+
+            // Apply per-tool overrides from config.toml (disable / replace).
+            if let Some(ref tools_config) = self.config.tools
+                && let Some(ref overrides) = tools_config.overrides
+            {
+                tool_registry.apply_overrides(overrides, &plugin_dir);
+            }
+
+            // Load auto-discovered plugin scripts from the tools directory.
+            tool_registry.load_plugins(&plugin_dir);
+
+            // Diff: any tool name that didn't exist before overrides/plugins
+            // is a user-registered tool. These should never be deferred.
+            let names_after: std::collections::HashSet<String> =
+                tool_registry.names().into_iter().map(|s| s.to_string()).collect();
+            plugin_tool_names = &names_after - &names_before;
         }
 
         let mcp_tools = if self.config.features.enabled(Feature::Mcp) {
@@ -1735,13 +1223,12 @@ In {new} mode: {policy}\n\n\
         } else {
             Vec::new()
         };
+
         let tools = tool_registry.as_ref().map(|registry| {
-            let mut catalog = build_model_tool_catalog(
-                registry.to_api_tools_with_cache(true),
-                mcp_tools,
-                mode,
-                &self.config.tools_always_load,
-            );
+            let mut catalog =
+                build_model_tool_catalog(registry.to_api_tools_with_cache(true), mcp_tools, mode);
+            // Ensure plugin/override tools are NOT deferred — they should be
+            // immediately visible since the user explicitly opted into them.
             for tool in &mut catalog {
                 if plugin_tool_names.contains(&tool.name) {
                     tool.defer_loading = Some(false);
@@ -1749,41 +1236,27 @@ In {new} mode: {policy}\n\n\
             }
             catalog
         });
-        let tool_catalog_for_event = tools.clone();
-        let base_url_for_event = self
-            .deepseek_client
-            .as_ref()
-            .map(|client| client.base_url().to_string());
 
-        // Main turn loop. Catch panics here so an internal error surfaces as a
-        // failed TurnComplete instead of unwinding through `engine.run()` and
-        // killing the whole engine-event-loop task — which left the UI stuck
-        // on "working" forever with the engine silently dead (#2583, #1269).
-        use futures_util::FutureExt as _;
-        let turn_result = std::panic::AssertUnwindSafe(self.handle_deepseek_turn(
-            &mut turn,
-            tool_registry.as_ref(),
-            tools,
-            mode,
-            force_update_plan_first,
-        ))
-        .catch_unwind()
-        .await;
-        let (status, error) = match turn_result {
-            Ok(outcome) => outcome,
-            Err(panic) => {
-                let detail = crate::utils::panic_message(&*panic);
-                crate::utils::record_caught_panic("engine-event-loop", &detail);
-                (
-                    TurnOutcomeStatus::Failed,
-                    Some(format!(
-                        "The engine hit an internal error and stopped this turn: {detail}. \
-                         Your session is intact — send your message again to retry. \
-                         A crash report was saved to ~/.codewhale/crashes/."
-                    )),
-                )
-            }
-        };
+        // Main turn loop
+        let (status, error) = self
+            .handle_deepseek_turn(
+                &mut turn,
+                tool_registry.as_ref(),
+                tools,
+                mode,
+                force_update_plan_first,
+            )
+            .await;
+
+        // Checkpoint-restart cycle boundary (issue #124). Run BEFORE
+        // TurnComplete so the engine loop doesn't block the terminal after
+        // the turn signal (#234). The status chip ("↻ context refreshing...")
+        // is visible during the wait, and once TurnComplete fires the
+        // terminal is immediately responsive. No-op unless the estimated
+        // input tokens have crossed the per-cycle threshold.
+        if matches!(status, TurnOutcomeStatus::Completed) {
+            self.maybe_advance_cycle(mode).await;
+        }
 
         // Update session usage
         self.session.total_usage.add(&turn.usage);
@@ -1796,8 +1269,6 @@ In {new} mode: {policy}\n\n\
                 usage: turn.usage,
                 status,
                 error,
-                tool_catalog: tool_catalog_for_event,
-                base_url: base_url_for_event,
             })
             .await;
 
@@ -1806,18 +1277,11 @@ In {new} mode: {policy}\n\n\
         // paste immediately (#234). The git work proceeds on the blocking
         // pool without forcing the engine loop to await it.
         if self.config.snapshots_enabled {
-            // `snapshot_prompt_post` was cloned from `content` above,
-            // before `content` was moved into the session messages.
             let post_workspace = self.session.workspace.clone();
             let post_seq = self.turn_counter;
             let post_cap = self.config.snapshots_max_workspace_bytes;
             crate::utils::spawn_blocking_supervised("post-turn-snapshot", move || {
-                post_turn_snapshot(
-                    &post_workspace,
-                    post_seq,
-                    post_cap,
-                    Some(&snapshot_prompt_post),
-                );
+                post_turn_snapshot(&post_workspace, post_seq, post_cap);
             });
         }
     }
@@ -1843,8 +1307,6 @@ In {new} mode: {policy}\n\n\
                     usage: zero_usage,
                     status: TurnOutcomeStatus::Failed,
                     error: Some(message),
-                    tool_catalog: None,
-                    base_url: None,
                 })
                 .await;
             return;
@@ -1922,89 +1384,6 @@ In {new} mode: {policy}\n\n\
                 usage: zero_usage,
                 status: turn_status,
                 error: turn_error,
-                tool_catalog: None,
-                base_url: None,
-            })
-            .await;
-    }
-
-    async fn handle_purge(&mut self) {
-        let zero_usage = Usage {
-            input_tokens: 0,
-            output_tokens: 0,
-            ..Usage::default()
-        };
-        let Some(client) = self.deepseek_client.clone() else {
-            let message = "Purge unavailable: API client not configured".to_string();
-            emit_purge_failed(&self.tx_event, message.clone()).await;
-            let _ = self
-                .tx_event
-                .send(Event::error(ErrorEnvelope::fatal_auth(message.clone())))
-                .await;
-            let _ = self
-                .tx_event
-                .send(Event::TurnComplete {
-                    usage: zero_usage,
-                    status: TurnOutcomeStatus::Failed,
-                    error: Some(message),
-                    tool_catalog: None,
-                    base_url: None,
-                })
-                .await;
-            return;
-        };
-
-        emit_purge_started(
-            &self.tx_event,
-            "Agent context purge in progress\u{2026}".to_string(),
-        )
-        .await;
-        let messages_before = self.session.messages.len();
-
-        let (status, error) = match run_purge(
-            &client,
-            &self.session.messages,
-            &self.session.model,
-            self.session.reasoning_effort.clone(),
-            effective_max_output_tokens(&self.session.model),
-        )
-        .await
-        {
-            Ok(result) => {
-                let messages_after = result.messages.len();
-                self.session.messages = result.messages;
-                self.emit_session_updated().await;
-
-                let summary = format!(
-                    "Purge complete: {messages_before} → {messages_after} messages \
-                         ({} removed, {} condensed)",
-                    result.removed_count, result.replaced_count,
-                );
-                emit_purge_completed(
-                    &self.tx_event,
-                    messages_before,
-                    messages_after,
-                    result.removed_count,
-                    result.replaced_count,
-                    summary,
-                )
-                .await;
-                (TurnOutcomeStatus::Completed, None)
-            }
-            Err(e) => {
-                emit_purge_failed(&self.tx_event, e.clone()).await;
-                (TurnOutcomeStatus::Failed, Some(e))
-            }
-        };
-
-        let _ = self
-            .tx_event
-            .send(Event::TurnComplete {
-                usage: zero_usage,
-                status,
-                error,
-                tool_catalog: None,
-                base_url: None,
             })
             .await;
     }
@@ -2027,8 +1406,15 @@ In {new} mode: {policy}\n\n\
         removed
     }
 
-    async fn recover_context_overflow(&mut self, client: &DeepSeekClient, reason: &str) -> bool {
-        let Some(target_budget) = context_input_budget(&self.session.model) else {
+    async fn recover_context_overflow(
+        &mut self,
+        client: &DeepSeekClient,
+        reason: &str,
+        requested_output_tokens: u32,
+    ) -> bool {
+        let Some(target_budget) =
+            context_input_budget(&self.session.model, requested_output_tokens)
+        else {
             return false;
         };
 
@@ -2050,6 +1436,10 @@ In {new} mode: {policy}\n\n\
             .token_threshold
             .min(target_budget.saturating_sub(1))
             .max(1);
+        // v0.8.11: forced compaction (capacity guardrail) bypasses the floor
+        // because we're at a hard ceiling and have to free budget regardless
+        // of cache cost.
+        forced_config.auto_floor_tokens = 0;
 
         match compact_messages_safe(
             client,
@@ -2094,7 +1484,7 @@ In {new} mode: {policy}\n\n\
                 "Emergency compaction complete: {before_count} → {after_count} messages ({removed} removed), ~{before_tokens} → ~{after_tokens} tokens"
             );
             if retries_used > 0 {
-                details.push_str(&format!(" ({retries_used} retries)"));
+                details.push_str(&format!(" ({} retries)", retries_used));
             }
             if trimmed > 0 {
                 details.push_str(&format!(", trimmed {trimmed} oldest"));
@@ -2113,7 +1503,8 @@ In {new} mode: {policy}\n\n\
 
         let message = format!(
             "Emergency context compaction failed to reduce request below model limit \
-             (estimate ~{after_tokens} tokens, budget ~{target_budget})."
+             (estimate ~{} tokens, budget ~{}).",
+            after_tokens, target_budget
         );
         self.emit_compaction_failed(id, true, message.clone()).await;
         let _ = self.tx_event.send(Event::status(message)).await;
@@ -2146,13 +1537,6 @@ In {new} mode: {policy}\n\n\
         .with_features(self.config.features.clone())
         .with_shell_manager(self.shell_manager.clone())
         .with_runtime_services(self.config.runtime_services.clone())
-        .with_session_objects(crate::rlm::session::SessionObjectSnapshot::new(
-            self.session.id.clone(),
-            self.session.model.clone(),
-            self.session.workspace.clone(),
-            self.session.system_prompt.clone(),
-            self.session.messages.clone(),
-        ))
         .with_cancel_token(self.cancel_token.clone())
         .with_trusted_external_paths(trusted_external_paths);
 
@@ -2340,14 +1724,209 @@ In {new} mode: {policy}\n\n\
             )))
             .await;
     }
+    /// its token threshold (issue #124). No-op in the common case.
+    ///
+    /// Caller must invoke this only at a clean turn boundary (no in-flight
+    /// tool, no open stream, no pending approval modal). The phase guard
+    /// inside `should_advance_cycle` is a defence-in-depth check; the
+    /// engine's wider state machine is the primary enforcement layer.
+    ///
+    /// Sub-agents are intentionally NOT awaited: each sub-agent has its own
+    /// context, the parent's reset doesn't invalidate them. Their handles
+    /// are captured in the structured-state block so the next cycle can see
+    /// they're still running.
+    async fn maybe_advance_cycle(&mut self, mode: AppMode) {
+        if !should_advance_cycle(
+            self.estimated_input_tokens() as u64,
+            turn_response_headroom_tokens(),
+            &self.session.model,
+            &self.config.cycle,
+            false,
+        ) {
+            return;
+        }
+
+        let Some(client) = self.deepseek_client.clone() else {
+            crate::logging::warn(
+                "Cycle boundary skipped: API client not configured for briefing turn",
+            );
+            return;
+        };
+
+        let from = self.session.cycle_count;
+        let to = from.saturating_add(1);
+        let archive_started = self.session.current_cycle_started;
+        let max_briefing_tokens = self.config.cycle.briefing_max_for(&self.session.model);
+
+        let _ = self
+            .tx_event
+            .send(Event::status(format!(
+                "↻ context refreshing (cycle {from} → {to}, generating briefing…)"
+            )))
+            .await;
+
+        // 1. Generate the model-curated briefing. Prefer the Flash seam
+        //    manager (#159) for cost and speed; fall back to the main model
+        //    (legacy produce_briefing) when the seam manager isn't available.
+        let briefing_text = if let Some(ref seam_mgr) = self.seam_manager {
+            let seams = seam_mgr.collect_seam_texts(&self.session.messages).await;
+            let state_text = {
+                let s = StructuredState::capture(
+                    mode.label(),
+                    self.config.workspace.clone(),
+                    std::env::current_dir().ok(),
+                    &self.session.working_set,
+                    &self.config.todos,
+                    &self.config.plan_state,
+                    Some(&self.subagent_manager),
+                )
+                .await;
+                s.to_system_block()
+            };
+            match seam_mgr
+                .produce_flash_briefing(&seams, state_text.as_deref())
+                .await
+            {
+                Ok(text) => text,
+                Err(err) => {
+                    crate::logging::warn(format!(
+                        "Flash briefing failed, falling back to main model: {err}"
+                    ));
+                    match produce_briefing(
+                        &client,
+                        &self.session.model,
+                        &self.session.messages,
+                        max_briefing_tokens,
+                    )
+                    .await
+                    {
+                        Ok(text) => text,
+                        Err(err2) => {
+                            crate::logging::warn(format!(
+                                "Cycle briefing turn failed; skipping cycle advance: {err2}"
+                            ));
+                            let _ = self
+                                .tx_event
+                                .send(Event::status(format!(
+                                    "↻ cycle handoff failed (continuing in cycle {from}): {err2}"
+                                )))
+                                .await;
+                            return;
+                        }
+                    }
+                }
+            }
+        } else {
+            match produce_briefing(
+                &client,
+                &self.session.model,
+                &self.session.messages,
+                max_briefing_tokens,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(err) => {
+                    crate::logging::warn(format!(
+                        "Cycle briefing turn failed; skipping cycle advance: {err}"
+                    ));
+                    let _ = self
+                        .tx_event
+                        .send(Event::status(format!(
+                            "↻ cycle handoff failed (continuing in cycle {from}): {err}"
+                        )))
+                        .await;
+                    return;
+                }
+            }
+        };
+
+        let briefing_tokens = estimate_briefing_tokens(&briefing_text);
+        let now = chrono::Utc::now();
+        let briefing = CycleBriefing {
+            cycle: to,
+            timestamp: now,
+            briefing_text: briefing_text.clone(),
+            token_estimate: briefing_tokens,
+        };
+
+        // 2. Archive the cycle to disk. If the archive write fails we still
+        //    proceed with the swap — the briefing alone preserves enough
+        //    state to continue, and the user can recover the lost archive
+        //    from their session log if needed.
+        match archive_cycle(
+            &self.session.id,
+            to,
+            &self.session.messages,
+            &self.session.model,
+            archive_started,
+        ) {
+            Ok(path) => {
+                crate::logging::info(format!("Cycle {to} archived to {}", path.display()));
+            }
+            Err(err) => {
+                crate::logging::warn(format!(
+                    "Failed to archive cycle {to}; continuing with swap: {err}"
+                ));
+            }
+        }
+
+        // 3. Capture structured state. Locks are held only for the snapshot.
+        let state = StructuredState::capture(
+            mode.label(),
+            self.config.workspace.clone(),
+            std::env::current_dir().ok(),
+            &self.session.working_set,
+            &self.config.todos,
+            &self.config.plan_state,
+            Some(&self.subagent_manager),
+        )
+        .await;
+        let state_block = state.to_system_block();
+
+        // 4. Build the seed messages. The next cycle starts with the
+        //    base system prompt (refreshed below) and these seeds.
+        let seed_messages = build_seed_messages(
+            state_block.as_deref(),
+            Some(&briefing),
+            None, // pending_user_message — pulled from steer/queue elsewhere
+        );
+
+        // 5. Atomic swap.
+        self.session.messages = seed_messages;
+        self.session.cycle_count = to;
+        self.session.current_cycle_started = now;
+        self.session.cycle_briefings.push(briefing.clone());
+        // Reset seam tracking for the new cycle.
+        if let Some(ref seam_mgr) = self.seam_manager {
+            seam_mgr.reset().await;
+        }
+        // Drop any compaction summary — that path is incompatible with the
+        // fresh-context model and would Frankenstein-merge with the briefing.
+        self.session.compaction_summary_prompt = None;
+        self.refresh_system_prompt(mode);
+        self.emit_session_updated().await;
+
+        let _ = self
+            .tx_event
+            .send(Event::CycleAdvanced {
+                from,
+                to,
+                briefing: briefing.clone(),
+            })
+            .await;
+        let _ = self
+            .tx_event
+            .send(Event::status(format!(
+                "↻ context refreshed (cycle {from} → {to}, briefing: {briefing_tokens} tokens carried)"
+            )))
+            .await;
+    }
+
     /// Refresh the system prompt based on current mode and context.
     fn refresh_system_prompt(&mut self, mode: AppMode) {
         let user_memory_block =
             crate::memory::compose_block(self.config.memory_enabled, &self.config.memory_path);
-        let prompt_goal_objective = goal_objective_for_prompt(
-            self.config.goal_objective.as_deref(),
-            &self.config.goal_state,
-        );
         let base = prompts::system_prompt_for_mode_with_context_skills_session_and_approval(
             mode,
             &self.config.workspace,
@@ -2356,29 +1935,15 @@ In {new} mode: {policy}\n\n\
             Some(&self.config.instructions),
             prompts::PromptSessionContext {
                 user_memory_block: user_memory_block.as_deref(),
-                goal_objective: prompt_goal_objective.as_deref(),
+                goal_objective: self.config.goal_objective.as_deref(),
                 project_context_pack_enabled: self.config.project_context_pack_enabled,
                 locale_tag: &self.config.locale_tag,
                 translation_enabled: self.config.translation_enabled,
-                model_id: &self.config.model,
-                show_thinking: self.config.show_thinking,
             },
             self.session.approval_mode,
         );
-        let mut stable_prompt =
+        let stable_prompt =
             merge_system_prompts(Some(&base), self.session.compaction_summary_prompt.clone());
-
-        // SlopLedger completion-gate: inject unresolved slop entries into the
-        // system prompt so the agent can autonomously review them before
-        // claiming the task is done (#2127).
-        let gate_block = self.slop_ledger_gate_block();
-        if let Some(ref block) = gate_block
-            && let Some(SystemPrompt::Text(prompt_text)) = &mut stable_prompt
-        {
-            prompt_text.push_str("\n\n");
-            prompt_text.push_str(block);
-        }
-
         let stable_hash = system_prompt_hash(stable_prompt.as_ref());
         if self.session.system_prompt_override {
             self.session.last_system_prompt_hash = Some(stable_hash);
@@ -2390,38 +1955,6 @@ In {new} mode: {policy}\n\n\
         }
     }
 
-    fn slop_ledger_gate_block(&mut self) -> Option<String> {
-        let modified = crate::slop_ledger::SlopLedger::default_path()
-            .ok()
-            .and_then(|path| std::fs::metadata(path).ok())
-            .and_then(|metadata| metadata.modified().ok());
-
-        if let Some((cached_modified, cached_block)) = &self.slop_ledger_gate_cache
-            && *cached_modified == modified
-        {
-            return cached_block.clone();
-        }
-
-        let loaded = crate::slop_ledger::SlopLedger::load()
-            .ok()
-            .and_then(|ledger| {
-                if ledger.has_open_entries() {
-                    ledger.completion_gate_summary()
-                } else {
-                    None
-                }
-            });
-        self.slop_ledger_gate_cache = Some((modified, loaded.clone()));
-        loaded
-    }
-
-    /// Merge a compaction summary into the system prompt.
-    ///
-    /// **Zone affiliation (#2264)**: this mutates the system prompt, which is
-    /// part of the `PinnedPrefix` zone in the three-zone contract. Compaction
-    /// is the one intentional mid-session prefix mutation — the engine
-    /// intentionally accepts the cache-invalidation cost because the
-    /// context-reduction benefit outweighs it.
     fn merge_compaction_summary(&mut self, summary_prompt: Option<SystemPrompt>) {
         if summary_prompt.is_none() {
             return;
@@ -2434,50 +1967,6 @@ In {new} mode: {policy}\n\n\
         self.session.last_system_prompt_hash = Some(system_prompt_hash(merged.as_ref()));
         self.session.system_prompt = merged;
     }
-}
-
-fn default_plugin_tools_dir() -> PathBuf {
-    codewhale_config::codewhale_home()
-        .unwrap_or_else(|_| {
-            dirs::home_dir().map_or_else(|| PathBuf::from(".codewhale"), |h| h.join(".codewhale"))
-        })
-        .join("tools")
-}
-
-fn plugin_tools_dir(tools_config: Option<&crate::config::ToolsConfig>) -> PathBuf {
-    if let Some(tools_config) = tools_config
-        && let Some(custom_dir) = tools_config.plugin_dir.as_deref()
-    {
-        return PathBuf::from(shellexpand::tilde(custom_dir).as_ref());
-    }
-    default_plugin_tools_dir()
-}
-
-fn configure_plugin_tools(
-    tool_registry: &mut crate::tools::ToolRegistry,
-    tools_config: Option<&crate::config::ToolsConfig>,
-) -> std::collections::HashSet<String> {
-    let names_before: std::collections::HashSet<String> = tool_registry
-        .names()
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
-
-    let plugin_dir = plugin_tools_dir(tools_config);
-    tool_registry.load_plugins(&plugin_dir);
-
-    if let Some(tools_config) = tools_config
-        && let Some(ref overrides) = tools_config.overrides
-    {
-        tool_registry.apply_overrides(overrides, &plugin_dir);
-    }
-
-    let names_after: std::collections::HashSet<String> = tool_registry
-        .names()
-        .into_iter()
-        .map(|s| s.to_string())
-        .collect();
-    &names_after - &names_before
 }
 
 fn system_prompt_hash(prompt: Option<&SystemPrompt>) -> u64 {
@@ -2502,45 +1991,6 @@ fn system_prompt_hash(prompt: Option<&SystemPrompt>) -> u64 {
         }
     }
     hasher.finish()
-}
-
-fn normalized_goal_objective(value: Option<&str>) -> Option<String> {
-    value
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn sync_goal_state_from_host(
-    goal_state: &SharedGoalState,
-    objective: Option<&str>,
-    token_budget: Option<u32>,
-    completed: bool,
-) {
-    match goal_state.lock() {
-        Ok(mut state) => state.sync_from_host(objective, token_budget, completed),
-        Err(err) => tracing::warn!("goal state lock poisoned while syncing host goal: {err}"),
-    }
-}
-
-fn goal_objective_for_prompt(
-    configured_goal: Option<&str>,
-    goal_state: &SharedGoalState,
-) -> Option<String> {
-    match goal_state.lock() {
-        Ok(state) => {
-            if state.objective().is_some() {
-                return state.is_active().then(|| {
-                    state
-                        .objective()
-                        .expect("checked goal objective")
-                        .to_string()
-                });
-            }
-        }
-        Err(err) => tracing::warn!("goal state lock poisoned while building prompt: {err}"),
-    }
-    normalized_goal_objective(configured_goal)
 }
 
 /// Spawn the engine in a background task
@@ -2633,8 +2083,9 @@ mod handle;
 pub(crate) use context::compact_tool_result_for_context;
 use context::{
     COMPACTION_SUMMARY_MARKER, MAX_CONTEXT_RECOVERY_ATTEMPTS, MIN_RECENT_MESSAGES_TO_KEEP,
-    context_input_budget, effective_max_output_tokens, estimate_input_tokens_conservative,
-    extract_compaction_summary_prompt, is_context_length_error_message, summarize_text,
+    TURN_MAX_OUTPUT_TOKENS, context_input_budget, effective_max_output_tokens,
+    estimate_input_tokens_conservative, extract_compaction_summary_prompt,
+    is_context_length_error_message, summarize_text, turn_response_headroom_tokens,
 };
 mod dispatch;
 mod loop_guard;
@@ -2644,10 +2095,6 @@ mod tool_catalog;
 mod tool_execution;
 mod tool_setup;
 mod turn_loop;
-
-pub(crate) fn default_active_native_tool_names() -> &'static [&'static str] {
-    tool_catalog::DEFAULT_ACTIVE_NATIVE_TOOLS
-}
 
 use self::approval::{ApprovalDecision, ApprovalResult, UserInputDecision};
 #[cfg(test)]
@@ -2661,7 +2108,7 @@ use self::dispatch::{
 };
 use self::loop_guard::{AttemptDecision, LoopGuard, OutcomeDecision};
 #[cfg(test)]
-use self::lsp_hooks::edited_paths_for_tool;
+use self::lsp_hooks::{edited_paths_for_tool, parse_patch_paths};
 #[cfg(test)]
 use self::streaming::TOOL_CALL_START_MARKERS;
 use self::streaming::{
@@ -2671,19 +2118,23 @@ use self::streaming::{
     should_transparently_retry_stream, stream_chunk_timeout_secs,
 };
 use self::tool_catalog::{
-    CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
-    REQUEST_USER_INPUT_NAME, active_tools_for_step, apply_provider_tool_policy,
-    build_model_tool_catalog, ensure_advanced_tooling, execute_code_execution_tool,
-    execute_tool_search, initial_active_tools, is_tool_search_tool,
-    maybe_hydrate_requested_deferred_tool, missing_tool_error_message,
+    CODE_EXECUTION_TOOL_NAME, DOTNET_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME,
+    GO_EXECUTION_TOOL_NAME, MULTI_TOOL_PARALLEL_NAME,
+    RUST_EXECUTION_TOOL_NAME, TS_EXECUTION_TOOL_NAME,
+    REQUEST_USER_INPUT_NAME, active_tools_for_step, build_model_tool_catalog,
+    ensure_advanced_tooling, execute_code_execution_tool, execute_runtime_tool,
+    execute_tool_search,
+    initial_active_tools, is_tool_search_tool, maybe_hydrate_requested_deferred_tool,
+    missing_tool_error_message,
 };
 #[cfg(test)]
 use self::tool_catalog::{
-    TOOL_SEARCH_BM25_NAME, TOOL_SEARCH_REGEX_NAME, maybe_activate_requested_deferred_tool,
+    TOOL_SEARCH_BM25_NAME, maybe_activate_requested_deferred_tool,
     preflight_requested_deferred_tool, should_default_defer_tool,
 };
 use self::tool_execution::emit_tool_audit;
 use self::tool_setup::sandbox_policy_for_mode;
+use crate::tools::dotnet_execution::execute_dotnet_execution_tool;
 use crate::tools::js_execution::execute_js_execution_tool;
 
 #[cfg(test)]
