@@ -2032,9 +2032,6 @@ impl RuntimeThreadManager {
             goal_objective: None,
             allowed_tools: None,
             hook_executor: None,
-            locale_tag: crate::localization::resolve_locale(&settings.locale)
-                .tag()
-                .to_string(),
             workshop: self.config.workshop.clone(),
             search_provider: self.config.search_provider(),
             search_api_key: self.config.search.as_ref().and_then(|s| s.api_key.clone()),

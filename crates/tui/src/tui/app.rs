@@ -1174,6 +1174,10 @@ pub struct App {
     /// Active tool restriction from custom slash command frontmatter.
     /// `None` means the current turn may use the normal tool set.
     pub active_allowed_tools: Option<Vec<String>>,
+    /// Whether the current pausable command is paused (ESC once).
+    pub paused: bool,
+    /// Whether the active command has `pausable: true` in frontmatter.
+    pub pausable: bool,
     pub history: Vec<HistoryCell>,
     pub history_version: u64,
     /// Per-cell revision counter, kept in lockstep with `history`.
@@ -1985,6 +1989,8 @@ impl App {
             hunt: HuntState::default(),
             session: SessionState::default(),
             active_allowed_tools: None,
+            paused: false,
+            pausable: false,
             history: Vec::new(),
             history_version: 0,
             history_revisions: Vec::new(),

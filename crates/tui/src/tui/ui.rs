@@ -855,7 +855,6 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         ),
         max_spawn_depth: crate::tools::subagent::DEFAULT_MAX_SPAWN_DEPTH,
         allowed_tools: app.active_allowed_tools.clone(),
-        hook_executor: app.runtime_services.hook_executor.clone(),
         network_policy: config.network.clone().map(|toml_cfg| {
             crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
         }),
@@ -3442,6 +3441,14 @@ async fn run_event_loop(
                             // straight into Selecting on the next Esc.
                             app.backtrack.reset();
                             app.close_slash_menu();
+                        }
+                        EscapeAction::PauseCommand => {
+                            app.backtrack.reset();
+                            app.paused = true;
+                            engine_handle.cancel();
+                            mark_active_turn_cancelled_locally(app);
+                            current_streaming_text.clear();
+                            app.status_message = Some("Command paused. Press Esc again to cancel.".to_string());
                         }
                         EscapeAction::CancelRequest => {
                             app.backtrack.reset();

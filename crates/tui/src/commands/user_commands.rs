@@ -1,5 +1,3 @@
-//! User-defined slash commands from `~/.codewhale/commands/<name>.md` and
-//! workspace-local `<workspace>/.codewhale/commands/<name>.md`.
 //!
 //! Users drop `.md` files into a commands directory and the filename
 //! (without `.md` extension) becomes a slash command. When invoked via
@@ -216,6 +214,10 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
                         app.active_allowed_tools = Some(parse_allowed_tools(value));
                     }
                     _ => {}
+                }
+                if key == "pausable" && value.trim().eq_ignore_ascii_case("true") {
+                    app.pausable = true;
+                    app.paused = false;
                 }
             }
             let message = apply_template(body, args);
