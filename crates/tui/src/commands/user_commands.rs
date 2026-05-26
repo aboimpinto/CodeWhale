@@ -714,4 +714,79 @@ mod tests {
         assert_eq!(app.active_allowed_tools, Some(vec!["bash".to_string(), "grep".to_string()]));
     }
 
+    // ── pausable frontmatter ────────────────────────────────────────
+
+    #[test]
+    fn test_pausable_frontmatter_sets_app_state() {
+        use crate::config::Config;
+
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+        write_command(&ws.join(".deepseek").join("commands"), "scan",
+            "---\npausable: true\n---\ndo scan");
+
+        let mut app = crate::tui::app::App::new(
+            crate::tui::app::TuiOptions {
+                model: "deepseek-v4-pro".to_string(),
+                workspace: ws.clone(),
+                config_path: None,
+                config_profile: None,
+                allow_shell: false,
+                use_alt_screen: true,
+                use_mouse_capture: false,
+                use_bracketed_paste: true,
+                max_subagents: 1,
+                skills_dir: PathBuf::from("."),
+                memory_path: PathBuf::from("memory.md"),
+                notes_path: PathBuf::from("notes.txt"),
+                mcp_config_path: PathBuf::from("mcp.json"),
+                use_memory: false,
+                start_in_agent_mode: false,
+                skip_onboarding: true,
+                yolo: false,
+                resume_session_id: None,
+                initial_input: None,
+            },
+            &Config::default(),
+        );
+        let _ = try_dispatch_user_command(&mut app, "/scan");
+        assert!(app.pausable, "expected pausable to be true when frontmatter has pausable: true");
+    }
+
+    #[test]
+    fn test_non_pausable_command_does_not_set_pausable() {
+        use crate::config::Config;
+
+        let tmp = TempDir::new().unwrap();
+        let ws = tmp.path().to_path_buf();
+        write_command(&ws.join(".deepseek").join("commands"), "plain", "just a command");
+
+        let mut app = crate::tui::app::App::new(
+            crate::tui::app::TuiOptions {
+                model: "deepseek-v4-pro".to_string(),
+                workspace: ws.clone(),
+                config_path: None,
+                config_profile: None,
+                allow_shell: false,
+                use_alt_screen: true,
+                use_mouse_capture: false,
+                use_bracketed_paste: true,
+                max_subagents: 1,
+                skills_dir: PathBuf::from("."),
+                memory_path: PathBuf::from("memory.md"),
+                notes_path: PathBuf::from("notes.txt"),
+                mcp_config_path: PathBuf::from("mcp.json"),
+                use_memory: false,
+                start_in_agent_mode: false,
+                skip_onboarding: true,
+                yolo: false,
+                resume_session_id: None,
+                initial_input: None,
+            },
+            &Config::default(),
+        );
+        let _ = try_dispatch_user_command(&mut app, "/plain");
+        assert!(!app.pausable, "expected pausable to remain false for non-pausable command");
+    }
+
 }
