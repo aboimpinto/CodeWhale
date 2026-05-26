@@ -284,6 +284,7 @@ fn work_panel_lines(
     let theme = Theme::for_palette_mode(palette_mode);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(max_rows.max(4));
 
+    tracing::debug!(target: "pausable", indicator = ?summary.pause_indicator, "work panel rendering");
     push_work_goal_lines(summary, content_width, max_rows, &mut lines);
 
     if summary.state_updating && lines.len() < max_rows {
