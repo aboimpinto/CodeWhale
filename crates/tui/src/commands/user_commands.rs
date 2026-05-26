@@ -194,7 +194,8 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
     let command = command.strip_prefix('/').unwrap_or(&command);
     let args = parts.get(1).copied().unwrap_or("").trim();
 
-    let user_commands = load_user_commands(Some(&app.workspace));
+        tracing::debug!(target: "pausable", input, command, "try_dispatch_user_command called");
+        let user_commands = load_user_commands(Some(&app.workspace));
 
     for (name, content) in &user_commands {
         if name == command {
