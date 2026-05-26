@@ -163,6 +163,9 @@ pub(crate) fn handle_history_search_key(app: &mut App, key: KeyEvent) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+    use crate::tui::app::QueuedMessage;
+
     use super::*;
 
     fn make_app(pausable: bool, paused: bool, is_loading: bool) -> App {
@@ -231,7 +234,7 @@ mod tests {
     #[test]
     fn test_discard_draft_when_paused() {
         let mut app = make_app(true, true, false);
-        app.queued_draft = Some("draft".to_string());
+        app.queued_draft = Some(QueuedMessage { display: "draft".to_string(), skill_instruction: None });
         let action = next_escape_action(&app, false);
         assert!(matches!(action, EscapeAction::DiscardQueuedDraft),
             "expected DiscardQueuedDraft when draft queued and not loading, got {action:?}");

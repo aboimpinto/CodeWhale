@@ -2125,7 +2125,7 @@ impl Engine {
         // When self.paused is true, the tool gate should produce a
         // blocked_error for any tool call.
         let mut blocked_error: Option<ToolError> = None;
-        let tool_name = "read_file".to_string();
+        let _tool_name = "read_file".to_string();
         let paused = true;
 
         if blocked_error.is_none() && paused {
@@ -2186,7 +2186,6 @@ impl Engine {
             "expected 'paused' error, got: {msg}");
     }
 
-    #[test]
 fn subagent_completion_runtime_message(payload: &str) -> Message {
     Message {
         role: "system".to_string(),

@@ -1822,7 +1822,7 @@ mod tests {
     use super::{
         ACTIVE_TOOL_COMPLETED_ROW_TTL, ACTIVE_TOOL_STALE_RUNNING_ROW_TTL, AutoSidebarPanel,
         AutoSidebarState, SidebarAgentRow, SidebarSubagentSummary, SidebarWorkChecklistItem,
-        SidebarWorkStrategyStep, SidebarWorkSummary, auto_sidebar_panels, subagent_panel_lines,
+        SidebarWorkStrategyStep, SidebarWorkSummary, auto_sidebar_panels, sidebar_work_summary, subagent_panel_lines,
         task_panel_lines, work_panel_empty_hint, work_panel_lines,
     };
     use crate::config::Config;
