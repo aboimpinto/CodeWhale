@@ -1176,6 +1176,8 @@ pub struct App {
     pub active_allowed_tools: Option<Vec<String>>,
     /// Whether the current pausable command is paused (ESC once).
     pub paused: bool,
+    /// Timestamp of the last pause (for ESC debounce).
+    pub paused_at: Option<std::time::Instant>,
     /// Whether the active command has `pausable: true` in frontmatter.
     pub pausable: bool,
     /// Snapshot ID for rollback of a pausable command.
@@ -1992,6 +1994,7 @@ impl App {
             session: SessionState::default(),
             active_allowed_tools: None,
             paused: false,
+            paused_at: None,
             pausable: false,
             active_snapshot: None,
             history: Vec::new(),

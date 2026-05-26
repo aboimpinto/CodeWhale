@@ -20,6 +20,18 @@ pub(crate) fn next_escape_action(app: &App, slash_menu_open: bool) -> EscapeActi
     } else if app.is_loading {
         if app.pausable && !app.paused {
             EscapeAction::PauseCommand
+        } else if app.pausable && app.paused {
+            // Cancel request from second ESC needs debounce
+            // to avoid terminal key-repeat overwriting pause message.
+            const PAUSE_DEBOUNCE_MS: u128 = 300;
+            let enough_time = app.paused_at
+                .map(|t| t.elapsed().as_millis() >= PAUSE_DEBOUNCE_MS)
+                .unwrap_or(true);
+            if enough_time {
+                EscapeAction::CancelRequest
+            } else {
+                EscapeAction::Noop
+            }
         } else {
             EscapeAction::CancelRequest
         }

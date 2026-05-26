@@ -1345,6 +1345,7 @@ async fn run_event_loop(
                         // user message has no restriction.
                         app.active_allowed_tools = None;
                         app.paused = false;
+                        app.paused_at = None;
                         app.pausable = false;
                         app.is_loading = true;
                         app.offline_mode = false;
@@ -2916,6 +2917,7 @@ async fn run_event_loop(
                         EscapeAction::PauseCommand => {
                             app.backtrack.reset();
                             app.paused = true;
+                            app.paused_at = Some(std::time::Instant::now());
                             let _ = engine_handle.send(crate::core::ops::Op::SetPaused { paused: true }).await;
                             current_streaming_text.clear();
                             current_streaming_text.clear();
