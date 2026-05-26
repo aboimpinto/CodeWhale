@@ -1999,7 +1999,6 @@ impl App {
             paused_at: None,
             pausable: false,
             paused_cancelled: false,
-            paused_cancelled: false,
             active_snapshot: None,
             history: Vec::new(),
             history_version: 0,
