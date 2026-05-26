@@ -12,6 +12,7 @@ mod core;
 mod debug;
 mod feedback;
 mod goal;
+pub mod groups;
 mod hooks;
 mod init;
 mod jobs;
@@ -554,139 +555,68 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         return result;
     }
 
-    // Match command or alias
+    // Legacy command migrations (kept out of registry/autocomplete intentionally).
     match command {
-        // Core commands
-        "anchor" | "maodian" => anchor::anchor(app, arg),
-        "help" | "?" | "bangzhu" | "帮助" => core::help(app, arg),
-        "clear" | "qingping" => core::clear(app),
-        "exit" | "quit" | "q" | "tuichu" => core::exit(),
-        "model" | "moxing" => core::model(app, arg),
-        "models" | "moxingliebiao" => core::models(app),
-        "provider" => provider::provider(app, arg),
-        "queue" | "queued" => queue::queue(app, arg),
-        "stash" | "park" => stash::stash(app, arg),
-        "hooks" | "hook" | "gouzi" => hooks::hooks(app, arg),
-        "subagents" | "agents" | "zhinengti" => core::subagents(app),
-        "agent" | "daili" => agent(app, arg),
-        "links" | "dashboard" | "api" | "lianjie" => core::deepseek_links(app),
-        "feedback" => feedback::feedback(app, arg),
-        "home" | "stats" | "overview" | "zhuye" | "shouye" => core::home_dashboard(app),
-        "workspace" | "cwd" => core::workspace_switch(app, arg),
-        "note" => note::note(app, arg),
-        "memory" => memory::memory(app, arg),
-        "attach" | "image" | "media" | "fujian" => attachment::attach(app, arg),
-        "task" | "tasks" => task::task(app, arg),
-        "jobs" | "job" | "zuoye" => jobs::jobs(app, arg),
-        "mcp" => mcp::mcp(app, arg),
-        "network" => network::network(app, arg),
-
-        // Session commands
-        "rename" | "gaiming" | "chongmingming" => rename::rename(app, arg),
-        "save" => session::save(app, arg),
-        "fork" | "branch" => session::fork(app),
-        "new" => session::new_session(app, arg),
-        "sessions" | "resume" => session::sessions(app, arg),
-        "relay" | "batonpass" | "接力" => relay(app, arg),
-        "load" | "jiazai" => session::load(app, arg),
-        "compact" | "yasuo" => session::compact(app),
-        "purge" | "qingchu" => session::purge(app),
-        "export" | "daochu" => session::export(app, arg),
-
-        // Config commands
-        "config" => config::config_command(app, arg),
-        "settings" => config::show_settings(app),
-        "status" => status::status(app),
-        "statusline" => config::status_line(app),
-        "mode" => config::mode(app, arg),
-        "jihua" => config::mode(app, Some("plan")),
-        "zidong" => config::mode(app, Some("yolo")),
-        "theme" => config::theme(app, arg),
-        "verbose" => config::verbose(app, arg),
-        "trust" | "xinren" => config::trust(app, arg),
-        "logout" => config::logout(app),
-
-        // Debug commands
-        "translate" | "translation" | "transale" => core::translate(app),
-        "tokens" => debug::tokens(app),
-        "cost" => debug::cost(app),
-        "balance" => balance::balance(app),
-        "cache" => debug::cache(app, arg),
-
-        // Slop ledger (#2127)
-        "slop" | "canzha" => config::slop(app, arg),
-
-        // ChangeLog command
-        "change" => change::change(app, arg),
-        "system" | "xitong" => debug::system_prompt(app),
-        "context" | "ctx" => debug::context(app),
-        "edit" => debug::edit(app),
-        "diff" => debug::diff(app),
-        "undo" => {
-            // Try surgical patch-undo first; fall back to conversation undo
-            // if no snapshots are available or if the snapshot undo couldn't
-            // find anything useful.
-            let result = debug::patch_undo(app);
-            if result.message.as_deref().is_none_or(|m| {
-                m.starts_with("No snapshots found")
-                    || m.starts_with("No tool or pre-turn")
-                    || m.starts_with("Snapshot repo")
-            }) {
-                debug::undo_conversation(app)
-            } else {
-                result
-            }
+        "set" => {
+            return CommandResult::error(
+                "The /set command was retired. Use /config to edit settings and /settings to inspect current values.",
+            );
         }
-        "retry" | "chongshi" => debug::retry(app),
-
-        // Project commands
-        "init" => init::init(app),
-        "lsp" => config::lsp_command(app, arg),
-        "share" => share::share(app, arg),
-        "goal" | "hunt" | "mubiao" | "狩猎" => goal::hunt(app, arg),
-
-        // Skills commands
-        "skills" | "jinengliebiao" => skills::list_skills(app, arg),
-        "skill" | "jineng" => skills::run_skill(app, arg),
-        "review" | "shencha" => review::review(app, arg),
-        "restore" => restore::restore(app, arg),
-
-        // Profile switch (#390)
-        "profile" | "dangan" => core::profile_switch(app, arg),
-
-        // RLM command
-        "rlm" | "recursive" | "digui" => rlm(app, arg),
-
-        // Legacy command migrations (kept out of registry/autocomplete intentionally).
-        "set" => CommandResult::error(
-            "The /set command was retired. Use /config to edit settings and /settings to inspect current values.",
-        ),
-        "deepseek" => CommandResult::error(
-            "The /deepseek command was renamed. Use /links (aliases: /dashboard, /api).",
-        ),
-
-        _ => {
-            // Third source: skills (lowest precedence after native and user-config).
-            // Try to run a skill whose name matches the command.
-            if skills::run_skill_by_name(app, command, arg).is_some() {
-                return skills::run_skill_by_name(app, command, arg).unwrap();
-            }
-            let suggestions = suggest_command_names(command, 3);
-            if suggestions.is_empty() {
-                CommandResult::error(format!(
-                    "Unknown command: /{command}. Type /help for available commands."
-                ))
-            } else {
-                let list = suggestions
-                    .into_iter()
-                    .map(|name| format!("/{name}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                CommandResult::error(format!(
-                    "Unknown command: /{command}. Did you mean: {list}? Type /help for available commands."
-                ))
-            }
+        "deepseek" => {
+            return CommandResult::error(
+                "The /deepseek command was renamed. Use /links (aliases: /dashboard, /api).",
+            );
         }
+        _ => {}
+    }
+
+    // Dispatch to command groups.
+    // Try each group in defined order; the first match wins.
+    if let Some(result) = groups::core::dispatch(command, arg, app) {
+        return result;
+    }
+    if let Some(result) = groups::session::dispatch(command, arg, app) {
+        return result;
+    }
+    if let Some(result) = groups::config::dispatch(command, arg, app) {
+        return result;
+    }
+    if let Some(result) = groups::debug::dispatch(command, arg, app) {
+        return result;
+    }
+    if let Some(result) = groups::project::dispatch(command, arg, app) {
+        return result;
+    }
+    if let Some(result) = groups::memory::dispatch(command, arg, app) {
+        return result;
+    }
+    if let Some(result) = groups::skills::dispatch(command, arg, app) {
+        return result;
+    }
+    if let Some(result) = groups::utility::dispatch(command, arg, app) {
+        return result;
+    }
+
+    // Third source: skills (lowest precedence after native and user-config).
+    // Try to run a skill whose name matches the command.
+    if let Some(result) = skills::run_skill_by_name(app, command, arg) {
+        return result;
+    }
+
+    let suggestions = suggest_command_names(command, 3);
+    if suggestions.is_empty() {
+        CommandResult::error(format!(
+            "Unknown command: /{command}. Type /help for available commands."
+        ))
+    } else {
+        let list = suggestions
+            .into_iter()
+            .map(|name| format!("/{name}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        CommandResult::error(format!(
+            "Unknown command: /{command}. Did you mean: {list}? Type /help for available commands."
+        ))
     }
 }
 
