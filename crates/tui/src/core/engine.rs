@@ -558,6 +558,7 @@ impl Engine {
             deepseek_client_error,
             api_key_env_only_recovery,
             session,
+            paused: false,
             subagent_manager,
             shell_manager,
             mcp_pool: None,
@@ -645,21 +646,6 @@ impl Engine {
                         self.reset_cancel_token();
                     }
                     let _ = self.tx_event.send(Event::Status {
-                        message: if paused {
-                            "Command paused".to_string()
-                        } else {
-                            "Command resumed".to_string()
-                        },
-                    }).await;
-                }
-                Op::SetPaused { paused } => {
-                    self.paused = paused;
-                    if paused {
-                        self.cancel_token.cancel();
-                    } else {
-                        self.reset_cancel_token();
-                    }
-                    let _ = self.tx_event.send(crate::core::events::Event::Status {
                         message: if paused {
                             "Command paused".to_string()
                         } else {
