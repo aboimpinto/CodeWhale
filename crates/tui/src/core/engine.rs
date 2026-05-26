@@ -299,6 +299,8 @@ pub struct Engine {
     deepseek_client_error: Option<String>,
     api_key_env_only_recovery: Option<String>,
     session: Session,
+    /// Whether the current turn is paused (for pausable commands).
+    pub paused: bool,
     subagent_manager: SharedSubAgentManager,
     shell_manager: SharedShellManager,
     mcp_pool: Option<Arc<AsyncMutex<McpPool>>>,

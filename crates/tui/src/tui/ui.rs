@@ -4114,6 +4114,7 @@ async fn dispatch_user_message(
             approval_mode: app.approval_mode,
             translation_enabled: app.translation_enabled,
             allowed_tools: app.active_allowed_tools.clone(),
+            hook_executor: Some(std::sync::Arc::new(app.hooks.clone())),
         })
         .await
     {
