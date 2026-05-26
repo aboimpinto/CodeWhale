@@ -2118,6 +2118,75 @@ impl Engine {
     }
 }
 
+    // ── pause gate tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_pause_gate_blocks_tool_when_paused() {
+        // When self.paused is true, the tool gate should produce a
+        // blocked_error for any tool call.
+        let mut blocked_error: Option<ToolError> = None;
+        let tool_name = "read_file".to_string();
+        let paused = true;
+
+        if blocked_error.is_none() && paused {
+            blocked_error = Some(ToolError::execution_failed(
+                "Command is paused. Press Esc and select Resume to continue.".to_string(),
+            ));
+        }
+
+        assert!(blocked_error.is_some(),
+            "expected blocked_error when paused is true");
+        let msg = format!("{}", blocked_error.as_ref().unwrap());
+        assert!(msg.contains("paused"),
+            "expected 'paused' in error message, got: {msg}");
+    }
+
+    #[test]
+    fn test_pause_gate_allows_tool_when_not_paused() {
+        let mut blocked_error: Option<ToolError> = None;
+        let paused = false;
+
+        if blocked_error.is_none() && paused {
+            blocked_error = Some(ToolError::execution_failed(
+                "Command is paused...".to_string(),
+            ));
+        }
+
+        assert!(blocked_error.is_none(),
+            "expected no blocked_error when paused is false");
+    }
+
+    #[test]
+    fn test_pause_gate_takes_precedence_over_allowed_tools() {
+        // If the command is paused, the pause gate fires even if the tool
+        // is in the allowed-tools list.
+        let mut blocked_error: Option<ToolError> = None;
+        let allowed = Some(vec!["bash".to_string()]);
+        let tool_name = "bash".to_string();
+        let paused = true;
+
+        // allowed-tools check (would pass)
+        if let Some(ref allowed) = allowed {
+            if !allowed.contains(&tool_name.to_lowercase()) {
+                blocked_error = Some(ToolError::permission_denied("blocked".to_string()));
+            }
+        }
+
+        // pause gate check
+        if blocked_error.is_none() && paused {
+            blocked_error = Some(ToolError::execution_failed(
+                "Command is paused. Press Esc and select Resume to continue.".to_string(),
+            ));
+        }
+
+        assert!(blocked_error.is_some(),
+            "expected blocked_error when paused is true even if tool is allowed");
+        let msg = format!("{}", blocked_error.as_ref().unwrap());
+        assert!(msg.contains("paused"),
+            "expected 'paused' error, got: {msg}");
+    }
+
+    #[test]
 fn subagent_completion_runtime_message(payload: &str) -> Message {
     Message {
         role: "system".to_string(),

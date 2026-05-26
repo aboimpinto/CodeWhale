@@ -160,3 +160,89 @@ pub(crate) fn handle_history_search_key(app: &mut App, key: KeyEvent) {
         _ => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_app(pausable: bool, paused: bool, is_loading: bool) -> App {
+        let mut app = App::new(
+            crate::tui::app::TuiOptions {
+                model: "test".to_string(),
+                workspace: PathBuf::from("."),
+                config_path: None,
+                config_profile: None,
+                allow_shell: false,
+                use_alt_screen: true,
+                use_mouse_capture: false,
+                use_bracketed_paste: true,
+                max_subagents: 1,
+                skills_dir: PathBuf::from("."),
+                memory_path: PathBuf::from("memory.md"),
+                notes_path: PathBuf::from("notes.txt"),
+                mcp_config_path: PathBuf::from("mcp.json"),
+                use_memory: false,
+                start_in_agent_mode: false,
+                skip_onboarding: true,
+                yolo: false,
+                resume_session_id: None,
+                initial_input: None,
+            },
+            &crate::config::Config::default(),
+        );
+        app.pausable = pausable;
+        app.paused = paused;
+        app.is_loading = is_loading;
+        app
+    }
+
+    #[test]
+    fn test_pause_command_returned_when_pausable_and_loading() {
+        let app = make_app(true, false, true);
+        let action = next_escape_action(&app, false);
+        assert!(matches!(action, EscapeAction::PauseCommand),
+            "expected PauseCommand when pausable+loading, got {action:?}");
+    }
+
+    #[test]
+    fn test_cancel_returned_when_already_paused() {
+        let app = make_app(true, true, true);
+        let action = next_escape_action(&app, false);
+        assert!(matches!(action, EscapeAction::CancelRequest),
+            "expected CancelRequest when already paused, got {action:?}");
+    }
+
+    #[test]
+    fn test_close_slash_menu_takes_priority() {
+        let app = make_app(true, false, true);
+        let action = next_escape_action(&app, true);
+        assert!(matches!(action, EscapeAction::CloseSlashMenu),
+            "expected CloseSlashMenu when slash menu open, got {action:?}");
+    }
+
+    #[test]
+    fn test_normal_cancel_when_not_pausable() {
+        let app = make_app(false, false, true);
+        let action = next_escape_action(&app, false);
+        assert!(matches!(action, EscapeAction::CancelRequest),
+            "expected CancelRequest when loading+not pausable, got {action:?}");
+    }
+
+    #[test]
+    fn test_discard_draft_when_paused() {
+        let mut app = make_app(true, true, false);
+        app.queued_draft = Some("draft".to_string());
+        let action = next_escape_action(&app, false);
+        assert!(matches!(action, EscapeAction::DiscardQueuedDraft),
+            "expected DiscardQueuedDraft when draft queued and not loading, got {action:?}");
+    }
+
+    #[test]
+    fn test_clear_input_when_not_loading() {
+        let mut app = make_app(true, false, false);
+        app.input = "hello".to_string();
+        let action = next_escape_action(&app, false);
+        assert!(matches!(action, EscapeAction::ClearInput),
+            "expected ClearInput when not loading and has input, got {action:?}");
+    }
+}
