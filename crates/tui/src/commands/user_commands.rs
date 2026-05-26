@@ -221,7 +221,7 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
                     // Snapshot workspace for potential rollback
                     if let Ok(repo) = crate::snapshot::repo::SnapshotRepo::open_or_init(&app.workspace) {
                         let id = repo.snapshot("pausable-command").ok();
-                        app.active_snapshot = id.map(|i| i.to_string());
+                        app.active_snapshot = id.map(|i| i.0);
                     }
                 }
             }

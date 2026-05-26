@@ -6,6 +6,7 @@
 //! checkpoints, and loop termination.
 
 use super::*;
+use crate::hooks::{HookContext, HookEvent};
 
 fn loop_guard_block_tool_result(message: String) -> ToolResult {
     ToolResult::error(message).with_metadata(json!({"loop_guard": "identical_tool_call"}))
@@ -1224,8 +1225,7 @@ impl Engine {
                     && hook_executor.has_hooks_for_event(HookEvent::ToolCallBefore)
                 {
                     let hook_ctx = HookContext::new()
-                        .with_tool_name(&tool_name)
-                        .with_tool_args(&tool_args);
+                        .with_tool_name(&tool_name);
                     let hook_results = hook_executor.execute(HookEvent::ToolCallBefore, &hook_ctx);
                     for result in &hook_results {
                         if result.exit_code == Some(2) {
