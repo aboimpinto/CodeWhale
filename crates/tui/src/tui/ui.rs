@@ -1346,7 +1346,6 @@ async fn run_event_loop(
                         app.active_allowed_tools = None;
                         app.paused = false;
                         app.pausable = false;
-                        app.active_snapshot = None;
                         app.is_loading = true;
                         app.offline_mode = false;
                         app.turn_error_posted = false;
