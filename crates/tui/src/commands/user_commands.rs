@@ -224,15 +224,28 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
                     }
                     app.pausable = true;
                     app.paused = false;
-                    // Snapshot workspace for potential rollback
-                    match crate::snapshot::repo::SnapshotRepo::open_or_init(&app.workspace) {
-                        Ok(repo) => {
-                            match repo.snapshot("pausable-command") {
-                                Ok(id) => { app.active_snapshot = Some(id.0); }
-                                Err(e) => { tracing::warn!(target: "pausable", error = %e, "failed to create snapshot for pausable command"); }
+                    // Snapshot workspace for potential rollback via git stash
+                    let git_stash_cmd = std::process::Command::new("git")
+                        .args(["-C", &app.workspace.to_string_lossy(), "stash", "push", "--include-untracked", "-m", "codewhale-pausable"])
+                        .output();
+                    match git_stash_cmd {
+                        Ok(output) if output.status.success() => {
+                            // git stash returns the stash reference on stdout
+                            let ref_name = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                            if ref_name.contains("stash") || ref_name.contains("HEAD") {
+                                app.active_snapshot = Some("stash".to_string());
+                            } else {
+                                app.active_snapshot = Some("stash".to_string());
                             }
+                            tracing::debug!(target: "pausable", "created git stash snapshot");
                         }
-                        Err(e) => { tracing::warn!(target: "pausable", error = %e, "failed to open snapshot repo for pausable command"); }
+                        Ok(output) => {
+                            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                            tracing::warn!(target: "pausable", stderr, "git stash failed");
+                        }
+                        Err(e) => {
+                            tracing::warn!(target: "pausable", error = %e, "failed to run git stash");
+                        }
                     }
                 }
             }

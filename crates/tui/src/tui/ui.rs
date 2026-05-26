@@ -2927,12 +2927,11 @@ async fn run_event_loop(
                             // Save snapshot state before taking it
                             let was_snapshotted = app.active_snapshot.is_some();
                             tracing::debug!(target: "pausable", was_snapshotted, "cancel request with snapshot check");
-                            // Restore workspace snapshot if this was a pausable command
-                            if let Some(snap_id) = app.active_snapshot.take() {
-                                if let Ok(repo) = crate::snapshot::repo::SnapshotRepo::open_or_init(&app.workspace) {
-                                    let id = crate::snapshot::repo::SnapshotId(snap_id);
-                                    let _ = repo.restore(&id);
-                                }
+                            // Restore workspace snapshot via git stash pop
+                            if app.active_snapshot.take().is_some() {
+                                let _ = std::process::Command::new("git")
+                                    .args(["-C", &app.workspace.to_string_lossy(), "stash", "pop"])
+                                    .output();
                             }
                             engine_handle.cancel();
                             mark_active_turn_cancelled_locally(app);
