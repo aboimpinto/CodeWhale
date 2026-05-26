@@ -1178,6 +1178,8 @@ pub struct App {
     pub paused: bool,
     /// Whether the active command has `pausable: true` in frontmatter.
     pub pausable: bool,
+    /// Snapshot ID for rollback of a pausable command.
+    pub active_snapshot: Option<String>,
     pub history: Vec<HistoryCell>,
     pub history_version: u64,
     /// Per-cell revision counter, kept in lockstep with `history`.
@@ -1991,6 +1993,7 @@ impl App {
             active_allowed_tools: None,
             paused: false,
             pausable: false,
+            active_snapshot: None,
             history: Vec::new(),
             history_version: 0,
             history_revisions: Vec::new(),
