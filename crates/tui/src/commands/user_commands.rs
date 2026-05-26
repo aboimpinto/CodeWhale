@@ -225,9 +225,14 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
                     app.pausable = true;
                     app.paused = false;
                     // Snapshot workspace for potential rollback
-                    if let Ok(repo) = crate::snapshot::repo::SnapshotRepo::open_or_init(&app.workspace) {
-                        let id = repo.snapshot("pausable-command").ok();
-                        app.active_snapshot = id.map(|i| i.0);
+                    match crate::snapshot::repo::SnapshotRepo::open_or_init(&app.workspace) {
+                        Ok(repo) => {
+                            match repo.snapshot("pausable-command") {
+                                Ok(id) => { app.active_snapshot = Some(id.0); }
+                                Err(e) => { tracing::warn!(target: "pausable", error = %e, "failed to create snapshot for pausable command"); }
+                            }
+                        }
+                        Err(e) => { tracing::warn!(target: "pausable", error = %e, "failed to open snapshot repo for pausable command"); }
                     }
                 }
             }
