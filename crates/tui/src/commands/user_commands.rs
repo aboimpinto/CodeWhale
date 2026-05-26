@@ -217,6 +217,7 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
                     _ => {}
                 }
                 if key == "pausable" && value.trim().eq_ignore_ascii_case("true") {
+                    tracing::debug!(target: "pausable", value, "PAUSABLE FRONTMATTER MATCHED");
                     // If a previous pausable command has a snapshot, restore it first
                     if let Some(snap_id) = app.active_snapshot.take() {
                         if let Ok(repo) = crate::snapshot::repo::SnapshotRepo::open_or_init(&app.workspace) {
