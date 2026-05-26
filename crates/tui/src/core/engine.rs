@@ -639,11 +639,8 @@ impl Engine {
                 Op::SetPaused { paused } => {
                     tracing::debug!(target: "engine", paused = paused, "set paused state");
                     self.paused = paused;
-                    if paused {
-                        self.cancel_token.cancel();
-                    } else {
-                        // Re-create cancel token when resuming so tool calls
-                        // can proceed.
+                    // Cancel only on unpause (pause just blocks tools via tool gate)
+                    if !paused {
                         self.reset_cancel_token();
                     }
                     let _ = self.tx_event.send(Event::Status {
