@@ -2924,6 +2924,9 @@ async fn run_event_loop(
                         }
                         EscapeAction::CancelRequest => {
                             app.backtrack.reset();
+                            // Save snapshot state before taking it
+                            let was_snapshotted = app.active_snapshot.is_some();
+                            tracing::debug!(target: "pausable", was_snapshotted, "cancel request with snapshot check");
                             // Restore workspace snapshot if this was a pausable command
                             if let Some(snap_id) = app.active_snapshot.take() {
                                 if let Ok(repo) = crate::snapshot::repo::SnapshotRepo::open_or_init(&app.workspace) {
@@ -2934,7 +2937,7 @@ async fn run_event_loop(
                             engine_handle.cancel();
                             mark_active_turn_cancelled_locally(app);
                             current_streaming_text.clear();
-                            app.status_message = Some("Request cancelled".to_string());
+                            app.status_message = Some(if was_snapshotted { "Pausable command cancelled and rolled back".to_string() } else { "Request cancelled".to_string() });
                         }
                         EscapeAction::DiscardQueuedDraft => {
                             app.backtrack.reset();

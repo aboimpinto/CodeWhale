@@ -637,6 +637,7 @@ impl Engine {
                     .await;
                 }
                 Op::SetPaused { paused } => {
+                    tracing::debug!(target: "engine", paused = paused, "set paused state");
                     self.paused = paused;
                     if paused {
                         self.cancel_token.cancel();
