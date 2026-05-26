@@ -1346,7 +1346,9 @@ async fn run_event_loop(
                         app.active_allowed_tools = None;
                         app.paused = false;
                         app.paused_at = None;
-                        app.pausable = false;
+                        // Don't clear pausable here -- it's set by frontmatter
+                        // parsing and must survive TurnStarted to be available
+                        // when the user presses ESC.
                         app.is_loading = true;
                         app.offline_mode = false;
                         app.turn_error_posted = false;
