@@ -2927,6 +2927,7 @@ async fn run_event_loop(
                             app.backtrack.reset();
                             // Save snapshot state before taking it
                             let was_snapshotted = app.active_snapshot.is_some();
+                            app.paused_cancelled = app.pausable;
                             tracing::debug!(target: "pausable", was_snapshotted, "cancel request with snapshot check");
                             // Restore workspace snapshot via git stash pop
                             if app.active_snapshot.take().is_some() {

@@ -1180,6 +1180,8 @@ pub struct App {
     pub paused_at: Option<std::time::Instant>,
     /// Whether the active command has `pausable: true` in frontmatter.
     pub pausable: bool,
+    /// Whether the last pausable command was cancelled.
+    pub paused_cancelled: bool,
     /// Snapshot ID for rollback of a pausable command.
     pub active_snapshot: Option<String>,
     pub history: Vec<HistoryCell>,
@@ -1996,6 +1998,8 @@ impl App {
             paused: false,
             paused_at: None,
             pausable: false,
+            paused_cancelled: false,
+            paused_cancelled: false,
             active_snapshot: None,
             history: Vec::new(),
             history_version: 0,

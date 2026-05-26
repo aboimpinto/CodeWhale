@@ -226,7 +226,7 @@ impl SidebarWorkSummary {
 fn sidebar_work_summary(app: &App) -> SidebarWorkSummary {
     let mut summary = SidebarWorkSummary {
         goal_objective: app.goal.goal_objective.clone(),
-        pause_indicator: if app.pausable { if app.paused { Some("(Paused)".to_string()) } else { None } } else { None },
+        pause_indicator: if app.pausable { if app.paused { Some("(Paused)".to_string()) } else if app.paused_cancelled { Some("(Cancelled)".to_string()) } else { None } } else if app.paused_cancelled { Some("(Cancelled)".to_string()) } else { None },
         goal_token_budget: app.goal.goal_token_budget,
         tokens_used: app.session.total_conversation_tokens,
         cycle_count: app.cycle_count,
