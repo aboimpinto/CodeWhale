@@ -91,3 +91,60 @@ pub(crate) fn handle_composer_history_arrow(
         _ => false,
     }
 }
+
+pub(crate) fn is_word_cursor_modifier(modifiers: KeyModifiers) -> bool {
+    modifiers.contains(KeyModifiers::CONTROL) || modifiers.contains(KeyModifiers::ALT)
+}
+
+pub(crate) fn is_composer_newline_key(key: KeyEvent) -> bool {
+    match key.code {
+        KeyCode::Char('j') => key.modifiers.contains(KeyModifiers::CONTROL),
+        KeyCode::Enter => {
+            key.modifiers.contains(KeyModifiers::ALT)
+                || (key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL))
+        }
+        _ => false,
+    }
+}
+
+pub(crate) fn handle_history_search_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Enter => {
+            let _ = app.accept_history_search();
+        }
+        KeyCode::Esc => {
+            app.cancel_history_search();
+        }
+        KeyCode::Char('c') | KeyCode::Char('C')
+            if key.modifiers.contains(KeyModifiers::CONTROL) =>
+        {
+            app.cancel_history_search();
+        }
+        KeyCode::Backspace => {
+            app.history_search_backspace();
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            while app
+                .history_search_query()
+                .is_some_and(|query| !query.is_empty())
+            {
+                app.history_search_backspace();
+            }
+        }
+        KeyCode::Up => {
+            app.history_search_select_previous();
+        }
+        KeyCode::Down => {
+            app.history_search_select_next();
+        }
+        KeyCode::Char(ch)
+            if key.modifiers.is_empty()
+                || key.modifiers == KeyModifiers::SHIFT
+                || key.modifiers == KeyModifiers::NONE =>
+        {
+            app.history_search_insert_char(ch);
+        }
+        _ => {}
+    }
+}
