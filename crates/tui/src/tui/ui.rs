@@ -2928,8 +2928,7 @@ async fn run_event_loop(
                             if let Some(snap_id) = app.active_snapshot.take() {
                                 if let Ok(repo) = crate::snapshot::repo::SnapshotRepo::open_or_init(&app.workspace) {
                                     let id = crate::snapshot::repo::SnapshotId(snap_id);
-                                        let _ = repo.restore(&id);
-                                    }
+                                    let _ = repo.restore(&id);
                                 }
                             }
                             engine_handle.cancel();
