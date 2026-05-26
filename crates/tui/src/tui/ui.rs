@@ -2935,6 +2935,7 @@ async fn run_event_loop(
                             engine_handle.cancel();
                             mark_active_turn_cancelled_locally(app);
                             current_streaming_text.clear();
+                            tracing::debug!(target: "pausable", was_snapshotted, "setting cancel status message");
                             app.status_message = Some(if was_snapshotted { "Pausable command cancelled and rolled back".to_string() } else { "Request cancelled".to_string() });
                         }
                         EscapeAction::DiscardQueuedDraft => {
