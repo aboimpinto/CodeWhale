@@ -5,9 +5,7 @@
 //! reads from `App` snapshots; mutation lives in the main app loop.
 
 use std::fmt::Write;
-use std::time::{Duration, Instant};
-
-use crate::tui::app::HuntVerdict;
+use std::time::Duration;
 
 use ratatui::{
     Frame,
@@ -24,7 +22,7 @@ use crate::tools::plan::StepStatus;
 use crate::tools::subagent::SubAgentStatus;
 use crate::tools::todo::TodoStatus;
 
-use super::app::{App, SidebarFocus, SidebarHoverSection, SidebarHoverState, TaskPanelEntry};
+use super::app::{App, SidebarFocus, TaskPanelEntry};
 use super::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus, summarize_tool_output};
 use super::subagent_routing::active_fanout_counts;
 use super::ui_text::{concise_shell_command_label, truncate_line_to_width};
@@ -37,9 +35,7 @@ const RECENT_TOOL_SCAN_LIMIT: usize = 24;
 const ACTIVE_TOOL_COMPLETED_ROW_TTL: Duration = Duration::from_secs(8);
 const ACTIVE_TOOL_STALE_RUNNING_ROW_TTL: Duration = Duration::from_secs(600);
 
-pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
-    // Clear hover state at the start of each render
-    app.sidebar_hover = SidebarHoverState::default();
+pub fn render_sidebar(f: &mut Frame, area: Rect, app: &App) {
     if area.width < 24 || area.height < 8 {
         // Paint a styled block over the area so stale cells from a previous
         // (wider) frame don't persist as bleed-through artifacts (#400).
@@ -64,7 +60,7 @@ pub fn render_sidebar(f: &mut Frame, area: Rect, app: &mut App) {
 /// Build the Auto-mode panel stack. Empty panels collapse to zero height so
 /// non-empty ones get the full sidebar real estate. Work appears when it has
 /// useful content, or as the one quiet empty state when nothing else is active.
-fn render_sidebar_auto(f: &mut Frame, area: Rect, app: &mut App) {
+fn render_sidebar_auto(f: &mut Frame, area: Rect, app: &App) {
     let work_has_content = sidebar_work_summary(app).has_useful_content();
     let tasks_empty = app.runtime_turn_id.is_none() && app.task_panel.is_empty();
     let agents_empty = app.subagent_cache.is_empty()
@@ -168,12 +164,12 @@ struct SidebarWorkStrategyStep {
 }
 
 #[derive(Debug, Clone, Default)]
-pub(crate) struct SidebarWorkSummary {
+struct SidebarWorkSummary {
     goal_objective: Option<String>,
+    pause_indicator: Option<String>,
     goal_token_budget: Option<u32>,
-    goal_completed: bool,
-    goal_started_at: Option<Instant>,
     tokens_used: u32,
+    cycle_count: u32,
     checklist_completion_pct: u8,
     checklist_items: Vec<SidebarWorkChecklistItem>,
     strategy_explanation: Option<String>,
@@ -193,6 +189,7 @@ impl SidebarWorkSummary {
         self.goal_objective
             .as_deref()
             .is_some_and(|s| !s.trim().is_empty())
+            || self.cycle_count > 0
             || !self.checklist_items.is_empty()
             || self.has_strategy()
             || self.state_updating
@@ -226,77 +223,56 @@ impl SidebarWorkSummary {
     }
 }
 
-fn sidebar_work_summary(app: &mut App) -> SidebarWorkSummary {
-    let fresh = (|| {
-        let todos = app.todos.try_lock().ok()?;
-        let plan = app.plan_state.try_lock().ok()?;
+fn sidebar_work_summary(app: &App) -> SidebarWorkSummary {
+    let mut summary = SidebarWorkSummary {
+        goal_objective: app.goal.goal_objective.clone(),
+        pause_indicator: if app.pausable { if app.paused { Some("(Paused)".to_string()) } else { None } } else { None },
+        goal_token_budget: app.goal.goal_token_budget,
+        tokens_used: app.session.total_conversation_tokens,
+        cycle_count: app.cycle_count,
+        ..SidebarWorkSummary::default()
+    };
 
-        let snapshot = todos.snapshot();
-        let checklist_completion_pct = snapshot.completion_pct;
-        let checklist_items = snapshot
-            .items
-            .into_iter()
-            .map(|item| SidebarWorkChecklistItem {
-                id: item.id,
-                content: item.content,
-                status: item.status,
-            })
-            .collect();
+    match app.todos.try_lock() {
+        Ok(todos) => {
+            let snapshot = todos.snapshot();
+            summary.checklist_completion_pct = snapshot.completion_pct;
+            summary.checklist_items = snapshot
+                .items
+                .into_iter()
+                .map(|item| SidebarWorkChecklistItem {
+                    id: item.id,
+                    content: item.content,
+                    status: item.status,
+                })
+                .collect();
+        }
+        Err(_) => {
+            summary.state_updating = true;
+        }
+    }
 
-        let (strategy_explanation, strategy_steps) = if plan.is_empty() {
-            (None, Vec::new())
-        } else {
-            (
-                plan.explanation().map(str::to_string),
-                plan.steps()
+    match app.plan_state.try_lock() {
+        Ok(plan) => {
+            if !plan.is_empty() {
+                summary.strategy_explanation = plan.explanation().map(str::to_string);
+                summary.strategy_steps = plan
+                    .steps()
                     .iter()
                     .map(|step| SidebarWorkStrategyStep {
                         text: step.text.clone(),
                         status: step.status.clone(),
                         elapsed: step.elapsed_str(),
                     })
-                    .collect(),
-            )
-        };
-
-        Some(SidebarWorkSummary {
-            goal_objective: app.hunt.quarry.clone(),
-            goal_token_budget: app.hunt.token_budget,
-            goal_completed: app.hunt.verdict == HuntVerdict::Hunted,
-            goal_started_at: app.hunt.started_at,
-            tokens_used: app.session.total_conversation_tokens,
-            checklist_completion_pct,
-            checklist_items,
-            strategy_explanation,
-            strategy_steps,
-            state_updating: false,
-        })
-    })();
-
-    if let Some(summary) = fresh {
-        app.cached_work_summary = Some(summary.clone());
-        return summary;
+                    .collect();
+            }
+        }
+        Err(_) => {
+            summary.state_updating = true;
+        }
     }
 
-    if let Some(cached) = app.cached_work_summary.as_ref() {
-        let mut summary = cached.clone();
-        summary.goal_objective = app.hunt.quarry.clone();
-        summary.goal_token_budget = app.hunt.token_budget;
-        summary.goal_completed = app.hunt.verdict == HuntVerdict::Hunted;
-        summary.goal_started_at = app.hunt.started_at;
-        summary.tokens_used = app.session.total_conversation_tokens;
-        return summary;
-    }
-
-    SidebarWorkSummary {
-        goal_objective: app.hunt.quarry.clone(),
-        goal_token_budget: app.hunt.token_budget,
-        goal_completed: app.hunt.verdict == HuntVerdict::Hunted,
-        goal_started_at: app.hunt.started_at,
-        tokens_used: app.session.total_conversation_tokens,
-        state_updating: true,
-        ..SidebarWorkSummary::default()
-    }
+    summary
 }
 
 fn work_panel_lines(
@@ -304,27 +280,37 @@ fn work_panel_lines(
     content_width: usize,
     max_rows: usize,
     palette_mode: palette::PaletteMode,
-    ui_theme: &palette::UiTheme,
 ) -> Vec<Line<'static>> {
     let theme = Theme::for_palette_mode(palette_mode);
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(max_rows.max(4));
 
-    push_work_goal_lines(summary, content_width, max_rows, &mut lines, ui_theme);
+    push_work_goal_lines(summary, content_width, max_rows, &mut lines);
 
     if summary.state_updating && lines.len() < max_rows {
         lines.push(Line::from(Span::styled(
             "Work state updating...",
-            Style::default().fg(ui_theme.text_muted),
+            Style::default().fg(palette::TEXT_MUTED),
         )));
     }
 
-    push_work_checklist_lines(summary, content_width, max_rows, &mut lines, ui_theme);
+    push_work_checklist_lines(summary, content_width, max_rows, &mut lines);
     push_work_strategy_lines(summary, content_width, max_rows, &mut lines, &theme);
+
+    if summary.cycle_count > 0 && lines.len() < max_rows {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "cycles: {} (active: {})",
+                summary.cycle_count,
+                summary.cycle_count.saturating_add(1)
+            ),
+            Style::default().fg(palette::TEXT_MUTED),
+        )));
+    }
 
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
             work_panel_empty_hint(content_width),
-            Style::default().fg(ui_theme.text_muted).italic(),
+            Style::default().fg(palette::TEXT_MUTED).italic(),
         )));
     }
 
@@ -336,7 +322,6 @@ fn push_work_goal_lines(
     content_width: usize,
     max_rows: usize,
     lines: &mut Vec<Line<'static>>,
-    theme: &palette::UiTheme,
 ) {
     let Some(objective) = summary.goal_objective.as_deref() else {
         return;
@@ -345,42 +330,25 @@ fn push_work_goal_lines(
         return;
     }
 
-    let icon = if summary.goal_completed { "✓" } else { "◆" };
-    let status_style = if summary.goal_completed {
-        Style::default()
-            .fg(theme.success)
-            .add_modifier(ratatui::style::Modifier::BOLD)
-    } else {
-        Style::default()
-            .fg(theme.warning)
-            .add_modifier(ratatui::style::Modifier::BOLD)
-    };
-
     lines.push(Line::from(Span::styled(
         format!(
-            "{} {}",
-            icon,
+            "◆ {}",
             truncate_line_to_width(objective, content_width.saturating_sub(2).max(1))
         ),
-        status_style,
+        Style::default()
+            .fg(palette::STATUS_WARNING)
+            .add_modifier(ratatui::style::Modifier::BOLD),
     )));
 
-    // Elapsed time
-    if let Some(started) = summary.goal_started_at
+    // Show pause indicator when the command is paused
+    if let Some(ref indicator) = summary.pause_indicator
         && lines.len() < max_rows
     {
-        let elapsed = crate::tui::notifications::humanize_duration(started.elapsed());
-        let elapsed_str = if summary.goal_completed {
-            format!("completed in {elapsed}")
-        } else {
-            format!("elapsed: {elapsed}")
-        };
         lines.push(Line::from(Span::styled(
-            truncate_line_to_width(&elapsed_str, content_width),
-            Style::default().fg(theme.text_muted),
+            format!("  {}", indicator),
+            Style::default().fg(palette::STATUS_INFO),
         )));
     }
-
     if let Some(budget) = summary.goal_token_budget
         && lines.len() < max_rows
     {
@@ -402,7 +370,7 @@ fn push_work_goal_lines(
                 &format!("tokens: {}/{} {}", summary.tokens_used, budget, bar),
                 content_width,
             ),
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(palette::TEXT_MUTED),
         )));
     }
 }
@@ -412,7 +380,6 @@ fn push_work_checklist_lines(
     content_width: usize,
     max_rows: usize,
     lines: &mut Vec<Line<'static>>,
-    theme: &palette::UiTheme,
 ) {
     if summary.checklist_items.is_empty() || lines.len() >= max_rows {
         return;
@@ -427,11 +394,11 @@ fn push_work_checklist_lines(
     lines.push(Line::from(vec![
         Span::styled(
             format!("{}%", summary.checklist_completion_pct),
-            Style::default().fg(theme.success).bold(),
+            Style::default().fg(palette::STATUS_SUCCESS).bold(),
         ),
         Span::styled(
             format!(" complete ({completed}/{total})"),
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(palette::TEXT_MUTED),
         ),
     ]));
 
@@ -452,9 +419,9 @@ fn push_work_checklist_lines(
         .min(summary.checklist_items.len());
     for item in summary.checklist_items[start..end].iter() {
         let (prefix, color) = match item.status {
-            TodoStatus::Pending => ("[ ]", theme.text_muted),
-            TodoStatus::InProgress => ("[~]", theme.warning),
-            TodoStatus::Completed => ("[✓]", theme.success),
+            TodoStatus::Pending => ("[ ]", palette::TEXT_MUTED),
+            TodoStatus::InProgress => ("[~]", palette::STATUS_WARNING),
+            TodoStatus::Completed => ("[x]", palette::STATUS_SUCCESS),
         };
         let text = format!("{prefix} #{} {}", item.id, item.content);
         lines.push(Line::from(Span::styled(
@@ -474,7 +441,7 @@ fn push_work_checklist_lines(
         };
         lines.push(Line::from(Span::styled(
             label,
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(palette::TEXT_MUTED),
         )));
     }
 }
@@ -510,7 +477,7 @@ fn push_work_strategy_lines(
         let total = pending + in_progress + completed;
         lines.push(Line::from(vec![
             Span::styled(
-                "Strategy metadata ",
+                "Strategy ",
                 Style::default().fg(theme.plan_summary_color).bold(),
             ),
             Span::styled(
@@ -524,7 +491,7 @@ fn push_work_strategy_lines(
         ]));
     } else {
         lines.push(Line::from(Span::styled(
-            "Strategy metadata",
+            "Strategy",
             Style::default().fg(theme.plan_summary_color).bold(),
         )));
     }
@@ -545,7 +512,7 @@ fn push_work_strategy_lines(
         let (prefix, color) = match step.status {
             StepStatus::Pending => ("[ ]", theme.plan_pending_color),
             StepStatus::InProgress => ("[~]", theme.plan_in_progress_color),
-            StepStatus::Completed => ("[✓]", theme.plan_completed_color),
+            StepStatus::Completed => ("[x]", theme.plan_completed_color),
         };
         let mut text = format!("{prefix} {}", step.text);
         if !step.elapsed.is_empty() {
@@ -571,7 +538,7 @@ fn work_panel_empty_hint(content_width: usize) -> String {
     truncate_line_to_width("No active work", content_width)
 }
 
-fn render_sidebar_work(f: &mut Frame, area: Rect, app: &mut App) {
+fn render_sidebar_work(f: &mut Frame, area: Rect, app: &App) {
     if area.height < 3 {
         return;
     }
@@ -584,14 +551,12 @@ fn render_sidebar_work(f: &mut Frame, area: Rect, app: &mut App) {
         content_width.max(1),
         usable_rows,
         app.ui_theme.mode,
-        &app.ui_theme,
     );
 
-    let full_texts: Vec<String> = lines.iter().map(|l| spans_to_text(&l.spans)).collect();
-    render_sidebar_section(f, area, "Work", lines, full_texts, app);
+    render_sidebar_section(f, area, "Work", lines, app);
 }
 
-fn render_sidebar_tasks(f: &mut Frame, area: Rect, app: &mut App) {
+fn render_sidebar_tasks(f: &mut Frame, area: Rect, app: &App) {
     if area.height < 3 {
         return;
     }
@@ -600,8 +565,7 @@ fn render_sidebar_tasks(f: &mut Frame, area: Rect, app: &mut App) {
     let usable_rows = area.height.saturating_sub(3) as usize;
     let lines = task_panel_lines(app, content_width.max(1), usable_rows.max(1));
 
-    let full_texts: Vec<String> = lines.iter().map(|l| spans_to_text(&l.spans)).collect();
-    render_sidebar_section(f, area, "Tasks", lines, full_texts, app);
+    render_sidebar_section(f, area, "Tasks", lines, app);
 }
 
 #[derive(Debug, Clone)]
@@ -613,7 +577,6 @@ struct SidebarToolRow {
 }
 
 fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Line<'static>> {
-    let theme = &app.ui_theme;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(max_rows.max(4));
 
     if let Some(turn_id) = app.runtime_turn_id.as_ref() {
@@ -622,23 +585,19 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
             .as_deref()
             .unwrap_or("unknown")
             .to_string();
-        // Show enough of the turn id prefix to identify it for
-        // task_read / task_cancel. A UUID needs ~13 chars before the
-        // first hyphen; 16 chars gives a safe prefix for disambiguation.
-        let turn_prefix = truncate_line_to_width(turn_id, 16);
         lines.push(Line::from(Span::styled(
             truncate_line_to_width(
-                &format!("turn {turn_prefix} ({status})",),
+                &format!("turn {} ({status})", truncate_line_to_width(turn_id, 12)),
                 content_width.max(1),
             ),
-            Style::default().fg(theme.accent_primary),
+            Style::default().fg(palette::DEEPSEEK_SKY),
         )));
     }
 
     let active_rows = active_tool_rows(app);
     if !active_rows.is_empty() && lines.len() < max_rows {
-        push_sidebar_label_theme(&mut lines, "Live tools", theme);
-        push_tool_rows(&mut lines, &active_rows, content_width, max_rows, theme);
+        push_sidebar_label(&mut lines, "Live tools", palette::DEEPSEEK_SKY);
+        push_tool_rows(&mut lines, &active_rows, content_width, max_rows);
     }
 
     let background_rows = background_task_rows(app, &active_rows);
@@ -647,28 +606,34 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
             .iter()
             .filter(|task| task.status == "running")
             .count();
-        let done = background_rows.len().saturating_sub(running);
-        let label = if running == 0 {
-            format!("Background commands: {done} completed")
-        } else if done == 0 {
-            format!("Background commands: {running} running")
-        } else {
-            format!("Background commands: {running} running, {done} completed")
-        };
-        lines.push(Line::from(Span::styled(
-            label,
-            Style::default().fg(theme.accent_primary).bold(),
-        )));
+        lines.push(Line::from(vec![
+            Span::styled(
+                if running == background_rows.len() {
+                    format!("Background jobs: {running} running")
+                } else {
+                    format!("Background jobs: {} active", background_rows.len())
+                },
+                Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+            ),
+            Span::styled(
+                if running == background_rows.len() {
+                    String::new()
+                } else {
+                    format!(" ({running} running)")
+                },
+                Style::default().fg(palette::TEXT_MUTED),
+            ),
+        ]));
 
         let max_items = max_rows.saturating_sub(lines.len());
         for task in background_rows.iter().take(max_items) {
             let color = match task.status.as_str() {
-                "queued" => theme.text_muted,
-                "running" => theme.warning,
-                "completed" => theme.success,
-                "failed" => theme.error_fg,
-                "canceled" => theme.text_dim,
-                _ => theme.text_muted,
+                "queued" => palette::TEXT_MUTED,
+                "running" => palette::STATUS_WARNING,
+                "completed" => palette::STATUS_SUCCESS,
+                "failed" => palette::STATUS_ERROR,
+                "canceled" => palette::TEXT_DIM,
+                _ => palette::TEXT_MUTED,
             };
             let duration = task
                 .duration_ms
@@ -684,7 +649,7 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
                     "  {}",
                     truncate_line_to_width(&detail, content_width.saturating_sub(2).max(1))
                 ),
-                Style::default().fg(theme.text_dim),
+                Style::default().fg(palette::TEXT_DIM),
             )));
         }
 
@@ -696,7 +661,7 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
             lines.push(Line::from(Span::styled(
                 truncate_line_to_width("Ctrl+K -> /jobs cancel-all", content_width.max(1)),
                 Style::default()
-                    .fg(theme.text_muted)
+                    .fg(palette::TEXT_MUTED)
                     .add_modifier(ratatui::style::Modifier::ITALIC),
             )));
         }
@@ -705,22 +670,9 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
     if lines.len() < max_rows {
         let recent_rows = recent_tool_rows(app, 4);
         if !recent_rows.is_empty() {
-            push_sidebar_label_theme(&mut lines, "Recent tools", theme);
-            push_tool_rows(&mut lines, &recent_rows, content_width, max_rows, theme);
+            push_sidebar_label(&mut lines, "Recent tools", palette::TEXT_DIM);
+            push_tool_rows(&mut lines, &recent_rows, content_width, max_rows);
         }
-    }
-
-    // Yank hint: surface the keyboard path for copying the focused task/turn ID.
-    if lines.len() + 1 < max_rows
-        && app.runtime_turn_id.is_some()
-        && app.sidebar_focus == SidebarFocus::Tasks
-    {
-        lines.push(Line::from(Span::styled(
-            "y → copy turn id  ·  Y → copy full status",
-            Style::default()
-                .fg(theme.text_dim)
-                .add_modifier(ratatui::style::Modifier::ITALIC),
-        )));
     }
 
     if lines.is_empty()
@@ -731,17 +683,17 @@ fn task_panel_lines(app: &App, content_width: usize, max_rows: usize) -> Vec<Lin
     {
         lines.push(Line::from(Span::styled(
             "No live tools or background jobs",
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(palette::TEXT_MUTED),
         )));
     }
 
     lines
 }
 
-fn push_sidebar_label_theme(lines: &mut Vec<Line<'static>>, label: &str, theme: &palette::UiTheme) {
+fn push_sidebar_label(lines: &mut Vec<Line<'static>>, label: &str, color: ratatui::style::Color) {
     lines.push(Line::from(Span::styled(
         label.to_string(),
-        Style::default().fg(theme.accent_primary).bold(),
+        Style::default().fg(color).bold(),
     )));
 }
 
@@ -750,7 +702,7 @@ fn background_task_labels(task: &TaskPanelEntry, duration: &str) -> (String, Str
         let command = concise_shell_command_label(command, 96);
         return (
             format!("{} {} {}", task.status, command, duration),
-            format!("{} \u{00B7} command", task.id),
+            format!("{} \u{00B7} shell job", task.id),
         );
     }
 
@@ -784,7 +736,7 @@ fn active_tool_rows(app: &App) -> Vec<SidebarToolRow> {
     if !stale_running.is_empty() {
         rows.push(collapsed_stale_running_row(stale_running));
     }
-    editorial_tool_rows(rows, usize::MAX, ToolRowOrder::OldestFirst)
+    editorial_tool_rows(rows, usize::MAX)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -851,7 +803,7 @@ fn recent_tool_rows(app: &App, limit: usize) -> Vec<SidebarToolRow> {
         .filter_map(sidebar_tool_row_from_cell)
         .take(RECENT_TOOL_SCAN_LIMIT)
         .collect();
-    editorial_tool_rows(rows, limit, ToolRowOrder::NewestFirst)
+    editorial_tool_rows(rows, limit)
 }
 
 fn push_tool_rows(
@@ -859,13 +811,12 @@ fn push_tool_rows(
     rows: &[SidebarToolRow],
     content_width: usize,
     max_rows: usize,
-    theme: &palette::UiTheme,
 ) {
     for row in rows {
         if lines.len() >= max_rows {
             break;
         }
-        let (marker, color) = tool_status_marker(row.status, theme);
+        let (marker, color) = tool_status_marker(row.status);
         let label = if let Some(duration_ms) = row.duration_ms {
             format!("{marker} {} {}", row.name, format_duration_ms(duration_ms))
         } else {
@@ -881,7 +832,7 @@ fn push_tool_rows(
                     "  {}",
                     truncate_line_to_width(&row.summary, content_width.saturating_sub(2).max(1))
                 ),
-                Style::default().fg(theme.text_dim),
+                Style::default().fg(palette::TEXT_DIM),
             )));
         }
     }
@@ -1091,9 +1042,9 @@ fn failure_summary_with_hint(summary: &str) -> String {
 
 fn friendly_generic_tool_name(name: &str) -> &str {
     match name {
-        "task_shell_start" => "start command",
-        "task_shell_wait" => "wait command",
-        "task_shell_write" => "write command",
+        "task_shell_start" => "start shell job",
+        "task_shell_wait" => "wait shell job",
+        "task_shell_write" => "write shell job",
         _ => name,
     }
 }
@@ -1102,7 +1053,7 @@ fn generic_tool_sidebar_summary(generic: &GenericToolCell) -> String {
     match generic.name.as_str() {
         "task_shell_start" => compact_join([
             generic.input_summary.clone().unwrap_or_default(),
-            "background command".to_string(),
+            "background shell job".to_string(),
         ]),
         "task_shell_wait" => compact_join([
             generic.input_summary.clone().unwrap_or_default(),
@@ -1157,17 +1108,7 @@ fn background_task_duplicates_live_tool(
         })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ToolRowOrder {
-    OldestFirst,
-    NewestFirst,
-}
-
-fn editorial_tool_rows(
-    rows: Vec<SidebarToolRow>,
-    limit: usize,
-    order_mode: ToolRowOrder,
-) -> Vec<SidebarToolRow> {
+fn editorial_tool_rows(rows: Vec<SidebarToolRow>, limit: usize) -> Vec<SidebarToolRow> {
     #[derive(Clone)]
     struct Candidate {
         rank: u8,
@@ -1180,26 +1121,9 @@ fn editorial_tool_rows(
     let mut ci_poll_groups: Vec<(usize, SidebarToolRow, usize)> = Vec::new();
     let mut shell_wait_groups: Vec<(usize, SidebarToolRow, usize, String)> = Vec::new();
     let mut seen_success: Vec<String> = Vec::new();
-    let mut seen_success_tool_names: Vec<String> = Vec::new();
-    let mut seen_failures: Vec<String> = Vec::new();
-    let mut visible_failure_count: usize = 0;
-    const MAX_VISIBLE_FAILURES: usize = 2;
 
     for (order, mut row) in rows.into_iter().enumerate() {
         if row.status == ToolStatus::Failed {
-            // Deduplicate failures for the same tool name: keep only the most
-            // recent failure per tool. Fixes #1884 — stale failures from
-            // tools that have since succeeded no longer crowd the sidebar.
-            let fail_key = row.name.trim().to_ascii_lowercase();
-            if order_mode == ToolRowOrder::NewestFirst
-                && seen_success_tool_names.contains(&fail_key)
-            {
-                continue;
-            }
-            if seen_failures.contains(&fail_key) {
-                continue;
-            }
-            seen_failures.push(fail_key);
             row.summary = failure_summary_with_hint(&row.summary);
         }
 
@@ -1255,52 +1179,13 @@ fn editorial_tool_rows(
         }
         if row.status == ToolStatus::Success {
             seen_success.push(key);
-            let normalized = row.name.trim().to_ascii_lowercase();
-            if !seen_success_tool_names.contains(&normalized) {
-                seen_success_tool_names.push(normalized.clone());
-            }
-
-            // Active rows are oldest-first, so a success means any candidate
-            // failure for the same tool is stale. Recent history rows are
-            // newest-first; in that path the success is older than any
-            // already-seen failure and must not remove it.
-            if order_mode == ToolRowOrder::OldestFirst {
-                let mut removed_visible_failures = 0usize;
-                let mut removed_any_failure = false;
-                candidates.retain(|c| {
-                    let remove = c.row.status == ToolStatus::Failed
-                        && c.row.name.trim().eq_ignore_ascii_case(&normalized);
-                    if remove {
-                        removed_any_failure = true;
-                        if c.rank == 0 {
-                            removed_visible_failures += 1;
-                        }
-                    }
-                    !remove
-                });
-                if removed_any_failure {
-                    seen_failures.retain(|seen| seen != &normalized);
-                    visible_failure_count =
-                        visible_failure_count.saturating_sub(removed_visible_failures);
-                }
-            }
         }
 
-        // Cap visible failures at MAX_VISIBLE_FAILURES. Excess failures
-        // get demoted to rank 3 so they don't crowd the top of the
-        // sidebar. (#1884)
-        let rank = if row.status == ToolStatus::Failed {
-            if visible_failure_count >= MAX_VISIBLE_FAILURES {
-                3
-            } else {
-                visible_failure_count += 1;
-                0
-            }
-        } else {
-            tool_row_rank(&row)
-        };
-
-        candidates.push(Candidate { rank, order, row });
+        candidates.push(Candidate {
+            rank: tool_row_rank(&row),
+            order,
+            row,
+        });
     }
 
     for (order, mut row, count) in ci_poll_groups {
@@ -1369,7 +1254,7 @@ fn is_ci_poll_row(row: &SidebarToolRow) -> bool {
 }
 
 fn is_shell_wait_poll_row(row: &SidebarToolRow) -> bool {
-    row.status == ToolStatus::Running && row.name == "wait command"
+    row.status == ToolStatus::Running && row.name == "wait shell job"
 }
 
 fn shell_wait_poll_key(row: &SidebarToolRow) -> String {
@@ -1390,9 +1275,7 @@ fn shell_wait_poll_key(row: &SidebarToolRow) -> String {
 }
 
 fn normalize_activity_text(text: &str) -> String {
-    let mut cleaned = String::with_capacity(text.len());
-    crate::tui::osc8::strip_ansi_into(text, &mut cleaned);
-    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 fn tool_row_rank(row: &SidebarToolRow) -> u8 {
@@ -1441,14 +1324,11 @@ fn first_nonempty_line(text: &str) -> &str {
         .unwrap_or("")
 }
 
-fn tool_status_marker(
-    status: ToolStatus,
-    theme: &palette::UiTheme,
-) -> (&'static str, ratatui::style::Color) {
+fn tool_status_marker(status: ToolStatus) -> (&'static str, ratatui::style::Color) {
     match status {
-        ToolStatus::Running => ("[~]", theme.warning),
-        ToolStatus::Success => ("[✓]", theme.success),
-        ToolStatus::Failed => ("[!]", theme.error_fg),
+        ToolStatus::Running => ("[~]", palette::STATUS_WARNING),
+        ToolStatus::Success => ("[x]", palette::STATUS_SUCCESS),
+        ToolStatus::Failed => ("[!]", palette::STATUS_ERROR),
     }
 }
 
@@ -1464,7 +1344,7 @@ fn duration_ms(duration: Duration) -> u64 {
     u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
 }
 
-fn render_sidebar_subagents(f: &mut Frame, area: Rect, app: &mut App) {
+fn render_sidebar_subagents(f: &mut Frame, area: Rect, app: &App) {
     if area.height < 3 {
         return;
     }
@@ -1509,15 +1389,9 @@ fn render_sidebar_subagents(f: &mut Frame, area: Rect, app: &mut App) {
         role_counts,
     };
     let rows = sidebar_agent_rows(app);
-    let lines = subagent_panel_lines(
-        &summary,
-        &rows,
-        content_width,
-        usable_rows.max(1),
-        &app.ui_theme,
-    );
+    let lines = subagent_panel_lines(&summary, &rows, content_width, usable_rows.max(1));
 
-    render_sidebar_section(f, area, "Agents", lines, Vec::new(), app);
+    render_sidebar_section(f, area, "Agents", lines, app);
 }
 
 /// Minimal projection of the data the sub-agent sidebar needs. Lifted out
@@ -1630,7 +1504,6 @@ pub fn subagent_panel_lines(
     rows: &[SidebarAgentRow],
     content_width: usize,
     max_rows: usize,
-    theme: &palette::UiTheme,
 ) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(max_rows.max(4));
 
@@ -1642,7 +1515,7 @@ pub fn subagent_panel_lines(
     {
         lines.push(Line::from(Span::styled(
             "No agents",
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(palette::TEXT_MUTED),
         )));
         return lines;
     }
@@ -1660,14 +1533,17 @@ pub fn subagent_panel_lines(
         vec![
             Span::styled(
                 format!("{live_running} running"),
-                Style::default().fg(theme.accent_primary).bold(),
+                Style::default().fg(palette::DEEPSEEK_SKY).bold(),
             ),
-            Span::styled(format!(" / {total}"), Style::default().fg(theme.text_muted)),
+            Span::styled(
+                format!(" / {total}"),
+                Style::default().fg(palette::TEXT_MUTED),
+            ),
         ]
     } else {
         vec![Span::styled(
             format!("{done} done"),
-            Style::default().fg(theme.success),
+            Style::default().fg(palette::STATUS_SUCCESS),
         )]
     };
     lines.push(Line::from(header));
@@ -1681,7 +1557,7 @@ pub fn subagent_panel_lines(
         let role_line = mix.join(" \u{00B7} ");
         lines.push(Line::from(Span::styled(
             truncate_line_to_width(&role_line, content_width.max(1)),
-            Style::default().fg(theme.text_dim),
+            Style::default().fg(palette::TEXT_DIM),
         )));
     }
 
@@ -1689,18 +1565,12 @@ pub fn subagent_panel_lines(
         if lines.len() >= max_rows {
             break;
         }
-        let (marker, color) = agent_status_marker(row.status.as_str(), theme);
+        let (marker, color) = agent_status_marker(row.status.as_str());
         let label = format!("{marker} {} {}", row.role, row.name);
         lines.push(Line::from(Span::styled(
             truncate_line_to_width(&label, content_width.max(1)),
             Style::default().fg(color),
         )));
-
-        // Auto-collapse finished sub-agents: hide detail lines for completed
-        // agents so the sidebar stays compact when work is done.
-        if row.status == "done" {
-            continue;
-        }
 
         if lines.len() >= max_rows {
             break;
@@ -1726,16 +1596,16 @@ pub fn subagent_panel_lines(
                     content_width.saturating_sub(2).max(1)
                 )
             ),
-            Style::default().fg(theme.text_dim),
+            Style::default().fg(palette::TEXT_DIM),
         )));
     }
 
     if summary.foreground_rlm_running {
         lines.push(Line::from(vec![
-            Span::styled("RLM", Style::default().fg(theme.accent_primary).bold()),
+            Span::styled("RLM", Style::default().fg(palette::DEEPSEEK_SKY).bold()),
             Span::styled(
                 " foreground work active",
-                Style::default().fg(theme.text_dim),
+                Style::default().fg(palette::TEXT_DIM),
             ),
         ]));
     }
@@ -1743,16 +1613,13 @@ pub fn subagent_panel_lines(
     lines
 }
 
-fn agent_status_marker(
-    status: &str,
-    theme: &palette::UiTheme,
-) -> (&'static str, ratatui::style::Color) {
+fn agent_status_marker(status: &str) -> (&'static str, ratatui::style::Color) {
     match status {
-        "running" => ("[~]", theme.warning),
-        "done" => ("[✓]", theme.success),
-        "failed" => ("[!]", theme.error_fg),
-        "canceled" | "interrupted" => ("[-]", theme.text_muted),
-        _ => ("[ ]", theme.text_muted),
+        "running" => ("[~]", palette::STATUS_WARNING),
+        "done" => ("[x]", palette::STATUS_SUCCESS),
+        "failed" => ("[!]", palette::STATUS_ERROR),
+        "canceled" | "interrupted" => ("[-]", palette::TEXT_MUTED),
+        _ => ("[ ]", palette::TEXT_MUTED),
     }
 }
 
@@ -1762,12 +1629,11 @@ fn agent_status_marker(
 /// cost, MCP server count, LSP toggle state, cycle count, and memory
 /// file size + mtime. Each section is a compact one-liner so the panel
 /// reads as a dashboard rather than a scrolling list.
-fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
+fn render_context_panel(f: &mut Frame, area: Rect, app: &App) {
     if area.height < 3 {
         return;
     }
 
-    let theme = &app.ui_theme;
     let content_width = area.width.saturating_sub(4) as usize;
     let mut lines: Vec<Line<'static>> = Vec::with_capacity(usize::from(area.height).max(4));
 
@@ -1781,11 +1647,11 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
     lines.push(Line::from(vec![
         Span::styled(
             truncate_line_to_width(&ws_name, content_width.max(1)),
-            Style::default().fg(theme.accent_primary).bold(),
+            Style::default().fg(palette::DEEPSEEK_SKY).bold(),
         ),
         Span::styled(
             format!("  {}", app.workspace_context.as_deref().unwrap_or("")),
-            Style::default().fg(theme.text_dim),
+            Style::default().fg(palette::TEXT_DIM),
         ),
     ]));
 
@@ -1812,7 +1678,7 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
             window,
             truncate_line_to_width(&bar, content_width.saturating_sub(32).max(8))
         ),
-        Style::default().fg(theme.text_muted),
+        Style::default().fg(palette::TEXT_MUTED),
     )));
 
     // ── Session cost ─────────────────────────────────────────────
@@ -1835,7 +1701,7 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
     };
     lines.push(Line::from(Span::styled(
         cost_line,
-        Style::default().fg(theme.text_muted),
+        Style::default().fg(palette::TEXT_MUTED),
     )));
 
     // ── MCP servers ──────────────────────────────────────────────
@@ -1850,16 +1716,28 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
                 "mcp: {} server(s){}",
                 app.mcp_configured_count, restart_hint
             ),
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(palette::TEXT_MUTED),
         )));
     }
 
     // ── LSP ──────────────────────────────────────────────────────
     let lsp_label = if app.lsp_enabled { "on" } else { "off" };
     lines.push(Line::from(Span::styled(
-        format!("lsp: {lsp_label}"),
-        Style::default().fg(theme.text_muted),
+        format!("lsp: {}", lsp_label),
+        Style::default().fg(palette::TEXT_MUTED),
     )));
+
+    // ── Cycles ───────────────────────────────────────────────────
+    if app.cycle_count > 0 {
+        lines.push(Line::from(Span::styled(
+            format!(
+                "cycles: {} crossed, {} briefing(s)",
+                app.cycle_count,
+                app.cycle_briefings.len()
+            ),
+            Style::default().fg(palette::TEXT_MUTED),
+        )));
+    }
 
     // ── Memory ───────────────────────────────────────────────────
     if app.use_memory {
@@ -1871,25 +1749,17 @@ fn render_context_panel(f: &mut Frame, area: Rect, app: &mut App) {
                 } else if bytes >= 1024 {
                     format!("{:.1} KB", bytes as f64 / 1024.0)
                 } else {
-                    format!("{bytes} B")
+                    format!("{} B", bytes)
                 }
             })
             .unwrap_or_else(|_| "—".to_string());
         lines.push(Line::from(Span::styled(
             format!("memory: {} ({})", app.memory_path.display(), size_hint),
-            Style::default().fg(theme.text_muted),
+            Style::default().fg(palette::TEXT_MUTED),
         )));
     }
 
-    render_sidebar_section(f, area, "Session", lines, Vec::new(), app);
-}
-
-fn spans_to_text(spans: &[Span<'_>]) -> String {
-    let mut s = String::new();
-    for span in spans {
-        s.push_str(span.content.as_ref());
-    }
-    s
+    render_sidebar_section(f, area, "Session", lines, app);
 }
 
 fn render_sidebar_section(
@@ -1897,8 +1767,7 @@ fn render_sidebar_section(
     area: Rect,
     title: &str,
     lines: Vec<Line<'static>>,
-    full_texts: Vec<String>,
-    app: &mut App,
+    app: &App,
 ) {
     if area.width < 4 || area.height < 3 {
         // Clear stale cells before bailing out (#400).
@@ -1909,19 +1778,6 @@ fn render_sidebar_section(
     }
 
     let theme = Theme::for_palette_mode(app.ui_theme.mode);
-
-    // Record hover metadata for mouse tooltip support.
-    let padding = theme.section_padding;
-    let content_area = Rect {
-        x: area.x + 1 + padding.left,
-        y: area.y + 1 + padding.top,
-        width: area.width.saturating_sub(2 + padding.left + padding.right),
-        height: area.height.saturating_sub(2 + padding.top + padding.bottom),
-    };
-    app.sidebar_hover.sections.push(SidebarHoverSection {
-        content_area,
-        lines: full_texts,
-    });
     // Truncate the panel title so it always fits within the section width
     // even after a resize. The title occupies up to 4 chars of border chrome
     // (two spaces + one space on each side), so the max title length is
@@ -1964,19 +1820,16 @@ fn render_sidebar_section(
 mod tests {
     use super::{
         ACTIVE_TOOL_COMPLETED_ROW_TTL, ACTIVE_TOOL_STALE_RUNNING_ROW_TTL, AutoSidebarPanel,
-        AutoSidebarState, SidebarAgentRow, SidebarHoverSection, SidebarHoverState,
-        SidebarSubagentSummary, SidebarToolRow, SidebarWorkChecklistItem, SidebarWorkStrategyStep,
-        SidebarWorkSummary, ToolRowOrder, auto_sidebar_panels, editorial_tool_rows,
-        normalize_activity_text, sidebar_work_summary, subagent_panel_lines, task_panel_lines,
-        work_panel_empty_hint, work_panel_lines,
+        AutoSidebarState, SidebarAgentRow, SidebarSubagentSummary, SidebarWorkChecklistItem,
+        SidebarWorkStrategyStep, SidebarWorkSummary, auto_sidebar_panels, subagent_panel_lines,
+        task_panel_lines, work_panel_empty_hint, work_panel_lines,
     };
     use crate::config::Config;
-    use crate::palette;
     use crate::palette::PaletteMode;
     use crate::tools::plan::StepStatus;
     use crate::tools::todo::TodoStatus;
     use crate::tui::active_cell::ActiveCell;
-    use crate::tui::app::{App, HuntVerdict, TaskPanelEntry, TuiOptions};
+    use crate::tui::app::{App, TaskPanelEntry, TuiOptions};
     use crate::tui::history::{
         ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolStatus,
     };
@@ -2009,15 +1862,6 @@ mod tests {
         App::new(options, &Config::default())
     }
 
-    fn sidebar_tool_row(name: &str, status: ToolStatus) -> SidebarToolRow {
-        SidebarToolRow {
-            name: name.to_string(),
-            status,
-            summary: String::new(),
-            duration_ms: None,
-        }
-    }
-
     fn lines_to_text(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()
@@ -2028,69 +1872,6 @@ mod tests {
                     .collect::<String>()
             })
             .collect()
-    }
-
-    #[test]
-    fn editorial_rows_keep_newer_failure_when_older_success_is_seen_later() {
-        let rows = vec![
-            sidebar_tool_row("gh issue create", ToolStatus::Failed),
-            sidebar_tool_row("gh issue create", ToolStatus::Success),
-        ];
-
-        let rendered = editorial_tool_rows(rows, 4, ToolRowOrder::NewestFirst);
-
-        assert!(
-            rendered
-                .iter()
-                .any(|row| row.name == "gh issue create" && row.status == ToolStatus::Failed),
-            "newest-first rows must keep a failure newer than a later-seen success: {rendered:?}"
-        );
-    }
-
-    #[test]
-    fn normalize_activity_text_strips_ansi_before_collapsing_text() {
-        let text = normalize_activity_text("running \x1b[48;2;10;17;32mtool\x1b[0m now");
-        assert_eq!(text, "running tool now");
-        assert!(!text.contains("48;2"));
-    }
-
-    #[test]
-    fn editorial_rows_hide_older_failure_after_newer_success() {
-        let rows = vec![
-            sidebar_tool_row("gh issue create", ToolStatus::Success),
-            sidebar_tool_row("gh issue create", ToolStatus::Failed),
-        ];
-
-        let rendered = editorial_tool_rows(rows, 4, ToolRowOrder::NewestFirst);
-
-        assert!(
-            !rendered
-                .iter()
-                .any(|row| row.name == "gh issue create" && row.status == ToolStatus::Failed),
-            "newest-first rows should hide stale failures older than success: {rendered:?}"
-        );
-    }
-
-    #[test]
-    fn editorial_rows_reclaim_failure_slot_after_oldest_first_success() {
-        let rows = vec![
-            sidebar_tool_row("gh issue create", ToolStatus::Failed),
-            sidebar_tool_row("grep_files", ToolStatus::Failed),
-            sidebar_tool_row("gh issue create", ToolStatus::Success),
-            sidebar_tool_row("cargo test", ToolStatus::Failed),
-        ];
-
-        let rendered = editorial_tool_rows(rows, 2, ToolRowOrder::OldestFirst);
-
-        assert_eq!(
-            rendered
-                .iter()
-                .filter(|row| row.status == ToolStatus::Failed)
-                .map(|row| row.name.as_str())
-                .collect::<Vec<_>>(),
-            vec!["grep_files", "cargo test"],
-            "success should clear its stale failure and free a visible failure slot"
-        );
     }
 
     #[test]
@@ -2168,13 +1949,7 @@ mod tests {
             ..SidebarWorkSummary::default()
         };
 
-        let text = lines_to_text(&work_panel_lines(
-            &summary,
-            80,
-            16,
-            PaletteMode::Dark,
-            &palette::UI_THEME,
-        ));
+        let text = lines_to_text(&work_panel_lines(&summary, 80, 16, PaletteMode::Dark));
 
         assert!(
             text[0].starts_with("33% complete (1/3)"),
@@ -2210,13 +1985,7 @@ mod tests {
             ..SidebarWorkSummary::default()
         };
 
-        let text = lines_to_text(&work_panel_lines(
-            &summary,
-            80,
-            6,
-            PaletteMode::Dark,
-            &palette::UI_THEME,
-        ));
+        let text = lines_to_text(&work_panel_lines(&summary, 80, 6, PaletteMode::Dark));
 
         assert!(
             text.iter()
@@ -2237,7 +2006,6 @@ mod tests {
             80,
             16,
             PaletteMode::Dark,
-            &palette::UI_THEME,
         ));
         assert!(
             !empty_text.iter().any(|line| line.contains("Strategy")),
@@ -2248,15 +2016,9 @@ mod tests {
             strategy_explanation: Some("High-level sequencing".to_string()),
             ..SidebarWorkSummary::default()
         };
-        let text = lines_to_text(&work_panel_lines(
-            &summary,
-            80,
-            16,
-            PaletteMode::Dark,
-            &palette::UI_THEME,
-        ));
+        let text = lines_to_text(&work_panel_lines(&summary, 80, 16, PaletteMode::Dark));
         assert!(
-            text.iter().any(|line| line == "Strategy metadata"),
+            text.iter().any(|line| line == "Strategy"),
             "non-empty plan should show strategy label: {text:?}"
         );
         assert!(
@@ -2264,82 +2026,6 @@ mod tests {
                 .any(|line| line.contains("High-level sequencing")),
             "non-empty plan explanation should render: {text:?}"
         );
-    }
-
-    #[test]
-    fn sidebar_work_summary_caches_on_success() {
-        let mut app = create_test_app();
-        {
-            let mut todos = app.todos.try_lock().expect("todos lock");
-            todos.add("cache test".to_string(), TodoStatus::InProgress);
-        }
-
-        let summary = sidebar_work_summary(&mut app);
-
-        assert!(!summary.state_updating, "should not be updating");
-        assert_eq!(summary.checklist_items.len(), 1);
-        assert!(
-            app.cached_work_summary.is_some(),
-            "cache should be populated"
-        );
-    }
-
-    #[test]
-    fn sidebar_work_summary_falls_back_to_cache_when_todos_lock_busy() {
-        let mut app = create_test_app();
-        {
-            let mut todos = app.todos.try_lock().expect("todos lock");
-            todos.add("will be cached".to_string(), TodoStatus::Completed);
-        }
-        let _first = sidebar_work_summary(&mut app);
-        assert!(app.cached_work_summary.is_some());
-
-        let held_arc = app.todos.clone();
-        let _held = held_arc.try_lock().expect("hold todos lock");
-
-        let summary = sidebar_work_summary(&mut app);
-
-        assert!(!summary.state_updating, "should fall back to cache");
-        assert!(
-            summary
-                .checklist_items
-                .iter()
-                .any(|item| item.content == "will be cached"),
-            "cached item should be present"
-        );
-    }
-
-    #[test]
-    fn sidebar_work_summary_returns_updating_when_no_cache_and_locks_busy() {
-        let mut app = create_test_app();
-        let held_arc = app.todos.clone();
-        let _held = held_arc.try_lock().expect("hold todos lock");
-
-        let summary = sidebar_work_summary(&mut app);
-
-        assert!(summary.state_updating, "should be updating without cache");
-    }
-
-    #[test]
-    fn sidebar_work_summary_keeps_live_fields_on_cache_fallback() {
-        let mut app = create_test_app();
-        app.hunt.quarry = Some("test quarry".to_string());
-        app.hunt.verdict = HuntVerdict::Hunted;
-        {
-            let mut todos = app.todos.try_lock().expect("todos lock");
-            todos.add("item".to_string(), TodoStatus::Pending);
-        }
-        let _first = sidebar_work_summary(&mut app);
-
-        app.hunt.quarry = Some("updated quarry".to_string());
-        app.hunt.verdict = HuntVerdict::Hunting;
-        let held_arc = app.todos.clone();
-        let _held = held_arc.try_lock().expect("hold todos lock");
-
-        let summary = sidebar_work_summary(&mut app);
-
-        assert_eq!(summary.goal_objective.as_deref(), Some("updated quarry"));
-        assert!(!summary.goal_completed, "verdict should be live");
     }
 
     #[test]
@@ -2403,7 +2089,7 @@ mod tests {
             "recent section missing: {text:?}"
         );
         assert!(
-            text.iter().any(|line| line.contains("[✓] read_file")),
+            text.iter().any(|line| line.contains("[x] read_file")),
             "recent read_file row missing: {text:?}"
         );
     }
@@ -2432,7 +2118,7 @@ mod tests {
         let text = lines_to_text(&task_panel_lines(&app, 64, 8));
 
         assert!(
-            !text.iter().any(|line| line.contains("[✓] read_file")),
+            !text.iter().any(|line| line.contains("[x] read_file")),
             "expired completed active row should leave the sidebar: {text:?}"
         );
     }
@@ -2470,7 +2156,7 @@ mod tests {
         let text = lines_to_text(&task_panel_lines(&app, 64, 8));
 
         assert!(
-            text.iter().any(|line| line.contains("[✓] read_file")),
+            text.iter().any(|line| line.contains("[x] read_file")),
             "fresh completed active row should linger briefly: {text:?}"
         );
     }
@@ -2548,7 +2234,7 @@ mod tests {
             "running shell command should not render as both live and background: {text:?}"
         );
         assert!(
-            !text.iter().any(|line| line.contains("Background commands")),
+            !text.iter().any(|line| line.contains("Background jobs")),
             "duplicate background shell row should be hidden: {text:?}"
         );
     }
@@ -2572,7 +2258,8 @@ mod tests {
             "background shell headline should show the command, not only the shell id: {text:?}"
         );
         assert!(
-            text.iter().any(|line| line.contains("shell_33a08c3c")),
+            text.iter()
+                .any(|line| line.contains("shell_33a08c3c") && line.contains("shell job")),
             "shell id should remain available as detail: {text:?}"
         );
     }
@@ -2623,7 +2310,7 @@ mod tests {
             .expect("failed grep row should stay visible");
         let read_group_index = text
             .iter()
-            .position(|line| line.contains("[✓] read_file x3"))
+            .position(|line| line.contains("[x] read_file x3"))
             .expect("repeated read_file rows should collapse");
 
         assert!(
@@ -2632,7 +2319,7 @@ mod tests {
         );
         assert_eq!(
             text.iter()
-                .filter(|line| line.contains("[✓] read_file"))
+                .filter(|line| line.contains("[x] read_file"))
                 .count(),
             1,
             "read_file should render once after grouping: {text:?}"
@@ -2732,7 +2419,7 @@ mod tests {
 
         assert!(
             text.iter()
-                .any(|line| line.contains("[✓] cargo check 1.2s")),
+                .any(|line| line.contains("[x] cargo check 1.2s")),
             "status marker and duration should stay in the row label: {text:?}"
         );
         assert!(
@@ -2763,7 +2450,7 @@ mod tests {
         let text = lines_to_text(&task_panel_lines(&app, 80, 6));
 
         assert!(
-            text.iter().any(|line| line.contains("[~] wait command")),
+            text.iter().any(|line| line.contains("[~] wait shell job")),
             "shell helper should render as a user-facing activity: {text:?}"
         );
         assert!(
@@ -2797,7 +2484,7 @@ mod tests {
 
         assert_eq!(
             text.iter()
-                .filter(|line| line.contains("[~] wait command"))
+                .filter(|line| line.contains("[~] wait shell job"))
                 .count(),
             1,
             "duplicate waits for the same shell job should collapse: {text:?}"
@@ -2811,7 +2498,7 @@ mod tests {
     #[test]
     fn navigator_empty_state_says_no_agents() {
         let summary = SidebarSubagentSummary::default();
-        let lines = subagent_panel_lines(&summary, &[], 32, 8, &palette::UI_THEME);
+        let lines = subagent_panel_lines(&summary, &[], 32, 8);
         let text = lines_to_text(&lines);
         assert_eq!(text, vec!["No agents".to_string()]);
     }
@@ -2851,13 +2538,7 @@ mod tests {
                 duration_ms: Some(21_000),
             },
         ];
-        let text = lines_to_text(&subagent_panel_lines(
-            &summary,
-            &rows,
-            64,
-            12,
-            &palette::UI_THEME,
-        ));
+        let text = lines_to_text(&subagent_panel_lines(&summary, &rows, 64, 12));
         assert!(text[0].contains("2 running"), "header: {:?}", text[0]);
         assert!(text[0].contains("/ 3"), "total in header: {:?}", text[0]);
         assert!(
@@ -2888,13 +2569,7 @@ mod tests {
             role_counts: std::collections::BTreeMap::new(),
         };
 
-        let text = lines_to_text(&subagent_panel_lines(
-            &summary,
-            &[],
-            64,
-            8,
-            &palette::UI_THEME,
-        ));
+        let text = lines_to_text(&subagent_panel_lines(&summary, &[], 64, 8));
 
         assert!(text[0].contains("1 running"), "header: {:?}", text[0]);
         assert!(text[0].contains("/ 6"), "fanout total: {:?}", text[0]);
@@ -2913,13 +2588,7 @@ mod tests {
             foreground_rlm_running: false,
             role_counts,
         };
-        let text = lines_to_text(&subagent_panel_lines(
-            &summary,
-            &[],
-            32,
-            8,
-            &palette::UI_THEME,
-        ));
+        let text = lines_to_text(&subagent_panel_lines(&summary, &[], 32, 8));
         assert!(text[0].contains("1 done"), "settled header: {:?}", text[0]);
     }
 
@@ -2939,7 +2608,7 @@ mod tests {
             foreground_rlm_running: false,
             role_counts,
         };
-        let lines = subagent_panel_lines(&summary, &[], 16, 8, &palette::UI_THEME);
+        let lines = subagent_panel_lines(&summary, &[], 16, 8);
         let role_line: &str = lines[1]
             .spans
             .first()
@@ -2957,63 +2626,13 @@ mod tests {
             foreground_rlm_running: true,
             ..SidebarSubagentSummary::default()
         };
-        let text = lines_to_text(&subagent_panel_lines(
-            &summary,
-            &[],
-            64,
-            8,
-            &palette::UI_THEME,
-        ));
+        let text = lines_to_text(&subagent_panel_lines(&summary, &[], 64, 8));
 
-        assert!(!text[0].contains("No agents"), "header: {text:?}");
+        assert!(!text[0].contains("No agents"), "header: {:?}", text);
         assert!(
             text.iter()
                 .any(|line| line.contains("RLM foreground work active")),
             "RLM work must be visible in Agents panel: {text:?}"
         );
-    }
-
-    // ---- Sidebar hover tooltip tests ----
-
-    #[test]
-    fn sidebar_hover_state_default_is_empty() {
-        let state = SidebarHoverState::default();
-        assert!(state.sections.is_empty());
-    }
-
-    #[test]
-    fn sidebar_hover_section_stores_lines() {
-        use ratatui::layout::Rect;
-        let section = SidebarHoverSection {
-            content_area: Rect::new(1, 1, 38, 8),
-            lines: vec!["line 1".to_string(), "line 2".to_string()],
-        };
-        assert_eq!(section.lines.len(), 2);
-        assert_eq!(section.lines[0], "line 1");
-        assert!(section.content_area.x > 0);
-    }
-
-    #[test]
-    fn hover_line_matching_respects_content_area_offset() {
-        use ratatui::layout::Rect;
-        let section = SidebarHoverSection {
-            content_area: Rect::new(62, 2, 36, 6),
-            lines: vec![
-                "first".to_string(),
-                "second".to_string(),
-                "third".to_string(),
-            ],
-        };
-
-        // Mouse within content area, first line
-        let line_idx = (2u16.saturating_sub(section.content_area.y)) as usize;
-        assert_eq!(section.lines[line_idx], "first");
-
-        // Mouse within content area, second line
-        let line_idx = (3u16.saturating_sub(section.content_area.y)) as usize;
-        assert_eq!(section.lines[line_idx], "second");
-
-        // Mouse outside content area (above) — row < content_area.y
-        assert!((1u16) < section.content_area.y);
     }
 }
