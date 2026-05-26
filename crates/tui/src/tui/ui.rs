@@ -1,10 +1,15 @@
 //! TUI event loop and rendering logic for `DeepSeek` CLI.
 
-use std::io::{self, Stdout, Write};
+use std::{
+    io::{self, Stdout, Write},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
+};
 use std::path::PathBuf;
-
-use std::sync::Arc;
-use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
@@ -18,6 +23,12 @@ use crossterm::{
 // On Windows the push/pop helpers write the escapes directly; crossterm's
 // PushKeyboardEnhancementFlags / PopKeyboardEnhancementFlags commands are
 // never referenced, so the imports are gated to avoid -D warnings failures.
+<<<<<<< Updated upstream
+=======
+use chrono;
+use dirs;
+use crate::logging;
+>>>>>>> Stashed changes
 #[cfg(not(windows))]
 use crossterm::event::{
     KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
@@ -730,6 +741,9 @@ fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
             .unwrap_or_default(),
         search_api_key: config.search.as_ref().and_then(|s| s.api_key.clone()),
         tools: config.tools.clone(),
+        subagent_api_timeout: Duration::from_secs(
+            config.subagent_api_timeout_secs(),
+        ),
     }
 }
 
@@ -897,6 +911,51 @@ async fn run_event_loop(
         .unwrap_or_else(Instant::now);
 
     let mut loop_ticks: u64 = 0;
+
+    // -----------------------------------------------------------------
+    // Watchdog: detects event-loop freezes and auto-captures a minidump.
+    // Incremented once per loop iteration; if the watchdog thread doesn't
+    // see it change for >= WATCHDOG_TIMEOUT seconds we know the main
+    // thread is stuck and we dump the process.
+    // -----------------------------------------------------------------
+    const WATCHDOG_TIMEOUT: Duration = Duration::from_secs(5);
+    let heartbeat = Arc::new(AtomicU64::new(0));
+    let hb = Arc::clone(&heartbeat);
+    let pid = std::process::id();
+    thread::Builder::new()
+        .name("tui-watchdog".into())
+        .spawn(move || {
+            eprintln!("[WATCHDOG] started pid={pid}");
+            loop {
+            let before = hb.load(Ordering::Relaxed);
+            thread::sleep(WATCHDOG_TIMEOUT);
+            let after = hb.load(Ordering::Relaxed);
+            if before == after && before != 0 {
+                // Main thread is stuck — try to capture a dump.
+                let ts = chrono::Local::now().format("%Y%m%d_%H%M%S");
+                let dump_path = dirs::home_dir()
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".deepseek")
+                    .join("crashes")
+                    .join(format!("tui-freeze-{ts}.dmp"));
+                // Best-effort: procdump may not be installed.
+                let _ = std::process::Command::new("procdump64.exe")
+                    .args(["-ma", &pid.to_string(), "-accepteula"])
+                    .arg(&dump_path)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .spawn();
+                // Write a marker to stderr that we detected a freeze.
+                eprintln!(
+                    "[WATCHDOG] HEARTBEAT_STALLED pid={pid} last_tick={before} dump={}",
+                    dump_path.display()
+                );
+                // Reset to the current value so we don't double-fire.
+                hb.store(after, Ordering::Relaxed);
+            }
+            }  // loop
+        })  // move closure
+        .ok();
 
     loop {
         loop_ticks += 1;
@@ -2149,8 +2208,41 @@ async fn run_event_loop(
         // `working.` with no network activity.
         tokio::task::yield_now().await;
 
+<<<<<<< Updated upstream
         if event::poll(poll_timeout)? {
+=======
+        // Poll with zero timeout to avoid hanging on a dead Windows console
+        // input handle.  Wrapping WaitForMultipleObjects with a non-zero
+        // timeout is not reliable on every Windows configuration — rapid
+        // `exec_shell` child-process exits can leave the console handle in a
+        // state where `WaitForSingleObject` never returns, even with a
+        // timeout.  Busy-polling with manual sleep avoids that kernel path
+        // entirely while keeping the CPU footprint negligible.
+        let poll_timer = Instant::now();
+        let event_available = loop {
+            match event::poll(Duration::ZERO) {
+                Ok(true) => break true,
+                Ok(false) => {
+                    if poll_timer.elapsed() >= poll_timeout { break false; }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(e) => return Err(e.into()),
+            }
+        };
+        let poll_elapsed = poll_timer.elapsed();
+        let poll_overshoot_ms = poll_elapsed.as_millis().saturating_sub(poll_timeout.as_millis());
+        if poll_overshoot_ms > 50 {
+            logging::warn(format!(
+                "[FREEZE-DEBUG] poll_overshoot tick={loop_ticks} requested_ms={} actual_ms={}",
+                poll_timeout.as_millis(), poll_elapsed.as_millis()
+            ));
+        }
+
+        if event_available {
+>>>>>>> Stashed changes
             let evt = event::read()?;
+            // Signal watchdog that we processed real user input.
+            heartbeat.store(loop_ticks, Ordering::Relaxed);
             app.needs_redraw = true;
 
             // Handle bracketed paste events
@@ -5540,6 +5632,7 @@ fn render(f: &mut Frame, app: &mut App) {
             crate::config::ApiProvider::Sglang => Some("SGLang"),
             crate::config::ApiProvider::Vllm => Some("vLLM"),
             crate::config::ApiProvider::Ollama => Some("Ollama"),
+            crate::config::ApiProvider::WanjieArk => Some("Wanjie"),
         };
         let status_indicator_started_at = if app.low_motion {
             None
@@ -6304,6 +6397,7 @@ async fn apply_provider_picker_api_key(
             ApiProvider::Sglang => &mut providers.sglang,
             ApiProvider::Vllm => &mut providers.vllm,
             ApiProvider::Ollama => &mut providers.ollama,
+            ApiProvider::WanjieArk => &mut providers.wanjie_ark,
         };
         entry.api_key = Some(api_key);
     }

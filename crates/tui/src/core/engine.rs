@@ -172,16 +172,26 @@ pub struct EngineConfig {
     pub search_provider: crate::config::SearchProvider,
     /// API key for Tavily or Bocha. `None` for Bing or DuckDuckGo.
     pub search_api_key: Option<String>,
+<<<<<<< Updated upstream
+=======
+    /// Tool override and plugin configuration (`[tools]` table in config.toml).
+    /// Applied to the per-turn tool registry after built-in tools are registered.
+    /// When `None`, no overrides or plugin loading occurs.
+    pub tools: Option<crate::config::ToolsConfig>,
+>>>>>>> Stashed changes
     /// Per-step DeepSeek API timeout for sub-agent `create_message` requests.
     /// Resolved from `[subagents] api_timeout_secs` (clamped to 1..=1800)
     /// once at engine construction, then threaded onto every
     /// `SubAgentRuntime` the engine builds (#1806, #1808).
     pub subagent_api_timeout: Duration,
+<<<<<<< Updated upstream
 
     /// Tool override and plugin configuration (`[tools]` table in config.toml).
     /// Applied to the per-turn tool registry after built-in tools are registered.
     /// When `None`, no overrides or plugin loading occurs.
     pub tools: Option<crate::config::ToolsConfig>,
+=======
+>>>>>>> Stashed changes
 }
 
 impl Default for EngineConfig {
@@ -224,10 +234,17 @@ impl Default for EngineConfig {
             workshop: None,
             search_provider: crate::config::SearchProvider::default(),
             search_api_key: None,
+<<<<<<< Updated upstream
             subagent_api_timeout: Duration::from_secs(
                 crate::config::DEFAULT_SUBAGENT_API_TIMEOUT_SECS,
             ),
             tools: None,
+=======
+            tools: None,
+            subagent_api_timeout: Duration::from_secs(
+                crate::config::DEFAULT_SUBAGENT_API_TIMEOUT_SECS,
+            ),
+>>>>>>> Stashed changes
         }
     }
 }

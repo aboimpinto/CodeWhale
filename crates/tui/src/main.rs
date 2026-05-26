@@ -673,6 +673,12 @@ enum SandboxCommand {
 #[tokio::main]
 async fn main() -> Result<()> {
     configure_windows_console_utf8();
+    
+    // Use the `ring` crypto provider instead of the default `aws-lc-rs`.
+    // `aws-lc-rs`'s jitter kernel entropy collector can stall on some Windows
+    // configurations, freezing the entire TUI during TLS handshakes.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
 
     // Set up process panic hook before anything else — writes crash dumps
     // to ~/.deepseek/crashes/ even if the panic happens before tokio is up,

@@ -484,6 +484,11 @@ pub fn run_cli() -> std::process::ExitCode {
 }
 
 fn run() -> Result<()> {
+    // Use the `ring` crypto provider instead of the default `aws-lc-rs`.
+    // `aws-lc-rs`'s jitter kernel entropy collector can stall on some Windows
+    // configurations, freezing the entire TUI during TLS handshakes.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let mut cli = Cli::parse();
 
     let mut store = ConfigStore::load(cli.config.clone())?;

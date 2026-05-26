@@ -1963,6 +1963,181 @@ mod tests {
     }
 
 
+
+    // -- pausable lifecycle tests ------------------------------------
+
+    #[test]
+    fn lifecycle_dispatch_shows_no_indicator_while_running() {
+        use crate::config::Config;
+        let mut app = App::new(
+            TuiOptions { model: "test".to_string(), workspace: PathBuf::from("."),
+                config_path: None, config_profile: None, allow_shell: false,
+                use_alt_screen: true, use_mouse_capture: false, use_bracketed_paste: true,
+                max_subagents: 1, skills_dir: PathBuf::from("."), memory_path: PathBuf::from("memory.md"),
+                notes_path: PathBuf::from("notes.txt"), mcp_config_path: PathBuf::from("mcp.json"),
+                use_memory: false, start_in_agent_mode: false, skip_onboarding: true, yolo: false,
+                resume_session_id: None, initial_input: None,
+            }, &Config::default(),
+        );
+        app.goal.goal_objective = Some("scan".to_string());
+        app.pausable = true;
+        app.paused = false;
+        app.paused_cancelled = false;
+        let summary = sidebar_work_summary(&app);
+        assert_eq!(summary.pause_indicator, None,
+            "expected no indicator while running");
+    }
+
+    #[test]
+    fn lifecycle_pause_shows_paused_indicator() {
+        use crate::config::Config;
+        let mut app = App::new(
+            TuiOptions { model: "test".to_string(), workspace: PathBuf::from("."),
+                config_path: None, config_profile: None, allow_shell: false,
+                use_alt_screen: true, use_mouse_capture: false, use_bracketed_paste: true,
+                max_subagents: 1, skills_dir: PathBuf::from("."), memory_path: PathBuf::from("memory.md"),
+                notes_path: PathBuf::from("notes.txt"), mcp_config_path: PathBuf::from("mcp.json"),
+                use_memory: false, start_in_agent_mode: false, skip_onboarding: true, yolo: false,
+                resume_session_id: None, initial_input: None,
+            }, &Config::default(),
+        );
+        app.goal.goal_objective = Some("scan".to_string());
+        app.pausable = true;
+        app.paused = true;
+        app.paused_cancelled = false;
+        let summary = sidebar_work_summary(&app);
+        assert_eq!(summary.pause_indicator.as_deref(), Some("(Paused)"),
+            "expected '(Paused)' when paused");
+    }
+
+    #[test]
+    fn lifecycle_cancel_persists_cancelled_indicator() {
+        use crate::config::Config;
+        let mut app = App::new(
+            TuiOptions { model: "test".to_string(), workspace: PathBuf::from("."),
+                config_path: None, config_profile: None, allow_shell: false,
+                use_alt_screen: true, use_mouse_capture: false, use_bracketed_paste: true,
+                max_subagents: 1, skills_dir: PathBuf::from("."), memory_path: PathBuf::from("memory.md"),
+                notes_path: PathBuf::from("notes.txt"), mcp_config_path: PathBuf::from("mcp.json"),
+                use_memory: false, start_in_agent_mode: false, skip_onboarding: true, yolo: false,
+                resume_session_id: None, initial_input: None,
+            }, &Config::default(),
+        );
+        app.goal.goal_objective = Some("scan".to_string());
+        // Simulate: command dispatched, then cancelled
+        app.pausable = false;   // TurnStarted cleared this
+        app.paused = false;
+        app.paused_cancelled = true;  // CancelRequest set this
+        let summary = sidebar_work_summary(&app);
+        assert_eq!(summary.pause_indicator.as_deref(), Some("(Cancelled)"),
+            "expected '(Cancelled)' to persist after cancel");
+    }
+
+    #[test]
+    fn lifecycle_new_pausable_command_removes_cancelled_indicator() {
+        use crate::config::Config;
+        let mut app = App::new(
+            TuiOptions { model: "test".to_string(), workspace: PathBuf::from("."),
+                config_path: None, config_profile: None, allow_shell: false,
+                use_alt_screen: true, use_mouse_capture: false, use_bracketed_paste: true,
+                max_subagents: 1, skills_dir: PathBuf::from("."), memory_path: PathBuf::from("memory.md"),
+                notes_path: PathBuf::from("notes.txt"), mcp_config_path: PathBuf::from("mcp.json"),
+                use_memory: false, start_in_agent_mode: false, skip_onboarding: true, yolo: false,
+                resume_session_id: None, initial_input: None,
+            }, &Config::default(),
+        );
+        app.goal.goal_objective = Some("scan".to_string());
+        // Previous cancelled state
+        app.pausable = false;
+        app.paused_cancelled = true;
+
+        // New pausable command dispatched
+        app.pausable = true;
+        app.paused = false;
+        app.paused_cancelled = false;  // must be cleared on new dispatch
+
+        let summary = sidebar_work_summary(&app);
+        assert_eq!(summary.pause_indicator, None,
+            "expected new command to clear cancelled indicator");
+    }
+
+    #[test]
+    fn lifecycle_resume_from_pause_shows_running() {
+        use crate::config::Config;
+        let mut app = App::new(
+            TuiOptions { model: "test".to_string(), workspace: PathBuf::from("."),
+                config_path: None, config_profile: None, allow_shell: false,
+                use_alt_screen: true, use_mouse_capture: false, use_bracketed_paste: true,
+                max_subagents: 1, skills_dir: PathBuf::from("."), memory_path: PathBuf::from("memory.md"),
+                notes_path: PathBuf::from("notes.txt"), mcp_config_path: PathBuf::from("mcp.json"),
+                use_memory: false, start_in_agent_mode: false, skip_onboarding: true, yolo: false,
+                resume_session_id: None, initial_input: None,
+            }, &Config::default(),
+        );
+        app.goal.goal_objective = Some("scan".to_string());
+        // Previously paused
+        app.pausable = true;
+        app.paused = true;
+
+        // User resumes (unpause)
+        app.paused = false;
+
+        let summary = sidebar_work_summary(&app);
+        assert_eq!(summary.pause_indicator, None,
+            "expected no indicator after resume (back to running)");
+    }
+
+    #[test]
+    fn lifecycle_complete_removes_indicator_and_pausable_flag() {
+        use crate::config::Config;
+        let mut app = App::new(
+            TuiOptions { model: "test".to_string(), workspace: PathBuf::from("."),
+                config_path: None, config_profile: None, allow_shell: false,
+                use_alt_screen: true, use_mouse_capture: false, use_bracketed_paste: true,
+                max_subagents: 1, skills_dir: PathBuf::from("."), memory_path: PathBuf::from("memory.md"),
+                notes_path: PathBuf::from("notes.txt"), mcp_config_path: PathBuf::from("mcp.json"),
+                use_memory: false, start_in_agent_mode: false, skip_onboarding: true, yolo: false,
+                resume_session_id: None, initial_input: None,
+            }, &Config::default(),
+        );
+        app.goal.goal_objective = Some("scan".to_string());
+        // Command completed successfully
+        app.pausable = false;
+        app.paused = false;
+        app.paused_cancelled = false;
+
+        let summary = sidebar_work_summary(&app);
+        assert_eq!(summary.pause_indicator, None,
+            "expected no indicator after successful completion");
+    }
+
+
+
+    #[test]
+    fn lifecycle_paused_text_appears_in_work_panel() {
+        let summary = SidebarWorkSummary {
+            goal_objective: Some("scan".to_string()),
+            pause_indicator: Some("(Paused)".to_string()),
+            ..SidebarWorkSummary::default()
+        };
+        let text = lines_to_text(&work_panel_lines(&summary, 80, 16, PaletteMode::Dark));
+        assert!(text.iter().any(|line| line.contains("(Paused)")),
+            "expected (Paused) in work panel text, got: {text:?}");
+    }
+
+    #[test]
+    fn lifecycle_cancelled_text_appears_in_work_panel() {
+        let summary = SidebarWorkSummary {
+            goal_objective: Some("scan".to_string()),
+            pause_indicator: Some("(Cancelled)".to_string()),
+            ..SidebarWorkSummary::default()
+        };
+        let text = lines_to_text(&work_panel_lines(&summary, 80, 16, PaletteMode::Dark));
+        assert!(text.iter().any(|line| line.contains("(Cancelled)")),
+            "expected (Cancelled) in work panel text, got: {text:?}");
+    }
+
+
     fn lines_to_text(lines: &[Line<'static>]) -> Vec<String> {
         lines
             .iter()

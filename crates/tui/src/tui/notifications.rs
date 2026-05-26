@@ -197,8 +197,9 @@ pub fn notify_done_to<W: Write>(
         return;
     }
     // Best-effort: ignore write errors (e.g. stdout closed).
+    // No explicit flush — the escape sequence is self-terminating (BEL/ST)
+    // and ratatui's next draw will flush the buffer naturally (#1778).
     let _ = sink.write_all(&bytes);
-    let _ = sink.flush();
 
     // On Windows, writing BEL (`\x07`) to the terminal is silent in most
     // terminals (Windows Terminal, Conhost, etc.). Call MessageBeep to
@@ -245,9 +246,10 @@ pub fn set_taskbar_progress(state: u8, progress: Option<u8>) {
     } else {
         format!("\x1b]9;4;{state}\x07")
     };
-    let mut stdout = io::stdout();
-    let _ = stdout.write_all(seq.as_bytes());
-    let _ = stdout.flush();
+    // Write through crossterm's queue to avoid racing with ratatui's
+    // alt-screen buffer. The BEL terminator makes the sequence
+    // self-terminating — no manual flush required (#1778).
+    let _ = crossterm::queue!(std::io::stdout(), crossterm::style::Print(&seq));
 }
 
 /// Set taskbar progress to indeterminate (cycling) — call at turn start.
@@ -270,12 +272,14 @@ const TITLE_ANIMATION_INTERVAL: Duration = Duration::from_millis(800);
 /// `start_title_animation()`, cleared by `stop_title_animation()`.
 static TITLE_ANIMATION_RUNNING: AtomicBool = AtomicBool::new(false);
 
-/// Write OSC 0 (set window title) sequence.
+/// Queue OSC 0 (set window title) through crossterm to avoid racing with
+/// ratatui's alt-screen buffer. No explicit flush — the sequence is
+/// self-terminating and ratatui's next draw pushes the buffer.
 fn set_terminal_title(title: &str) {
-    let seq = format!("\x1b]0;{title}\x07");
-    let mut stdout = io::stdout();
-    let _ = stdout.write_all(seq.as_bytes());
-    let _ = stdout.flush();
+    let _ = crossterm::queue!(
+        std::io::stdout(),
+        crossterm::terminal::SetTitle(title)
+    );
 }
 
 /// Tracks whether the ✅ completion marker was set, so

@@ -203,6 +203,7 @@ pub fn try_dispatch_user_command(app: &mut App, input: &str) -> Option<CommandRe
                     }
                     app.pausable = true;
                     app.paused = false;
+                    app.paused_cancelled = false;
                     // Snapshot workspace for potential rollback via git stash
                     let git_stash_cmd = std::process::Command::new("git")
                         .args(["-C", &app.workspace.to_string_lossy(), "stash", "push", "--include-untracked", "-m", "codewhale-pausable"])
