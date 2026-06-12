@@ -39,7 +39,7 @@ fn legacy_global_commands_dir() -> PathBuf {
 }
 
 /// Return all candidate commands directories in precedence order.
-fn commands_dirs(workspace: Option<&Path>) -> Vec<PathBuf> {
+pub(crate) fn commands_dirs(workspace: Option<&Path>) -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(ws) = workspace {
         dirs.push(ws.join(".codewhale").join("commands"));
@@ -54,7 +54,7 @@ fn commands_dirs(workspace: Option<&Path>) -> Vec<PathBuf> {
 
 /// Scan a single commands directory for `.md` files and return
 /// `(name, content)` pairs. Errors are silently skipped.
-fn load_commands_from_dir(dir: &Path) -> Vec<(String, String)> {
+pub(crate) fn load_commands_from_dir(dir: &Path) -> Vec<(String, String)> {
     let mut commands: Vec<(String, String)> = Vec::new();
 
     if !dir.is_dir() {
@@ -162,7 +162,7 @@ fn strip_matched_quotes(value: &str) -> &str {
     value
 }
 
-fn parse_allowed_tools(value: &str) -> Vec<String> {
+pub(crate) fn parse_allowed_tools(value: &str) -> Vec<String> {
     value
         .split(',')
         .map(|tool| {

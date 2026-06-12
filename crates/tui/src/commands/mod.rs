@@ -33,6 +33,7 @@ mod stash;
 mod status;
 mod task;
 pub mod user_commands;
+pub mod user_registry;
 
 use std::fmt::Write as _;
 
@@ -1776,5 +1777,150 @@ mod tests {
             .expect("unknown command should return an error message");
         assert!(msg.contains("Unknown command: /zzzzzz"));
         assert!(msg.contains("Type /help for available commands."));
+    }
+
+    // ── User command precedence (Phase 6 integration) ──────────────
+
+    /// Create a minimal `App` pointing at a given workspace path, without
+    /// relying on `create_isolated_test_app` (which owns its own TempDir).
+    fn app_for_workspace(ws: &std::path::Path) -> App {
+        let config_path = ws.join(".deepseek").join("config.toml");
+        std::fs::create_dir_all(config_path.parent().expect("config parent"))
+            .expect("config dir");
+        let options = crate::tui::app::TuiOptions {
+            model: "deepseek-v4-pro".to_string(),
+            workspace: ws.to_path_buf(),
+            config_path: Some(config_path),
+            config_profile: None,
+            allow_shell: false,
+            use_alt_screen: true,
+            use_mouse_capture: false,
+            use_bracketed_paste: true,
+            max_subagents: 1,
+            skills_dir: ws.join("skills"),
+            memory_path: ws.join("memory.md"),
+            notes_path: ws.join("notes.txt"),
+            mcp_config_path: ws.join("mcp.json"),
+            use_memory: false,
+            start_in_agent_mode: false,
+            skip_onboarding: true,
+            yolo: false,
+            resume_session_id: None,
+            initial_input: None,
+        };
+        App::new(options, &crate::Config::default())
+    }
+
+    /// Verify that a user command shadowing a built-in name is dispatched
+    /// first (precedence). The built-in `/help` returns a message with help
+    /// text; a user command with the same name should return a `SendMessage`
+    /// action with the user-defined body.
+    #[test]
+    fn user_command_shadows_builtin_and_executes_first() {
+        let tmp = tempfile::TempDir::new().expect("tempdir for shadow test");
+        let ws = tmp.path();
+
+        // Create a user command file that shadows the built-in "help" command.
+        let cmds_dir = ws.join(".codewhale").join("commands");
+        std::fs::create_dir_all(&cmds_dir).expect("create cmds dir");
+        std::fs::write(
+            cmds_dir.join("help.md"),
+            "---\ndescription: Custom help\n---\nYou asked for help. This is user-defined.",
+        )
+        .expect("write help.md");
+
+        // Pre-load the global registry from this workspace.
+        super::user_registry::reload(Some(ws));
+
+        let mut app = app_for_workspace(ws);
+
+        // Dispatch /help — user command should intercept and return SendMessage.
+        let result = execute("/help", &mut app);
+        assert!(!result.is_error);
+        let Some(AppAction::SendMessage(msg)) = result.action else {
+            panic!(
+                "expected SendMessage from user command, got action={:?} msg={:?}",
+                result.action, result.message
+            );
+        };
+        assert!(
+            msg.contains("user-defined"),
+            "expected user command body, got: {msg}"
+        );
+    }
+
+    /// Verify that when no user command shadows a built-in, the built-in
+    /// dispatch runs normally (returns help text, no action).
+    #[test]
+    fn user_command_absent_falls_through_to_builtin() {
+        let tmp = tempfile::TempDir::new().expect("tempdir for fallthrough test");
+        let ws = tmp.path();
+
+        // Empty workspace — no user commands -> registry is empty.
+        super::user_registry::reload(Some(ws));
+
+        let mut app = app_for_workspace(ws);
+
+        // Dispatch /help — no user command shadows it, built-in should run.
+        let result = execute("/help", &mut app);
+        assert!(!result.is_error);
+        assert!(
+            result.action.is_none(),
+            "expected built-in help (no action), got: {:?}",
+            result.action
+        );
+        let msg = result
+            .message
+            .expect("built-in help should return a message");
+        assert!(
+            msg.contains("help"),
+            "expected built-in help message, got: {msg}"
+        );
+    }
+
+    /// Verify that a user command with frontmatter fields (description,
+    /// allowed-tools) is correctly parsed and applied on dispatch through
+    /// the full `execute` path.
+    #[test]
+    fn user_command_frontmatter_fields_are_applied_on_dispatch() {
+        let tmp = tempfile::TempDir::new().expect("tempdir for frontmatter test");
+        let ws = tmp.path();
+
+        let cmds_dir = ws.join(".codewhale").join("commands");
+        std::fs::create_dir_all(&cmds_dir).expect("create cmds dir");
+        std::fs::write(
+            cmds_dir.join("scan.md"),
+            "---\ndescription: Scan the codebase\nallowed-tools: [\"Bash\", \"Read\"]\npausable: true\n---\nScanning $ARGUMENTS",
+        )
+        .expect("write scan.md");
+
+        super::user_registry::reload(Some(ws));
+
+        let mut app = app_for_workspace(ws);
+
+        let result = execute("/scan src/", &mut app);
+        assert!(!result.is_error);
+        let Some(AppAction::SendMessage(msg)) = result.action else {
+            panic!("expected SendMessage from user command, got: {:?}", result.action);
+        };
+        // Template substitution
+        assert!(
+            msg.contains("Scanning src/"),
+            "expected substituted body, got: {msg}"
+        );
+        // Frontmatter fields applied to app state
+        assert!(
+            app.hunt.quarry.as_deref() == Some("Scan the codebase"),
+            "description not set: {:?}",
+            app.hunt.quarry
+        );
+        assert!(app.pausable, "pausable should be true");
+        assert!(
+            app.active_allowed_tools
+                .as_ref()
+                .is_some_and(|t| t.contains(&"Bash".to_string())),
+            "allowed-tools not set: {:?}",
+            app.active_allowed_tools
+        );
     }
 }

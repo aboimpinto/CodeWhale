@@ -1,11 +1,11 @@
 //! Core command group dispatch.
 //!
 //! Commands: anchor, help, clear, exit, model, models, provider, queue,
-//! stash, hooks, subagents, agent, links, feedback, hf, note, home, workspace,
+//! stash, hooks, subagents, agent, links, feedback, hf, home, workspace,
 //! attach, task, jobs, mcp, network, rlm, profile
 
 use crate::commands::{
-    CommandResult, agent, anchor, attachment, core, feedback, hf, hooks, jobs, mcp, network, note,
+    CommandResult, agent, anchor, attachment, core, feedback, hf, hooks, jobs, mcp, network,
     provider, queue, rlm, stash, task,
 };
 use crate::tui::app::App;
@@ -30,7 +30,6 @@ pub fn dispatch(command: &str, arg: Option<&str>, app: &mut App) -> Option<Comma
         "links" | "dashboard" | "api" | "lianjie" => Some(core::deepseek_links(app)),
         "feedback" => Some(feedback::feedback(app, arg)),
         "hf" | "huggingface" => Some(hf::hf(app, arg)),
-        "note" => Some(note::note(app, arg)),
         "home" | "stats" | "overview" | "zhuye" | "shouye" => Some(core::home_dashboard(app)),
         "workspace" | "cwd" => Some(core::workspace_switch(app, arg)),
         "attach" | "image" | "media" | "fujian" => Some(attachment::attach(app, arg)),
