@@ -73,6 +73,8 @@ project_overhaul_prompt.md
 !**/.codewhale/constitution.json
 .deepseek/
 **/session_*.json
+chat_export_*.md
+**/chat_export_*.md
 *.db
 npm/*/bin/downloads/
 
