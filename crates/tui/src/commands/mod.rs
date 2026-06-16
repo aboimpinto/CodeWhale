@@ -10,6 +10,7 @@ mod groups;
 mod plugins;
 pub mod traits;
 pub mod user_commands;
+pub mod user_registry;
 
 use std::sync::OnceLock;
 
@@ -119,7 +120,8 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         .filter(|value| !value.is_empty());
 
     // Check user-defined commands FIRST so they can override built-ins.
-    if let Some(result) = user_commands::try_dispatch_user_command(app, trimmed) {
+    user_registry::ensure_initialized(Some(&app.workspace));
+    if let Some(result) = user_registry::try_dispatch(app, trimmed) {
         return result;
     }
 
@@ -301,6 +303,66 @@ mod tests {
             initial_input: None,
         };
         App::new(options, &Config::default())
+    }
+
+    #[test]
+    fn user_registry_module_is_compiled() {
+        super::user_registry::reload(None);
+        let registry = super::user_registry::current_registry();
+        assert!(registry.is_valid());
+    }
+
+    #[test]
+    fn user_command_shadows_builtin_before_group_dispatch() {
+        let temp = tempdir().unwrap();
+        let commands_dir = temp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("help.md"),
+            "---\ndescription: User help\n---\nuser help $ARGUMENTS",
+        )
+        .unwrap();
+
+        let mut app = create_test_app();
+        app.workspace = temp.path().to_path_buf();
+        super::user_registry::reload(Some(temp.path()));
+
+        let result = execute("/help now", &mut app);
+        assert!(!result.is_error);
+        match result.action {
+            Some(AppAction::SendMessage(message)) => assert_eq!(message, "user help now"),
+            other => panic!("expected user command SendMessage action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn removed_user_command_reloads_and_falls_back_to_builtin() {
+        let temp = tempdir().unwrap();
+        let commands_dir = temp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        let command_path = commands_dir.join("help.md");
+        std::fs::write(&command_path, "user help").unwrap();
+
+        let mut app = create_test_app();
+        app.workspace = temp.path().to_path_buf();
+        super::user_registry::reload(Some(temp.path()));
+        assert!(matches!(
+            execute("/help config", &mut app).action,
+            Some(AppAction::SendMessage(_))
+        ));
+
+        std::fs::remove_file(command_path).unwrap();
+        super::user_registry::reload(Some(temp.path()));
+        let result = execute("/help config", &mut app);
+        assert!(!result.is_error);
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("config")),
+            "built-in /help should handle the command"
+        );
+        assert!(result.action.is_none());
     }
 
     #[test]

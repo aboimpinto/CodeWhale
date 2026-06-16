@@ -54,8 +54,12 @@ pub fn build_entries(
     mcp_snapshot: Option<&crate::mcp::McpManagerSnapshot>,
 ) -> Vec<CommandPaletteEntry> {
     let mut entries = Vec::new();
+    let user_registry = commands::user_registry::registry_for_workspace(Some(workspace));
 
     for command in commands::command_infos() {
+        if user_registry.get(command.name).is_some() {
+            continue;
+        }
         let mut description = command.palette_description_for(locale);
         if command.requires_argument() {
             description.push_str("  ");
@@ -75,6 +79,36 @@ pub fn build_entries(
             label: format!("/{}", command.name),
             description,
             command: command.palette_command(),
+            action,
+        });
+    }
+
+    for command in user_registry.iter().filter(|command| !command.hidden) {
+        let mut description = command
+            .description
+            .clone()
+            .unwrap_or_else(|| "User-defined command".to_string());
+        if let Some(hint) = &command.argument_hint
+            && !hint.trim().is_empty()
+        {
+            description.push_str("  ");
+            description.push_str(hint.trim());
+        }
+        let slash_command = format!("/{}", command.name);
+        let action = if command.argument_hint.is_some() {
+            CommandPaletteAction::InsertText {
+                text: format!("{slash_command} "),
+            }
+        } else {
+            CommandPaletteAction::ExecuteCommand {
+                command: slash_command.clone(),
+            }
+        };
+        entries.push(CommandPaletteEntry {
+            section: PaletteSection::Command,
+            label: slash_command.clone(),
+            description,
+            command: slash_command,
             action,
         });
     }
@@ -1147,6 +1181,65 @@ mod tests {
     }
 
     #[test]
+    fn command_palette_includes_workspace_user_commands() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let commands_dir = workspace.join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).expect("create commands dir");
+        std::fs::write(
+            commands_dir.join("review.md"),
+            "---\ndescription: Review with context\nargument-hint: <path>\n---\nReview $ARGUMENTS",
+        )
+        .expect("write user command");
+
+        let entries = build_entries(
+            Locale::En,
+            tmp.path().join("skills").as_path(),
+            workspace.as_path(),
+            tmp.path().join("mcp.json").as_path(),
+            None,
+        );
+        let user_entry = entries
+            .iter()
+            .find(|entry| entry.section == PaletteSection::Command && entry.label == "/review")
+            .expect("user command should appear in command palette");
+
+        assert!(user_entry.description.contains("Review with context"));
+        assert!(user_entry.description.contains("<path>"));
+        assert!(matches!(
+            &user_entry.action,
+            CommandPaletteAction::InsertText { text } if text == "/review "
+        ));
+    }
+
+    #[test]
+    fn command_palette_excludes_hidden_user_commands() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workspace = tmp.path().join("workspace");
+        let commands_dir = workspace.join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).expect("create commands dir");
+        std::fs::write(
+            commands_dir.join("secret.md"),
+            "---\ndescription: Internal workflow\nhidden: true\n---\nsecret",
+        )
+        .expect("write hidden user command");
+
+        let entries = build_entries(
+            Locale::En,
+            tmp.path().join("skills").as_path(),
+            workspace.as_path(),
+            tmp.path().join("mcp.json").as_path(),
+            None,
+        );
+
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.section == PaletteSection::Command && entry.label == "/secret")
+        );
+    }
+
+    #[test]
     fn command_palette_has_one_entry_for_every_registered_command() {
         let tmp = TempDir::new().expect("tempdir");
         let skills_dir = tmp.path().join("skills");
@@ -1163,9 +1256,24 @@ mod tests {
             .iter()
             .filter(|entry| entry.section == PaletteSection::Command)
             .collect::<Vec<_>>();
-        assert_eq!(command_entries.len(), commands::command_infos().len());
+        let user_registry = commands::user_registry::registry_for_workspace(Some(tmp.path()));
+        let visible_user_commands = user_registry
+            .iter()
+            .filter(|command| !command.hidden)
+            .count();
+        let shadowed_builtins = commands::command_infos()
+            .iter()
+            .filter(|command| user_registry.get(command.name).is_some())
+            .count();
+        assert_eq!(
+            command_entries.len(),
+            commands::command_infos().len() - shadowed_builtins + visible_user_commands
+        );
 
         for command in commands::command_infos() {
+            if user_registry.get(command.name).is_some() {
+                continue;
+            }
             let label = format!("/{}", command.name);
             let matching = command_entries
                 .iter()

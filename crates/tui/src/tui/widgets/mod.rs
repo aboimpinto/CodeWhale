@@ -2287,16 +2287,25 @@ pub(crate) fn slash_completion_hints(
     let mut entries: Vec<SlashMenuEntry> = Vec::new();
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     let prefix_lower = prefix.to_ascii_lowercase();
-    let user_commands = if completing_skill_arg.is_none() {
-        commands::user_commands::load_user_commands(workspace)
-    } else {
-        Vec::new()
-    };
+    let all_user_commands: Vec<commands::user_registry::UserCommandMetadata> =
+        if completing_skill_arg.is_none() {
+            commands::user_registry::registry_for_workspace(workspace)
+                .iter()
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
+    let user_commands: Vec<_> = all_user_commands
+        .iter()
+        .filter(|cmd| !cmd.hidden)
+        .cloned()
+        .collect();
 
     // ── Phase 1: prefix (starts_with) matches ─────────────────────────
     // Highest priority — preserves existing exact-prefix completion.
     if completing_skill_arg.is_none() {
-        for name in all_command_names_matching_loaded(prefix, &user_commands) {
+        for name in all_command_names_matching_loaded(prefix, &user_commands, &all_user_commands) {
             seen.insert(name.clone());
             let command_key = name.trim_start_matches('/');
             push_command_entry(
@@ -2319,16 +2328,37 @@ pub(crate) fn slash_completion_hints(
                 continue;
             }
             let cmd_lower = cmd.name.to_ascii_lowercase();
-            let alias_match = cmd
-                .aliases
-                .iter()
-                .any(|a| a.to_ascii_lowercase().contains(&prefix_lower));
-            if cmd_lower.contains(&prefix_lower) || alias_match {
+            let name_match = cmd_lower.contains(&prefix_lower);
+            let alias_matches = |alias: &str| alias.to_ascii_lowercase().contains(&prefix_lower);
+            if builtin_visible_for_completion_match(
+                cmd,
+                &all_user_commands,
+                name_match,
+                alias_matches,
+            ) {
                 seen.insert(name.clone());
                 push_command_entry(
                     &mut entries,
                     &name,
                     cmd.name,
+                    &prefix_lower,
+                    locale,
+                    &user_commands,
+                );
+            }
+        }
+        for cmd in &user_commands {
+            let name = format!("/{}", cmd.name);
+            if seen.contains(&name) {
+                continue;
+            }
+            let alias_match = cmd.aliases.iter().any(|a| a.contains(&prefix_lower));
+            if cmd.name.contains(&prefix_lower) || alias_match {
+                seen.insert(name.clone());
+                push_command_entry(
+                    &mut entries,
+                    &name,
+                    &cmd.name,
                     &prefix_lower,
                     locale,
                     &user_commands,
@@ -2346,16 +2376,40 @@ pub(crate) fn slash_completion_hints(
                 continue;
             }
             let cmd_lower = cmd.name.to_ascii_lowercase();
-            let alias_match = cmd
-                .aliases
-                .iter()
-                .any(|a| fuzzy_chars_in_order(&prefix_lower, &a.to_ascii_lowercase()));
-            if fuzzy_chars_in_order(&prefix_lower, &cmd_lower) || alias_match {
+            let name_match = fuzzy_chars_in_order(&prefix_lower, &cmd_lower);
+            let alias_matches = |alias: &str| fuzzy_chars_in_order(&prefix_lower, alias);
+            if builtin_visible_for_completion_match(
+                cmd,
+                &all_user_commands,
+                name_match,
+                alias_matches,
+            ) {
                 seen.insert(name.clone());
                 push_command_entry(
                     &mut entries,
                     &name,
                     cmd.name,
+                    &prefix_lower,
+                    locale,
+                    &user_commands,
+                );
+            }
+        }
+        for cmd in &user_commands {
+            let name = format!("/{}", cmd.name);
+            if seen.contains(&name) {
+                continue;
+            }
+            let alias_match = cmd
+                .aliases
+                .iter()
+                .any(|a| fuzzy_chars_in_order(&prefix_lower, a));
+            if fuzzy_chars_in_order(&prefix_lower, &cmd.name) || alias_match {
+                seen.insert(name.clone());
+                push_command_entry(
+                    &mut entries,
+                    &name,
+                    &cmd.name,
                     &prefix_lower,
                     locale,
                     &user_commands,
@@ -2454,27 +2508,80 @@ pub(crate) fn slash_completion_hints(
 
 fn all_command_names_matching_loaded(
     prefix: &str,
-    user_commands: &[(String, String)],
+    user_commands: &[commands::user_registry::UserCommandMetadata],
+    all_user_commands: &[commands::user_registry::UserCommandMetadata],
 ) -> Vec<String> {
     let prefix = prefix.strip_prefix('/').unwrap_or(prefix).to_lowercase();
     let mut result: Vec<String> = commands::command_infos()
         .iter()
         .filter(|cmd| {
-            cmd.name.starts_with(&prefix) || cmd.aliases.iter().any(|a| a.starts_with(&prefix))
+            builtin_visible_for_completion_match(
+                cmd,
+                all_user_commands,
+                cmd.name.starts_with(&prefix),
+                |alias| alias.starts_with(&prefix),
+            )
         })
         .map(|cmd| format!("/{}", cmd.name))
         .collect();
 
-    result.extend(
-        user_commands
+    result.extend(user_commands.iter().filter_map(|command| {
+        let name_matches = command.name.starts_with(&prefix);
+        let alias_matches = command
+            .aliases
             .iter()
-            .filter(|(name, _)| name.starts_with(&prefix))
-            .map(|(name, _)| format!("/{name}")),
-    );
+            .any(|alias| alias.starts_with(&prefix));
+        (name_matches || alias_matches).then(|| format!("/{}", command.name))
+    }));
 
     result.sort();
     result.dedup();
     result
+}
+
+fn builtin_visible_for_completion_match(
+    builtin: &commands::CommandInfo,
+    user_commands: &[commands::user_registry::UserCommandMetadata],
+    canonical_name_matches: bool,
+    alias_matches: impl Fn(&str) -> bool,
+) -> bool {
+    if user_command_shadows_builtin_canonical(builtin, user_commands) {
+        return false;
+    }
+
+    // Keep the canonical built-in visible when the typed text matches the
+    // canonical name, even if a user command shadows one of the built-in's
+    // aliases. Example: a user command with alias `/image` must not hide
+    // canonical `/attach` for `/att`.
+    if canonical_name_matches {
+        return true;
+    }
+
+    // If the built-in is visible only through an alias, hide it when that
+    // specific alias is shadowed by a user command. Example: `/image` should
+    // complete to the user command, not built-in `/attach` via its `/image`
+    // alias.
+    builtin.aliases.iter().any(|alias| {
+        alias_matches(alias) && !user_command_shadows_builtin_alias(alias, user_commands)
+    })
+}
+
+fn user_command_shadows_builtin_canonical(
+    builtin: &commands::CommandInfo,
+    user_commands: &[commands::user_registry::UserCommandMetadata],
+) -> bool {
+    user_commands.iter().any(|user| {
+        user.name == builtin.name || user.aliases.iter().any(|alias| alias == builtin.name)
+    })
+}
+
+fn user_command_shadows_builtin_alias(
+    builtin_alias: &str,
+    user_commands: &[commands::user_registry::UserCommandMetadata],
+) -> bool {
+    user_commands.iter().any(|user| {
+        user.name == builtin_alias || user.aliases.iter().any(|alias| alias == builtin_alias)
+    })
 }
 
 /// Push a built-in command entry to the slash menu, resolving description
@@ -2485,9 +2592,39 @@ fn push_command_entry(
     command_key: &str,
     prefix_lower: &str,
     locale: crate::localization::Locale,
-    user_commands: &[(String, String)],
+    user_commands: &[commands::user_registry::UserCommandMetadata],
 ) {
-    let (description, alias_hint) = if let Some(info) = commands::get_command_info(command_key) {
+    let user_command = user_commands
+        .iter()
+        .find(|command| command.name == command_key);
+
+    let (description, alias_hint) = if let Some(command) = user_command {
+        // User command shadows any built-in — use user metadata.
+        let mut description = command
+            .description
+            .clone()
+            .unwrap_or_else(|| String::from("User-defined command"));
+        if let Some(hint) = &command.argument_hint
+            && !hint.trim().is_empty()
+        {
+            description.push_str("  ");
+            description.push_str(hint.trim());
+        }
+        let alias_hint = if !command_key.to_ascii_lowercase().starts_with(prefix_lower) {
+            command
+                .aliases
+                .iter()
+                .find(|alias| {
+                    alias.starts_with(prefix_lower)
+                        || alias.contains(prefix_lower)
+                        || fuzzy_chars_in_order(prefix_lower, alias)
+                })
+                .cloned()
+        } else {
+            None
+        };
+        (description, alias_hint)
+    } else if let Some(info) = commands::get_command_info(command_key) {
         let hint = if !command_key.to_ascii_lowercase().starts_with(prefix_lower) {
             info.aliases
                 .iter()
@@ -2515,25 +2652,7 @@ fn push_command_entry(
         };
         (desc, hint)
     } else {
-        let mut description = String::from("User-defined command");
-        let mut argument_hint = None;
-        if let Some((_, content)) = user_commands.iter().find(|(key, _)| key == command_key) {
-            let (metadata, _) = commands::user_commands::parse_frontmatter(content);
-            for (key, value) in metadata {
-                match key.as_str() {
-                    "description" => description = value,
-                    "argument-hint" => argument_hint = Some(value),
-                    _ => {}
-                }
-            }
-        }
-        if let Some(hint) = argument_hint
-            && !hint.trim().is_empty()
-        {
-            description.push_str("  ");
-            description.push_str(hint.trim());
-        }
-        (description, None)
+        (String::from("User-defined command"), None)
     };
     entries.push(SlashMenuEntry {
         name: name.to_string(),
@@ -3256,11 +3375,132 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_hints_exclude_hidden_user_commands() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("secret.md"),
+            "---\ndescription: Internal command\nhidden: true\n---\nsecret",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/secret",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+
+        assert!(!hints.iter().any(|hint| hint.name == "/secret"));
+    }
+
+    #[test]
+    fn slash_completion_hints_match_user_command_aliases() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("deploy-target.md"),
+            "---\ndescription: Deploy target\nalias: ship\n---\ndeploy",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/ship",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+        let entry = hints
+            .iter()
+            .find(|hint| hint.name == "/deploy-target")
+            .expect("user command should be matched by alias");
+
+        assert_eq!(entry.alias_hint.as_deref(), Some("ship"));
+        assert_eq!(entry.description, "Deploy target");
+    }
+
+    #[test]
+    fn slash_completion_hints_keep_builtin_canonical_when_only_builtin_alias_is_shadowed() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("attach-review.md"),
+            "---\ndescription: Review image\nalias: image\n---\nreview image",
+        )
+        .unwrap();
+
+        let canonical_hints = slash_completion_hints(
+            "/att",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+
+        assert!(
+            canonical_hints.iter().any(|hint| hint.name == "/attach"),
+            "canonical /attach should remain visible when only its /image alias is shadowed"
+        );
+
+        let alias_hints = slash_completion_hints(
+            "/image",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+
+        assert!(
+            alias_hints.iter().any(|hint| hint.name == "/attach-review"),
+            "user command should complete through its /image alias"
+        );
+        assert!(
+            !alias_hints.iter().any(|hint| hint.name == "/attach"),
+            "built-in /attach should not complete through shadowed /image alias"
+        );
+    }
+
+    #[test]
+    fn slash_completion_hints_prefer_user_metadata_for_shadowed_builtin() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("help.md"),
+            "---\ndescription: Custom help workflow\nargument-hint: <topic>\n---\nhelp",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/help",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+        let help_entries: Vec<_> = hints.iter().filter(|hint| hint.name == "/help").collect();
+
+        assert_eq!(help_entries.len(), 1);
+        assert_eq!(help_entries[0].description, "Custom help workflow  <topic>");
+    }
+
+    #[test]
     fn review_regression_push_command_entry_uses_preloaded_user_command_frontmatter() {
-        let user_commands = vec![(
+        let registry = crate::commands::user_registry::UserCommandRegistry::from_loaded(vec![(
             "deploy".to_string(),
             "---\ndescription: Deploy target\nargument-hint: <env>\n---\ndeploy".to_string(),
-        )];
+        )]);
+        let user_commands: Vec<_> = registry.iter().cloned().collect();
         let mut entries = Vec::new();
 
         push_command_entry(
