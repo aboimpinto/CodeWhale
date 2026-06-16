@@ -1,5 +1,9 @@
 //! Memory command area: persistent memory and quick notes.
 
+// This group dir contains `mod memory;` while a `memory.rs` submodule exists with the same
+// name — a standard Rust structural pattern. `#[allow(clippy::module_inception)]` is a
+// permanent attribute, not migration scaffolding.
+// See FEAT-003 planning-analysis-report.md (candidate D.1) for rationale.
 #[allow(clippy::module_inception)]
 mod memory;
 mod note;

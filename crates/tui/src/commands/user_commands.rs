@@ -19,6 +19,14 @@
 //! 4. `<workspace>/.cursor/commands/`    (Cursor interop)
 //! 5. `~/.codewhale/commands/`           (user-global)
 //! 6. `~/.deepseek/commands/`            (legacy user-global)
+//!
+//! ## Permanent Role
+//!
+//! This module is the permanent lower-level scanning/parsing layer for user-defined
+//! commands. Its `commands_dirs()`, `load_commands_from_dir()`, `parse_frontmatter()`,
+//! `parse_allowed_tools()`, and `apply_template()` functions are consumed by
+//! `UserCommandRegistry` in `user_registry.rs`. Do not remove or rename this file —
+//! see FEAT-003 planning-analysis-report.md (candidate E.3) for rationale.
 
 #[cfg(test)]
 use std::collections::HashSet;

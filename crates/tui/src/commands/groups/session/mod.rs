@@ -2,6 +2,10 @@
 //! `/relay` session-handoff artifact.
 
 mod rename;
+// This group dir contains `mod session;` while a `session.rs` submodule exists with the same
+// name — a standard Rust structural pattern. `#[allow(clippy::module_inception)]` is a
+// permanent attribute, not migration scaffolding.
+// See FEAT-003 planning-analysis-report.md (candidate D.1) for rationale.
 #[allow(clippy::module_inception)]
 mod session;
 

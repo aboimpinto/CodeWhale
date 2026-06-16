@@ -54,6 +54,11 @@ impl UserCommandRegistry {
     }
 
     pub fn load(workspace: Option<&Path>) -> Self {
+        // NOTE: user_commands::commands_dirs() and load_commands_from_dir() are the
+        // permanent lower-level scanning/parsing layer. This dependency is intentional:
+        // user_commands.rs provides shared file I/O, frontmatter parsing, and template
+        // support consumed by UserCommandRegistry. See FEAT-003 planning-analysis-report.md
+        // (candidate B.1/E.3) for rationale.
         Self::load_from_paths(&user_commands::commands_dirs(workspace))
     }
 

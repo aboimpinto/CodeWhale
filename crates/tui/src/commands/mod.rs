@@ -125,7 +125,9 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         return result;
     }
 
-    // Compatibility aliases whose historical behavior also supplied an arg.
+    // Permanent backward-compatible aliases: /jihua → /mode plan, /zidong → /mode yolo.
+    // These predate the group-owned dispatch and are permanently kept for users who
+    // relied on them. See FEAT-003 planning-analysis-report.md (candidate A.2/E.2).
     match command.as_str() {
         "jihua" => {
             return groups::config::dispatch(app, "jihua", arg).unwrap_or_else(|| {
@@ -145,7 +147,10 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
     }
 
     match command.as_str() {
-        // Legacy command migrations (kept out of registry/autocomplete intentionally).
+        // Permanent legacy migration hints: /set and /deepseek were retired/renamed.
+        // These are deliberately excluded from the command registry and autocomplete
+        // so they only appear when a user explicitly types the old names.
+        // See FEAT-003 planning-analysis-report.md (candidate A.3/E.1) for rationale.
         "set" => CommandResult::error(
             "The /set command was retired. Use /config to edit settings and /settings to inspect current values.",
         ),
