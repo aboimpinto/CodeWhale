@@ -1,8 +1,8 @@
 # Command Dispatch Architecture
 
-**Last updated:** 2026-06-16  
-**Branch:** `release/v0.8.60` (HEAD at `6d8e6c7b`)  
-**Related EPIC:** [EPIC-001 — Command Dispatch and Ownership Refactor](https://github.com/Hmbown/CodeWhale/issues/2870)  
+**Last updated:** 2026-06-16
+**Branch:** `release/v0.8.60` (HEAD at `6175b7cf`)
+**Related EPIC:** [EPIC-001 — Command Dispatch and Ownership Refactor](https://github.com/Hmbown/CodeWhale/issues/2870)
 **Related issue:** [Command refactor](https://github.com/Hmbown/CodeWhale/issues/2791)
 
 ## Overview
@@ -170,12 +170,12 @@ Each group module registers `CommandGroup` implementations and provides a `dispa
 |-------|------|----------|-------------|
 | **core** | `groups/core/mod.rs` | anchor, help, clear, exit, model, models, provider, queue, stash, hooks, subagents, agent, swarm, links, feedback, hf, home, workspace, profile, rlm, translate, voice, voicesend, voicecontrol | `?`, `q`, `cwd`, `dashboard`, `huggingface`, bilingual Chinese aliases |
 | **config** | `groups/config/mod.rs` | config, sidebar, settings, status, statusline, mode, theme, verbose, trust, logout, slop | `experiments`, `xinren`, `jihua`, `zidong`, `canzha` |
-| **session** | `groups/session/mod.rs` | session, history, rename, context, relay | `会话`, `context`, `ctx`, `batonpass`, `接力` |
-| **skills** | `groups/skills/mod.rs` | skills, restore, review | `jineng`, `edit`, `huifu`, `inspect`, `code_review` |
-| **debug** | `groups/debug/mod.rs` | debug, cache, tokens, modelinfo | — |
-| **memory** | `groups/memory/mod.rs` | memory, forget, note, goal, hunt | `jiyi`, `wangji`, `biji`, `mubiao` |
-| **project** | `groups/project/mod.rs` | share, init, export, save | `fenxiang`, `chushihua` |
-| **utility** | `groups/utility/mod.rs` | task, jobs, mcp, attachment, network, balance, plugins | — |
+| **session** | `groups/session/mod.rs` | rename, save, fork, new, sessions, load, compact, purge, relay, export | `gaiming`, `chongmingming`, `branch`, `resume`, `jiazai`, `yasuo`, `qingchu`, `batonpass`, `接力`, `daochu` |
+| **skills** | `groups/skills/mod.rs` | skills, skill, review, restore | `jinengliebiao`, `jineng`, `shencha` |
+| **debug** | `groups/debug/mod.rs` | tokens, cost, balance, cache, change, system, context, edit, diff, undo, retry | `xitong`, `ctx`, `chongshi` |
+| **memory** | `groups/memory/mod.rs` | note, memory | — |
+| **project** | `groups/project/mod.rs` | init, lsp, share, goal | `hunt`, `mubiao`, `狩猎` |
+| **utility** | `groups/utility/mod.rs` | attach, task, jobs, mcp, network, plugins | `image`, `media`, `fujian`, `tasks`, `job`, `zuoye`, `plugin` |
 
 Each group follows the same pattern:
 1. Static `CommandInfo` constants for metadata.
@@ -279,6 +279,3 @@ cargo test --workspace
 ## Related Documents
 
 - [ARCHITECTURE.md](../../docs/ARCHITECTURE.md) — overall system architecture
-- [`planning-analysis-report.md`](../../Features/03_IN_PROGRESS/FEAT-003-completion-cleanup-and-full-validation/planning-analysis-report.md) — FEAT-003 planning
-- [`deferred-items-tracking.md`](../../Features/03_IN_PROGRESS/FEAT-003-completion-cleanup-and-full-validation/deferred-items-tracking.md) — test migration tracking
-- [EPIC-001 EpicDescription.md](../../Features/00_EPICS/EPIC-001-command-dispatch-ownership-refactor/EpicDescription.md)

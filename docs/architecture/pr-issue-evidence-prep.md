@@ -1,9 +1,9 @@
 # PR/Issue Evidence Preparation — FEAT-003
 
-**Prepared for:** Phase 8 (Final Checkpoint) consumption  
-**Date:** 2026-06-16  
-**Branch:** `release/v0.8.60`  
-**HEAD:** `6d8e6c7b`
+**Prepared for:** Phase 8 (Final Checkpoint) consumption
+**Date:** 2026-06-16
+**Branch:** `release/v0.8.60`
+**HEAD:** `6175b7cf`
 
 This document provides the evidence structure and closure criteria for the
 final PR body and issue updates. Phase 8 will fill in live check results and
@@ -22,7 +22,7 @@ commit SHAs.
 ```
 ## Summary
 
-Closes EPIC-001 ([#2870](https://github.com/Hmbown/CodeWhale/issues/2870)) 
+Closes EPIC-001 ([#2870](https://github.com/Hmbown/CodeWhale/issues/2870))
 and [#2791](https://github.com/Hmbown/CodeWhale/issues/2791) by removing
 temporary migration scaffolding from Layers 4-5, running full workspace
 validation, and updating the central command architecture document.
@@ -63,13 +63,13 @@ validation, and updating the central command architecture document.
 
 | Check | Result |
 |-------|--------|
-| `cargo fmt --all -- --check` | ✅ |
-| `cargo check -p codewhale-tui` | ✅ (no errors, no warnings) |
-| `cargo clippy -p codewhale-tui -- -D warnings` | ✅ |
-| `cargo test -p codewhale-tui commands::` | 446 ✅ |
-| `cargo test -p codewhale-tui command_palette` | 18 ✅ |
-| `cargo test -p codewhale-tui slash_completion` | 17 ✅ |
-| `cargo test --workspace` | ✅ |
+| `cargo fmt --all -- --check` | ⬜ |
+| `cargo check -p codewhale-tui` | ⬜ |
+| `cargo clippy -p codewhale-tui -- -D warnings` | ⬜ |
+| `cargo test -p codewhale-tui commands::` | ⬜ |
+| `cargo test -p codewhale-tui command_palette` | ⬜ |
+| `cargo test -p codewhale-tui slash_completion` | ⬜ |
+| `cargo test --workspace` | ⬜ |
 
 ### Landed Layers
 
@@ -179,10 +179,10 @@ FEAT-001, FEAT-002, FEAT-003). The final architecture is documented in
 
 ### Validation
 
-- `cargo test --workspace` ✅
-- `cargo test -p codewhale-tui commands::` 446 ✅
-- `cargo test -p codewhale-tui command_palette` 18 ✅
-- `cargo test -p codewhale-tui slash_completion` 17 ✅
+- `cargo test --workspace` [fill in Phase 8 result]
+- `cargo test -p codewhale-tui commands::` [fill in Phase 8 result]
+- `cargo test -p codewhale-tui command_palette` [fill in Phase 8 result]
+- `cargo test -p codewhale-tui slash_completion` [fill in Phase 8 result]
 
 ### Residual Follow-Up
 
