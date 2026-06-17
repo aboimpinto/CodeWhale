@@ -59,8 +59,9 @@ Every extracted command module must satisfy this contract:
   outside the group's `CommandGroup::commands()` return.
 - Duplicate command names or aliases across modules.
   The `command_registry_has_unique_names_and_aliases` test catches this.
-- Command-specific presentation logic in palette, completion, or help code.
-  Those surfaces consume metadata from `command_infos()` only.
+- Command-specific presentation logic in palette, completion, or help code,
+  except the documented current `command_runs_directly()` palette-action list.
+  New and extracted surfaces must consume metadata from `command_infos()` only.
 
 ### Target Module Layout
 
