@@ -82,7 +82,7 @@ crates/tui/src/commands/groups/<group>/<cmd>.rs
 | Command group module | Owns the list of commands belonging to that group via `CommandGroup::commands()`. Must not duplicate commands from other groups. | `crates/tui/src/commands/groups/<group>/mod.rs` |
 | Command module | Owns command metadata, aliases, dispatch entry, and implementation. | `crates/tui/src/commands/groups/<group>/<cmd>.rs` |
 | Parser / Dispatcher | Owns parsing and routing behavior (`execute()` in `commands/mod.rs`). Never contains command-specific business logic. | `crates/tui/src/commands/mod.rs` (`execute()`) |
-| Palette integration | Consumes command metadata from `command_infos()`. Never hardcodes command-specific facts. | `crates/tui/src/tui/command_palette.rs` (`build_entries()`) |
+| Palette integration | Consumes command metadata from `command_infos()`. Target contract: no command-specific hardcoding in extracted state. Current exception: `command_runs_directly()` hardcodes ~30 command names to decide Execute vs Insert behavior — later FEATs must either eliminate this or move the dispatch-time-flag into `CommandInfo`. | `crates/tui/src/tui/command_palette.rs` (`build_entries()`, `command_runs_directly()`) |
 | Slash completion | Consumes command metadata from `command_infos()`. Never hardcodes command-specific facts. | `crates/tui/src/tui/widgets/mod.rs` (`slash_completion_hints()`) |
 
 Top-level registration must not contain command-specific implementation logic.
@@ -159,6 +159,20 @@ metadata from `command_infos()` (which reads from `registry().infos()` via
 `build_registry()`). No presentation surface hardcodes command-specific names,
 aliases, descriptions, or usage text.
 
+**Current exception — `command_runs_directly()`:** The palette function
+`command_runs_directly()` at `command_palette.rs:434-470` hardcodes ~30 command
+names to decide whether a palette action should execute immediately or insert
+the command text for the user to edit. This is pre-extraction legacy behavior;
+the ideal contract would move a "runs-directly" flag into `CommandInfo`, but
+that change is deferred to a later extraction FEAT. Until then, this function
+is the only palette-specific command list, and Layer 4.1-4.4 extraction FEATs
+must ensure that any command added to or removed from this list is documented
+in the extraction PR.
+
+Note: the hardcoded names in `command_runs_directly()` affect only the palette
+*action* (Execute vs Insert Text), not the palette *entry* visibility or
+metadata — those still come from `command_infos()`.
+
 | Surface | Source of Truth | Consumer Code Path |
 |---------|----------------|-------------------|
 | Palette entries (built-in) | `commands::command_infos()` | `command_palette.rs:build_entries()` |
@@ -218,6 +232,7 @@ Every extraction FEAT (Layers 4.1-4.4) must satisfy these parity requirements:
 | P8 | Retired commands `/set`, `/deepseek` remain excluded | Existing exclusion tests |
 | P9 | Hidden user commands stay runnable but non-discoverable | `hidden_user_commands_*` tests |
 | P10 | Unknown command suggestions remain stable | `unknown_command_suggests_nearest_match` and fallback tests |
+| P11 | Palette action (Execute vs Insert Text) matches pre-extraction baseline | Code review of extracted command vs `command_runs_directly()` list |
 
 ## Baseline Gherkin Scenarios
 
@@ -252,8 +267,11 @@ Feature: Built-in command dispatch
       | core    | /help    |
       | session | /relay   |
       | config  | /config  |
+      | debug   | /tokens  |
       | project | /hunt    |
       | memory  | /note    |
+      | skills  | /skills  |
+      | utility | /mcp     |
 ```
 
 Existing coverage: `every_registered_command_dispatches_to_a_handler` and
@@ -324,7 +342,7 @@ prepared. Final cleanup deferred to Layer 4.4.
 
 | Field | Value |
 |-------|-------|
-| Target branch/commit | `release/v0.8.60` / `bb2c9400` |
+| Target branch/commit | `release/v0.8.60` / `4017409b` |
 | Gherkin command | `cargo test -p codewhale-tui --test epic_acceptance_harness -- --test-threads=1` |
 | Gherkin result | 3/3 steps pass |
 | Focused command tests | 36 inline + 19 user_commands + 12 user_registry |
@@ -339,7 +357,7 @@ When updating the GitHub [EPIC-style issue](https://github.com/Hmbown/CodeWhale/
 use the following checklist format:
 
 - [ ] Layer 4.0: Command Extraction Contract and Baseline **⬜**
-  - [ ] Target branch/commit: `release/v0.8.60` / `bb2c9400`
+  - [ ] Target branch/commit: `release/v0.8.60` / `4017409b`
   - [ ] Gherkin acceptance harness smoke test
   - [ ] Command-module contract documented in architecture docs
   - [ ] Acceptance traceability mapped to existing tests
