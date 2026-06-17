@@ -276,6 +276,22 @@ cargo test -p codewhale-tui slash_completion
 cargo test --workspace
 ```
 
+## Next Steps: EPIC-002 Command Extraction
+
+This document describes the command dispatch architecture after EPIC-001.
+The follow-up [EPIC-002](https://github.com/Hmbown/CodeWhale/issues/2870)
+moves each command inside a group into a focused single-responsibility module.
+
+See [command-extraction-contract.md](./command-extraction-contract.md) for:
+- The command-module ownership contract that every extraction must satisfy
+- Group registration responsibilities
+- User-command precedence matrix
+- Parity expectations for extraction FEATs
+- Baseline Gherkin scenarios
+- EPIC acceptance traceability
+- Issue checklist for Layer 4.x tracking
+
 ## Related Documents
 
 - [ARCHITECTURE.md](../../docs/ARCHITECTURE.md) — overall system architecture
+- [command-extraction-contract.md](./command-extraction-contract.md) — EPIC-002 extraction contract
