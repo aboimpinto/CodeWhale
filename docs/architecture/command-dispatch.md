@@ -1,7 +1,7 @@
 # Command Dispatch Architecture
 
 **Last updated:** 2026-06-16
-**Branch:** `release/v0.8.60` (HEAD at `6175b7cf`)
+**Branch:** `release/v0.8.60` (HEAD at `b30f4e48`)
 **Related EPIC:** [EPIC-001 — Command Dispatch and Ownership Refactor](https://github.com/Hmbown/CodeWhale/issues/2870)
 **Related issue:** [Command refactor](https://github.com/Hmbown/CodeWhale/issues/2791)
 
@@ -160,7 +160,7 @@ The `execute()` function in `commands/mod.rs` follows this strict precedence:
   - `try_dispatch_user_command()` — `#[cfg(test)]` only (deferred migration)
   - `load_user_commands()` — `#[cfg(test)]` only (deferred migration)
 - **Status:** Permanent. Consumed by `user_registry.rs`. Not removable.
-- **Deferred cleanup:** The `#[cfg(test)]` functions `try_dispatch_user_command()` and `load_user_commands()` have ~15 dependent tests that should be migrated to `user_registry` APIs. Tracked in [deferred-items-tracking.md](MemoryBank link).
+- **Deferred cleanup:** The `#[cfg(test)]` functions `try_dispatch_user_command()` and `load_user_commands()` have ~15 dependent tests that should be migrated to `user_registry` APIs. A separate GitHub issue labeled `cleanup`, `tests` should be created to track this work.
 
 ### `commands/groups/` — Group-owned built-in command areas
 
@@ -228,7 +228,7 @@ referencing the FEAT-003 planning documentation:
 | `user_registry::load()` → `user_commands::commands_dirs()` | `user_registry.rs:57` | Lower-level scanning/parsing dependency, not a bridge. |
 | `#[allow(clippy::module_inception)]` × 6 | `groups/{config,core,debug,memory,session,skills}/mod.rs` | Standard Rust structural pattern for group dirs sharing a name with a submodule. |
 | `user_commands.rs` as permanent lower layer | `user_commands.rs` module doc | Provides shared file I/O, frontmatter parsing, and template support consumed by `UserCommandRegistry`. |
-| `try_dispatch_user_command()` / `load_user_commands()` (`#[cfg(test)]`) | `user_commands.rs` | Deferred test migration — see `deferred-items-tracking.md`. |
+| `try_dispatch_user_command()` / `load_user_commands()` (`#[cfg(test)]`) | `user_commands.rs` | Deferred test migration — ~15 tests to migrate to `user_registry` APIs (track via GitHub issue labeled `cleanup`, `tests`) |
 
 ## Test and Evidence Matrix
 

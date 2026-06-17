@@ -3,7 +3,7 @@
 **Prepared for:** Phase 8 (Final Checkpoint) consumption
 **Date:** 2026-06-16
 **Branch:** `release/v0.8.60`
-**HEAD:** `6175b7cf`
+**HEAD:** `b30f4e48`
 
 This document provides the evidence structure and closure criteria for the
 final PR body and issue updates. Phase 8 will fill in live check results and
