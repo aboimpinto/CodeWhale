@@ -1,7 +1,7 @@
 # Command Dispatch Architecture
 
 **Last updated:** 2026-06-16
-**Branch:** `release/v0.8.60` (HEAD at `b30f4e48`)
+**Branch:** `release/v0.8.60`
 **Related EPIC:** [EPIC-001 — Command Dispatch and Ownership Refactor](https://github.com/Hmbown/CodeWhale/issues/2870)
 **Related issue:** [Command refactor](https://github.com/Hmbown/CodeWhale/issues/2791)
 

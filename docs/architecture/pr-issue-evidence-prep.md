@@ -3,7 +3,6 @@
 **Prepared for:** Phase 8 (Final Checkpoint) consumption
 **Date:** 2026-06-16
 **Branch:** `release/v0.8.60`
-**HEAD:** `b30f4e48`
 
 This document provides the evidence structure and closure criteria for the
 final PR body and issue updates. Phase 8 will fill in live check results and
@@ -42,10 +41,10 @@ validation, and updating the central command architecture document.
    - `user_commands.rs` — module-level permanent role documentation
    - 6 group `mod.rs` files — `#[allow(clippy::module_inception)]` rationale
 
-3. **Deferred-items tracking** (Phase 3): Created
-   `deferred-items-tracking.md` for 2 test-only functions
-   (`try_dispatch_user_command()`, `load_user_commands()`) with migration
-   strategy — ~15 tests to migrate to `user_registry` APIs.
+3. **Deferred-items tracking** (Phase 3): Identified 2 test-only functions
+   (`try_dispatch_user_command()`, `load_user_commands()`) for deferred
+   migration — ~15 tests to migrate to `user_registry` APIs. A separate GitHub
+   issue labeled `cleanup`, `tests` should track this work.
 
 4. **Architecture documentation** (Phase 4): Created
    `docs/architecture/command-dispatch.md` with:
