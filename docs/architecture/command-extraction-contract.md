@@ -342,7 +342,7 @@ prepared. Final cleanup deferred to Layer 4.4.
 
 | Field | Value |
 |-------|-------|
-| Target branch/commit | `release/v0.8.60` / `4c6b3d49` |
+| Target branch/commit | `release/v0.8.60` / `<final Layer 4.0 commit hash>` |
 | Gherkin command | `cargo test -p codewhale-tui --test epic_acceptance_harness -- --test-threads=1` |
 | Gherkin result | 3/3 steps pass |
 | Focused command tests | 36 inline + 19 user_commands + 12 user_registry |
@@ -357,7 +357,7 @@ When updating the GitHub [EPIC-style issue](https://github.com/Hmbown/CodeWhale/
 use the following checklist format:
 
 - [ ] Layer 4.0: Command Extraction Contract and Baseline **⬜**
-  - [ ] Target branch/commit: `release/v0.8.60` / `4c6b3d49`
+  - [ ] Target branch/commit: `release/v0.8.60` / `<final Layer 4.0 commit hash>`
   - [ ] Gherkin acceptance harness smoke test
   - [ ] Command-module contract documented in architecture docs
   - [ ] Acceptance traceability mapped to existing tests
