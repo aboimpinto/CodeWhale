@@ -31,12 +31,12 @@ pub mod util;
 pub mod voice;
 mod workspace;
 
-pub(in crate::commands) use self::core::reset_conversation_state;
+pub(in crate::commands) use self::clear::reset_conversation_state;
 
 use crate::commands::CommandResult;
 use crate::commands::traits::{Command, CommandGroup, CommandInfo, FunctionCommand};
 use crate::localization::MessageId;
-use crate::tui::app::{App, AppAction};
+use crate::tui::app::App;
 
 pub struct CoreCommands;
 
@@ -300,26 +300,26 @@ pub(in crate::commands) fn dispatch(
 ) -> Option<CommandResult> {
     let result = match command {
         "anchor" | "maodian" => anchor::anchor(app, arg),
-        "help" | "?" | "bangzhu" | "帮助" => core::help(app, arg),
-        "clear" | "qingping" => core::clear(app),
-        "exit" | "quit" | "q" | "tuichu" => core::exit(),
-        "model" | "moxing" => core::model(app, arg),
-        "models" | "moxingliebiao" => core::models(app),
+        "help" | "?" | "bangzhu" | "帮助" => help::help(app, arg),
+        "clear" | "qingping" => clear::clear(app),
+        "exit" | "quit" | "q" | "tuichu" => exit::exit(),
+        "model" | "moxing" => model::model(app, arg),
+        "models" | "moxingliebiao" => models::models(),
         "provider" => provider::provider(app, arg),
         "queue" | "queued" => queue::queue(app, arg),
         "stash" | "park" => stash::stash(app, arg),
         "hooks" | "hook" | "gouzi" => hooks::hooks(app, arg),
-        "subagents" | "agents" | "zhinengti" => core::subagents(app),
-        "agent" | "daili" => agent(app, arg),
-        "swarm" | "fanout" | "qun" => swarm(app, arg),
-        "links" | "dashboard" | "api" | "lianjie" => core::deepseek_links(app),
+        "subagents" | "agents" | "zhinengti" => subagents::subagents(app),
+        "agent" | "daili" => agent::agent(app, arg),
+        "swarm" | "fanout" | "qun" => swarm::swarm(app, arg),
+        "links" | "dashboard" | "api" | "lianjie" => links::deepseek_links(app),
         "feedback" => feedback::feedback(app, arg),
         "hf" | "huggingface" => hf::hf(app, arg),
-        "home" | "stats" | "overview" | "zhuye" | "shouye" => core::home_dashboard(app),
-        "workspace" | "cwd" => core::workspace_switch(app, arg),
-        "profile" | "dangan" => core::profile_switch(app, arg),
-        "rlm" | "recursive" | "digui" => rlm(app, arg),
-        "translate" | "translation" | "transale" => core::translate(app),
+        "home" | "stats" | "overview" | "zhuye" | "shouye" => home::home_dashboard(app),
+        "workspace" | "cwd" => workspace::workspace_switch(app, arg),
+        "profile" | "dangan" => profile::profile_switch(app, arg),
+        "rlm" | "recursive" | "digui" => rlm::rlm(app, arg),
+        "translate" | "translation" | "transale" => translate::translate(app),
         "voice" | "yuyin" | "语音" => voice::voice(app),
         "voicesend" | "voice-send" | "yuyinsend" | "语音发送" => voice::voice_send(app),
         "voicecontrol" | "voice-control" | "yuyincontrol" | "语音控制" => {
@@ -328,94 +328,4 @@ pub(in crate::commands) fn dispatch(
         _ => return None,
     };
     Some(result)
-}
-
-/// Execute a Recursive Language Model (RLM) turn — Algorithm 1 from
-/// Zhang et al. (arXiv:2512.24601).
-///
-/// The user's prompt text is passed as the argument. It will be stored
-/// in the REPL as the `PROMPT` variable. The root LLM will only see
-/// metadata about the REPL state, never the prompt text directly.
-pub fn rlm(app: &mut App, arg: Option<&str>) -> CommandResult {
-    let (max_depth, target) = match util::parse_depth_prefixed_arg(arg, 1) {
-        Ok(parsed) => parsed,
-        Err(message) => return CommandResult::error(message),
-    };
-    let target = match target {
-        Some(p) if !p.trim().is_empty() => p.trim().to_string(),
-        _ => {
-            return CommandResult::error(
-                "Usage: /rlm [N] <file_or_text>\n\n\
-                 Opens a persistent RLM context with sub_rlm depth N (0-3, default 1)."
-                    .to_string(),
-            );
-        }
-    };
-
-    let source_arg = if util::resolves_to_existing_file(app, &target) {
-        format!(r#"file_path: "{target}""#)
-    } else {
-        format!("content: {target:?}")
-    };
-    let message = format!(
-        "Open and use a persistent RLM session for this request. Call `rlm_open` with name `slash_rlm` and {source_arg}. Then call `rlm_configure` with `sub_rlm_max_depth: {max_depth}`. Use `rlm_eval` to inspect the context through `peek`, `search`, and `chunk`, and call `finalize(...)` from the REPL when ready. If a `var_handle` is returned, use `handle_read` for bounded slices or projections before answering."
-    );
-
-    CommandResult::with_message_and_action(
-        format!("Opening persistent RLM context at depth {max_depth}..."),
-        AppAction::SendMessage(message),
-    )
-}
-
-/// Open a persistent sub-agent session from a slash command.
-pub fn agent(_app: &mut App, arg: Option<&str>) -> CommandResult {
-    let (max_depth, task) = match util::parse_depth_prefixed_arg(arg, 1) {
-        Ok(parsed) => parsed,
-        Err(message) => return CommandResult::error(message),
-    };
-    let task = match task {
-        Some(task) if !task.trim().is_empty() => task.trim().to_string(),
-        _ => {
-            return CommandResult::error(
-                "Usage: /agent [N] <task>\n\n\
-                 Opens a persistent sub-agent session with recursive agent depth N (0-3, default 1).",
-            );
-        }
-    };
-    let message = format!(
-        "Open a persistent sub-agent session for this task. Call `agent_open` with name `slash_agent`, `prompt: {task:?}`, and `max_depth: {max_depth}`. Use nonblocking `agent_eval` to poll the current projection or send follow-up input while you keep working; pass `block:true` only when you deliberately want to wait for a terminal result. Use `handle_read` on the returned transcript_handle if you need more detail. Verify any claimed side effects before reporting success."
-    );
-    CommandResult::with_message_and_action(
-        format!("Opening persistent sub-agent at depth {max_depth}..."),
-        AppAction::SendMessage(message),
-    )
-}
-
-/// Run a WhaleFlow-backed multi-agent swarm: high-fanout headless sub-agents
-/// over one task. This is an overlay on the current mode (Agent/Plan/YOLO), not
-/// a fourth mode — it instructs the model to decompose and fan out, collecting
-/// compact result summaries rather than child transcripts (#3178).
-pub fn swarm(_app: &mut App, arg: Option<&str>) -> CommandResult {
-    let (max_depth, task) = match util::parse_depth_prefixed_arg(arg, 1) {
-        Ok(parsed) => parsed,
-        Err(message) => return CommandResult::error(message),
-    };
-    let task = match task {
-        Some(task) if !task.trim().is_empty() => task.trim().to_string(),
-        _ => {
-            return CommandResult::error(
-                "Usage: /swarm [N] <task>\n\n\
-                 Runs a multi-agent swarm: decomposes the task and fans out \
-                 headless sub-agents (recursive depth N, 0-3, default 1), then \
-                 synthesizes their results.",
-            );
-        }
-    };
-    let message = format!(
-        "Run a multi-agent swarm for this task: {task:?}. Decompose it into independent, parallelizable subtasks and open one headless sub-agent per subtask with `agent_open` (pass `max_depth: {max_depth}` for nested delegation, and an `agent_type`/role that fits each subtask — explore for research, review for verification, implementer for edits). Run them concurrently; poll each worker with nonblocking `agent_eval`, synthesize results as they arrive, and pass `block:true` only for a deliberate final wait. Keep the fanout proportional to the task, and verify any claimed side effects before reporting success."
-    );
-    CommandResult::with_message_and_action(
-        format!("Dispatching a swarm at depth {max_depth}..."),
-        AppAction::SendMessage(message),
-    )
 }
