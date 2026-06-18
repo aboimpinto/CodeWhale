@@ -3030,6 +3030,46 @@ impl App {
         self.needs_redraw = true;
     }
 
+    /// Reset active conversation state without choosing the next session id.
+    pub fn reset_conversation_state(&mut self) -> bool {
+        self.clear_history();
+        self.mark_history_updated();
+        self.api_messages.clear();
+        self.system_prompt = None;
+        self.viewport.transcript_selection.clear();
+        self.queued_messages.clear();
+        self.queued_draft = None;
+        self.session.total_tokens = 0;
+        self.session.total_conversation_tokens = 0;
+        self.session.reset_token_breakdown();
+        self.session.session_cost = 0.0;
+        self.session.session_cost_cny = 0.0;
+        self.session.subagent_cost = 0.0;
+        self.session.subagent_cost_cny = 0.0;
+        self.session.subagent_cost_event_seqs.clear();
+        self.session.displayed_cost_high_water = 0.0;
+        self.session.displayed_cost_high_water_cny = 0.0;
+        let todos_cleared = self.clear_todos();
+        self.tool_log.clear();
+        self.tool_cells.clear();
+        self.tool_details_by_cell.clear();
+        self.exploring_entries.clear();
+        self.ignored_tool_calls.clear();
+        self.pending_tool_uses.clear();
+        self.last_exec_wait_command = None;
+        self.session.last_prompt_tokens = None;
+        self.session.last_completion_tokens = None;
+        self.session.last_prompt_cache_hit_tokens = None;
+        self.session.last_prompt_cache_miss_tokens = None;
+        self.session.last_reasoning_replay_tokens = None;
+        self.session.turn_cache_history.clear();
+        self.session.last_cache_inspection = None;
+        self.session.last_warmup_key = None;
+        self.session.last_tool_catalog = None;
+        self.session.last_base_url = None;
+        todos_cleared
+    }
+
     /// Pop the trailing history cell, keeping revisions in sync.
     pub fn pop_history(&mut self) -> Option<HistoryCell> {
         let cell = self.history.pop();

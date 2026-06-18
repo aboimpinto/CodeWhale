@@ -13,6 +13,9 @@ tui = ["dep:schemaui", "schemaui/tui", "json", "toml"]
 web = ["dep:schemaui", "schemaui/web", "json", "toml"]
 json = ["schemaui/json"]
 toml = ["schemaui/toml"]
+# Opt-in acceptance/Gherkin workflows. These tests are intentionally excluded
+# from default unit-test runs because they are broader and can be slow.
+long-running-tests = []
 
 [[bin]]
 name = "codewhale-tui"

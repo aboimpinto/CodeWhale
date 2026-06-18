@@ -17,6 +17,8 @@ mod sessions;
 // See FEAT-003 planning-analysis-report.md (candidate D.1) for rationale.
 #[allow(clippy::module_inception)]
 mod session;
+#[cfg(all(test, feature = "long-running-tests"))]
+mod acceptance;
 
 use crate::commands::CommandResult;
 use crate::commands::traits::{Command, CommandGroup, FunctionCommand, RegisterCommand};

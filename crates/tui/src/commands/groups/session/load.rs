@@ -28,10 +28,6 @@ impl RegisterCommand for LoadCmd {
     }
 }
 
-/// Extracted `save` module used by tests for session fixture persistence.
-#[cfg(test)]
-use crate::commands::groups::session::save;
-
 /// Load session from file
 pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
     let load_path = if let Some(p) = path {
@@ -116,7 +112,9 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::session_manager::create_saved_session_with_mode;
     use crate::tui::app::{App, TuiOptions};
+    use std::path::Path;
     use tempfile::TempDir;
 
     fn create_test_app_with_tmpdir(tmpdir: &TempDir) -> App {
@@ -142,6 +140,20 @@ mod tests {
             initial_input: None,
         };
         App::new(options, &Config::default())
+    }
+
+    fn write_session_fixture(app: &App, path: &Path) {
+        let mut session = create_saved_session_with_mode(
+            &app.api_messages,
+            &app.model,
+            &app.workspace,
+            u64::from(app.session.total_tokens),
+            app.system_prompt.as_ref(),
+            Some(app.mode.label()),
+        );
+        session.artifacts = app.session_artifacts.clone();
+        let json = serde_json::to_string_pretty(&session).expect("serialize session fixture");
+        std::fs::write(path, json).expect("write session fixture");
     }
 
     #[test]
@@ -187,7 +199,7 @@ mod tests {
         });
         app1.session.total_tokens = 500;
         let save_path = tmpdir.path().join("test.json");
-        save::save(&mut app1, Some(save_path.to_str().unwrap()));
+        write_session_fixture(&app1, &save_path);
 
         // Create new app and load
         let mut app2 = create_test_app_with_tmpdir(&tmpdir);
@@ -214,7 +226,7 @@ mod tests {
         saved_app.last_effective_model = Some("deepseek-v4-flash".to_string());
         saved_app.last_effective_reasoning_effort = Some(ReasoningEffort::Low);
         let save_path = tmpdir.path().join("auto_model.json");
-        save::save(&mut saved_app, Some(save_path.to_str().unwrap()));
+        write_session_fixture(&saved_app, &save_path);
 
         let mut app = create_test_app_with_tmpdir(&tmpdir);
         app.set_model_selection("deepseek-v4-flash".to_string());
@@ -249,7 +261,7 @@ mod tests {
                 storage_path: tmpdir.path().join("call-big.txt"),
             });
         let save_path = tmpdir.path().join("artifact_load.json");
-        save::save(&mut saved_app, Some(save_path.to_str().unwrap()));
+        write_session_fixture(&saved_app, &save_path);
 
         let mut app = create_test_app_with_tmpdir(&tmpdir);
         app.session_artifacts
@@ -287,7 +299,7 @@ mod tests {
         });
         saved_app.session.total_tokens = 500;
         let save_path = tmpdir.path().join("checkpoint.json");
-        save::save(&mut saved_app, Some(save_path.to_str().unwrap()));
+        write_session_fixture(&saved_app, &save_path);
 
         let mut app = create_test_app_with_tmpdir(&tmpdir);
         app.session.session_cost = 1.25;

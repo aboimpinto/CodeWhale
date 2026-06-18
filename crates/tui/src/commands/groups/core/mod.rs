@@ -8,6 +8,8 @@ mod anchor;
 // See FEAT-003 planning-analysis-report.md (candidate D.1) for rationale.
 #[allow(clippy::module_inception)]
 mod core;
+#[cfg(all(test, feature = "long-running-tests"))]
+mod acceptance;
 mod agent;
 mod clear;
 mod exit;
@@ -30,8 +32,6 @@ mod translate;
 pub mod util;
 pub mod voice;
 mod workspace;
-
-pub(in crate::commands) use self::clear::reset_conversation_state;
 
 use crate::commands::CommandResult;
 use crate::commands::traits::{Command, CommandGroup, FunctionCommand, RegisterCommand};
