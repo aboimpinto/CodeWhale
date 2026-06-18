@@ -1,7 +1,7 @@
 //! FEAT-005 Gherkin binary health and eval harness smoke test.
 //!
-//! Proves that after core/session command extraction, the binary still loads
-//! and the evaluation harness runs without errors. This is an end-to-end
+//! Proves that after core/session command extraction, the binary still loads,
+//! links, and the evaluation harness runs without errors. This is an end-to-end
 //! integration test: it builds the binary, runs `codewhale-tui eval` with a
 //! shell command, and asserts on the JSON output report.
 //!
@@ -14,7 +14,7 @@
 //!
 //! The exhaustive command-dispatch correctness is verified by the 55/55
 //! command registry unit tests. This acceptance test proves that the binary
-//! compiles, links, and initializes the command registry without panicking at
+//! compiles, links, and starts the eval harness without panicking at
 //! startup — a different layer of validation that cannot be covered by unit tests.
 //!
 //! Step definitions use the same `TempDir` + `Command::new(codewhale_tui_binary())`
@@ -77,8 +77,8 @@ fn eval_harness_runs_shell_command(world: &mut CoreSessionExtractionWorld) {
         .expect("codewhale-tui eval should start");
 
     // Fail fast if the binary could not start or panicked.
-    // A non-zero exit or stderr output after extraction means the registry or
-    // harness initialization is broken.
+    // A non-zero exit or stderr output after extraction means the binary or
+    // eval harness initialization is broken.
     assert!(
         output.status.success(),
         "codewhale-tui eval failed\nstderr:\n{}",
