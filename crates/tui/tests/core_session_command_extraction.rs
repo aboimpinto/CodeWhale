@@ -1,11 +1,16 @@
-//! FEAT-005 Gherkin acceptance test.
-//!
-//! AT-002: Representative Built-In Commands Still Dispatch.
+//! FEAT-005 Gherkin binary health and eval harness smoke test.
 //!
 //! Proves that after core/session command extraction, the binary still loads
 //! and the evaluation harness runs without errors. This is an end-to-end
 //! integration test: it builds the binary, runs `codewhale-tui eval` with a
 //! shell command, and asserts on the JSON output report.
+//!
+//! NOTE: This test runs the eval harness tool-loop path, NOT the slash-command
+//! dispatch path (`commands/mod.rs:108`). The eval mode only supports shell
+//! commands (List/Read/Search/Edit/Patch/Shell steps); there is no CLI mode to
+//! route individual slash commands like `/help` through `commands::execute()`.
+//! Therefore this test does NOT verify AT-002 (Representative Built-In Dispatch).
+//! AT-002 coverage is provided by the 55/55 command registry unit tests.
 //!
 //! The exhaustive command-dispatch correctness is verified by the 55/55
 //! command registry unit tests. This acceptance test proves that the binary
