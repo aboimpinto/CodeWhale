@@ -53,6 +53,24 @@ pub trait CommandGroup: Send + Sync {
 
 pub(crate) type CommandHandler = fn(&mut App, Option<&str>) -> CommandResult;
 
+/// Trait that each focused command module satisfies.
+///
+/// A command module provides its own metadata (`CommandInfo`) and execution
+/// function through this trait, implemented on a module-level unit struct.
+/// The group file then registers commands by calling the trait's static
+/// methods through `FunctionCommand::new(T::info(), T::execute)`.
+///
+/// This moves `CommandInfo` ownership into the command module so the
+/// module — not the group file — is the single source of truth for its
+/// metadata, aliases, usage, and description. Tests for the command's
+/// metadata live alongside the module that owns it.
+pub trait RegisterCommand {
+    /// The static `CommandInfo` describing this command.
+    fn info() -> &'static CommandInfo;
+    /// Execute this command with the given arguments.
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult;
+}
+
 pub(crate) struct FunctionCommand {
     info: &'static CommandInfo,
     handler: CommandHandler,

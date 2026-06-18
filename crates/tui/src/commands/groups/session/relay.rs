@@ -2,9 +2,30 @@
 
 use std::fmt::Write as _;
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "relay",
+    aliases: &["batonpass", "接力"],
+    usage: "/relay [focus]",
+    description_id: MessageId::CmdRelayDescription,
+};
+
+pub(in crate::commands) struct RelayCmd;
+
+impl RegisterCommand for RelayCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        relay(app, arg)
+    }
+}
 
 /// Ask the active model to write a compact relay artifact for the next thread.
 ///

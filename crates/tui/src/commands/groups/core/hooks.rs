@@ -6,10 +6,36 @@
 //! actually configured in `~/.codewhale/config.toml`'s `[hooks]`
 //! table — the most-asked question once hooks start firing.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::hooks::HookEvent;
+use crate::localization::MessageId;
 use crate::tui::app::App;
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "hooks",
+    aliases: &["hook", "gouzi"],
+    usage: "/hooks [list|events]",
+    description_id: MessageId::CmdHooksDescription,
+};
+
+/// Handler wrapper — reborrows `&mut App` to `&App` for the hooks function.
+fn run(app: &mut App, arg: Option<&str>) -> CommandResult {
+    hooks(app, arg)
+}
+
+pub(in crate::commands) struct HooksCmd;
+
+impl RegisterCommand for HooksCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        run(app, arg)
+    }
+}
 
 /// Top-level dispatch for `/hooks`. Subcommands:
 ///

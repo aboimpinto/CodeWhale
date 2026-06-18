@@ -1,11 +1,37 @@
 //! `/fork` command — fork the active conversation into a new saved sibling session.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::session_manager::{
     SessionManager, create_saved_session_with_id_and_mode, create_saved_session_with_mode,
 };
 use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "fork",
+    aliases: &["branch"],
+    usage: "/fork",
+    description_id: MessageId::CmdForkDescription,
+};
+
+/// Handler wrapper suitable for FunctionCommand registration.
+fn run(app: &mut App, _arg: Option<&str>) -> CommandResult {
+    fork(app)
+}
+
+pub(in crate::commands) struct ForkCmd;
+
+impl RegisterCommand for ForkCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        run(app, arg)
+    }
+}
 
 /// Fork the active conversation into a new saved sibling session and switch to it.
 pub fn fork(app: &mut App) -> CommandResult {

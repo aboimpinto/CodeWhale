@@ -1,5 +1,26 @@
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use super::CommandResult;
 use crate::tui::app::{App, AppAction};
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "feedback",
+    aliases: &[],
+    usage: "/feedback [bug|feature|security]",
+    description_id: MessageId::CmdFeedbackDescription,
+};
+
+pub(in crate::commands) struct FeedbackCmd;
+
+impl RegisterCommand for FeedbackCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        feedback(app, arg)
+    }
+}
 
 const SECURITY_POLICY_URL: &str = "https://github.com/Hmbown/CodeWhale/security/policy";
 

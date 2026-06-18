@@ -4,6 +4,28 @@
 //! `/provider` with no args opens the picker modal (#52). `/provider <name>`
 //! keeps the v0.6.6 CLI form for muscle-memory + scripted use.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "provider",
+    aliases: &[],
+    usage: "/provider [name] [model]",
+    description_id: MessageId::CmdProviderDescription,
+};
+
+pub(in crate::commands) struct ProviderCmd;
+
+impl RegisterCommand for ProviderCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        provider(app, arg)
+    }
+}
+
 use crate::config::{
     ApiProvider, normalize_model_name, normalize_model_name_for_provider,
     provider_passes_model_through,

@@ -2,10 +2,35 @@
 
 use std::fmt::Write;
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::localization::{MessageId, tr};
 use crate::tui::app::{App, AppMode};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "home",
+    aliases: &["stats", "overview", "zhuye", "shouye"],
+    usage: "/home",
+    description_id: MessageId::CmdHomeDescription,
+};
+
+/// Handler wrapper for FunctionCommand registration.
+fn run(app: &mut App, _arg: Option<&str>) -> CommandResult {
+    home_dashboard(app)
+}
+
+pub(in crate::commands) struct HomeCmd;
+
+impl RegisterCommand for HomeCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        run(app, arg)
+    }
+}
 
 /// Show home dashboard with stats and quick actions
 pub fn home_dashboard(app: &mut App) -> CommandResult {

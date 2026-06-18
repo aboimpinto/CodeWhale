@@ -1,11 +1,36 @@
 //! `/subagents` command — list sub-agent status from the engine.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::localization::{MessageId, tr};
 use crate::tui::app::App;
 use crate::tui::views::ModalKind;
 use crate::tui::views::{SubAgentsView, subagent_view_agents};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "subagents",
+    aliases: &["agents", "zhinengti"],
+    usage: "/subagents",
+    description_id: MessageId::CmdSubagentsDescription,
+};
+
+/// Handler wrapper for FunctionCommand registration.
+fn run(app: &mut App, _arg: Option<&str>) -> CommandResult {
+    subagents(app)
+}
+
+pub(in crate::commands) struct SubagentsCmd;
+
+impl RegisterCommand for SubagentsCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        run(app, arg)
+    }
+}
 
 /// List sub-agent status from the engine
 pub fn subagents(app: &mut App) -> CommandResult {

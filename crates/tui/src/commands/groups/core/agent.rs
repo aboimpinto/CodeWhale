@@ -1,8 +1,29 @@
 //! `/agent` command — open a persistent sub-agent session.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "agent",
+    aliases: &["daili"],
+    usage: "/agent [N] <task>",
+    description_id: MessageId::CmdAgentDescription,
+};
+
+pub(in crate::commands) struct AgentCmd;
+
+impl RegisterCommand for AgentCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        agent(app, arg)
+    }
+}
 
 /// Open a persistent sub-agent session from a slash command.
 pub fn agent(_app: &mut App, arg: Option<&str>) -> CommandResult {

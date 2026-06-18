@@ -1,8 +1,29 @@
 //! `/swarm` command — WhaleFlow-backed multi-agent swarm.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "swarm",
+    aliases: &["fanout", "qun"],
+    usage: "/swarm [N] <task>",
+    description_id: MessageId::CmdSwarmDescription,
+};
+
+pub(in crate::commands) struct SwarmCmd;
+
+impl RegisterCommand for SwarmCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        swarm(app, arg)
+    }
+}
 
 /// Run a WhaleFlow-backed multi-agent swarm: high-fanout headless sub-agents
 /// over one task. This is an overlay on the current mode (Agent/Plan/YOLO), not

@@ -2,9 +2,29 @@
 
 use std::fmt::Write;
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::localization::{MessageId, tr};
 use crate::tui::app::App;
 use crate::tui::views::ModalKind;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "help",
+    aliases: &["?", "bangzhu", "帮助"],
+    usage: "/help [command]",
+    description_id: MessageId::CmdHelpDescription,
+};
+
+pub(in crate::commands) struct HelpCmd;
+
+impl RegisterCommand for HelpCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        help(app, arg)
+    }
+}
 use crate::tui::views::HelpView;
 
 use super::CommandResult;

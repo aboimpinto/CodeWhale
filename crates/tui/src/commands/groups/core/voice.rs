@@ -29,9 +29,71 @@ use std::time::Duration;
 use regex::Regex;
 
 use crate::commands::CommandResult;
+use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::config::Config;
 use crate::localization::{MessageId, tr};
 use crate::tui::app::{App, AppAction};
+
+pub(in crate::commands) const COMMAND_INFO_VOICE: CommandInfo = CommandInfo {
+    name: "voice",
+    aliases: &["yuyin", "语音"],
+    usage: "/voice",
+    description_id: MessageId::CmdVoiceDescription,
+};
+pub(in crate::commands) const COMMAND_INFO_VOICE_SEND: CommandInfo = CommandInfo {
+    name: "voicesend",
+    aliases: &["voice-send", "yuyinsend", "语音发送"],
+    usage: "/voicesend",
+    description_id: MessageId::CmdVoiceSendDescription,
+};
+pub(in crate::commands) const COMMAND_INFO_VOICE_CONTROL: CommandInfo = CommandInfo {
+    name: "voicecontrol",
+    aliases: &["voice-control", "yuyincontrol", "语音控制"],
+    usage: "/voicecontrol",
+    description_id: MessageId::CmdVoiceControlDescription,
+};
+
+fn run_voice(app: &mut App, _arg: Option<&str>) -> CommandResult {
+    voice(app)
+}
+fn run_voice_send(app: &mut App, _arg: Option<&str>) -> CommandResult {
+    voice_send(app)
+}
+fn run_voice_control(app: &mut App, _arg: Option<&str>) -> CommandResult {
+    voice_control(app)
+}
+
+pub(in crate::commands) struct VoiceCmd;
+pub(in crate::commands) struct VoiceSendCmd;
+pub(in crate::commands) struct VoiceControlCmd;
+
+impl RegisterCommand for VoiceCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO_VOICE
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        run_voice(app, arg)
+    }
+}
+impl RegisterCommand for VoiceSendCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO_VOICE_SEND
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        run_voice_send(app, arg)
+    }
+}
+impl RegisterCommand for VoiceControlCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO_VOICE_CONTROL
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        run_voice_control(app, arg)
+    }
+}
 
 /// Transcription model requested from the provider's chat-completions API.
 const ASR_MODEL: &str = "mimo-v2.5-asr";

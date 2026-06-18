@@ -1,9 +1,34 @@
 //! `/links` command — show DeepSeek dashboard and API links.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::localization::{MessageId, tr};
 
 use super::CommandResult;
 use crate::tui::app::App;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "links",
+    aliases: &["dashboard", "api", "lianjie"],
+    usage: "/links",
+    description_id: MessageId::CmdLinksDescription,
+};
+
+/// Handler wrapper for FunctionCommand registration.
+fn run(app: &mut App, _arg: Option<&str>) -> CommandResult {
+    deepseek_links(app)
+}
+
+pub(in crate::commands) struct LinksCmd;
+
+impl RegisterCommand for LinksCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        run(app, arg)
+    }
+}
 
 /// Show DeepSeek dashboard and docs links
 pub fn deepseek_links(app: &mut App) -> CommandResult {

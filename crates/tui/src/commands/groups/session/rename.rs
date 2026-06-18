@@ -1,9 +1,30 @@
 //! `/rename` command — set a custom title for the current session.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::session_manager::{SessionManager, update_session};
 use crate::tui::app::App;
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "rename",
+    aliases: &["gaiming", "chongmingming"],
+    usage: "/rename <new title>",
+    description_id: MessageId::CmdRenameDescription,
+};
+
+pub(in crate::commands) struct RenameCmd;
+
+impl RegisterCommand for RenameCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        rename(app, arg)
+    }
+}
 
 const MAX_TITLE_LEN: usize = 100;
 
@@ -180,5 +201,49 @@ mod tests {
 
         let reloaded = manager.load_session(&session_id).unwrap();
         assert_eq!(reloaded.metadata.title, max_title);
+    }
+
+    // -- CommandInfo metadata tests --
+
+    #[test]
+    fn rename_command_info_name() {
+        assert_eq!(COMMAND_INFO.name, "rename");
+    }
+
+    #[test]
+    fn rename_command_info_aliases() {
+        assert_eq!(COMMAND_INFO.aliases, &["gaiming", "chongmingming"]);
+    }
+
+    #[test]
+    fn rename_command_info_usage_starts_with_slash_name() {
+        assert!(COMMAND_INFO.usage.starts_with("/rename"),
+            "usage should start with /rename, got: {}", COMMAND_INFO.usage);
+    }
+
+    #[test]
+    fn rename_command_info_description_not_empty() {
+        use crate::localization::Locale;
+        let desc = COMMAND_INFO.description_for(Locale::En);
+        assert!(!desc.trim().is_empty(),
+            "rename CommandInfo should have non-empty English description");
+    }
+
+    #[test]
+    fn rename_register_command_trait_info_matches_const() {
+        let info = RenameCmd::info();
+        assert_eq!(info.name, COMMAND_INFO.name);
+        assert_eq!(info.aliases, COMMAND_INFO.aliases);
+        assert_eq!(info.usage, COMMAND_INFO.usage);
+    }
+
+    #[test]
+    fn rename_register_command_execute_delegates() {
+        let tmp = TempDir::new().unwrap();
+        let mut app = make_app(&tmp);
+        // Without active session, execute should return error same as rename()
+        let result = RenameCmd::execute(&mut app, Some("test"));
+        assert!(result.is_error);
+        assert!(result.message.as_deref().unwrap_or("").contains("No active session"));
     }
 }

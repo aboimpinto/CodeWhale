@@ -1,5 +1,6 @@
 //! `/model` command — switch or view the current model.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::config::{
     ApiProvider, COMMON_DEEPSEEK_MODELS, normalize_custom_model_id,
     normalize_model_name_for_provider, provider_passes_model_through,
@@ -8,6 +9,25 @@ use crate::localization::{MessageId, tr};
 use crate::tui::app::{App, AppAction, ReasoningEffort};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "model",
+    aliases: &["moxing"],
+    usage: "/model [name]",
+    description_id: MessageId::CmdModelDescription,
+};
+
+pub(in crate::commands) struct ModelCmd;
+
+impl RegisterCommand for ModelCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        model(app, arg)
+    }
+}
 
 /// Switch or view current model. With no argument, open the two-pane
 /// picker (Pro/Flash + thinking effort) per #39 — gives users a discoverable

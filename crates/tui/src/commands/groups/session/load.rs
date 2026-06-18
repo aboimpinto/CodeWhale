@@ -2,10 +2,31 @@
 
 use std::path::PathBuf;
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
 use crate::tui::history::history_cells_from_message;
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "load",
+    aliases: &["jiazai"],
+    usage: "/load [path]",
+    description_id: MessageId::CmdLoadDescription,
+};
+
+pub(in crate::commands) struct LoadCmd;
+
+impl RegisterCommand for LoadCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        load(app, arg)
+    }
+}
 
 /// Extracted `save` module used by tests for session fixture persistence.
 #[cfg(test)]

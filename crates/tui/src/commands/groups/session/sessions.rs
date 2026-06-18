@@ -1,9 +1,30 @@
 //! `/sessions` command — open session picker or manage persisted sessions.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::tui::app::App;
 use crate::tui::session_picker::SessionPickerView;
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "sessions",
+    aliases: &["resume"],
+    usage: "/sessions [show|prune <days>]",
+    description_id: MessageId::CmdSessionsDescription,
+};
+
+pub(in crate::commands) struct SessionsCmd;
+
+impl RegisterCommand for SessionsCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        sessions(app, arg)
+    }
+}
 
 /// Open the session picker UI, or run a sub-action like
 /// `prune <days>` for housekeeping (#406 phase-1.5).

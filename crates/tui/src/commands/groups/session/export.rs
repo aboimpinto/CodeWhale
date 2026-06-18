@@ -3,10 +3,31 @@
 use std::fmt::Write;
 use std::path::PathBuf;
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::tui::app::App;
 use crate::tui::history::{HistoryCell, ToolCell};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "export",
+    aliases: &["daochu"],
+    usage: "/export [path]",
+    description_id: MessageId::CmdExportDescription,
+};
+
+pub(in crate::commands) struct ExportCmd;
+
+impl RegisterCommand for ExportCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        export(app, arg)
+    }
+}
 
 /// Export conversation to markdown
 pub fn export(app: &mut App, path: Option<&str>) -> CommandResult {

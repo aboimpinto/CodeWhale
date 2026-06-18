@@ -1,8 +1,29 @@
 //! `/rlm` command — Recursive Language Model (RLM) turn.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "rlm",
+    aliases: &["recursive", "digui"],
+    usage: "/rlm [N] <file_or_text>",
+    description_id: MessageId::CmdRlmDescription,
+};
+
+pub(in crate::commands) struct RlmCmd;
+
+impl RegisterCommand for RlmCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        rlm(app, arg)
+    }
+}
 
 /// Execute a Recursive Language Model (RLM) turn — Algorithm 1 from
 /// Zhang et al. (arXiv:2512.24601).

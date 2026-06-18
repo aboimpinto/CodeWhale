@@ -1,8 +1,34 @@
 //! `/compact` command — trigger context compaction.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "compact",
+    aliases: &["yasuo"],
+    usage: "/compact",
+    description_id: MessageId::CmdCompactDescription,
+};
+
+/// Handler wrapper suitable for FunctionCommand registration.
+fn run(app: &mut App, _arg: Option<&str>) -> CommandResult {
+    compact(app)
+}
+
+pub(in crate::commands) struct CompactCmd;
+
+impl RegisterCommand for CompactCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        run(app, arg)
+    }
+}
 
 /// Trigger context compaction
 pub fn compact(_app: &mut App) -> CommandResult {

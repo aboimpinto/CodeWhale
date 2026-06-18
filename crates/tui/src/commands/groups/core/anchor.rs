@@ -5,11 +5,32 @@
 //! preserve invariants like "This API's status field is unreliable" or
 //! ".ssh/ must never be touched".
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::tui::app::App;
 use std::fs;
 use std::io::Write;
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "anchor",
+    aliases: &["maodian"],
+    usage: "/anchor <text> | /anchor list | /anchor remove <n>",
+    description_id: MessageId::CmdAnchorDescription,
+};
+
+pub(in crate::commands) struct AnchorCmd;
+
+impl RegisterCommand for AnchorCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        anchor(app, arg)
+    }
+}
 
 const USAGE: &str = "/anchor <text> | /anchor list | /anchor remove <n>";
 

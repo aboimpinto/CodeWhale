@@ -1,8 +1,29 @@
 //! `/new` command — start a fresh session.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
+use crate::localization::MessageId;
 use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "new",
+    aliases: &[],
+    usage: "/new [--force]",
+    description_id: MessageId::CmdNewDescription,
+};
+
+pub(in crate::commands) struct NewCmd;
+
+impl RegisterCommand for NewCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        new_session(app, arg)
+    }
+}
 
 /// Start a fresh saved session from the current TUI state.
 pub fn new_session(app: &mut App, arg: Option<&str>) -> CommandResult {
