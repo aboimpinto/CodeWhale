@@ -1,7 +1,16 @@
 //! Session command area: saving, forking, resuming, exporting, and the
 //! `/relay` session-handoff artifact.
 
+mod compact;
+mod export;
+mod fork;
+mod load;
+mod new;
+mod purge;
+mod relay;
 mod rename;
+mod save;
+mod sessions;
 // This group dir contains `mod session;` while a `session.rs` submodule exists with the same
 // name — a standard Rust structural pattern. `#[allow(clippy::module_inception)]` is a
 // permanent attribute, not migration scaffolding.

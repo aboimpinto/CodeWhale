@@ -8,13 +8,28 @@ mod anchor;
 // See FEAT-003 planning-analysis-report.md (candidate D.1) for rationale.
 #[allow(clippy::module_inception)]
 mod core;
+mod agent;
+mod clear;
+mod exit;
 mod feedback;
+mod help;
 mod hf;
+mod home;
 mod hooks;
+mod links;
+mod model;
+mod models;
+mod profile;
 mod provider;
 mod queue;
+mod rlm;
 mod stash;
+mod subagents;
+mod swarm;
+mod translate;
+pub mod util;
 pub mod voice;
+mod workspace;
 
 pub(in crate::commands) use self::core::reset_conversation_state;
 
@@ -322,7 +337,7 @@ pub(in crate::commands) fn dispatch(
 /// in the REPL as the `PROMPT` variable. The root LLM will only see
 /// metadata about the REPL state, never the prompt text directly.
 pub fn rlm(app: &mut App, arg: Option<&str>) -> CommandResult {
-    let (max_depth, target) = match parse_depth_prefixed_arg(arg, 1) {
+    let (max_depth, target) = match util::parse_depth_prefixed_arg(arg, 1) {
         Ok(parsed) => parsed,
         Err(message) => return CommandResult::error(message),
     };
@@ -337,7 +352,7 @@ pub fn rlm(app: &mut App, arg: Option<&str>) -> CommandResult {
         }
     };
 
-    let source_arg = if resolves_to_existing_file(app, &target) {
+    let source_arg = if util::resolves_to_existing_file(app, &target) {
         format!(r#"file_path: "{target}""#)
     } else {
         format!("content: {target:?}")
@@ -354,7 +369,7 @@ pub fn rlm(app: &mut App, arg: Option<&str>) -> CommandResult {
 
 /// Open a persistent sub-agent session from a slash command.
 pub fn agent(_app: &mut App, arg: Option<&str>) -> CommandResult {
-    let (max_depth, task) = match parse_depth_prefixed_arg(arg, 1) {
+    let (max_depth, task) = match util::parse_depth_prefixed_arg(arg, 1) {
         Ok(parsed) => parsed,
         Err(message) => return CommandResult::error(message),
     };
@@ -381,7 +396,7 @@ pub fn agent(_app: &mut App, arg: Option<&str>) -> CommandResult {
 /// a fourth mode — it instructs the model to decompose and fan out, collecting
 /// compact result summaries rather than child transcripts (#3178).
 pub fn swarm(_app: &mut App, arg: Option<&str>) -> CommandResult {
-    let (max_depth, task) = match parse_depth_prefixed_arg(arg, 1) {
+    let (max_depth, task) = match util::parse_depth_prefixed_arg(arg, 1) {
         Ok(parsed) => parsed,
         Err(message) => return CommandResult::error(message),
     };
@@ -403,36 +418,4 @@ pub fn swarm(_app: &mut App, arg: Option<&str>) -> CommandResult {
         format!("Dispatching a swarm at depth {max_depth}..."),
         AppAction::SendMessage(message),
     )
-}
-
-fn parse_depth_prefixed_arg(
-    arg: Option<&str>,
-    default_depth: u32,
-) -> Result<(u32, Option<&str>), String> {
-    let Some(raw) = arg.map(str::trim).filter(|raw| !raw.is_empty()) else {
-        return Ok((default_depth, None));
-    };
-    let mut parts = raw.splitn(2, char::is_whitespace);
-    let first = parts.next().unwrap_or_default();
-    if first.chars().all(|ch| ch.is_ascii_digit()) {
-        let depth: u32 = first
-            .parse()
-            .map_err(|_| "Depth must be an integer from 0 to 3".to_string())?;
-        if depth > 3 {
-            return Err("Depth must be between 0 and 3".to_string());
-        }
-        Ok((depth, parts.next().map(str::trim)))
-    } else {
-        Ok((default_depth, Some(raw)))
-    }
-}
-
-fn resolves_to_existing_file(app: &App, input: &str) -> bool {
-    let path = std::path::Path::new(input);
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        app.workspace.join(path)
-    };
-    candidate.is_file()
 }
