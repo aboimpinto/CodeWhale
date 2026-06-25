@@ -10,10 +10,30 @@
 //! `SendMessage` action that asks the model to translate the changelog into
 //! the user's language.
 
+use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::localization::{Locale, MessageId, tr};
 use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "change",
+    aliases: &[],
+    usage: "/change [version]",
+    description_id: MessageId::CmdChangeDescription,
+};
+
+pub(in crate::commands) struct ChangeCmd;
+
+impl RegisterCommand for ChangeCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
+        crate::commands::groups::debug::change::change(app, arg)
+    }
+}
 
 /// Maximum length of the changelog excerpt we'll show inline (characters).
 /// If the changelog section exceeds this, we truncate and show a notice.

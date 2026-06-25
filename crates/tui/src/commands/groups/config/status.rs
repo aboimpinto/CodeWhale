@@ -4,10 +4,31 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use super::CommandResult;
+use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::compaction::estimate_input_tokens_conservative;
 use crate::config::provider_capability;
+use crate::localization::MessageId;
 use crate::tui::app::App;
 use crate::utils::{display_path, estimate_message_chars};
+
+pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
+    name: "status",
+    aliases: &[],
+    usage: "/status",
+    description_id: MessageId::CmdStatusDescription,
+};
+
+pub(in crate::commands) struct StatusCmd;
+
+impl RegisterCommand for StatusCmd {
+    fn info() -> &'static CommandInfo {
+        &COMMAND_INFO
+    }
+
+    fn execute(app: &mut App, _arg: Option<&str>) -> CommandResult {
+        crate::commands::groups::config::status::status(app)
+    }
+}
 
 /// Show a compact runtime status report for the current TUI session.
 pub fn status(app: &mut App) -> CommandResult {
