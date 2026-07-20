@@ -8,9 +8,8 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::Duration;
 
-use crate::client::DeepSeekClient;
 use crate::config::DEFAULT_TEXT_MODEL;
-use crate::llm_client::LlmClient;
+use crate::core::model_client::ModelClient;
 use crate::logging;
 use crate::models::{
     CacheControl, ContentBlock, Message, MessageRequest, SystemBlock, SystemPrompt,
@@ -30,6 +29,9 @@ pub struct CompactionConfig {
     pub enabled: bool,
     pub token_threshold: usize,
     pub model: String,
+    /// Route-effective context window. `None` preserves compatibility for
+    /// callers that have not resolved a provider route yet.
+    pub effective_context_window: Option<u32>,
     pub cache_summary: bool,
 }
 
@@ -54,6 +56,7 @@ impl Default for CompactionConfig {
             // `compaction_threshold_for_model_and_effort`.
             token_threshold: 800_000,
             model: DEFAULT_TEXT_MODEL.to_string(),
+            effective_context_window: None,
             cache_summary: true,
         }
     }
@@ -74,9 +77,21 @@ const LARGE_CONTEXT_SUMMARY_INPUT_MAX_CHARS: usize = 120_000;
 const LARGE_CONTEXT_SUMMARY_INPUT_HEAD_CHARS: usize = 72_000;
 const LARGE_CONTEXT_SUMMARY_INPUT_TAIL_CHARS: usize = 36_000;
 const TOOL_PRUNE_STOP_CHECK_BYTES: usize = 16 * 1024;
+const RETAINED_TOOL_RESULT_MAX_CHARS: usize = 64 * 1024;
+const RETAINED_THINKING_MAX_CHARS: usize = 16 * 1024;
 const LARGE_CONTEXT_SUMMARY_MAX_TOKENS: u32 = 2_048;
 const LARGE_CONTEXT_WINDOW_TOKENS: u32 = 500_000;
 const CACHE_ALIGNED_SUMMARY_CONTEXT_BUDGET_PERCENT: usize = 85;
+
+// File types whose contents are useful working-set context after compaction.
+// Keep this structural table separate from the path-extraction regex so new
+// source languages do not require another large regex alternation.
+const WORKING_SET_EXTENSIONS: &[&str] = &[
+    "rs", "toml", "md", "json", "yaml", "yml", "txt", "py", "pyi", "ipynb", "js", "jsx", "ts",
+    "tsx", "mjs", "cjs", "go", "java", "kt", "kts", "c", "h", "cc", "cpp", "hpp", "cs", "rb",
+    "php", "swift", "m", "mm", "scala", "sh", "bash", "zsh", "ps1", "sql", "proto", "tf", "vue",
+    "svelte", "dart", "lua", "r", "jl", "ex", "exs", "erl", "hs", "zig",
+];
 
 #[derive(Debug, Clone, Copy)]
 struct SummaryInputLimits {
@@ -89,9 +104,13 @@ struct SummaryInputLimits {
     word_limit: usize,
 }
 
-fn summary_input_limits_for_model(model: &str) -> SummaryInputLimits {
-    let is_large_context =
-        context_window_for_model(model).is_some_and(|window| window >= LARGE_CONTEXT_WINDOW_TOKENS);
+fn summary_input_limits_for_model(
+    model: &str,
+    effective_context_window: Option<u32>,
+) -> SummaryInputLimits {
+    let is_large_context = effective_context_window
+        .or_else(|| context_window_for_model(model))
+        .is_some_and(|window| window >= LARGE_CONTEXT_WINDOW_TOKENS);
     if is_large_context {
         SummaryInputLimits {
             text_snippet_chars: LARGE_CONTEXT_SUMMARY_TEXT_SNIPPET_CHARS,
@@ -140,7 +159,7 @@ fn path_regex() -> &'static Regex {
             (?P<path>
                 (?:[A-Za-z0-9._-]+/)+
                 [A-Za-z0-9._-]+
-                \.(?:rs|toml|md|json|ya?ml|txt|lock)
+                \.[A-Za-z0-9]+
             )
         ",
         )
@@ -202,6 +221,38 @@ fn looks_repo_relative(path: &str) -> bool {
         || path.starts_with("crates/")
         || path.starts_with(".github/")
         || (path.contains('/') && path.rsplit('.').next().is_some())
+}
+
+fn is_working_set_path(path: &str) -> bool {
+    // Do not spend the fixed working-set budget on dependencies or build
+    // output, even when those trees contain source-looking file names.
+    if path.split('/').any(|component| {
+        matches!(
+            component,
+            "node_modules" | "target" | "vendor" | "dist" | "build"
+        )
+    }) {
+        return false;
+    }
+
+    let file_name = path.rsplit('/').next().unwrap_or(path);
+    if file_name.ends_with(".min.js") || file_name.ends_with(".min.css") {
+        return false;
+    }
+    // Cargo.lock is an existing explicitly recognized project anchor. Other
+    // lockfiles are dependency snapshots rather than edited source context.
+    if file_name == "Cargo.lock" {
+        return true;
+    }
+    if file_name.ends_with(".lock") {
+        return false;
+    }
+
+    let Some(extension) = file_name.rsplit('.').next() else {
+        return false;
+    };
+    let extension = extension.to_ascii_lowercase();
+    WORKING_SET_EXTENSIONS.contains(&extension.as_str())
 }
 
 fn extract_paths_from_text(text: &str, workspace: Option<&Path>) -> Vec<String> {
@@ -315,6 +366,9 @@ fn derive_working_set_paths(
 
     for idx in seeds {
         for candidate in extract_paths_from_message(&messages[idx], workspace) {
+            if !is_working_set_path(&candidate) {
+                continue;
+            }
             if seen.insert(candidate.clone()) {
                 paths.push(candidate);
                 if paths.len() >= MAX_WORKING_SET_PATHS {
@@ -326,6 +380,9 @@ fn derive_working_set_paths(
 
     for msg in messages.iter().rev().take(RECENT_WORKING_SET_WINDOW) {
         for candidate in extract_paths_from_message(msg, workspace) {
+            if !is_working_set_path(&candidate) {
+                continue;
+            }
             if seen.insert(candidate.clone()) {
                 paths.push(candidate);
                 if paths.len() >= MAX_WORKING_SET_PATHS {
@@ -397,7 +454,9 @@ pub fn plan_compaction(
     let mut working_set_paths = derive_working_set_paths(messages, workspace, seed_indices);
     if let Some(paths) = external_working_set_paths {
         for path in paths {
-            if let Some(normalized) = normalize_path_candidate(path, workspace) {
+            if let Some(normalized) = normalize_path_candidate(path, workspace)
+                && is_working_set_path(&normalized)
+            {
                 let _ = working_set_paths.insert(normalized);
             }
         }
@@ -852,6 +911,62 @@ where
     bytes_saved
 }
 
+fn truncate_retained_block(label: &str, content: &mut String, max_chars: usize) -> bool {
+    let char_count = content.chars().count();
+    if char_count <= max_chars {
+        return false;
+    }
+
+    let snippet_budget = max_chars.saturating_sub(256).max(1024);
+    let head_chars = snippet_budget / 2;
+    let tail_chars_budget = snippet_budget.saturating_sub(head_chars);
+    let head = truncate_chars(content, head_chars).to_string();
+    let tail = tail_chars(content, tail_chars_budget);
+    *content =
+        format!("[{label} retained-history truncated from {char_count} chars]\n{head}\n…\n{tail}");
+    true
+}
+
+// A match guard cannot mutably borrow `content`; keeping the mutation inside
+// the arm updates both retained representations together without indirection.
+#[allow(clippy::collapsible_match)]
+fn sanitize_retained_messages(mut messages: Vec<Message>) -> Vec<Message> {
+    for message in &mut messages {
+        for block in &mut message.content {
+            match block {
+                ContentBlock::ToolResult {
+                    content,
+                    content_blocks,
+                    ..
+                } => {
+                    if truncate_retained_block(
+                        "tool result",
+                        content,
+                        RETAINED_TOOL_RESULT_MAX_CHARS,
+                    ) {
+                        *content_blocks = None;
+                    }
+                }
+                // Signed thinking must stay byte-for-byte valid for providers that
+                // verify replay signatures. Unsigned thinking is local memory pressure
+                // and can be capped once compaction has summarized the old turn.
+                ContentBlock::Thinking {
+                    thinking,
+                    signature,
+                } if signature.is_none() => {
+                    truncate_retained_block(
+                        "thinking block",
+                        thinking,
+                        RETAINED_THINKING_MAX_CHARS,
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+    messages
+}
+
 /// Result of a compaction operation with metadata.
 #[derive(Debug)]
 pub struct CompactionResult {
@@ -859,10 +974,6 @@ pub struct CompactionResult {
     pub messages: Vec<Message>,
     /// Summary system prompt
     pub summary_prompt: Option<SystemPrompt>,
-    /// Messages that were removed from the active window
-    // TODO(v0.8.71): kept for replay compatibility; dead in production, see #3490
-    #[allow(dead_code)]
-    pub removed_messages: Vec<Message>,
     /// Number of retries used before success
     pub retries_used: u32,
 }
@@ -891,7 +1002,7 @@ fn is_transient_error(e: &anyhow::Error) -> bool {
 /// - Never corrupts the original messages (returns error instead)
 /// - Only retries on transient errors (network, rate limit, etc.)
 pub async fn compact_messages_safe(
-    client: &DeepSeekClient,
+    client: &dyn ModelClient,
     messages: &[Message],
     config: &CompactionConfig,
     workspace: Option<&Path>,
@@ -951,9 +1062,8 @@ pub async fn compact_messages_safe(
         ));
         if was_over_threshold && now_under_threshold {
             return Ok(CompactionResult {
-                messages: pruned_messages,
+                messages: sanitize_retained_messages(pruned_messages),
                 summary_prompt: None,
-                removed_messages: Vec::new(),
                 retries_used: 0,
             });
         }
@@ -982,10 +1092,10 @@ pub async fn compact_messages_safe(
         .await
         {
             Ok((msgs, prompt, removed)) => {
+                drop(removed);
                 return Ok(CompactionResult {
-                    messages: msgs,
+                    messages: sanitize_retained_messages(msgs),
                     summary_prompt: prompt,
-                    removed_messages: removed,
                     retries_used: attempt,
                 });
             }
@@ -1048,7 +1158,7 @@ fn anchor_summary_section(workspace: Option<&Path>) -> String {
 }
 
 pub async fn compact_messages(
-    client: &DeepSeekClient,
+    client: &dyn ModelClient,
     messages: &[Message],
     config: &CompactionConfig,
     workspace: Option<&Path>,
@@ -1077,10 +1187,17 @@ pub async fn compact_messages(
         .collect();
 
     // Create a summary of the unpinned portion of the conversation
-    let summary = create_summary(client, &to_summarize, &config.model).await?;
+    let summary = create_summary(
+        client,
+        &to_summarize,
+        &config.model,
+        config.effective_context_window,
+    )
+    .await?;
 
     // Extract workflow context (files touched, tasks in progress, etc.)
     let workflow_context = extract_workflow_context(&to_summarize, workspace);
+    drop(to_summarize);
 
     let anchors_section = anchor_summary_section(workspace);
 
@@ -1118,19 +1235,21 @@ pub async fn compact_messages(
         .collect();
 
     Ok((
-        pinned_messages,
+        sanitize_retained_messages(pinned_messages),
         Some(SystemPrompt::Blocks(vec![summary_block])),
-        to_summarize,
+        Vec::new(),
     ))
 }
 
 async fn create_summary(
-    client: &DeepSeekClient,
+    client: &dyn ModelClient,
     messages: &[Message],
     model: &str,
+    effective_context_window: Option<u32>,
 ) -> Result<String> {
-    let limits = summary_input_limits_for_model(model);
-    let used_cache_aligned = should_use_cache_aligned_summary(model, messages);
+    let limits = summary_input_limits_for_model(model, effective_context_window);
+    let used_cache_aligned =
+        should_use_cache_aligned_summary(model, effective_context_window, messages);
     let request = if used_cache_aligned {
         build_cache_aligned_summary_request(model, messages, limits)
     } else {
@@ -1160,7 +1279,9 @@ async fn create_summary(
     // Compaction summary calls are billed by DeepSeek; route the
     // tokens through the side-channel so the dashboard total
     // matches the website (#526).
-    crate::cost_status::report(&response.model, &response.usage);
+    let api_provider = crate::config::ApiProvider::parse(client.provider_name())
+        .unwrap_or(crate::config::ApiProvider::Custom);
+    crate::cost_status::report(api_provider, &response.model, &response.usage);
 
     // #584: emit one debug-level event per summary call so the
     // V4 cache-aligned win is observable post-deploy without
@@ -1285,8 +1406,12 @@ fn log_summary_cache_telemetry(used_cache_aligned: bool, usage: &crate::models::
 /// `create_summary` emits a `tracing::debug!` event under
 /// `target = "compaction"` after each call so the path choice and
 /// cache-hit rate are observable post-deploy without UI surface.
-fn should_use_cache_aligned_summary(model: &str, messages: &[Message]) -> bool {
-    let Some(window) = context_window_for_model(model) else {
+fn should_use_cache_aligned_summary(
+    model: &str,
+    effective_context_window: Option<u32>,
+    messages: &[Message],
+) -> bool {
+    let Some(window) = effective_context_window.or_else(|| context_window_for_model(model)) else {
         return false;
     };
     if window < LARGE_CONTEXT_WINDOW_TOKENS {
@@ -1799,12 +1924,27 @@ mod tests {
 
     #[test]
     fn summary_limits_expand_for_v4_context() {
-        let legacy = summary_input_limits_for_model("deepseek-v3.2-128k");
-        let v4 = summary_input_limits_for_model("deepseek-v4-pro");
+        let legacy = summary_input_limits_for_model("deepseek-v3.2-128k", None);
+        let v4 = summary_input_limits_for_model("deepseek-v4-pro", None);
 
         assert!(v4.input_max_chars > legacy.input_max_chars);
         assert!(v4.tool_result_snippet_chars > legacy.tool_result_snippet_chars);
         assert!(v4.max_tokens > legacy.max_tokens);
+    }
+
+    #[test]
+    fn route_effective_window_bounds_same_id_oauth_summary() {
+        let api = summary_input_limits_for_model("gpt-5.5", None);
+        let oauth = summary_input_limits_for_model("gpt-5.5", Some(272_000));
+        let messages = vec![msg("user", "summarize this route")];
+
+        assert!(api.input_max_chars > oauth.input_max_chars);
+        assert!(should_use_cache_aligned_summary("gpt-5.5", None, &messages));
+        assert!(!should_use_cache_aligned_summary(
+            "gpt-5.5",
+            Some(272_000),
+            &messages
+        ));
     }
 
     #[test]
@@ -1813,10 +1953,12 @@ mod tests {
 
         assert!(should_use_cache_aligned_summary(
             "deepseek-v4-flash",
+            None,
             &messages
         ));
         assert!(!should_use_cache_aligned_summary(
             "deepseek-v3.2-128k",
+            None,
             &messages
         ));
     }
@@ -1877,7 +2019,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let limits = summary_input_limits_for_model("deepseek-v4-pro");
+        let limits = summary_input_limits_for_model("deepseek-v4-pro", None);
 
         let request = build_formatted_summary_request("deepseek-v4-pro", &messages, limits);
 
@@ -1895,7 +2037,7 @@ mod tests {
             msg("user", "Please edit crates/tui/src/compaction.rs"),
             msg("assistant", "I will inspect the file."),
         ];
-        let limits = summary_input_limits_for_model("deepseek-v4-pro");
+        let limits = summary_input_limits_for_model("deepseek-v4-pro", None);
         let request = build_cache_aligned_summary_request("deepseek-v4-pro", &messages, limits);
 
         assert_eq!(request.system, None);
@@ -2110,6 +2252,114 @@ mod tests {
         );
 
         assert!(plan.pinned_indices.contains(&0));
+    }
+
+    #[test]
+    fn plan_compaction_pins_edited_python_typescript_and_go_paths() {
+        let messages = vec![
+            msg("user", "start working"),
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "py-edit".to_string(),
+                    name: "write_file".to_string(),
+                    input: json!({"path": "src/worker.py"}),
+                    caller: None,
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "py-edit".to_string(),
+                    content: "wrote src/worker.py".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "ts-edit".to_string(),
+                    name: "write_file".to_string(),
+                    input: json!({"path": "web/app.tsx"}),
+                    caller: None,
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "ts-edit".to_string(),
+                    content: "wrote web/app.tsx".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "go-edit".to_string(),
+                    name: "write_file".to_string(),
+                    input: json!({"path": "cmd/server/main.go"}),
+                    caller: None,
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "go-edit".to_string(),
+                    content: "wrote cmd/server/main.go".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+            msg("user", "continue with the next task"),
+        ];
+
+        let plan = plan_compaction(&messages, None, 1, None, None);
+        for idx in [1, 2, 3, 4, 5, 6] {
+            assert!(
+                plan.pinned_indices.contains(&idx),
+                "edited source message {idx} should be pinned"
+            );
+        }
+    }
+
+    #[test]
+    fn plan_compaction_excludes_dependency_build_lock_and_minified_paths() {
+        let messages = vec![
+            msg("user", "start working"),
+            Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "junk-1".to_string(),
+                    name: "write_file".to_string(),
+                    input: json!({"path": "node_modules/pkg/index.js"}),
+                    caller: None,
+                }],
+            },
+            Message {
+                role: "user".to_string(),
+                content: vec![ContentBlock::ToolResult {
+                    tool_use_id: "junk-1".to_string(),
+                    content: "wrote node_modules/pkg/index.js".to_string(),
+                    is_error: None,
+                    content_blocks: None,
+                }],
+            },
+            msg("assistant", "target/debug/generated.rs"),
+            msg("assistant", "dist/app.min.js"),
+            msg("assistant", "package-lock.json"),
+            msg("assistant", "workspace.lock"),
+            msg("user", "continue with the next task"),
+        ];
+
+        let plan = plan_compaction(&messages, None, 1, None, None);
+        for idx in 1..7 {
+            assert!(
+                !plan.pinned_indices.contains(&idx),
+                "junk path message {idx} should not be newly pinned"
+            );
+        }
     }
 
     #[test]
@@ -2765,13 +3015,11 @@ mod tests {
         let result = CompactionResult {
             messages: vec![],
             summary_prompt: None,
-            removed_messages: vec![],
             retries_used: 2,
         };
 
         assert_eq!(result.retries_used, 2);
         assert!(result.messages.is_empty());
-        assert!(result.removed_messages.is_empty());
     }
 
     #[test]

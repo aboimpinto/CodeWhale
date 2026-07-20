@@ -14,6 +14,7 @@ pub mod decision_card;
 pub mod pending_input_preview;
 mod renderable;
 pub mod tool_card;
+pub mod workflow_panel;
 
 pub use footer::{
     FooterProps, FooterToast, FooterWidget, footer_agents_chip, footer_shell_label_chip,
@@ -29,17 +30,18 @@ use std::time::Duration;
 use crate::commands;
 #[cfg(test)]
 use crate::config::ApiProvider;
-#[cfg(test)]
-use crate::config::model_completion_names_for_provider;
 use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
+#[cfg(test)]
+use crate::provider_lake::all_catalog_models_for_provider;
 use crate::tui::app::{App, AppMode, ComposerDensity, VimMode};
 use crate::tui::approval::{
     ApprovalRequest, ApprovalView, ElevationOption, ElevationRequest, RiskLevel, ToolCategory,
 };
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus};
 use crate::tui::scrolling::TranscriptLineMeta;
-use crate::tui::ui_text::{char_display_width, text_display_width};
+use crate::tui::ui_text::{grapheme_display_width, text_display_width};
+use crate::tui::underwater::ShellPhase;
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
@@ -54,6 +56,7 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 const SEND_FLASH_DURATION: Duration = Duration::from_millis(500);
+#[cfg(test)]
 const COMPOSER_PANEL_HEIGHT: u16 = 2;
 const JUMP_TO_LATEST_BUTTON_WIDTH: u16 = 3;
 const JUMP_TO_LATEST_BUTTON_HEIGHT: u16 = 3;
@@ -61,9 +64,18 @@ const JUMP_TO_LATEST_BUTTON_HEIGHT: u16 = 3;
 pub struct ChatWidget {
     content_area: Rect,
     lines: Vec<Line<'static>>,
+    line_links: Vec<Vec<crate::tui::osc8::LineLink>>,
     scrollbar: Option<TranscriptScrollbar>,
     jump_to_latest_button: Option<Rect>,
     background: Color,
+    ocean_column: Option<crate::tui::ocean::OceanColumn>,
+    /// Ink for idle fish/bubbles. Present for every underwater treatment —
+    /// flat and Terminal-owned keep ambient life without the ombre field.
+    ambient_inks: Option<(Color, Color)>,
+    ocean_elapsed_ms: u128,
+    ocean_animated: bool,
+    fish_flee_elapsed_ms: Option<u128>,
+    ambient_life: bool,
     scroll_track: Color,
     scroll_thumb: Color,
     jump_border: Color,
@@ -81,6 +93,50 @@ impl ChatWidget {
     pub fn new(app: &mut App, area: Rect) -> Self {
         let content_area = area;
         let background = app.ui_theme.surface_bg;
+        let ocean_ramp = app
+            .ocean_treatment
+            .is_ombre()
+            .then(|| crate::tui::ocean::OceanRamp::for_theme(&app.ui_theme))
+            .flatten();
+        let ambient_inks = app
+            .ocean_treatment
+            .supports_ambient_life()
+            .then(|| crate::tui::ocean::ambient_inks(&app.ui_theme));
+        let ocean_elapsed_ms = app.ocean_started_at.elapsed().as_millis();
+        let completion_elapsed_ms = (!app.low_motion && app.fancy_animations)
+            .then_some(())
+            .and(app.ocean_completion_started_at)
+            .map(|started| started.elapsed().as_millis())
+            .filter(|elapsed| *elapsed < 800);
+        let render_empty_state = should_render_empty_state(app);
+        let phase = ShellPhase::from_app(app);
+        // Keep the water alive while a turn is doing work, even after the
+        // transcript exists. Previously motion was limited to a pristine
+        // empty composer, so typing or receiving the first message made the
+        // fish appear to die.
+        let underwater_motion_enabled =
+            crate::tui::underwater::decorative_shell_motion_enabled(app);
+        let browsing_history = !app.viewport.transcript_scroll.is_at_tail();
+        let ocean_animated = underwater_motion_enabled
+            && (render_empty_state
+                || browsing_history
+                || matches!(phase, ShellPhase::Working | ShellPhase::Verifying));
+        let ocean_column = ocean_ramp.map(|ramp| {
+            crate::tui::ocean::OceanColumn::new(
+                ramp,
+                content_area,
+                ocean_elapsed_ms,
+                completion_elapsed_ms,
+                phase,
+                ocean_animated,
+            )
+        });
+        let fish_flee_elapsed_ms = underwater_motion_enabled
+            .then_some(())
+            .and(app.turn_started_at)
+            .map(|started| started.elapsed().as_millis())
+            .filter(|elapsed| *elapsed < 800)
+            .filter(|_| matches!(phase, ShellPhase::Working | ShellPhase::Verifying));
         let scroll_track = app.ui_theme.border;
         let scroll_thumb = app.ui_theme.status_working;
         let jump_border = app.ui_theme.border;
@@ -88,7 +144,7 @@ impl ChatWidget {
         let visible_lines = content_area.height as usize;
         let render_options = app.transcript_render_options();
 
-        if should_render_empty_state(app) {
+        if render_empty_state {
             let lines = build_empty_state_lines(app, content_area);
             app.viewport.last_transcript_area = Some(content_area);
             app.viewport.last_transcript_top = 0;
@@ -99,9 +155,25 @@ impl ChatWidget {
             return Self {
                 content_area,
                 lines,
+                line_links: Vec::new(),
                 scrollbar: None,
                 jump_to_latest_button: None,
                 background,
+                ocean_column,
+                ambient_inks,
+                ocean_elapsed_ms,
+                ocean_animated,
+                fish_flee_elapsed_ms,
+                // Reduced-motion users still get the quiet, static scene;
+                // only movement itself is opt-in.
+                ambient_life: !app.attention_hold_active()
+                    && matches!(
+                        phase,
+                        ShellPhase::Idle
+                            | ShellPhase::Typing
+                            | ShellPhase::Working
+                            | ShellPhase::Verifying
+                    ),
                 scroll_track,
                 scroll_thumb,
                 jump_border,
@@ -161,16 +233,17 @@ impl ChatWidget {
         if !has_collapsed {
             let mut cell_revisions: Vec<u64> =
                 Vec::with_capacity(app.history.len() + active_entries.len());
-            cell_revisions.extend_from_slice(&app.history_revisions);
+            cell_revisions.extend(
+                app.history_revisions
+                    .iter()
+                    .copied()
+                    .map(history_entry_revision),
+            );
             if !active_entries.is_empty() {
                 let active_rev = app.active_cell_revision;
                 for i in 0..active_entries.len() {
                     let salt = (i as u64).wrapping_add(1);
-                    cell_revisions.push(
-                        active_rev
-                            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-                            .wrapping_add(salt),
-                    );
+                    cell_revisions.push(active_entry_revision(active_rev, salt));
                 }
             }
             // Build identity mapping: filtered index == original index.
@@ -186,10 +259,26 @@ impl ChatWidget {
                 None,
             );
         } else {
-            // Slow path: clone non-collapsed cells into filtered vecs so
-            // collapsed cells are excluded from rendering. Build the
-            // filtered→original index mapping.
-            let mut filtered_cells: Vec<HistoryCell> =
+            // Slow path: borrow non-collapsed cells into a filtered ref list
+            // so collapsed cells are excluded from rendering, and build the
+            // filtered→original index mapping. Collapsed run starts render a
+            // synthetic summary cell; those few summaries are materialized
+            // up front so the ref list can borrow from a stable Vec —
+            // avoiding the per-frame deep clone of every visible cell that
+            // this path used to pay (#3896).
+            let summary_cells: Vec<(usize, HistoryCell)> = tool_runs
+                .iter()
+                .filter(|run| collapsed_run_starts.contains(&run.start))
+                .map(|run| (run.start, tool_run_summary_cell(run)))
+                .collect();
+            let summary_cell_for = |idx: usize| -> Option<&HistoryCell> {
+                summary_cells
+                    .iter()
+                    .find(|(start, _)| *start == idx)
+                    .map(|(_, cell)| cell)
+            };
+
+            let mut filtered_cells: Vec<&HistoryCell> =
                 Vec::with_capacity(history_len + active_entries.len());
             let mut filtered_revs: Vec<u64> =
                 Vec::with_capacity(history_len + active_entries.len());
@@ -207,7 +296,7 @@ impl ChatWidget {
                     .iter()
                     .find(|run| run.start == idx && collapsed_run_starts.contains(&idx))
                 {
-                    filtered_cells.push(tool_run_summary_cell(run));
+                    filtered_cells.push(summary_cell_for(idx).expect("summary cell materialized"));
                     filtered_revs.push(tool_run_summary_revision(
                         run,
                         &app.history_revisions,
@@ -217,8 +306,8 @@ impl ChatWidget {
                     filtered_to_original.push(idx);
                     continue;
                 }
-                filtered_cells.push(cell.clone());
-                filtered_revs.push(app.history_revisions[idx]);
+                filtered_cells.push(cell);
+                filtered_revs.push(history_entry_revision(app.history_revisions[idx]));
                 filtered_to_original.push(idx);
             }
 
@@ -235,7 +324,8 @@ impl ChatWidget {
                     if let Some(run) = tool_runs.iter().find(|run| {
                         run.start == original_idx && collapsed_run_starts.contains(&original_idx)
                     }) {
-                        filtered_cells.push(tool_run_summary_cell(run));
+                        filtered_cells
+                            .push(summary_cell_for(original_idx).expect("summary materialized"));
                         filtered_revs.push(tool_run_summary_revision(
                             run,
                             &app.history_revisions,
@@ -245,7 +335,7 @@ impl ChatWidget {
                         filtered_to_original.push(original_idx);
                         continue;
                     }
-                    filtered_cells.push(cell.clone());
+                    filtered_cells.push(cell);
                     let salt = (i as u64).wrapping_add(1);
                     filtered_revs.push(active_entry_revision(active_rev, salt));
                     filtered_to_original.push(original_idx);
@@ -254,9 +344,8 @@ impl ChatWidget {
 
             app.collapsed_cell_map = filtered_to_original;
 
-            let shards: [&[HistoryCell]; 1] = [&filtered_cells];
-            app.viewport.transcript_cache.ensure_split(
-                &shards,
+            app.viewport.transcript_cache.ensure_filtered(
+                &filtered_cells,
                 &filtered_revs,
                 content_area.width.max(1),
                 render_options,
@@ -326,6 +415,29 @@ impl ChatWidget {
         } else {
             app.viewport.transcript_cache.lines()[top..end].to_vec()
         };
+        let mut line_links = if total_lines == 0 {
+            vec![Vec::new()]
+        } else {
+            app.viewport.transcript_cache.line_links()[top..end].to_vec()
+        };
+
+        if !app.low_motion
+            && app.fancy_animations
+            && let (Some(start), Some(started)) = (
+                app.ocean_receipt_settle_start,
+                app.ocean_completion_started_at,
+            )
+        {
+            apply_receipt_settle_cascade(
+                &mut lines,
+                top,
+                line_meta,
+                &app.collapsed_cell_map,
+                &app.history,
+                start,
+                started.elapsed().as_millis(),
+            );
+        }
 
         // Brief flash highlight on the most recently sent user message.
         if !app.low_motion
@@ -356,9 +468,20 @@ impl ChatWidget {
 
         apply_selection(&mut lines, top, app);
 
-        if app.viewport.transcript_scroll.is_at_tail() {
-            app.viewport.last_transcript_padding_top = visible_lines.saturating_sub(lines.len());
+        // The HTML contract is a top-first ledger. Bottom-padding the short
+        // transcript made every newly wrapped stream line shift all prior
+        // rows upward, producing repeated thousand-cell repaints and the
+        // visible "slab" motion recorded in live QA. Empty-state centering is
+        // handled separately; active work starts at the top and appends in
+        // place until scrolling is genuinely necessary. The old anchoring is
+        // retained only inside the explicitly selected classic treatment.
+        if app.ocean_treatment.is_classic() && app.viewport.transcript_scroll.is_at_tail() {
+            let padding_top = visible_lines.saturating_sub(lines.len());
+            app.viewport.last_transcript_padding_top = padding_top;
             pad_lines_to_bottom(&mut lines, visible_lines);
+            line_links.splice(0..0, std::iter::repeat_n(Vec::new(), padding_top));
+        } else {
+            app.viewport.last_transcript_padding_top = 0;
         }
 
         let scrollbar = (total_lines > visible_lines && content_area.width > 1).then_some(
@@ -379,15 +502,84 @@ impl ChatWidget {
         Self {
             content_area,
             lines,
+            line_links,
             scrollbar,
             jump_to_latest_button,
             background,
+            ocean_column,
+            ambient_inks,
+            ocean_elapsed_ms,
+            ocean_animated,
+            fish_flee_elapsed_ms,
+            // Fish also accompany intentional transcript browsing. They only
+            // occupy blank cells and are collision-checked, so history stays
+            // legible while the ocean remains playful when scrolling upward.
+            ambient_life: !app.attention_hold_active()
+                && (browsing_history
+                    || matches!(phase, ShellPhase::Working | ShellPhase::Verifying)),
             scroll_track,
             scroll_thumb,
             jump_border,
             jump_arrow,
         }
     }
+
+    /// Sample the water field against the full terminal instead of restarting
+    /// it at the transcript's first row. Standalone widget callers keep the
+    /// local column, which is useful for previews and focused tests.
+    #[must_use]
+    pub(crate) fn with_ocean_viewport(mut self, viewport: Rect) -> Self {
+        self.ocean_column = self
+            .ocean_column
+            .map(|column| column.with_viewport(viewport));
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn ocean_column(&self) -> Option<crate::tui::ocean::OceanColumn> {
+        self.ocean_column
+    }
+}
+
+fn apply_receipt_settle_cascade(
+    lines: &mut [Line<'static>],
+    top: usize,
+    line_meta: &[TranscriptLineMeta],
+    filtered_to_original: &[usize],
+    history: &[HistoryCell],
+    start: usize,
+    elapsed_ms: u128,
+) {
+    for (visible_index, line) in lines.iter_mut().enumerate() {
+        let Some((filtered_cell, _)) = line_meta
+            .get(top + visible_index)
+            .and_then(TranscriptLineMeta::cell_line)
+        else {
+            continue;
+        };
+        let original_cell = filtered_to_original
+            .get(filtered_cell)
+            .copied()
+            .unwrap_or(filtered_cell);
+        if original_cell < start
+            || !matches!(
+                history.get(original_cell),
+                Some(HistoryCell::Tool(_) | HistoryCell::SubAgent(_))
+            )
+            || !receipt_is_settling(original_cell - start, elapsed_ms)
+        {
+            continue;
+        }
+        for span in &mut line.spans {
+            span.style = span.style.add_modifier(Modifier::DIM);
+        }
+    }
+}
+
+#[must_use]
+fn receipt_is_settling(receipt_order: usize, elapsed_ms: u128) -> bool {
+    let delay = u128::try_from(receipt_order.min(6)).unwrap_or(6) * 70;
+    elapsed_ms < delay + 140
 }
 
 fn tool_run_summary_cell(run: &ToolRun) -> HistoryCell {
@@ -411,19 +603,49 @@ fn tool_run_summary_revision(
 ) -> u64 {
     let mut revision = 0xA11C_EA5E_D00D_2692u64 ^ ((run.start as u64) << 32) ^ (run.count as u64);
     for idx in run.start..run.start.saturating_add(run.count) {
-        let cell_revision = revisions.get(idx).copied().unwrap_or_else(|| {
-            let active_idx = idx.saturating_sub(history_len);
-            active_entry_revision(active_rev, (active_idx as u64).wrapping_add(1))
-        });
+        let cell_revision = revisions
+            .get(idx)
+            .copied()
+            .map(history_entry_revision)
+            .unwrap_or_else(|| {
+                let active_idx = idx.saturating_sub(history_len);
+                active_entry_revision(active_rev, (active_idx as u64).wrapping_add(1))
+            });
         revision = revision.rotate_left(7) ^ cell_revision;
     }
-    revision
+    let extends_into_active = run.start.saturating_add(run.count) > history_len;
+    revision_in_domain(revision, extends_into_active)
+}
+
+const ACTIVE_REVISION_DOMAIN: u64 = 1 << 63;
+
+fn revision_in_domain(revision: u64, active: bool) -> u64 {
+    // The top bit is exclusively a cache-domain tag. Clearing it means raw
+    // counters that differ only by bit 63 can theoretically alias within one
+    // domain after 2^63 updates; that lifetime is acceptable, while active and
+    // committed-history keys must never alias each other.
+    let payload = revision & !ACTIVE_REVISION_DOMAIN;
+    if active {
+        ACTIVE_REVISION_DOMAIN | payload
+    } else {
+        payload
+    }
+}
+
+fn history_entry_revision(revision: u64) -> u64 {
+    revision_in_domain(revision, false)
 }
 
 fn active_entry_revision(active_rev: u64, salt: u64) -> u64 {
-    active_rev
+    // Active entries and committed history cells can occupy the same
+    // positional cache slot across `flush_active_cell`. Keep their revision
+    // domains distinct so the first active entry (`active_rev = 0`,
+    // `salt = 1`) cannot collide with the first history revision (`1`) and
+    // reuse a stale `running` render after cancellation.
+    let mixed = active_rev
         .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-        .wrapping_add(salt)
+        .wrapping_add(salt);
+    revision_in_domain(mixed, true)
 }
 
 impl Renderable for ChatWidget {
@@ -458,14 +680,18 @@ impl Renderable for ChatWidget {
             Paragraph::new(self.lines.clone()).style(Style::default().bg(self.background));
         paragraph.render(area, buf);
 
-        // #3029: the transcript carries OSC 8 hyperlinks in-band inside span
-        // content. Scan the rendered buffer for those payloads, blank the
-        // payload cells (so no cell ever holds `\x1b`/`]8;;` — fixes the
-        // column-drift corruption), and publish the recovered link regions
-        // for ColorCompatBackend::draw to re-emit out-of-band. This is the
-        // main transcript surface; the live-transcript overlay appends its
-        // own regions separately. Replaces the frame buffer each render.
-        let regions = crate::tui::osc8::extract_buffer_link_regions(buf, area);
+        self.render_underwater_field(area, buf);
+
+        // Link targets travel beside the wrapped lines, never inside Span
+        // content. Convert relative line columns to absolute viewport regions
+        // for the backend; clip the final column when a scrollbar owns it.
+        let link_area = Rect {
+            width: area
+                .width
+                .saturating_sub(u16::from(self.scrollbar.is_some())),
+            ..area
+        };
+        let regions = crate::tui::osc8::link_regions_for_lines(link_area, &self.line_links);
         crate::tui::osc8::set_frame_links(regions);
 
         if let Some(scrollbar) = self.scrollbar {
@@ -497,6 +723,278 @@ impl Renderable for ChatWidget {
     fn desired_height(&self, _width: u16) -> u16 {
         1
     }
+}
+
+impl ChatWidget {
+    /// Paint the underwater field. The water column belongs to ombre;
+    /// ambient life belongs to every underwater treatment. Flat keeps the
+    /// theme surface, Solarized Light keeps canonical Base3, and Terminal
+    /// keeps its inherited background, but none of those means a lifeless
+    /// ocean.
+    fn render_underwater_field(&self, area: Rect, buf: &mut Buffer) {
+        if let Some(column) = self.ocean_column {
+            for local_y in 0..area.height {
+                let protected = self
+                    .lines
+                    .get(usize::from(local_y))
+                    .and_then(occupied_text_bounds);
+                let row_bg = column.color_at_y(area.y.saturating_add(local_y));
+                for local_x in 0..area.width {
+                    let is_protected = protected.is_some_and(|(start, end)| {
+                        usize::from(local_x) >= start && usize::from(local_x) < end
+                    });
+                    let cell = &mut buf[(area.x + local_x, area.y + local_y)];
+                    // Plain transcript text participates in the water column;
+                    // explicit semantic surfaces (selection, code, warnings)
+                    // retain their own background.
+                    if !is_protected || cell.bg == self.background {
+                        cell.set_bg(row_bg);
+                    }
+                }
+            }
+        }
+
+        if self.ambient_life
+            && let Some(inks) = self.ambient_inks
+        {
+            render_ambient_life(
+                area,
+                buf,
+                inks,
+                &self.lines,
+                self.ocean_elapsed_ms,
+                self.ocean_animated,
+                self.fish_flee_elapsed_ms,
+            );
+        }
+    }
+}
+
+fn occupied_text_bounds(line: &Line<'_>) -> Option<(usize, usize)> {
+    let text = line
+        .spans
+        .iter()
+        .map(|span| span.content.as_ref())
+        .collect::<String>();
+    if text.trim().is_empty() {
+        return None;
+    }
+
+    let leading = text
+        .chars()
+        .take_while(|ch| ch.is_whitespace())
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum::<usize>();
+    let total = UnicodeWidthStr::width(text.as_str());
+    let trailing = text
+        .chars()
+        .rev()
+        .take_while(|ch| ch.is_whitespace())
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum::<usize>();
+    Some((leading, total.saturating_sub(trailing)))
+}
+
+fn render_ambient_life(
+    area: Rect,
+    buf: &mut Buffer,
+    inks: (Color, Color),
+    lines: &[Line<'static>],
+    elapsed_ms: u128,
+    animated: bool,
+    fish_flee_elapsed_ms: Option<u128>,
+) {
+    if area.width < crate::tui::ocean::AMBIENT_MIN_WIDTH
+        || area.height < crate::tui::ocean::AMBIENT_MIN_HEIGHT
+    {
+        return;
+    }
+
+    let span_a = (area.width / 6).clamp(10, 24);
+    let span_b = (area.width / 7).clamp(8, 20);
+    let span_c = (area.width / 8).clamp(7, 18);
+    let (drift_a, fish_a_forward) = if animated {
+        ambient_ping_pong(elapsed_ms, 480, span_a, 0)
+    } else {
+        (0, true)
+    };
+    let (drift_b, fish_b_forward) = if animated {
+        ambient_ping_pong(elapsed_ms, 560, span_b, 1_900)
+    } else {
+        (0, false)
+    };
+    let (drift_c, fish_c_forward) = if animated {
+        ambient_ping_pong(elapsed_ms, 640, span_c, 3_700)
+    } else {
+        (0, true)
+    };
+    let heading_sample_ms = u128::from(crate::tui::ui::UI_UNDERWATER_ANIMATION_MS);
+    let previous_elapsed_ms = elapsed_ms.saturating_sub(heading_sample_ms);
+    let next_elapsed_ms = elapsed_ms.saturating_add(heading_sample_ms);
+    let previous_drift_a = if animated {
+        ambient_ping_pong(previous_elapsed_ms, 480, span_a, 0).0
+    } else {
+        drift_a
+    };
+    let next_drift_a = if animated {
+        ambient_ping_pong(next_elapsed_ms, 480, span_a, 0).0
+    } else {
+        drift_a
+    };
+    let previous_drift_b = if animated {
+        ambient_ping_pong(previous_elapsed_ms, 560, span_b, 1_900).0
+    } else {
+        drift_b
+    };
+    let next_drift_b = if animated {
+        ambient_ping_pong(next_elapsed_ms, 560, span_b, 1_900).0
+    } else {
+        drift_b
+    };
+    let previous_drift_c = if animated {
+        ambient_ping_pong(previous_elapsed_ms, 640, span_c, 3_700).0
+    } else {
+        drift_c
+    };
+    let next_drift_c = if animated {
+        ambient_ping_pong(next_elapsed_ms, 640, span_c, 3_700).0
+    } else {
+        drift_c
+    };
+    let rise = if animated {
+        u16::try_from((elapsed_ms / 720) % 5).unwrap_or(0)
+    } else {
+        0
+    };
+    let bubble = if animated {
+        ["·", "˚", "°", "˚"][(elapsed_ms / 300) as usize % 4]
+    } else {
+        "°"
+    };
+    let flee = fish_flee_elapsed_ms.map_or(0, fish_flee_offset);
+    let previous_flee = fish_flee_elapsed_ms
+        .map(|elapsed| fish_flee_offset(elapsed.saturating_sub(heading_sample_ms)))
+        .unwrap_or(flee);
+    let next_flee = fish_flee_elapsed_ms
+        .map(|elapsed| fish_flee_offset(elapsed.saturating_add(heading_sample_ms)))
+        .unwrap_or(flee);
+    let max_fish_x = area.width.saturating_sub(3);
+    let fish_a_x = (area.width / 12 + drift_a)
+        .saturating_sub(flee)
+        .min(max_fish_x);
+    let fish_a_previous_x = (area.width / 12 + previous_drift_a)
+        .saturating_sub(previous_flee)
+        .min(max_fish_x);
+    let fish_a_next_x = (area.width / 12 + next_drift_a)
+        .saturating_sub(next_flee)
+        .min(max_fish_x);
+    let fish_b_x = (area.width * 5 / 6)
+        .saturating_sub(drift_b)
+        .saturating_add(flee)
+        .min(max_fish_x);
+    let fish_b_previous_x = (area.width * 5 / 6)
+        .saturating_sub(previous_drift_b)
+        .saturating_add(previous_flee)
+        .min(max_fish_x);
+    let fish_b_next_x = (area.width * 5 / 6)
+        .saturating_sub(next_drift_b)
+        .saturating_add(next_flee)
+        .min(max_fish_x);
+    let fish_c_x = (area.width / 3 + drift_c)
+        .saturating_sub(flee / 2)
+        .min(max_fish_x);
+    let fish_c_previous_x = (area.width / 3 + previous_drift_c)
+        .saturating_sub(previous_flee / 2)
+        .min(max_fish_x);
+    let fish_c_next_x = (area.width / 3 + next_drift_c)
+        .saturating_sub(next_flee / 2)
+        .min(max_fish_x);
+    let fish_a_faces_right =
+        fish_heading(fish_a_previous_x, fish_a_x, fish_a_next_x, fish_a_forward);
+    let fish_b_faces_right =
+        fish_heading(fish_b_previous_x, fish_b_x, fish_b_next_x, !fish_b_forward);
+    let fish_c_faces_right =
+        fish_heading(fish_c_previous_x, fish_c_x, fish_c_next_x, fish_c_forward);
+    let marks = [
+        (fish_a_x, area.height * 3 / 4, fish_mark(fish_a_faces_right)),
+        (fish_b_x, area.height * 3 / 8, fish_mark(fish_b_faces_right)),
+        (fish_c_x, area.height / 6, fish_mark(fish_c_faces_right)),
+        (
+            area.width * 3 / 4,
+            (area.height / 4).saturating_sub(rise),
+            bubble,
+        ),
+    ];
+    for (index, (local_x, local_y, mark)) in marks.into_iter().enumerate() {
+        let protected = lines
+            .get(usize::from(local_y))
+            .and_then(occupied_text_bounds);
+        let mark_width = UnicodeWidthStr::width(mark);
+        // A one-cell gap on either side keeps life from visually attaching
+        // to occupied text, not merely from overlapping it.
+        let collides = protected.is_some_and(|(start, end)| {
+            usize::from(local_x) < end.saturating_add(1)
+                && usize::from(local_x) + mark_width > start.saturating_sub(1)
+        });
+        if collides || local_x.saturating_add(mark_width as u16) > area.width {
+            continue;
+        }
+        for (offset, ch) in mark.chars().enumerate() {
+            buf[(area.x + local_x + offset as u16, area.y + local_y)]
+                .set_symbol(&ch.to_string())
+                .set_fg(if index == 1 { inks.1 } else { inks.0 });
+        }
+    }
+}
+
+/// One-shot flee arc: fish leave their ambient positions, peak halfway, then
+/// return to the same stable positions. The deterministic 800 ms envelope is
+/// keyed to the typed Working transition and never loops.
+fn fish_flee_offset(elapsed_ms: u128) -> u16 {
+    let progress = elapsed_ms.min(800) as f32 / 800.0;
+    let excursion = (progress * std::f32::consts::PI).sin() * 9.0;
+    excursion.round().clamp(0.0, 9.0) as u16
+}
+
+#[must_use]
+fn fish_mark(facing_right: bool) -> &'static str {
+    if facing_right { "><>" } else { "<><" }
+}
+
+/// Prefer the next visible displacement, then the most recent displacement.
+/// The fallback matters only while easing leaves the fish in the same terminal
+/// cell for several frames. Crucially, callers pass the fallback in screen-x
+/// coordinates, so mirrored paths cannot accidentally swim backwards.
+#[must_use]
+fn fish_heading(previous_x: u16, current_x: u16, next_x: u16, fallback_right: bool) -> bool {
+    if next_x != current_x {
+        next_x > current_x
+    } else if current_x != previous_x {
+        current_x > previous_x
+    } else {
+        fallback_right
+    }
+}
+
+/// A cosine-eased ping-pong path keeps the fish continuous and lets it settle
+/// gently before turning. The event loop supplies the shared underwater
+/// cadence; this function only maps elapsed time and never requests frames.
+fn ambient_ping_pong(elapsed_ms: u128, step_ms: u128, span: u16, phase_ms: u128) -> (u16, bool) {
+    if span == 0 || step_ms == 0 {
+        return (0, true);
+    }
+    let leg_ms = step_ms.saturating_mul(u128::from(span));
+    let period_ms = leg_ms.saturating_mul(2);
+    let phase = (elapsed_ms.saturating_add(phase_ms)) % period_ms;
+    let (leg_elapsed, forward) = if phase <= leg_ms {
+        (phase, true)
+    } else {
+        (phase.saturating_sub(leg_ms), false)
+    };
+    let progress = leg_elapsed as f64 / leg_ms as f64;
+    let eased = (1.0 - (progress * std::f64::consts::PI).cos()) * 0.5;
+    let position = if forward { eased } else { 1.0 - eased };
+    ((position * f64::from(span)).round() as u16, forward)
 }
 
 fn jump_to_latest_button_rect(area: Rect, has_scrollbar: bool) -> Option<Rect> {
@@ -541,6 +1039,66 @@ fn render_jump_to_latest_button(
     buf[(arrow_x, arrow_y)]
         .set_symbol("↓")
         .set_style(Style::default().fg(arrow).add_modifier(Modifier::BOLD));
+}
+
+const COMPOSER_PROMPT_GUTTER_WIDTH: u16 = 2;
+
+/// Canonical horizontal geometry for composer input text.
+///
+/// The prompt glyph occupies the first gutter column and the second column is
+/// breathing room. Every consumer that wraps or maps input must use
+/// `text_area`: rendering and cursor placement, viewport scroll bookkeeping,
+/// and mouse hit-to-character conversion. Keeping the inset here prevents the
+/// first typed character and exact wrap boundaries from using different
+/// effective widths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ComposerContentGeometry {
+    pub(crate) text_area: Rect,
+    pub(crate) prompt_inset: u16,
+}
+
+impl ComposerContentGeometry {
+    #[must_use]
+    pub(crate) fn text_width(self) -> usize {
+        usize::from(self.text_area.width.max(1))
+    }
+
+    #[must_use]
+    fn prompt_padding(self) -> &'static str {
+        if self.prompt_inset == COMPOSER_PROMPT_GUTTER_WIDTH {
+            "  "
+        } else {
+            ""
+        }
+    }
+
+    #[must_use]
+    fn prompt_x(self) -> Option<u16> {
+        (self.prompt_inset > 0).then(|| self.text_area.x.saturating_sub(self.prompt_inset))
+    }
+}
+
+#[must_use]
+pub(crate) fn composer_content_geometry(
+    inner_area: Rect,
+    history_search_active: bool,
+) -> ComposerContentGeometry {
+    let prompt_inset = if !history_search_active
+        && inner_area.width >= COMPOSER_PROMPT_GUTTER_WIDTH.saturating_add(1)
+    {
+        COMPOSER_PROMPT_GUTTER_WIDTH
+    } else {
+        0
+    };
+    ComposerContentGeometry {
+        text_area: Rect {
+            x: inner_area.x.saturating_add(prompt_inset),
+            y: inner_area.y,
+            width: inner_area.width.saturating_sub(prompt_inset),
+            height: inner_area.height,
+        },
+        prompt_inset,
+    }
 }
 
 pub struct ComposerWidget<'a> {
@@ -605,13 +1163,24 @@ impl<'a> ComposerWidget<'a> {
         actual.max(usize::from(self.max_height_cap()))
     }
 
-    fn has_panel(&self, area: Rect) -> bool {
-        self.app.composer_border && area.height >= 3 && area.width >= 12
+    fn wants_enclosed_panel(&self) -> bool {
+        self.app.composer_border
+            && (self.app.is_history_search_active()
+                || self.app.composer_display_input().contains('\n')
+                || self.active_menu_row_count() > 0)
+    }
+
+    pub(crate) fn has_panel(&self, area: Rect) -> bool {
+        self.wants_enclosed_panel() && area.height >= 3 && area.width >= 12
     }
 
     fn inner_area(&self, area: Rect) -> Rect {
         if self.has_panel(area) {
-            Block::default().borders(Borders::ALL).inner(area)
+            Block::default()
+                .borders(Borders::TOP | Borders::BOTTOM)
+                .inner(area)
+        } else if area.height >= 2 {
+            Block::default().borders(Borders::TOP).inner(area)
         } else {
             area
         }
@@ -619,10 +1188,9 @@ impl<'a> ComposerWidget<'a> {
 
     fn mode_color(&self) -> Color {
         match self.app.mode {
-            AppMode::Agent => palette::MODE_AGENT,
-            AppMode::Auto => palette::MODE_AGENT,
-            AppMode::Yolo => palette::MODE_YOLO,
+            AppMode::Agent | AppMode::Auto | AppMode::Yolo => palette::MODE_AGENT,
             AppMode::Plan => palette::MODE_PLAN,
+            AppMode::Operate => palette::MODE_OPERATE,
         }
     }
 
@@ -652,9 +1220,22 @@ impl Renderable for ComposerWidget<'_> {
         let menu_lines_for_budget = self.active_menu_reserved_rows().max(menu_lines);
         let input_rows_budget =
             composer_input_rows_budget(inner_area.height, menu_lines_for_budget);
+        // Menu rows span the full inner panel. Input text alone uses the
+        // prompt-adjusted geometry below.
         let content_width = usize::from(inner_area.width.max(1));
-        let (visible_lines, _cursor_row, _cursor_col, scroll_offset) =
-            layout_input_with_scroll(input_text, input_cursor, content_width, input_rows_budget);
+        let content_geometry =
+            composer_content_geometry(inner_area, self.app.is_history_search_active());
+        let input_content_width = content_geometry.text_width();
+
+        // Use the extended version that also returns character indices to avoid
+        // redundant wrapping when rendering text selections (issue #3909).
+        let (visible_lines, _cursor_row, _cursor_col, _scroll_offset, visible_char_indices) =
+            layout_input_with_scroll_and_char_indices(
+                input_text,
+                input_cursor,
+                input_content_width,
+                input_rows_budget,
+            );
         let is_draft_mode = input_text.contains('\n') || visible_lines.len() > 1;
         if has_panel {
             let border_color = if input_text.trim().is_empty() {
@@ -686,11 +1267,11 @@ impl Renderable for ComposerWidget<'_> {
                     ),
                 ]))
             } else if !self.slash_menu_entries.is_empty() {
-                Some(Line::from(vec![
-                    Span::styled(" Up/Down move  ", Style::default().fg(palette::TEXT_MUTED)),
-                    Span::styled("Tab accept  ", Style::default().fg(palette::TEXT_MUTED)),
-                    Span::styled("Esc close", Style::default().fg(palette::TEXT_MUTED)),
-                ]))
+                Some(Line::from(Span::styled(
+                    self.app
+                        .tr(crate::localization::MessageId::ComposerSlashMenuHint),
+                    Style::default().fg(self.app.ui_theme.text_hint),
+                )))
             } else if !input_text.trim().is_empty() {
                 // Live disambiguation for #345: when there's content in the
                 // composer, show what `Enter` will do RIGHT NOW so the user
@@ -704,7 +1285,7 @@ impl Renderable for ComposerWidget<'_> {
                         if queue_count > 0 {
                             (
                                 Some(format!("↵ send ({queue_count} queued)")),
-                                palette::DEEPSEEK_SKY,
+                                palette::WHALE_INFO,
                             )
                         } else {
                             (None, palette::TEXT_MUTED)
@@ -713,22 +1294,38 @@ impl Renderable for ComposerWidget<'_> {
                     SubmitDisposition::Queue => {
                         if self.app.offline_mode {
                             (Some("↵ offline queue".to_string()), palette::STATUS_WARNING)
+                        } else if self.app.mode == crate::tui::app::AppMode::Operate {
+                            let label = if queue_count > 0 {
+                                format!(
+                                    "↵ queue task ({} waiting, double-↵ to steer)",
+                                    queue_count.saturating_add(1)
+                                )
+                            } else {
+                                "↵ queue task (double-↵ to steer)".to_string()
+                            };
+                            (Some(label), palette::WHALE_INFO)
                         } else {
                             let label = if queue_count > 0 {
-                                format!("↵ queue ({} waiting)", queue_count.saturating_add(1))
+                                format!(
+                                    "↵ queue ({} waiting, double-↵ to steer)",
+                                    queue_count.saturating_add(1)
+                                )
                             } else {
-                                "↵ queue for next turn".to_string()
+                                "↵ queue (double-↵ to steer)".to_string()
                             };
                             (Some(label), palette::TEXT_MUTED)
                         }
                     }
-                    // Steer and QueueFollowUp are now only reached via Ctrl+Enter override.
-                    SubmitDisposition::Steer => (
-                        Some("↵ steering (Ctrl+Enter)".to_string()),
-                        palette::DEEPSEEK_SKY,
-                    ),
+                    // Steer reached via double-tap Enter or Ctrl+Enter override.
+                    SubmitDisposition::Steer => {
+                        (Some("↵ steering".to_string()), palette::WHALE_INFO)
+                    }
                     SubmitDisposition::QueueFollowUp => (
-                        Some("↵ queued (Ctrl+Enter to steer)".to_string()),
+                        Some(if self.app.mode == crate::tui::app::AppMode::Operate {
+                            "↵ queued task (double-↵ to steer)".to_string()
+                        } else {
+                            "↵ queued (double-↵ to steer)".to_string()
+                        }),
                         palette::TEXT_MUTED,
                     ),
                 };
@@ -743,7 +1340,7 @@ impl Renderable for ComposerWidget<'_> {
             };
 
             let mut block = Block::default()
-                .borders(Borders::ALL)
+                .borders(Borders::TOP | Borders::BOTTOM)
                 .border_style(Style::default().fg(border_color))
                 .style(background);
             if self.app.is_history_search_active() || is_draft_mode {
@@ -763,11 +1360,24 @@ impl Renderable for ComposerWidget<'_> {
             // Top-right corner: editor state plus transient turn receipts.
             // Receipts are lifecycle chrome, not transcript content; they
             // should appear briefly without displacing conversation rows.
-            if let Some(chrome) = composer_top_right_chrome(self.app, area.width) {
+            if self.app.ocean_treatment.is_classic()
+                && let Some(chrome) = composer_top_right_chrome(self.app, area.width)
+            {
                 block = block.title_top(chrome.right_aligned());
             }
             if let Some(hint_line) = hint_line {
                 block = block.title_bottom(hint_line);
+            }
+            block.render(area, buf);
+        } else if area.height >= 2 {
+            let mut block = Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(self.app.ui_theme.border))
+                .style(background);
+            if self.app.ocean_treatment.is_classic()
+                && let Some(chrome) = composer_top_right_chrome(self.app, area.width)
+            {
+                block = block.title_top(chrome.right_aligned());
             }
             block.render(area, buf);
         } else {
@@ -776,35 +1386,34 @@ impl Renderable for ComposerWidget<'_> {
 
         let mut input_lines = Vec::new();
         if input_text.is_empty() {
-            input_lines.push(Line::from(""));
-            if input_rows_budget > 1 {
-                let (placeholder, style): (Cow<'_, str>, Style) = if let Some(ref suggestion) =
-                    self.app.prompt_suggestion
-                    && !self.app.is_history_search_active()
-                {
-                    (
-                        Cow::Borrowed(suggestion.as_str()),
-                        Style::default().fg(palette::TEXT_HINT),
-                    )
-                } else {
-                    (
-                        composer_empty_hint_text(self.app),
-                        Style::default().fg(palette::TEXT_MUTED).italic(),
-                    )
-                };
-                input_lines.push(Line::from(Span::styled(placeholder, style)));
-            }
+            let (placeholder, style): (Cow<'_, str>, Style) = if let Some(ref suggestion) =
+                self.app.prompt_suggestion
+                && !self.app.is_history_search_active()
+            {
+                (
+                    Cow::Borrowed(suggestion.as_str()),
+                    Style::default().fg(palette::TEXT_HINT),
+                )
+            } else {
+                (
+                    composer_empty_hint_text(self.app),
+                    Style::default().fg(palette::TEXT_MUTED).italic(),
+                )
+            };
+            input_lines.push(Line::from(vec![
+                Span::raw(content_geometry.prompt_padding()),
+                Span::styled(placeholder, style),
+            ]));
         } else if let Some((sel_start, sel_end)) = self.app.selection_range() {
-            let line_ranges: Vec<(usize, usize)> =
-                wrap_input_lines_for_mouse(&self.app.input, content_width)
-                    .into_iter()
-                    .skip(scroll_offset)
-                    .take(visible_lines.len())
-                    .map(|(start, text)| (start, start + text.chars().count()))
-                    .collect();
+            // Use the character indices we already computed during layout
+            // to avoid redundant wrapping (issue #3909).
+            let line_ranges: Vec<(usize, usize)> = visible_char_indices
+                .iter()
+                .map(|(start, text)| (*start, *start + text.chars().count()))
+                .collect();
             for (line_text, (line_start, line_end)) in visible_lines.iter().zip(line_ranges.iter())
             {
-                let spans = line_spans_with_selection(
+                let mut spans = line_spans_with_selection(
                     line_text,
                     *line_start,
                     *line_end,
@@ -812,14 +1421,22 @@ impl Renderable for ComposerWidget<'_> {
                     sel_end,
                     self.app.ui_theme.selection_bg,
                 );
+                if content_geometry.prompt_inset > 0 {
+                    spans.insert(0, Span::raw(content_geometry.prompt_padding()));
+                }
                 input_lines.push(Line::from(spans));
             }
         } else {
             for line in &visible_lines {
-                input_lines.push(Line::from(Span::styled(
+                let mut spans = Vec::new();
+                if content_geometry.prompt_inset > 0 {
+                    spans.push(Span::raw(content_geometry.prompt_padding()));
+                }
+                spans.push(Span::styled(
                     line.clone(),
                     Style::default().fg(palette::TEXT_PRIMARY),
-                )));
+                ));
+                input_lines.push(Line::from(spans));
             }
         }
 
@@ -835,7 +1452,7 @@ impl Renderable for ComposerWidget<'_> {
             } else {
                 Some(composer_empty_hint_text(self.app))
             };
-            empty_composer_visual_rows(hint.as_deref(), content_width, input_rows_budget)
+            empty_composer_visual_rows(hint.as_deref(), input_content_width, input_rows_budget)
         } else {
             input_lines.len()
         };
@@ -893,7 +1510,7 @@ impl Renderable for ComposerWidget<'_> {
                     } else {
                         Style::default().fg(palette::TEXT_MUTED)
                     };
-                    let marker = if is_selected { "▸" } else { " " };
+                    let marker = crate::tui::glyphs::selection_marker(is_selected);
                     lines.push(Line::from(vec![
                         Span::styled(" ", Style::default()),
                         Span::styled(marker, style),
@@ -943,7 +1560,7 @@ impl Renderable for ComposerWidget<'_> {
                 } else {
                     Style::default().fg(palette::TEXT_MUTED)
                 };
-                let marker = if is_selected { "▸" } else { " " };
+                let marker = crate::tui::glyphs::selection_marker(is_selected);
                 lines.push(Line::from(vec![
                     Span::styled(" ", Style::default()),
                     Span::styled(marker, style),
@@ -1010,11 +1627,11 @@ impl Renderable for ComposerWidget<'_> {
                 } else {
                     Style::default().fg(palette::TEXT_MUTED)
                 };
-                let marker = if is_selected { "▸" } else { " " };
+                let marker = crate::tui::glyphs::selection_marker(is_selected);
 
                 // Name column
                 let name_style = if entry.is_skill && !is_selected {
-                    Style::default().fg(palette::DEEPSEEK_SKY)
+                    Style::default().fg(palette::WHALE_INFO)
                 } else {
                     sel_style
                 };
@@ -1107,16 +1724,28 @@ impl Renderable for ComposerWidget<'_> {
             .style(background)
             .wrap(Wrap { trim: false });
         paragraph.render(inner_area, buf);
+
+        // The prompt is a persistent focus anchor, not empty-state chrome.
+        // Rendering it on every input row keeps the first character from
+        // causing a visible leftward jump.
+        if let Some(prompt_x) = content_geometry.prompt_x()
+            && let Some((cursor_x, cursor_y)) = self.cursor_pos(area)
+        {
+            debug_assert!(cursor_x >= content_geometry.text_area.x);
+            buf[(prompt_x, cursor_y)]
+                .set_symbol("❯")
+                .set_style(Style::default().fg(self.app.ui_theme.accent_primary));
+        }
     }
 
     fn desired_height(&self, width: u16) -> u16 {
         composer_height(
             self.app.composer_display_input(),
-            width,
+            width.saturating_sub(2),
             self.max_height.min(self.max_height_cap()),
             self.active_menu_reserved_rows(),
             self.app.composer_density,
-            self.app.composer_border,
+            self.wants_enclosed_panel(),
         )
     }
 
@@ -1124,14 +1753,20 @@ impl Renderable for ComposerWidget<'_> {
         let inner_area = self.inner_area(area);
         let input_text = self.app.composer_display_input();
         let input_cursor = self.app.composer_display_cursor();
-        let content_width = usize::from(inner_area.width.max(1));
+        let content_geometry =
+            composer_content_geometry(inner_area, self.app.is_history_search_active());
+        let input_content_width = content_geometry.text_width();
         // Match the render path's locked-budget calculation so the cursor
         // lands on the same row the input is drawn on.
         let input_rows_budget =
             composer_input_rows_budget(inner_area.height, self.active_menu_reserved_rows());
 
-        let (visible_lines, cursor_row, cursor_col) =
-            layout_input(input_text, input_cursor, content_width, input_rows_budget);
+        let (visible_lines, cursor_row, cursor_col) = layout_input(
+            input_text,
+            input_cursor,
+            input_content_width,
+            input_rows_budget,
+        );
         let visual_rows = if input_text.is_empty() {
             let hint: Option<Cow<'_, str>> = if let Some(ref suggestion) =
                 self.app.prompt_suggestion
@@ -1141,19 +1776,18 @@ impl Renderable for ComposerWidget<'_> {
             } else {
                 Some(composer_empty_hint_text(self.app))
             };
-            empty_composer_visual_rows(hint.as_deref(), content_width, input_rows_budget)
+            empty_composer_visual_rows(hint.as_deref(), input_content_width, input_rows_budget)
         } else {
             visible_lines.len()
         };
         let top_padding = composer_top_padding(visual_rows, input_rows_budget);
 
-        let cursor_x = area
+        let cursor_x = content_geometry
+            .text_area
             .x
-            .saturating_add(inner_area.x.saturating_sub(area.x))
             .saturating_add(u16::try_from(cursor_col).unwrap_or(u16::MAX));
-        let cursor_y = area
+        let cursor_y = inner_area
             .y
-            .saturating_add(inner_area.y.saturating_sub(area.y))
             .saturating_add(u16::try_from(top_padding + cursor_row).unwrap_or(u16::MAX));
         if cursor_x < area.x + area.width && cursor_y < area.y + area.height {
             Some((cursor_x, cursor_y))
@@ -1163,12 +1797,12 @@ impl Renderable for ComposerWidget<'_> {
     }
 }
 
-/// Codex-style full-screen approval takeover (#129).
+/// Compact, bottom-anchored approval card.
 ///
 /// The widget reads its selected option and locale directly from the
-/// [`ApprovalView`]. Rendering reflows to fill most of the transcript
-/// area instead of a centered popup; on small terminals it falls back to
-/// a 65×22 card so existing snapshot tests still see a coherent layout.
+/// [`ApprovalView`]. Rendering preserves transcript context while reserving
+/// the complete action set and at least one load-bearing command/preview row
+/// on ordinary terminal sizes.
 pub struct ApprovalWidget<'a> {
     request: &'a ApprovalRequest,
     view: &'a ApprovalView,
@@ -1188,7 +1822,12 @@ impl<'a> ApprovalWidget<'a> {
         let risk = self.request.risk;
         let stakes = self.request.stakes();
         let locale = self.view.locale();
-        let palette_colors = approval_palette(stakes);
+        let repo_law = self.request.is_repo_law_prompt();
+        let palette_colors = if repo_law {
+            repo_law_approval_palette()
+        } else {
+            approval_palette(stakes)
+        };
         let critical = matches!(stakes, crate::tui::approval::ApprovalStakes::Critical);
 
         let mut body: Vec<Line<'static>> = Vec::with_capacity(16);
@@ -1196,20 +1835,64 @@ impl<'a> ApprovalWidget<'a> {
         body.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(
-                format!(" {} ", stakes_badge_text(stakes, locale)),
+                format!(
+                    " {} ",
+                    if repo_law {
+                        tr(locale, MessageId::ApprovalRepoLawBadge)
+                    } else {
+                        stakes_badge_text(stakes, locale)
+                    }
+                ),
                 Style::default()
-                    .fg(palette::DEEPSEEK_INK)
+                    .fg(palette::WHALE_BG)
                     .bg(palette_colors.accent)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::raw("  "),
             Span::styled(
-                self.request.tool_name.clone(),
+                if repo_law {
+                    format!(
+                        "{} · {}",
+                        tr(locale, MessageId::ApprovalRepoLawTitle),
+                        self.request.tool_name
+                    )
+                } else {
+                    self.request.tool_name.clone()
+                },
                 Style::default()
-                    .fg(palette::DEEPSEEK_SKY)
+                    .fg(palette::WHALE_INFO)
                     .add_modifier(Modifier::BOLD),
             ),
         ]));
+
+        if repo_law {
+            body.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    "◆ ",
+                    Style::default()
+                        .fg(palette::STATUS_WARNING)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    tr(locale, MessageId::ApprovalRepoLawWarning),
+                    Style::default()
+                        .fg(palette::WHALE_ERROR)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]));
+            body.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(
+                    tr(locale, MessageId::ApprovalRepoLawRuleLabel),
+                    Style::default().fg(palette::TEXT_HINT),
+                ),
+                Span::styled(
+                    self.request.description.clone(),
+                    Style::default().fg(palette::TEXT_SECONDARY),
+                ),
+            ]));
+        }
 
         // Command / change preview FIRST — for an approval the thing being run
         // is the load-bearing content, so on a short terminal it is the
@@ -1224,8 +1907,19 @@ impl<'a> ApprovalWidget<'a> {
                 let is_change_preview = matches!(detail.label.as_str(), "Preview" | "预览");
                 if let Some(shell_lines) = detail.shell_lines.as_deref() {
                     let command_width = area.width.saturating_sub(10) as usize;
+                    // A short approval band has room for only one detail row
+                    // before its truncation hint. Project the most useful
+                    // command/change into that row instead of spending it on
+                    // setup (`cd`, `set`) or diff metadata. The complete,
+                    // original-order value remains available in the details
+                    // pager.
+                    let inline_shell_lines = prioritize_inline_shell_lines(
+                        shell_lines,
+                        is_change_preview,
+                        area.height <= 24,
+                    );
                     // Bound every multi-line preview so one huge command cannot
-                    // grow the band without limit; the [v] pager shows the rest.
+                    // grow the band without limit; the details chord opens the rest.
                     let max_rows = if is_change_preview {
                         if self.request.intent_summary.is_some() {
                             Some(3)
@@ -1238,7 +1932,7 @@ impl<'a> ApprovalWidget<'a> {
                     push_shell_command_lines(
                         &mut body,
                         &detail.label,
-                        shell_lines,
+                        &inline_shell_lines,
                         command_width.max(20),
                         max_rows,
                     );
@@ -1300,7 +1994,7 @@ impl<'a> ApprovalWidget<'a> {
 
         // Secondary context: what it is and what it touches. Only critical
         // prompts carry the full about/impact/category dossier by default —
-        // everything stays one `v` away in the details pager. Keep a single
+        // everything stays one details chord away in the pager. Keep a single
         // About line as fallback context when nothing else was rendered.
         if critical || details.is_empty() {
             body.push(Line::from(vec![
@@ -1387,21 +2081,35 @@ impl Renderable for ApprovalWidget<'_> {
         // Collapsed mode: a single-line banner at the bottom of the area
         // so the user can still see the transcript behind it.
         if self.view.collapsed {
+            self.view.set_mouse_hitboxes(Vec::new());
             let bar_y = area.y.saturating_add(area.height.saturating_sub(1));
             let bar_area = Rect::new(area.x, bar_y, area.width, 1);
             Clear.render(bar_area, buf);
 
             let stakes = self.request.stakes();
-            let palette_colors = approval_palette(stakes);
+            let repo_law = self.request.is_repo_law_prompt();
+            let palette_colors = if repo_law {
+                repo_law_approval_palette()
+            } else {
+                approval_palette(stakes)
+            };
             let summary = format!(
                 " {} — {}  [Tab to expand] ",
-                self.request.tool_name,
-                stakes_badge_text(stakes, self.view.locale()),
+                if repo_law {
+                    tr(self.view.locale(), MessageId::ApprovalRepoLawTitle)
+                } else {
+                    Cow::Borrowed(self.request.tool_name.as_str())
+                },
+                if repo_law {
+                    tr(self.view.locale(), MessageId::ApprovalRepoLawBadge)
+                } else {
+                    stakes_badge_text(stakes, self.view.locale())
+                },
             );
             let line = Line::from(Span::styled(
                 summary,
                 Style::default()
-                    .fg(palette::DEEPSEEK_INK)
+                    .fg(palette::WHALE_BG)
                     .bg(palette_colors.accent)
                     .add_modifier(Modifier::BOLD),
             ));
@@ -1413,7 +2121,12 @@ impl Renderable for ApprovalWidget<'_> {
         // analysis on shell commands); reuse it for the palette and the
         // left-rail gate instead of re-deriving per band.
         let stakes = self.request.stakes();
-        let palette_colors = approval_palette(stakes);
+        let repo_law = self.request.is_repo_law_prompt();
+        let palette_colors = if repo_law {
+            repo_law_approval_palette()
+        } else {
+            approval_palette(stakes)
+        };
         let (body, controls) = self.build_inline_content(area);
         let region = inline_region_for(area, &body, &controls);
         if region.width == 0 || region.height == 0 {
@@ -1425,12 +2138,13 @@ impl Renderable for ApprovalWidget<'_> {
         // approval is no longer a full-screen takeover (#3799).
         Clear.render(region, buf);
         Block::default()
-            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .style(Style::default().bg(palette::WHALE_BG))
             .render(region, buf);
 
         // Top separator rule, risk-tinted, so the prompt reads as a distinct
         // panel without a heavy full border box.
-        let rule: String = "─".repeat(region.width as usize);
+        let rule_glyph = if repo_law { "═" } else { "─" };
+        let rule: String = rule_glyph.repeat(region.width as usize);
         buf.set_string(
             region.x,
             region.y,
@@ -1462,10 +2176,30 @@ impl Renderable for ApprovalWidget<'_> {
             height: control_rows,
         };
 
+        let mut hitboxes = Vec::new();
+        let option_count =
+            approval_options_for_request(self.request, self.request.risk, self.view.locale()).len();
+        for index in 0..option_count {
+            let first_line = 1 + index;
+            let y_offset = measure_wrapped_rows(&controls[..first_line], region.width);
+            let next_offset = measure_wrapped_rows(&controls[..first_line + 1], region.width);
+            let y = control_rect.y.saturating_add(y_offset);
+            let height = next_offset.saturating_sub(y_offset).min(
+                control_rect
+                    .y
+                    .saturating_add(control_rect.height)
+                    .saturating_sub(y),
+            );
+            if height > 0 {
+                hitboxes.push(Rect::new(control_rect.x, y, control_rect.width, height));
+            }
+        }
+        self.view.set_mouse_hitboxes(hitboxes);
+
         let body_rows = measure_wrapped_rows(&body, region.width);
         if body_rows > body_height && body_height > 0 {
             // Body does not fit (short terminal): show as much as we can and
-            // point at the params pager ([v]) for the full content.
+            // point at the params pager through the platform-aware details chord.
             let shown = body_height.saturating_sub(1);
             if shown > 0 {
                 Paragraph::new(body).wrap(Wrap { trim: false }).render(
@@ -1491,10 +2225,6 @@ impl Renderable for ApprovalWidget<'_> {
         Paragraph::new(controls)
             .wrap(Wrap { trim: false })
             .render(control_rect, buf);
-
-        if matches!(stakes, crate::tui::approval::ApprovalStakes::Critical) {
-            paint_left_rail(region, buf, palette_colors.accent);
-        }
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
@@ -1503,8 +2233,10 @@ impl Renderable for ApprovalWidget<'_> {
 }
 
 /// Bottom-anchored band the inline approval prompt occupies within `area`.
-/// Sized to the measured content but never taller than the frame, and always
-/// tall enough to show the reserved controls (#3799).
+/// Sized to the measured content, capped to half the frame like the compact
+/// permission surfaces in peer coding agents, and always tall enough to show
+/// the reserved controls (#3799). Full details remain available through the
+/// platform-aware details chord.
 fn inline_region_for(area: Rect, body: &[Line<'static>], controls: &[Line<'static>]) -> Rect {
     if area.width == 0 || area.height == 0 {
         return Rect {
@@ -1519,9 +2251,27 @@ fn inline_region_for(area: Rect, body: &[Line<'static>], controls: &[Line<'stati
     let control_rows = measure_wrapped_rows(controls, width);
     // +1 for the top separator rule.
     let desired = 1u16.saturating_add(body_rows).saturating_add(control_rows);
-    // Never shrink below the rule + controls; never exceed the frame.
-    let min_height = 1u16.saturating_add(control_rows).min(area.height);
-    let height = desired.clamp(min_height, area.height);
+    // Never shrink below the rule + controls. At normal terminal heights,
+    // reserve four body rows: header, detail label, at least one command or
+    // preview row, and the truncation hint. Half a viewport is the preferred
+    // cap; up to three quarters is allowed only when necessary to retain that
+    // load-bearing preview on a short frame. Truly tiny frames prioritize the
+    // complete action set and details chord.
+    let controls_floor = 1u16.saturating_add(control_rows).min(area.height);
+    let preview_rows = if area.height >= 16 {
+        body_rows.min(4)
+    } else {
+        0
+    };
+    let preview_floor = controls_floor.saturating_add(preview_rows).min(area.height);
+    let preferred_cap = area.height.div_ceil(2);
+    let short_frame_cap = area.height.saturating_mul(3).div_ceil(4);
+    let max_height = preferred_cap
+        .max(preview_floor.min(short_frame_cap))
+        .max(controls_floor)
+        .min(area.height);
+    let min_height = controls_floor;
+    let height = desired.clamp(min_height, max_height);
     Rect {
         x: area.x,
         y: area.y.saturating_add(area.height.saturating_sub(height)),
@@ -1530,22 +2280,17 @@ fn inline_region_for(area: Rect, body: &[Line<'static>], controls: &[Line<'stati
     }
 }
 
-/// Terminal rows `lines` occupy when wrapped to `width`, using display width
-/// (CJK/emoji aware). The controls reserve a trailing blank row of headroom so
-/// that even if ratatui word-wrap rounds up past this estimate, the action row
-/// is never clipped.
+/// Terminal rows `lines` occupy under the exact ratatui word-wrap used by the
+/// renderer. Exact measurement keeps localized controls and their mouse
+/// hitboxes aligned without padding the compact approval band.
 fn measure_wrapped_rows(lines: &[Line<'static>], width: u16) -> u16 {
     if width == 0 {
         return lines.len() as u16;
     }
-    let w = width as usize;
-    lines
-        .iter()
-        .map(|line| {
-            let dw: usize = line.spans.iter().map(|s| s.content.as_ref().width()).sum();
-            dw.div_ceil(w).max(1) as u16
-        })
-        .fold(0u16, |acc, rows| acc.saturating_add(rows))
+    let rows = Paragraph::new(lines.to_vec())
+        .wrap(Wrap { trim: false })
+        .line_count(width);
+    u16::try_from(rows).unwrap_or(u16::MAX)
 }
 
 /// Build the always-visible approval controls: a "proceed?" prompt, the
@@ -1559,8 +2304,7 @@ fn build_approval_controls(
     accent: Color,
     shortcut: Color,
 ) -> Vec<Line<'static>> {
-    let mut controls: Vec<Line<'static>> = Vec::with_capacity(8);
-    controls.push(Line::from(""));
+    let mut controls: Vec<Line<'static>> = Vec::with_capacity(6);
     controls.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -1570,7 +2314,8 @@ fn build_approval_controls(
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
-    for (i, opt) in approval_options_for(risk, locale).iter().enumerate() {
+    let options = approval_options_for_request(request, risk, locale);
+    for (i, opt) in options.iter().enumerate() {
         let is_selected = i == view.selected();
         let label_color = if opt.dangerous {
             accent
@@ -1598,16 +2343,8 @@ fn build_approval_controls(
     controls.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
-            selection_hint_prefix(locale),
-            Style::default().fg(palette::TEXT_HINT),
-        ),
-        Span::styled(
-            selection_hint_value(locale),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
             footer_controls(locale),
-            Style::default().fg(palette::TEXT_HINT),
+            Style::default().fg(palette::TEXT_MUTED),
         ),
         if request.can_save_ask_rule() {
             Span::styled(save_ask_rule_hint(locale), Style::default().fg(shortcut))
@@ -1615,9 +2352,6 @@ fn build_approval_controls(
             Span::raw("")
         },
     ]));
-    // Trailing blank: bottom padding plus a row of headroom so word-wrap of the
-    // hint line can never push a control row out of the reserved region.
-    controls.push(Line::from(""));
     controls
 }
 
@@ -1628,30 +2362,9 @@ fn approval_proceed_question(locale: Locale) -> &'static str {
     }
 }
 
-fn approval_truncation_hint(locale: Locale) -> &'static str {
-    match locale {
-        Locale::ZhHans => "  … 已截断 · 按 [v] 查看完整内容",
-        _ => "  … truncated · press [v] for full details",
-    }
-}
-
-/// Paint a single-column accent on the inside-left of the card. Only
-/// touches cells that already exist in the buffer area.
-fn paint_left_rail(card: Rect, buf: &mut Buffer, color: Color) {
-    if card.width < 2 || card.height < 4 {
-        return;
-    }
-    let rail_x = card.x + 1;
-    let top = card.y + 1;
-    let bot = card.y + card.height.saturating_sub(2);
-    for y in top..=bot {
-        if y >= buf.area.y + buf.area.height {
-            break;
-        }
-        let cell = &mut buf[(rail_x, y)];
-        cell.set_char('\u{2503}'); // ┃ — heavy bar so the warning reads at a glance
-        cell.set_style(Style::default().fg(color).bg(palette::DEEPSEEK_INK));
-    }
+fn approval_truncation_hint(locale: Locale) -> Cow<'static, str> {
+    let details = crate::tui::shell_key_routing::tool_details_chord();
+    Cow::Owned(tr(locale, MessageId::ApprovalTruncationHint).replace("{details}", details.as_ref()))
 }
 
 /// Approval palette per risk variant.
@@ -1666,20 +2379,28 @@ fn approval_palette(stakes: crate::tui::approval::ApprovalStakes) -> ApprovalCol
     match stakes {
         ApprovalStakes::Routine => ApprovalColors {
             border: palette::BORDER_COLOR,
-            accent: palette::DEEPSEEK_SKY,
-            shortcut: palette::DEEPSEEK_SKY,
+            accent: palette::WHALE_HUMAN,
+            shortcut: palette::WHALE_INFO,
         },
         // Ordinary state-touching work: a calm ask, not an alarm.
         ApprovalStakes::Elevated => ApprovalColors {
-            border: palette::BORDER_COLOR,
-            accent: palette::STATUS_WARNING,
-            shortcut: palette::DEEPSEEK_SKY,
+            border: palette::WHALE_HUMAN,
+            accent: palette::WHALE_HUMAN,
+            shortcut: palette::WHALE_INFO,
         },
         ApprovalStakes::Critical => ApprovalColors {
-            border: palette::DEEPSEEK_RED,
-            accent: palette::DEEPSEEK_RED,
+            border: palette::WHALE_ERROR,
+            accent: palette::WHALE_ERROR,
             shortcut: palette::STATUS_WARNING,
         },
+    }
+}
+
+fn repo_law_approval_palette() -> ApprovalColors {
+    ApprovalColors {
+        border: palette::STATUS_WARNING,
+        accent: palette::WHALE_ERROR,
+        shortcut: palette::STATUS_WARNING,
     }
 }
 
@@ -1726,9 +2447,9 @@ fn category_label_for(category: ToolCategory, locale: Locale) -> (Cow<'static, s
         ToolCategory::FileWrite => palette::STATUS_WARNING,
         ToolCategory::Shell => palette::STATUS_ERROR,
         ToolCategory::Network => palette::STATUS_WARNING,
-        ToolCategory::McpRead => palette::DEEPSEEK_SKY,
+        ToolCategory::McpRead => palette::WHALE_INFO,
         ToolCategory::McpAction => palette::STATUS_WARNING,
-        ToolCategory::Agent => palette::DEEPSEEK_SKY,
+        ToolCategory::Agent => palette::WHALE_INFO,
         ToolCategory::Unknown => palette::STATUS_ERROR,
     };
     (label, color)
@@ -1756,7 +2477,7 @@ fn push_detail_line(lines: &mut Vec<Line<'static>>, label: &str, value: &str) {
         Span::styled(
             format!("{label:<7} "),
             Style::default()
-                .fg(palette::DEEPSEEK_SKY)
+                .fg(palette::WHALE_INFO)
                 .add_modifier(Modifier::BOLD),
         ),
         Span::styled(value.to_string(), Style::default().fg(palette::TEXT_BODY)),
@@ -1831,7 +2552,7 @@ fn push_shell_command_lines(
         Span::styled(
             format!("{label}:"),
             Style::default()
-                .fg(palette::DEEPSEEK_SKY)
+                .fg(palette::WHALE_INFO)
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
@@ -1862,6 +2583,114 @@ fn push_shell_command_lines(
             ]));
             rendered += 1;
         }
+    }
+}
+
+/// Put one representative command/change first for compact inline rendering.
+/// This is a display-only projection: approval parameters and the details
+/// pager retain the exact original order.
+fn prioritize_inline_shell_lines(
+    command_lines: &[String],
+    is_change_preview: bool,
+    compact: bool,
+) -> Vec<String> {
+    if !compact || command_lines.len() < 2 {
+        return command_lines.to_vec();
+    }
+
+    let representative = if is_change_preview {
+        command_lines
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, line)| (preview_line_priority(line), std::cmp::Reverse(*index)))
+            .map(|(index, _)| index)
+    } else {
+        command_lines
+            .iter()
+            .enumerate()
+            .max_by_key(|(index, line)| (command_line_priority(line), std::cmp::Reverse(*index)))
+            .map(|(index, _)| index)
+    };
+    let Some(representative) = representative.filter(|index| *index > 0) else {
+        return command_lines.to_vec();
+    };
+
+    let mut projected = Vec::with_capacity(command_lines.len());
+    projected.push(command_lines[representative].clone());
+    projected.extend(
+        command_lines
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != representative)
+            .map(|(_, line)| line.clone()),
+    );
+    projected
+}
+
+fn preview_line_priority(line: &str) -> u8 {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('+') && !trimmed.starts_with("+++") {
+        4
+    } else if trimmed.starts_with('-') && !trimmed.starts_with("---") {
+        3
+    } else if trimmed.starts_with("@@") {
+        2
+    } else if trimmed.starts_with("diff ")
+        || trimmed.starts_with("---")
+        || trimmed.starts_with("+++")
+    {
+        0
+    } else {
+        1
+    }
+}
+
+fn command_line_priority(line: &str) -> u8 {
+    let trimmed = line.trim();
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return 0;
+    }
+
+    let tokens = trimmed
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ';' | '|' | '&' | '(' | ')'))
+        .filter(|token| !token.is_empty())
+        .map(|token| token.rsplit('/').next().unwrap_or(token))
+        .collect::<Vec<_>>();
+    if tokens.iter().any(|token| {
+        matches!(
+            *token,
+            "rm" | "rmdir"
+                | "unlink"
+                | "mv"
+                | "dd"
+                | "chmod"
+                | "chown"
+                | "kill"
+                | "pkill"
+                | "shutdown"
+                | "reboot"
+                | "mkfs"
+        )
+    }) || tokens.windows(2).any(|pair| {
+        matches!(
+            pair,
+            ["git", "push"] | ["cargo", "publish"] | ["npm", "publish"]
+        )
+    }) || trimmed.contains('>')
+    {
+        return 4;
+    }
+
+    let first = tokens.first().copied().unwrap_or_default();
+    if matches!(
+        first,
+        "cd" | "pushd" | "popd" | "set" | "export" | "unset" | "pwd" | ":" | "true"
+    ) {
+        1
+    } else if matches!(first, "echo" | "printf") {
+        2
+    } else {
+        3
     }
 }
 
@@ -1922,7 +2751,10 @@ fn destructive_approval_semantics(locale: Locale) -> [(&'static str, &'static st
 }
 
 fn footer_controls(locale: Locale) -> Cow<'static, str> {
-    tr(locale, MessageId::ApprovalControlsHint)
+    // Platform-aware details chord (⌥V on macOS, Alt+V elsewhere). Bare `v`
+    // is never advertised as a details shortcut (TUI-DOG-002).
+    let details = crate::tui::shell_key_routing::tool_details_chord();
+    Cow::Owned(tr(locale, MessageId::ApprovalControlsHint).replace("{details}", details.as_ref()))
 }
 
 fn save_ask_rule_hint(locale: Locale) -> &'static str {
@@ -1932,14 +2764,7 @@ fn save_ask_rule_hint(locale: Locale) -> &'static str {
     }
 }
 
-fn selection_hint_prefix(locale: Locale) -> Cow<'static, str> {
-    tr(locale, MessageId::ApprovalChooseHint)
-}
-
-fn selection_hint_value(locale: Locale) -> Cow<'static, str> {
-    tr(locale, MessageId::ApprovalChooseAction)
-}
-
+#[derive(Clone)]
 struct ApprovalOptionRow {
     label: Cow<'static, str>,
     key_hint: &'static str,
@@ -1972,6 +2797,61 @@ fn approval_options_for(risk: RiskLevel, locale: Locale) -> [ApprovalOptionRow; 
     ]
 }
 
+/// Workflow elevated-plan card options (#4126): Approve / Edit plan / Cancel.
+fn workflow_approval_options(risk: RiskLevel, locale: Locale) -> [ApprovalOptionRow; 3] {
+    let dangerous = matches!(risk, RiskLevel::Destructive);
+    [
+        ApprovalOptionRow {
+            label: workflow_option_approve(locale),
+            key_hint: "1 / y",
+            dangerous,
+        },
+        ApprovalOptionRow {
+            label: workflow_option_edit_plan(locale),
+            key_hint: "2 / e",
+            dangerous: false,
+        },
+        ApprovalOptionRow {
+            label: workflow_option_cancel(locale),
+            key_hint: "3 / Esc",
+            dangerous: false,
+        },
+    ]
+}
+
+fn approval_options_for_request(
+    request: &ApprovalRequest,
+    risk: RiskLevel,
+    locale: Locale,
+) -> Vec<ApprovalOptionRow> {
+    if request.tool_name == "workflow" {
+        workflow_approval_options(risk, locale).to_vec()
+    } else {
+        approval_options_for(risk, locale).to_vec()
+    }
+}
+
+fn workflow_option_approve(locale: Locale) -> Cow<'static, str> {
+    match locale {
+        Locale::ZhHans => Cow::Borrowed("批准"),
+        _ => Cow::Borrowed("Approve"),
+    }
+}
+
+fn workflow_option_edit_plan(locale: Locale) -> Cow<'static, str> {
+    match locale {
+        Locale::ZhHans => Cow::Borrowed("编辑计划"),
+        _ => Cow::Borrowed("Edit plan"),
+    }
+}
+
+fn workflow_option_cancel(locale: Locale) -> Cow<'static, str> {
+    match locale {
+        Locale::ZhHans => Cow::Borrowed("取消"),
+        _ => Cow::Borrowed("Cancel"),
+    }
+}
+
 fn option_approve_once(locale: Locale) -> Cow<'static, str> {
     tr(locale, MessageId::ApprovalOptionApproveOnce)
 }
@@ -1992,14 +2872,31 @@ pub struct ElevationWidget<'a> {
     request: &'a ElevationRequest,
     selected: usize,
     locale: Locale,
+    hitboxes: Option<&'a std::cell::RefCell<Vec<Rect>>>,
 }
 
 impl<'a> ElevationWidget<'a> {
+    #[allow(dead_code)]
     pub fn new(request: &'a ElevationRequest, selected: usize, locale: Locale) -> Self {
         Self {
             request,
             selected,
             locale,
+            hitboxes: None,
+        }
+    }
+
+    pub fn new_with_hitboxes(
+        request: &'a ElevationRequest,
+        selected: usize,
+        locale: Locale,
+        hitboxes: &'a std::cell::RefCell<Vec<Rect>>,
+    ) -> Self {
+        Self {
+            request,
+            selected,
+            locale,
+            hitboxes: Some(hitboxes),
         }
     }
 }
@@ -2034,7 +2931,7 @@ impl Renderable for ElevationWidget<'_> {
                 Span::styled(
                     &self.request.tool_name,
                     Style::default()
-                        .fg(palette::DEEPSEEK_SKY)
+                        .fg(palette::WHALE_INFO)
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
@@ -2095,6 +2992,7 @@ impl Renderable for ElevationWidget<'_> {
         )));
         lines.push(Line::from(""));
 
+        let option_start = lines.len();
         for (i, option) in self.request.options.iter().enumerate() {
             let is_selected = i == self.selected;
             let style = if is_selected {
@@ -2156,8 +3054,24 @@ impl Renderable for ElevationWidget<'_> {
             .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .style(Style::default().bg(palette::WHALE_BG))
             .padding(Padding::uniform(1));
+
+        if let Some(hitboxes) = self.hitboxes {
+            hitboxes.borrow_mut().clear();
+            let content = block.inner(popup_area);
+            for i in 0..self.request.options.len() {
+                let y = content
+                    .y
+                    .saturating_add(u16::try_from(option_start + i * 2).unwrap_or(u16::MAX));
+                let height = 2u16.min(content.y.saturating_add(content.height).saturating_sub(y));
+                if height > 0 {
+                    hitboxes
+                        .borrow_mut()
+                        .push(Rect::new(content.x, y, content.width, height));
+                }
+            }
+        }
 
         let paragraph = Paragraph::new(lines)
             .block(block)
@@ -2262,7 +3176,7 @@ fn apply_send_flash(
         return;
     };
 
-    let flash_bg = Color::Rgb(30, 40, 55); // subtle dark-blue tint
+    let flash_bg = palette::SURFACE_TOOL_ACTIVE; // subtle dark-blue tint
 
     for (idx, line) in lines.iter_mut().enumerate() {
         let line_index = top + idx;
@@ -2305,20 +3219,20 @@ fn apply_selection_to_line(
             let mut before = String::new();
             let mut selected = String::new();
             let mut after = String::new();
-            let mut ch_col = current_col;
+            let mut grapheme_col = current_col;
 
-            for ch in span_text.chars() {
-                let ch_width = char_display_width(ch);
-                let ch_start = ch_col;
-                let ch_end = ch_col.saturating_add(ch_width);
-                if ch_end <= col_start {
-                    before.push(ch);
-                } else if ch_start >= col_end {
-                    after.push(ch);
+            for grapheme in span_text.graphemes(true) {
+                let grapheme_width = grapheme_display_width(grapheme);
+                let grapheme_start = grapheme_col;
+                let grapheme_end = grapheme_col.saturating_add(grapheme_width);
+                if grapheme_end <= col_start {
+                    before.push_str(grapheme);
+                } else if grapheme_start >= col_end {
+                    after.push_str(grapheme);
                 } else {
-                    selected.push(ch);
+                    selected.push_str(grapheme);
                 }
-                ch_col = ch_end;
+                grapheme_col = grapheme_end;
             }
 
             if !before.is_empty() {
@@ -2367,7 +3281,7 @@ fn truncate_display_width(text: &str, max_width: usize) -> String {
 fn vim_mode_style(mode: VimMode) -> Style {
     let color = match mode {
         VimMode::Normal => palette::TEXT_MUTED,
-        VimMode::Insert => palette::DEEPSEEK_SKY,
+        VimMode::Insert => palette::WHALE_INFO,
         VimMode::Visual => palette::MODE_PLAN,
     };
     Style::default().fg(color).bold()
@@ -2459,49 +3373,16 @@ fn should_render_empty_state(app: &App) -> bool {
         && !app.is_loading
         && !app.is_compacting
         && !app.is_purging
+        && !app.attention_hold_active()
+        && !app
+            .task_panel
+            .iter()
+            .any(|task| task.kind == crate::tui::app::TaskPanelEntryKind::Background)
+        && crate::tui::sidebar::compact_work_indicator(app).is_none()
 }
 
 fn build_empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
-    if area.width == 0 || area.height == 0 {
-        return Vec::new();
-    }
-
-    let workspace = crate::utils::display_path(&app.workspace);
-    let title = format!(">_ codewhale (v{})", env!("CARGO_PKG_VERSION"));
-    let model = format!("model: {}  /model to switch", app.model);
-    let directory = format!("directory: {workspace}");
-    let block_width = [&title, &model, &directory]
-        .into_iter()
-        .map(|line| UnicodeWidthStr::width(line.as_str()))
-        .max()
-        .unwrap_or(0);
-    let left_padding = usize::from(area.width).saturating_sub(block_width) / 2;
-    let inset = " ".repeat(left_padding);
-
-    let body = vec![
-        Line::from(Span::styled(
-            format!("{inset}{title}"),
-            Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!("{inset}{model}"),
-            Style::default().fg(palette::TEXT_MUTED),
-        )),
-        Line::from(Span::styled(
-            format!("{inset}{directory}"),
-            Style::default().fg(palette::TEXT_MUTED),
-        )),
-    ];
-
-    // Keep the welcome block near the top of the chat pane (header is separate).
-    let top_padding = 2usize;
-    let mut lines = Vec::new();
-    for _ in 0..top_padding {
-        lines.push(Line::from(""));
-    }
-    lines.extend(body);
-    lines
+    crate::tui::underwater::empty_state_lines(app, area)
 }
 
 pub fn composer_input_rows_budget(inner_height: u16, extra_lines: usize) -> usize {
@@ -2509,7 +3390,7 @@ pub fn composer_input_rows_budget(inner_height: u16, extra_lines: usize) -> usiz
 }
 
 fn composer_top_padding(content_lines: usize, rows_budget: usize) -> usize {
-    rows_budget.saturating_sub(content_lines.clamp(1, rows_budget))
+    crate::tui::composer_chrome::top_padding(content_lines, rows_budget)
 }
 
 /// Placeholder text shown when the composer input is empty.
@@ -2522,6 +3403,7 @@ fn placeholder_visual_lines(content_width: usize) -> usize {
     placeholder_visual_lines_for(COMPOSER_PLACEHOLDER, content_width)
 }
 
+#[cfg(test)]
 fn placeholder_visual_lines_for(placeholder: &str, content_width: usize) -> usize {
     wrap_text(placeholder, content_width).len().max(1)
 }
@@ -2529,39 +3411,28 @@ fn placeholder_visual_lines_for(placeholder: &str, content_width: usize) -> usiz
 pub(crate) fn composer_empty_hint_text(app: &App) -> Cow<'static, str> {
     if app.is_history_search_active() {
         app.tr(crate::localization::MessageId::HistorySearchPlaceholder)
+    } else if app.mode == crate::tui::app::AppMode::Operate {
+        Cow::Borrowed("Coordinate parallel tasks...")
     } else {
         app.tr(crate::localization::MessageId::ComposerPlaceholder)
     }
 }
 
 pub(crate) fn empty_composer_visual_rows(
-    hint: Option<&str>,
-    content_width: usize,
-    rows_budget: usize,
+    _hint: Option<&str>,
+    _content_width: usize,
+    _rows_budget: usize,
 ) -> usize {
-    if rows_budget <= 1 {
-        1
-    } else {
-        1 + hint
-            .map(|text| placeholder_visual_lines_for(text, content_width))
-            .unwrap_or(0)
-    }
+    1
 }
 
+#[cfg(test)]
 fn composer_min_input_rows(density: ComposerDensity) -> usize {
-    match density {
-        ComposerDensity::Compact => 2,
-        ComposerDensity::Comfortable => 3,
-        ComposerDensity::Spacious => 4,
-    }
+    crate::tui::composer_chrome::ComposerChrome::for_density(density, false).min_content_rows
 }
 
 fn composer_max_height(density: ComposerDensity) -> u16 {
-    match density {
-        ComposerDensity::Compact => 7,
-        ComposerDensity::Comfortable => 9,
-        ComposerDensity::Spacious => 12,
-    }
+    crate::tui::composer_chrome::ComposerChrome::for_density(density, false).max_total_rows
 }
 
 fn composer_height(
@@ -2573,28 +3444,18 @@ fn composer_height(
     show_panel: bool,
 ) -> u16 {
     let has_panel = show_panel && available_height >= 3 && width >= 12;
-    let chrome_height = if has_panel {
-        usize::from(COMPOSER_PANEL_HEIGHT)
-    } else {
-        0
-    };
-    let content_width = if has_panel {
-        usize::from(width.saturating_sub(2).max(1))
-    } else {
-        usize::from(width.max(1))
-    };
+    let content_width = usize::from(width.max(1));
     let mut line_count = wrap_input_lines(input, content_width).len();
     if line_count == 0 {
         line_count = 1;
     }
-    if has_panel {
-        line_count = line_count.max(composer_min_input_rows(density));
-    }
-    line_count = line_count
-        .saturating_add(extra_lines)
-        .saturating_add(chrome_height);
-    let max_height = usize::from(available_height.clamp(1, composer_max_height(density)));
-    line_count.clamp(1, max_height).try_into().unwrap_or(1)
+    crate::tui::composer_chrome::desired_height(
+        line_count,
+        extra_lines,
+        available_height,
+        density,
+        has_panel,
+    )
 }
 
 /// A single entry in the slash-command autocomplete popup.
@@ -2636,10 +3497,7 @@ pub(crate) fn slash_completion_hints(
     workspace: Option<&std::path::Path>,
     api_provider: ApiProvider,
 ) -> Vec<SlashMenuEntry> {
-    let model_candidates = model_completion_names_for_provider(api_provider)
-        .into_iter()
-        .map(str::to_string)
-        .collect::<Vec<_>>();
+    let model_candidates = all_catalog_models_for_provider(api_provider);
     slash_completion_hints_with_model_candidates(
         input,
         limit,
@@ -2688,7 +3546,11 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
 
     let prefix = input.trim_start_matches('/');
     let completing_skill_arg = prefix.strip_prefix("skill ").map(str::trim_start);
-    if input.contains(char::is_whitespace) && completing_skill_arg.is_none() {
+    let completing_model_arg = prefix.strip_prefix("model ").map(str::trim_start);
+    if input.contains(char::is_whitespace)
+        && completing_skill_arg.is_none()
+        && completing_model_arg.is_none()
+    {
         return Vec::new();
     }
     let mut entries: Vec<SlashMenuEntry> = Vec::new();
@@ -2696,7 +3558,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
 
     // ── Phase 1: prefix (starts_with) matches ─────────────────────────
     // Highest priority — preserves existing exact-prefix completion.
-    if completing_skill_arg.is_none() {
+    if completing_skill_arg.is_none() && completing_model_arg.is_none() {
         commands::user_registry::with_registry_for_workspace(workspace, |registry| {
             let all_user_commands = registry.iter().collect::<Vec<_>>();
             let user_commands = all_user_commands
@@ -2822,6 +3684,27 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
     }
 
     // ── Skills (only after user has typed `/skill `) ──────────────────
+    // `/model <prefix>` is the only slash-argument path that needs the
+    // provider inventory. Filter it here instead of rebuilding that inventory
+    // for every generic slash-menu keystroke.
+    if let Some(model_prefix) = completing_model_arg {
+        let model_prefix = model_prefix.to_ascii_lowercase();
+        for model_name in model_candidates {
+            let lower = model_name.to_ascii_lowercase();
+            if lower.starts_with(&model_prefix)
+                || lower.contains(&model_prefix)
+                || fuzzy_chars_in_order(&model_prefix, &lower)
+            {
+                entries.push(SlashMenuEntry {
+                    name: format!("/model {model_name}"),
+                    description: String::from("Switch to this model"),
+                    is_skill: false,
+                    alias_hint: None,
+                });
+            }
+        }
+    }
+
     let skill_prefix = completing_skill_arg.unwrap_or(prefix).to_ascii_lowercase();
     if completing_skill_arg.is_some() {
         for (skill_name, skill_desc) in cached_skills {
@@ -3046,13 +3929,21 @@ fn push_command_entry(
         } else {
             None
         };
-        let desc = if info.aliases.is_empty() {
+        // Omit aliases already shown in the label (`/clear or /qingping`) so
+        // the description does not repeat them (#3990).
+        let remaining_aliases: Vec<&str> = info
+            .aliases
+            .iter()
+            .copied()
+            .filter(|alias| hint.as_deref() != Some(*alias))
+            .collect();
+        let desc = if remaining_aliases.is_empty() {
             info.description_for(locale).to_string()
         } else {
             format!(
                 "{}  (aliases: {})",
                 info.description_for(locale),
-                info.aliases
+                remaining_aliases
                     .iter()
                     .map(|a| format!("/{a}"))
                     .collect::<Vec<_>>()
@@ -3117,6 +4008,56 @@ pub fn layout_input_with_scroll(
     )
 }
 
+/// Extended version of `layout_input_with_scroll` that also returns character
+/// indices for each wrapped line. Used by ComposerWidget to avoid redundant
+/// wrapping when rendering text selections.
+fn layout_input_with_scroll_and_char_indices(
+    input: &str,
+    cursor: usize,
+    width: usize,
+    max_height: usize,
+) -> (Vec<String>, usize, usize, usize, Vec<(usize, String)>) {
+    let (all_lines, all_with_indices) = wrap_input_lines_internal(input, width);
+
+    let lines = if all_lines.is_empty() {
+        vec![String::new()]
+    } else {
+        all_lines
+    };
+
+    let (cursor_row, cursor_col) = cursor_row_col(input, cursor, width.max(1));
+
+    let max_height = max_height.max(1);
+    let mut start = 0usize;
+    if cursor_row >= max_height {
+        start = cursor_row + 1 - max_height;
+    }
+    if start + max_height > lines.len() {
+        start = lines.len().saturating_sub(max_height);
+    }
+    let visible = lines
+        .into_iter()
+        .skip(start)
+        .take(max_height)
+        .collect::<Vec<_>>();
+    let visible_cursor_row = cursor_row.saturating_sub(start);
+
+    // Also slice the char indices to match visible lines
+    let visible_with_indices = all_with_indices
+        .into_iter()
+        .skip(start)
+        .take(max_height)
+        .collect();
+
+    (
+        visible,
+        visible_cursor_row,
+        cursor_col.min(width.saturating_sub(1)),
+        start,
+        visible_with_indices,
+    )
+}
+
 fn cursor_row_col(input: &str, cursor: usize, width: usize) -> (usize, usize) {
     let mut row = 0usize;
     let mut col = 0usize;
@@ -3159,24 +4100,53 @@ fn cursor_row_col(input: &str, cursor: usize, width: usize) -> (usize, usize) {
     (row, col)
 }
 
-fn wrap_input_lines(input: &str, width: usize) -> Vec<String> {
+/// Internal helper that returns both wrapped lines and character indices.
+/// Used by `wrap_input_lines`, `wrap_input_lines_for_mouse`, and
+/// `layout_input_with_scroll` to avoid redundant wrapping computations.
+fn wrap_input_lines_internal(input: &str, width: usize) -> (Vec<String>, Vec<(usize, String)>) {
     let mut lines = Vec::new();
+    let mut lines_with_indices = Vec::new();
+    let mut char_idx = 0usize;
+
     if input.is_empty() {
-        return lines;
+        lines_with_indices.push((0, String::new()));
+        return (lines, lines_with_indices);
     }
 
-    for raw in input.split('\n') {
-        let wrapped = wrap_text(raw, width);
+    for raw_line in input.split('\n') {
+        if raw_line.is_empty() {
+            lines.push(String::new());
+            if width != 0 {
+                lines_with_indices.push((char_idx, String::new()));
+            }
+            char_idx += 1; // the '\n'
+            continue;
+        }
+
+        let wrapped = wrap_text(raw_line, width);
         if wrapped.is_empty() {
             lines.push(String::new());
+            if width != 0 {
+                lines_with_indices.push((char_idx, String::new()));
+            }
         } else {
-            lines.extend(wrapped);
+            for wrapped_line in &wrapped {
+                let line_char_len: usize = wrapped_line.chars().count();
+                lines.push(wrapped_line.clone());
+                if width != 0 {
+                    lines_with_indices.push((char_idx, wrapped_line.clone()));
+                }
+                char_idx += line_char_len;
+            }
         }
+        char_idx += 1; // the '\n'
     }
 
-    // Note: No need for ends_with('\n') check - split('\n') already includes
-    // the trailing empty string for inputs ending with newline.
+    (lines, lines_with_indices)
+}
 
+fn wrap_input_lines(input: &str, width: usize) -> Vec<String> {
+    let (lines, _) = wrap_input_lines_internal(input, width);
     lines
 }
 
@@ -3187,25 +4157,8 @@ pub fn wrap_input_lines_for_mouse(input: &str, width: usize) -> Vec<(usize, Stri
         return vec![(0, String::new())];
     }
 
-    let mut result = Vec::new();
-    let mut char_idx = 0usize;
-
-    for raw_line in input.split('\n') {
-        if raw_line.is_empty() {
-            result.push((char_idx, String::new()));
-            char_idx += 1; // the '\n'
-            continue;
-        }
-        let wrapped = wrap_text(raw_line, width);
-        for wrapped_line in &wrapped {
-            let line_char_len: usize = wrapped_line.chars().count();
-            result.push((char_idx, wrapped_line.clone()));
-            char_idx += line_char_len;
-        }
-        char_idx += 1; // the '\n'
-    }
-
-    result
+    let (_, lines_with_indices) = wrap_input_lines_internal(input, width);
+    lines_with_indices
 }
 
 fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -3302,27 +4255,42 @@ fn line_spans_with_selection<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER, ChatWidget, ComposerWidget,
-        Renderable, SlashMenuEntry, apply_detail_target_highlight, apply_selection_to_line,
-        apply_send_flash, build_empty_state_lines, composer_height, composer_max_height,
+        ACTIVE_REVISION_DOMAIN, ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER,
+        ChatWidget, ComposerWidget, Renderable, SlashMenuEntry, active_entry_revision,
+        ambient_ping_pong, apply_detail_target_highlight, apply_selection_to_line,
+        apply_send_flash, approval_palette, approval_truncation_hint, build_empty_state_lines,
+        composer_content_geometry, composer_empty_hint_text, composer_height, composer_max_height,
         composer_min_input_rows, composer_top_padding, cursor_row_col, empty_composer_visual_rows,
-        layout_input, pad_lines_to_bottom, placeholder_visual_lines, push_command_entry,
-        should_render_empty_state, slash_completion_hints, wrap_input_lines, wrap_text,
+        fish_flee_offset, fish_heading, fish_mark, history_entry_revision, layout_input,
+        layout_input_with_scroll, pad_lines_to_bottom, placeholder_visual_lines,
+        push_command_entry, receipt_is_settling, revision_in_domain, should_render_empty_state,
+        slash_completion_hints, tool_run_summary_revision, wrap_input_lines,
+        wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
     use crate::palette;
     use crate::tui::active_cell::ActiveCell;
-    use crate::tui::app::{App, ComposerDensity, ToolCollapseMode, TuiOptions};
-    use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
+    use crate::tui::app::{
+        App, AppMode, ComposerDensity, TaskPanelEntry, TaskPanelEntryKind, ToolCollapseMode,
+        TuiOptions,
+    };
+    use crate::tui::history::{
+        ExecCell, ExecSource, GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus,
+    };
     use crate::tui::scrolling::{TranscriptLineMeta, TranscriptScroll};
     use ratatui::{
+        Terminal,
+        backend::TestBackend,
         buffer::Buffer,
         layout::Rect,
         style::{Color, Style},
         text::{Line, Span},
     };
-    use std::path::PathBuf;
+    use std::{
+        path::PathBuf,
+        time::{Duration, Instant},
+    };
     use unicode_width::UnicodeWidthStr;
 
     fn create_test_app() -> App {
@@ -3364,6 +4332,54 @@ mod tests {
         text
     }
 
+    #[test]
+    fn approval_palette_reserves_signal_gold_for_human_decisions() {
+        use crate::tui::approval::ApprovalStakes;
+
+        let routine = approval_palette(ApprovalStakes::Routine);
+        let elevated = approval_palette(ApprovalStakes::Elevated);
+        let critical = approval_palette(ApprovalStakes::Critical);
+
+        assert_eq!(routine.accent, palette::WHALE_HUMAN);
+        assert_eq!(routine.shortcut, palette::WHALE_ACTION);
+        assert_eq!(elevated.border, palette::WHALE_HUMAN);
+        assert_eq!(elevated.accent, palette::WHALE_HUMAN);
+        assert_eq!(critical.accent, palette::WHALE_ERROR);
+    }
+
+    #[test]
+    fn first_active_tool_settles_when_flushed_to_history() {
+        let mut app = create_test_app();
+        app.clear_history();
+        app.next_history_revision = 1;
+        app.active_cell_revision = 0;
+
+        let mut active = ActiveCell::new();
+        active.push_tool("user_shell_1", running_user_shell_cell());
+        app.active_cell = Some(active);
+
+        let area = Rect::new(0, 0, 100, 20);
+        let mut running_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut running_buf);
+        let running = buffer_text(&running_buf, area);
+        assert!(running.contains("run running"), "{running}");
+
+        app.finalize_active_cell_as_interrupted();
+        let HistoryCell::Tool(ToolCell::Exec(exec)) = &app.history[0] else {
+            panic!("expected settled exec history cell")
+        };
+        assert_eq!(exec.status, ToolStatus::Failed);
+
+        let mut settled_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut settled_buf);
+        let settled = buffer_text(&settled_buf, area);
+        assert!(
+            !settled.contains("run running"),
+            "flushed terminal state reused the active cache entry:\n{settled}"
+        );
+        assert!(settled.contains("run issue"), "{settled}");
+    }
+
     fn render_approval_request(
         request: &crate::tui::approval::ApprovalRequest,
         area: Rect,
@@ -3396,6 +4412,23 @@ mod tests {
         }))
     }
 
+    fn running_user_shell_cell() -> HistoryCell {
+        HistoryCell::Tool(ToolCell::Exec(ExecCell {
+            command: "sleep 30".to_string(),
+            status: ToolStatus::Running,
+            output: None,
+            live_output: None,
+            shell_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+            started_at: None,
+            duration_ms: None,
+            source: ExecSource::User,
+            interaction: None,
+            output_summary: None,
+        }))
+    }
+
     fn add_dense_tool_run(app: &mut App) {
         app.add_message(success_tool_cell("read_file"));
         app.add_message(success_tool_cell("list_dir"));
@@ -3422,7 +4455,10 @@ mod tests {
 
         apply_send_flash(&mut lines, 0, &history, &line_meta, &original_index_map);
 
-        assert_eq!(lines[0].spans[0].style.bg, Some(Color::Rgb(30, 40, 55)));
+        assert_eq!(
+            lines[0].spans[0].style.bg,
+            Some(palette::SURFACE_TOOL_ACTIVE)
+        );
     }
 
     #[test]
@@ -3439,6 +4475,47 @@ mod tests {
         apply_detail_target_highlight(&mut lines, 0, 4, &line_meta, &original_index_map);
 
         assert_eq!(lines[0].spans[0].style.bg, Some(Color::Reset));
+    }
+
+    #[test]
+    fn tool_run_summary_revision_separates_128_entry_history_and_active_alias() {
+        let active_rev = 17;
+        let run = ToolRun {
+            start: 0,
+            count: 128,
+            tool_families: Vec::new(),
+            activity: Default::default(),
+        };
+        let history_revisions = (1..=run.count)
+            .map(|salt| active_entry_revision(active_rev, salt as u64))
+            .collect::<Vec<_>>();
+
+        let history_key =
+            tool_run_summary_revision(&run, &history_revisions, run.count, active_rev);
+        let active_key = tool_run_summary_revision(&run, &[], 0, active_rev);
+
+        // Rotating by seven over 128 entries cancels the 128 identical domain
+        // bits, reproducing the old untagged hash alias. The final domain tag
+        // must still keep the cache keys distinct.
+        assert_eq!(
+            history_key & !ACTIVE_REVISION_DOMAIN,
+            active_key & !ACTIVE_REVISION_DOMAIN,
+            "fixture must exercise the 128-entry payload alias"
+        );
+        assert_eq!(history_key & ACTIVE_REVISION_DOMAIN, 0);
+        assert_eq!(active_key & ACTIVE_REVISION_DOMAIN, ACTIVE_REVISION_DOMAIN);
+        assert_ne!(history_key, active_key);
+    }
+
+    #[test]
+    fn high_bit_raw_revision_remains_distinct_across_history_and_active_domains() {
+        let raw = ACTIVE_REVISION_DOMAIN | 0x2692;
+        let history_key = history_entry_revision(raw);
+        let active_key = revision_in_domain(raw, true);
+
+        assert_eq!(history_key, 0x2692);
+        assert_eq!(active_key, ACTIVE_REVISION_DOMAIN | 0x2692);
+        assert_ne!(history_key, active_key);
     }
 
     #[test]
@@ -3506,6 +4583,46 @@ mod tests {
     }
 
     #[test]
+    fn collapsed_slow_path_does_not_reuse_running_active_cache_after_flush() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        add_dense_tool_run(&mut app);
+
+        // Force the next committed history revision to have the same raw key
+        // as active revision 0, salt 1. The prior collapsed run keeps both
+        // renders on the filtered slow path.
+        app.next_history_revision = ACTIVE_REVISION_DOMAIN | 1;
+        app.active_cell_revision = 0;
+        let mut active = ActiveCell::new();
+        active.push_tool("user_shell_slow_path", running_user_shell_cell());
+        app.active_cell = Some(active);
+
+        let area = Rect::new(0, 0, 100, 20);
+        let mut running_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut running_buf);
+        let running = buffer_text(&running_buf, area);
+        assert!(running.contains("run running"), "{running}");
+        assert_eq!(app.collapsed_cell_map, vec![0, 3]);
+
+        app.finalize_active_cell_as_interrupted();
+        assert_eq!(
+            app.history_revisions[3],
+            ACTIVE_REVISION_DOMAIN | 1,
+            "fixture must force the old raw-revision collision"
+        );
+
+        let mut settled_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut settled_buf);
+        let settled = buffer_text(&settled_buf, area);
+        assert!(
+            !settled.contains("run running"),
+            "history cell reused the active slow-path cache entry:\n{settled}"
+        );
+        assert!(settled.contains("run issue"), "{settled}");
+    }
+
+    #[test]
     fn chat_widget_expands_dense_tool_runs_on_demand() {
         let mut app = create_test_app();
         app.tool_collapse_mode = ToolCollapseMode::Compact;
@@ -3550,6 +4667,80 @@ mod tests {
         let _widget = ChatWidget::new(&mut app, area);
 
         assert_eq!(app.collapsed_cell_map, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn chat_widget_collapse_path_stable_across_frames() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        add_dense_tool_run(&mut app);
+        app.add_message(HistoryCell::User {
+            content: "trailing prompt".to_string(),
+        });
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 10,
+        };
+
+        let mut first_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut first_buf);
+        let first = buffer_text(&first_buf, area);
+        let first_map = app.collapsed_cell_map.clone();
+        let first_total = app.viewport.last_transcript_total;
+
+        // Second frame without any app mutation: the borrowed filtered path
+        // must reproduce the identical output and index map.
+        let mut second_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut second_buf);
+        let second = buffer_text(&second_buf, area);
+
+        assert_eq!(first, second, "collapse path is frame-stable");
+        assert_eq!(first_map, app.collapsed_cell_map);
+        assert_eq!(first_total, app.viewport.last_transcript_total);
+        assert!(first.contains("Explored 2 files, 1 search"), "{first}");
+        assert!(first.contains("trailing prompt"), "{first}");
+    }
+
+    #[test]
+    fn chat_widget_collapses_run_spanning_history_and_active_entries() {
+        let mut app = create_test_app();
+        app.tool_collapse_mode = ToolCollapseMode::Compact;
+        app.tool_collapse_threshold = 3;
+        app.add_message(success_tool_cell("read_file"));
+        app.add_message(success_tool_cell("list_dir"));
+        let active = app.active_cell.get_or_insert_with(ActiveCell::new);
+        active.push_untracked(success_tool_cell("web_search"));
+        app.bump_active_cell_revision();
+
+        let area = Rect {
+            x: 0,
+            y: 0,
+            width: 80,
+            height: 8,
+        };
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+
+        assert_eq!(app.collapsed_cell_map, vec![0]);
+        assert!(
+            rendered.contains("Explored 2 files, 1 search"),
+            "run spanning the history/active boundary renders one summary: {rendered}"
+        );
+
+        // Mutating the active tail must re-render the summary (its revision
+        // folds in the covered active entries).
+        let rev_before = app.active_cell_revision;
+        app.bump_active_cell_revision();
+        assert_ne!(rev_before, app.active_cell_revision);
+        let mut second_buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut second_buf);
+        let second = buffer_text(&second_buf, area);
+        assert!(second.contains("Explored 2 files, 1 search"), "{second}");
     }
 
     #[test]
@@ -3678,6 +4869,18 @@ mod tests {
     }
 
     #[test]
+    fn wrap_input_lines_for_mouse_empty_input() {
+        // Empty input should return a single empty line at position 0.
+        // This ensures empty composer mouse selection works correctly (issue #3909).
+        let result = wrap_input_lines_for_mouse("", 10);
+        assert_eq!(result, vec![(0, String::new())]);
+
+        // Also verify with width=0 edge case
+        let result_zero = wrap_input_lines_for_mouse("", 0);
+        assert_eq!(result_zero, vec![(0, String::new())]);
+    }
+
+    #[test]
     fn cursor_and_wrap_consistency() {
         // Ensure cursor_row_col is consistent with wrap_text
         // for various inputs
@@ -3731,6 +4934,33 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_does_not_repeat_alias_already_in_label() {
+        // Typing `/p` matches `/clear` via alias `qingping`, so the label
+        // shows `/clear or /qingping`. The description must not also append
+        // `(aliases: /qingping)` (#3990).
+        let hints = slash_completion_hints("/p", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        let clear = hints
+            .iter()
+            .find(|h| h.name == "/clear")
+            .expect("/clear should appear for /p via qingping");
+        assert_eq!(
+            clear.alias_hint.as_deref(),
+            Some("qingping"),
+            "label should surface the matching alias"
+        );
+        assert!(
+            !clear.description.contains("(aliases:"),
+            "description should omit alias list when the only alias is already in the label: {}",
+            clear.description
+        );
+        assert!(
+            !clear.description.contains("/qingping"),
+            "description must not repeat /qingping: {}",
+            clear.description
+        );
+    }
+
+    #[test]
     fn slash_completion_hints_keep_prefix_match_alphabetical_within_tier() {
         // Within the same rank tier (no exact-alias match), entries fall
         // back to alphabetical name order, same as the prior behavior.
@@ -3770,6 +5000,7 @@ mod tests {
         assert!(!root.iter().any(|hint| hint.name == "/rlm"));
         assert!(!root.iter().any(|hint| hint.name == "/modeldb"));
         assert!(!root.iter().any(|hint| hint.name == "/models"));
+        assert!(!root.iter().any(|hint| hint.name == "/plugin"));
         assert!(!root.iter().any(|hint| hint.name == "/subagents"));
 
         let rlm = slash_completion_hints("/rl", 128, &[], Locale::En, None, ApiProvider::Deepseek);
@@ -3778,6 +5009,10 @@ mod tests {
         let modeldb =
             slash_completion_hints("/modeld", 128, &[], Locale::En, None, ApiProvider::Deepseek);
         assert!(modeldb.iter().any(|hint| hint.name == "/modeldb"));
+
+        let plugin =
+            slash_completion_hints("/pl", 128, &[], Locale::En, None, ApiProvider::Deepseek);
+        assert!(plugin.iter().any(|hint| hint.name == "/plugin"));
 
         let subagents =
             slash_completion_hints("/sub", 128, &[], Locale::En, None, ApiProvider::Deepseek);
@@ -4117,6 +5352,21 @@ mod tests {
     }
 
     #[test]
+    fn selection_keeps_keycap_grapheme_intact() {
+        let line = Line::from(Span::raw("A1\u{fe0f}\u{20e3}B"));
+        let selection_style = Style::default().bg(palette::SELECTION_BG);
+
+        // Selecting the second display column of the two-column keycap must
+        // style the complete grapheme, never only FE0F/U+20E3.
+        let styled = apply_selection_to_line(&line, 2, 3, selection_style);
+        assert_eq!(styled.len(), 3);
+        assert_eq!(styled[0].content.as_ref(), "A");
+        assert_eq!(styled[1].content.as_ref(), "1\u{fe0f}\u{20e3}");
+        assert_eq!(styled[1].style.bg, Some(palette::SELECTION_BG));
+        assert_eq!(styled[2].content.as_ref(), "B");
+    }
+
+    #[test]
     fn composer_layout_helpers_stay_consistent() {
         let input = "line one wraps nicely\nline two wraps as well";
         let width = 16;
@@ -4167,12 +5417,15 @@ mod tests {
     }
 
     #[test]
-    fn composer_height_skips_panel_chrome_when_border_disabled() {
+    fn composer_height_uses_quiet_rule_when_panel_is_not_needed() {
         let with_border = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, true);
         let without_border = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, false);
 
+        // Quiet composer keeps a single top rule but still reserves the
+        // density baseline (3 content rows) so it never collapses to a
+        // one-line afterthought when height allows.
         assert_eq!(with_border, 5);
-        assert_eq!(without_border, 1);
+        assert_eq!(without_border, 4);
         assert!(without_border < with_border);
     }
 
@@ -4187,7 +5440,43 @@ mod tests {
     }
 
     #[test]
-    fn empty_composer_cursor_sits_above_placeholder_hint() {
+    fn composer_content_geometry_is_the_single_prompt_adjusted_text_rect() {
+        let inner = Rect::new(10, 4, 7, 3);
+        let normal = composer_content_geometry(inner, false);
+        assert_eq!(normal.prompt_inset, 2);
+        assert_eq!(normal.text_area, Rect::new(12, 4, 5, 3));
+        assert_eq!(normal.text_width(), 5);
+
+        let history = composer_content_geometry(inner, true);
+        assert_eq!(history.prompt_inset, 0);
+        assert_eq!(history.text_area, inner);
+
+        let narrow = composer_content_geometry(Rect::new(3, 2, 2, 1), false);
+        assert_eq!(narrow.prompt_inset, 0);
+        assert_eq!(narrow.text_area, Rect::new(3, 2, 2, 1));
+    }
+
+    #[test]
+    fn composer_wrap_boundary_cursor_scroll_and_mouse_lines_share_text_width() {
+        let geometry = composer_content_geometry(Rect::new(0, 0, 7, 2), false);
+        let input = "abcde";
+        let cursor = input.chars().count();
+        let width = geometry.text_width();
+
+        let (absolute_row, absolute_col) = cursor_row_col(input, cursor, width);
+        let (visible, visible_row, visible_col, scroll_offset) =
+            layout_input_with_scroll(input, cursor, width, 1);
+        let mouse_lines = wrap_input_lines_for_mouse(input, width);
+
+        assert_eq!((absolute_row, absolute_col), (1, 0));
+        assert_eq!(scroll_offset, 1);
+        assert_eq!((visible_row, visible_col), (0, 0));
+        assert_eq!(visible, vec![String::new()]);
+        assert_eq!(mouse_lines[scroll_offset], (cursor, String::new()));
+    }
+
+    #[test]
+    fn empty_composer_keeps_prompt_and_hint_on_one_row() {
         let mut app = create_test_app();
         // Pin density so the test is independent of any loaded user settings.
         app.composer_density = ComposerDensity::Comfortable;
@@ -4203,17 +5492,16 @@ mod tests {
             height: 5,
         };
 
-        // inner_area: {x:1, y:1, w:38, h:3}  (borders shrink by 1 each side)
-        // input_rows_budget = 3
-        // empty_composer_visual_rows = cursor row + one hint row = 2
-        // top_padding = 3 - clamp(2, 1, 3) = 1
-        // cursor_x = 0 + (1-0) + 0 = 1
-        // cursor_y = 0 + (1-0) + (1+0) = 2
+        // Normal one-line composition uses only the top rule, preserving the
+        // reference's continuous water field instead of drawing a full box.
+        // inner_area: {x:0, y:1, w:40, h:4}
+        // input_rows_budget = 4
+        // The prompt and hint share one quiet row.
         assert_eq!(
-            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 38, 3),
-            2
+            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 40, 4),
+            1
         );
-        assert_eq!(widget.cursor_pos(area), Some((1, 2)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 3)));
     }
 
     #[test]
@@ -4232,23 +5520,21 @@ mod tests {
             height: 5,
         };
 
-        // inner_area: {x:1, y:1, w:12, h:3}
-        // input_rows_budget = 3
-        // placeholder_visual_lines(12) = 2  ("Write a task" / " or use /.")
-        // empty_composer_visual_rows = cursor row + two hint rows = 3
-        // top_padding = 3 - clamp(3, 1, 3) = 0
-        // cursor_x = 0 + (1-0) + 0 = 1
-        // cursor_y = 0 + (1-0) + (0+0) = 1
-        assert_eq!(placeholder_visual_lines(12), 2);
+        // inner_area: {x:0, y:1, w:14, h:4}
+        // input_rows_budget = 4
+        // placeholder_visual_lines(14) = 2
+        // The narrow fallback still reserves one composer row; Paragraph
+        // clipping keeps it from growing the shell.
+        assert_eq!(placeholder_visual_lines(14), 2);
         assert_eq!(
-            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 12, 3),
-            3
+            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 14, 4),
+            1
         );
-        assert_eq!(widget.cursor_pos(area), Some((1, 1)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 3)));
     }
 
     #[test]
-    fn empty_composer_keeps_cursor_row_clear_for_ime_preedit() {
+    fn empty_composer_renders_prompt_and_hint_on_cursor_row() {
         let mut app = create_test_app();
         app.composer_density = ComposerDensity::Comfortable;
         let slash_menu_entries = Vec::<SlashMenuEntry>::new();
@@ -4268,20 +5554,49 @@ mod tests {
         };
         let rendered = buffer_text(&buf, area);
 
-        assert_eq!(buf[(cursor_x, cursor_y)].symbol(), " ");
+        assert_eq!(buf[(cursor_x, cursor_y)].symbol(), "W");
         assert!(
             rendered.contains(COMPOSER_PLACEHOLDER),
-            "placeholder hint should still render below the cursor row: {rendered}"
+            "placeholder hint should render on the prompt row: {rendered}"
         );
         assert!(
-            !row_text(&buf, area, cursor_y).contains(COMPOSER_PLACEHOLDER),
-            "cursor row must remain clear for terminal IME preedit text: {rendered}"
+            row_text(&buf, area, cursor_y).contains(COMPOSER_PLACEHOLDER),
+            "prompt and hint should share one row: {rendered}"
         );
+        assert!(
+            row_text(&buf, area, cursor_y.saturating_add(1))
+                .trim()
+                .is_empty(),
+            "comfortable composer should keep a quiet row before the footer: {rendered}"
+        );
+    }
+
+    #[test]
+    fn composer_keeps_prompt_anchored_after_first_keystroke() {
+        let mut app = create_test_app();
+        app.composer_density = ComposerDensity::Comfortable;
+        app.input = "hello".to_string();
+        app.cursor_position = app.input.len();
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
+        let mention_menu_entries = Vec::<String>::new();
+        let widget = ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+        let area = Rect::new(0, 0, 40, 5);
+        let mut buf = Buffer::empty(area);
+
+        widget.render(area, &mut buf);
+        let (cursor_x, cursor_y) = widget
+            .cursor_pos(area)
+            .expect("composer with input should expose a cursor");
+
+        assert_eq!(buf[(0, cursor_y)].symbol(), "❯");
+        assert_eq!(buf[(2, cursor_y)].symbol(), "h");
+        assert_eq!(cursor_x, 7, "cursor keeps the prompt gutter reserved");
     }
 
     #[test]
     fn composer_border_renders_session_title() {
         let mut app = create_test_app();
+        app.ocean_treatment = crate::tui::ocean::OceanTreatment::Classic;
         app.composer_density = ComposerDensity::Comfortable;
         app.session_title = Some("my-session".to_string());
         let slash_menu_entries = Vec::<SlashMenuEntry>::new();
@@ -4305,6 +5620,7 @@ mod tests {
     #[test]
     fn composer_border_renders_active_turn_receipt() {
         let mut app = create_test_app();
+        app.ocean_treatment = crate::tui::ocean::OceanTreatment::Classic;
         app.composer_density = ComposerDensity::Comfortable;
         app.set_receipt_text("✓ turn completed · 2 tool(s) used");
         let slash_menu_entries = Vec::<SlashMenuEntry>::new();
@@ -4425,7 +5741,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_composer_cursor_uses_full_area_when_border_disabled() {
+    fn empty_composer_cursor_follows_idle_prompt_when_border_disabled() {
         let mut app = create_test_app();
         app.composer_density = ComposerDensity::Comfortable;
         app.composer_border = false;
@@ -4440,7 +5756,18 @@ mod tests {
             height: 3,
         };
 
-        assert_eq!(widget.cursor_pos(area), Some((0, 1)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 2)));
+    }
+
+    #[test]
+    fn operate_composer_invites_ordinary_parallel_tasks() {
+        let mut app = create_test_app();
+        app.mode = AppMode::Operate;
+
+        assert_eq!(
+            composer_empty_hint_text(&app),
+            "Coordinate parallel tasks..."
+        );
     }
 
     #[test]
@@ -4473,9 +5800,9 @@ mod tests {
     #[test]
     fn composer_top_padding_uses_clamp() {
         // content_lines=0 is clamped to 1
-        assert_eq!(composer_top_padding(0, 3), 2);
+        assert_eq!(composer_top_padding(0, 3), 1);
         // content_lines=1
-        assert_eq!(composer_top_padding(1, 3), 2);
+        assert_eq!(composer_top_padding(1, 3), 1);
         // content_lines=3 fills the budget
         assert_eq!(composer_top_padding(3, 3), 0);
         // content_lines > budget is clamped
@@ -4493,10 +5820,78 @@ mod tests {
     }
 
     #[test]
+    fn durable_tasks_suppress_the_launch_tableau() {
+        let mut app = create_test_app();
+        app.task_panel.push(TaskPanelEntry {
+            id: "shell_1".to_string(),
+            status: "running".to_string(),
+            prompt_summary: "cargo test".to_string(),
+            duration_ms: Some(100),
+            kind: TaskPanelEntryKind::Background,
+            stale: false,
+            elapsed_since_output_ms: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+        });
+
+        assert!(!should_render_empty_state(&app));
+    }
+
+    #[test]
+    fn chat_widget_publishes_wrapped_url_regions_without_touching_cells() {
+        let mut app = create_test_app();
+        app.low_motion = true;
+        let target = "https://example.test/a/very/long/path/that/wraps/across/chat/rows";
+        app.add_message(HistoryCell::Assistant {
+            content: target.to_string(),
+            streaming: false,
+        });
+
+        let area = Rect::new(4, 2, 20, 10);
+        let mut buf = Buffer::empty(area);
+        let _ = crate::tui::osc8::take_frame_links();
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+        let regions = crate::tui::osc8::take_frame_links();
+
+        assert!(regions.len() > 1, "narrow chat should wrap: {regions:?}");
+        assert!(regions.iter().all(|region| region.target == target));
+        assert!(regions.iter().all(|region| {
+            area.contains(ratatui::layout::Position {
+                x: region.col_start,
+                y: region.row,
+            }) && area.contains(ratatui::layout::Position {
+                x: region.col_end,
+                y: region.row,
+            })
+        }));
+        assert!((area.y..area.bottom()).all(|y| {
+            (area.x..area.right()).all(|x| {
+                let symbol = buf[(x, y)].symbol();
+                !symbol.contains('\x1b') && !symbol.contains("]8;;")
+            })
+        }));
+    }
+
+    #[test]
+    fn waiting_state_freezes_the_whole_ocean_field() {
+        let mut app = create_test_app();
+        app.low_motion = false;
+        app.fancy_animations = true;
+        app.plan_prompt_pending = true;
+
+        let widget = ChatWidget::new(&mut app, Rect::new(0, 0, 100, 20));
+
+        assert!(!widget.ocean_animated);
+        assert!(!widget.ambient_life);
+        assert!(!should_render_empty_state(&app));
+    }
+
+    #[test]
     fn empty_state_shows_startup_context() {
         let mut app = create_test_app();
+        app.onboarding_needs_api_key = false;
         app.workspace = PathBuf::from("/tmp/codewhale-test-workspace");
-        app.model = "deepseek-v4-pro".to_string();
+        app.mcp_configured_count = 2;
 
         let lines = build_empty_state_lines(&app, Rect::new(0, 0, 100, 20));
         let rendered = lines
@@ -4510,16 +5905,39 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
 
-        assert!(rendered.contains(&format!(">_ codewhale (v{})", env!("CARGO_PKG_VERSION"))));
-        assert!(rendered.contains("model: deepseek-v4-pro  /model to switch"));
-        assert!(rendered.contains("directory: /tmp/codewhale-test-workspace"));
+        assert!(rendered.contains("codewhale · /tmp/codewhale-test-workspace · no git · mcp 2"));
+        assert!(rendered.contains("Fleet ready  /fleet setup"));
+        assert!(
+            !rendered.contains("Fleet setup  /fleet setup"),
+            "the idle action must not imply that built-in Fleet roles still require setup"
+        );
+        assert!(rendered.contains("/help or Ctrl+K"));
+        assert!(!rendered.contains("Model  /model"));
+        assert!(!rendered.contains("Rules  /constitution"));
+    }
+
+    #[test]
+    fn empty_state_does_not_claim_fleet_ready_without_a_provider_route() {
+        let mut app = create_test_app();
+        app.onboarding_needs_api_key = true;
+
+        for area in [Rect::new(0, 0, 40, 12), Rect::new(0, 0, 100, 20)] {
+            let rendered = build_empty_state_lines(&app, area)
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .map(|span| span.content.as_ref())
+                .collect::<String>();
+
+            assert!(rendered.contains("Fleet  /provider"), "{rendered}");
+            assert!(!rendered.contains("Fleet ready"), "{rendered}");
+            assert!(!rendered.contains("/fleet setup"), "{rendered}");
+        }
     }
 
     #[test]
     fn empty_state_centers_startup_block_by_actual_text_width() {
         let mut app = create_test_app();
         app.workspace = PathBuf::from("/tmp/codewhale-test-workspace");
-        app.model = "deepseek-v4-pro".to_string();
 
         let lines = build_empty_state_lines(&app, Rect::new(0, 0, 100, 20));
         let text_lines = lines
@@ -4531,21 +5949,330 @@ mod tests {
                     .collect::<String>()
             })
             .collect::<Vec<_>>();
-        let title = format!(">_ codewhale (v{})", env!("CARGO_PKG_VERSION"));
-        let model = "model: deepseek-v4-pro  /model to switch";
-        let directory = "directory: /tmp/codewhale-test-workspace";
-        let block_width = [title.as_str(), model, directory]
-            .into_iter()
-            .map(UnicodeWidthStr::width)
-            .max()
-            .expect("startup block has lines");
-        let expected_padding = (100usize - block_width) / 2;
-        let actual_padding = text_lines[2].chars().take_while(|ch| *ch == ' ').count();
+        let context = "codewhale · /tmp/codewhale-test-workspace · no git · mcp 0";
+        let context_line = text_lines
+            .iter()
+            .find(|line| line.trim_start() == context)
+            .expect("context line");
+        let expected_padding = (100usize - UnicodeWidthStr::width(context)) / 2;
+        let actual_padding = context_line.chars().take_while(|ch| *ch == ' ').count();
 
         assert_eq!(actual_padding, expected_padding);
-        assert_eq!(text_lines[2].trim_start(), title);
-        assert_eq!(text_lines[4].trim_start(), model);
-        assert_eq!(text_lines[5].trim_start(), directory);
+    }
+
+    #[test]
+    fn underwater_launch_is_visibly_deep_and_preserves_text_cells() {
+        let mut app = create_test_app();
+        app.workspace = PathBuf::from("/tmp/codewhale-test-workspace");
+        app.model = "deepseek-v4-pro".to_string();
+
+        let area = Rect::new(0, 0, 100, 20);
+        let base = app.ui_theme.surface_bg;
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+
+        assert_ne!(buf[(0, 0)].bg, buf[(0, 19)].bg);
+        let rendered = buffer_text(&buf, area);
+        let fish_count = rendered.matches("><>").count() + rendered.matches("<><").count();
+        assert_eq!(
+            fish_count, 3,
+            "wide idle water should contain three fish:\n{rendered}"
+        );
+
+        let context = "codewhale · /tmp/codewhale-test-workspace · no git · mcp 0";
+        let context_x = ((100usize - UnicodeWidthStr::width(context)) / 2) as u16;
+        let context_cell = (0..area.height)
+            .find_map(|y| (buf[(context_x, y)].symbol() == "c").then_some((context_x, y)))
+            .expect("context line");
+        assert_eq!(
+            buf[context_cell].bg,
+            buf[(0, context_cell.1)].bg,
+            "ordinary transcript text must share its row's water color"
+        );
+        assert_ne!(
+            buf[context_cell].bg, base,
+            "the water column should continue behind ordinary text"
+        );
+    }
+
+    #[test]
+    fn compact_launch_states_that_fleet_is_ready_without_ambient_clutter() {
+        let mut app = create_test_app();
+        app.onboarding_needs_api_key = false;
+        let rendered = build_empty_state_lines(&app, Rect::new(0, 0, 40, 12))
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .map(|span| span.content.as_ref())
+            .collect::<String>();
+
+        assert!(rendered.contains("Fleet ready  /fleet setup"));
+        assert!(!rendered.contains("▗▄▄"));
+    }
+
+    #[test]
+    fn launch_hierarchy_survives_responsive_gate_sizes() {
+        for (width, height) in [(40, 12), (60, 16), (80, 24), (100, 32), (140, 40)] {
+            let mut app = create_test_app();
+            app.onboarding_needs_api_key = false;
+            app.low_motion = false;
+            app.fancy_animations = true;
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("terminal");
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    let widget = ChatWidget::new(&mut app, area);
+                    widget.render(area, frame.buffer_mut());
+                })
+                .expect("responsive idle draw");
+            let area = Rect::new(0, 0, width, height);
+            let rendered = buffer_text(terminal.backend().buffer(), area);
+
+            assert!(
+                rendered.contains("Fleet ready") && rendered.contains("/fleet setup"),
+                "Fleet readiness must remain explicit at {width}x{height}:\n{rendered}"
+            );
+            if height < 14 {
+                assert!(
+                    !rendered.contains("▗▄▄"),
+                    "the decorative whale must yield before the Fleet action at {width}x{height}"
+                );
+            } else if width >= 60 && height >= 16 {
+                assert!(
+                    rendered.contains("▗▄▄"),
+                    "the idle whale should remain visible at {width}x{height}:\n{rendered}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn flat_treatment_keeps_theme_surface_and_ambient_life() {
+        let mut app = create_test_app();
+        app.ocean_treatment = crate::tui::ocean::OceanTreatment::Flat;
+        app.low_motion = false;
+        app.fancy_animations = true;
+        let area = Rect::new(0, 0, 100, 20);
+        let base = app.ui_theme.surface_bg;
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+
+        assert_eq!(buf[(0, 0)].bg, base);
+        assert_eq!(buf[(0, 19)].bg, base, "flat keeps the plain theme surface");
+        let rendered = buffer_text(&buf, area);
+        assert!(
+            rendered.contains("><>") || rendered.contains("<><"),
+            "flat means a plain surface, not a lifeless ocean — idle fish must survive:\n{rendered}"
+        );
+        assert!(
+            (0..area.height).any(|y| (0..area.width).any(|x| buf[(x, y)].symbol() == "F")),
+            "Fleet setup remains available in flat mode"
+        );
+    }
+
+    #[test]
+    fn solarized_light_ombre_keeps_canonical_surface_and_ambient_life() {
+        let mut app = create_test_app();
+        app.ui_theme = crate::palette::SOLARIZED_LIGHT_UI_THEME;
+        app.ocean_treatment = crate::tui::ocean::OceanTreatment::Ombre;
+        app.low_motion = false;
+        app.fancy_animations = true;
+        // The old cyan-tinted ramp produced the reported #e1e9da at row 16
+        // of a common 30-row viewport.
+        let area = Rect::new(0, 0, 100, 30);
+        let canonical_base3 = Color::Rgb(0xfd, 0xf6, 0xe3);
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+
+        assert_eq!(buf[(0, 0)].bg, canonical_base3);
+        assert_eq!(
+            buf[(0, 16)].bg,
+            canonical_base3,
+            "Solarized Light must not regress to the reported #e1e9da tint"
+        );
+        assert_eq!(
+            buf[(0, 29)].bg,
+            canonical_base3,
+            "Solarized Light must keep canonical Base3 through the viewport"
+        );
+        let rendered = buffer_text(&buf, area);
+        assert!(
+            rendered.contains("><>") || rendered.contains("<><"),
+            "preserving the background must not remove ambient life:\n{rendered}"
+        );
+    }
+
+    #[test]
+    fn solarized_light_custom_background_keeps_ombre() {
+        let mut app = create_test_app();
+        let custom = Color::Rgb(0x1a, 0x1b, 0x26);
+        app.ui_theme = crate::palette::SOLARIZED_LIGHT_UI_THEME.with_background_color(custom);
+        app.ocean_treatment = crate::tui::ocean::OceanTreatment::Ombre;
+
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+
+        assert_ne!(buf[(0, 0)].bg, custom);
+        assert_ne!(
+            buf[(0, 0)].bg,
+            buf[(0, 29)].bg,
+            "custom Solarized Light backgrounds must retain ombre depth"
+        );
+    }
+
+    #[test]
+    fn terminal_owned_background_still_carries_foreground_life() {
+        let mut app = create_test_app();
+        app.ui_theme = crate::palette::TERMINAL_UI_THEME;
+        app.low_motion = false;
+        app.fancy_animations = true;
+        let area = Rect::new(0, 0, 100, 20);
+        let mut buf = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut buf);
+
+        assert!(
+            (0..area.height).all(|y| (0..area.width).all(|x| buf[(x, y)].bg == Color::Reset)),
+            "the Terminal treatment must never paint a background"
+        );
+        let rendered = buffer_text(&buf, area);
+        assert!(
+            rendered.contains("><>") || rendered.contains("<><"),
+            "Terminal keeps foreground ambient life without owning the background:\n{rendered}"
+        );
+    }
+
+    /// #4208: `CODEWHALE_ASCII_SAFE=1` must narrow every CodeWhale-authored
+    /// decorative glyph — whale mark, fish, bubble, context meter, borders,
+    /// braille state markers — across real rendered surfaces, not a
+    /// hand-picked symbol list.
+    #[test]
+    fn ascii_safe_tier_covers_whole_rendered_surfaces() {
+        let mut app = create_test_app();
+        app.low_motion = false;
+        app.fancy_animations = true;
+
+        // Idle empty water at a size that earns the whale, fish, and bubble.
+        let transcript_area = Rect::new(0, 0, 100, 32);
+        let mut transcript = Buffer::empty(transcript_area);
+        ChatWidget::new(&mut app, transcript_area).render(transcript_area, &mut transcript);
+
+        // Pre-session launch menu.
+        app.launch.visible = true;
+        let launch_area = Rect::new(0, 0, 100, 32);
+        let mut launch = Buffer::empty(launch_area);
+        crate::tui::underwater::render_launch_screen(launch_area, &mut launch, &app);
+        app.launch.visible = false;
+
+        // Header owns the route facts and the block context meter.
+        let header_area = Rect::new(0, 0, 100, 2);
+        let mut header = Buffer::empty(header_area);
+        crate::tui::underwater::render_header(header_area, &mut header, &app);
+
+        // Footer while working carries the braille state marker.
+        app.is_loading = true;
+        let footer_area = Rect::new(0, 0, 100, 1);
+        let mut footer = Buffer::empty(footer_area);
+        crate::tui::underwater::render_footer(footer_area, &mut footer, &mut app);
+        app.is_loading = false;
+
+        for (surface, buf, rect) in [
+            ("idle transcript", &transcript, transcript_area),
+            ("launch", &launch, launch_area),
+            ("header", &header, header_area),
+            ("footer", &footer, footer_area),
+        ] {
+            for y in rect.y..rect.bottom() {
+                for x in rect.x..rect.right() {
+                    let mut cell = buf[(x, y)].clone();
+                    crate::tui::color_compat::adapt_cell_symbol_for_ascii(&mut cell);
+                    assert!(
+                        cell.symbol().is_ascii(),
+                        "{surface} cell ({x},{y}) {:?} lacks an ASCII-safe alternative",
+                        buf[(x, y)].symbol()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reduced_motion_freezes_the_ocean_without_removing_depth() {
+        let mut app = create_test_app();
+        app.low_motion = true;
+        app.fancy_animations = true;
+        let area = Rect::new(0, 0, 100, 20);
+        app.ocean_started_at = Instant::now() - Duration::from_secs(2);
+        let mut first = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut first);
+
+        app.ocean_started_at = Instant::now() - Duration::from_secs(11);
+        let mut second = Buffer::empty(area);
+        ChatWidget::new(&mut app, area).render(area, &mut second);
+
+        assert_ne!(first[(0, 0)].bg, first[(0, 19)].bg);
+        assert_eq!(first[(0, 0)].bg, second[(0, 0)].bg);
+        assert_eq!(first[(11, 14)].symbol(), second[(11, 14)].symbol());
+    }
+
+    #[test]
+    fn ambient_path_reverses_without_teleporting() {
+        let step = 620;
+        let span = 11;
+        assert_eq!(ambient_ping_pong(0, step, span, 0), (0, true));
+        assert_eq!(ambient_ping_pong(step * 11, step, span, 0), (11, true));
+        let after_turn = ambient_ping_pong(step * 12, step, span, 0);
+        assert!(!after_turn.1);
+        assert!(
+            after_turn.0 >= 10,
+            "the eased turn must not jump: {after_turn:?}"
+        );
+        let near_origin = ambient_ping_pong(step * 21, step, span, 0);
+        assert!(!near_origin.1);
+        assert!(
+            near_origin.0 <= 1,
+            "the eased return should settle: {near_origin:?}"
+        );
+        assert_eq!(ambient_ping_pong(step * 22, step, span, 0), (0, true));
+    }
+
+    #[test]
+    fn fish_glyph_always_matches_screen_direction() {
+        assert_eq!(fish_mark(true), "><>");
+        assert_eq!(fish_mark(false), "<><");
+        assert!(fish_heading(8, 9, 10, false));
+        assert!(!fish_heading(10, 9, 8, true));
+        assert!(fish_heading(8, 9, 9, false));
+        assert!(!fish_heading(10, 9, 9, true));
+
+        // Mirrored tracks are the regression case: a forward path flag can
+        // correspond to decreasing screen x. Heading follows x, not the flag.
+        assert!(!fish_heading(74, 73, 72, true));
+    }
+
+    #[test]
+    fn browsing_history_keeps_fish_in_available_water() {
+        let mut app = create_test_app();
+        app.low_motion = false;
+        app.fancy_animations = true;
+        for index in 0..30 {
+            app.add_message(HistoryCell::Assistant {
+                content: format!("history row {index}"),
+                streaming: false,
+            });
+        }
+        app.viewport.transcript_scroll = TranscriptScroll::at_line(0);
+        let area = Rect::new(0, 0, 100, 20);
+        let widget = ChatWidget::new(&mut app, area);
+        assert!(widget.ambient_life);
+        assert!(widget.ocean_animated);
+
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+        assert!(
+            rendered.contains("><>") || rendered.contains("<><"),
+            "scrollback should keep fish in collision-free cells:\n{rendered}"
+        );
     }
 
     /// Probe: confirm `cell.lines_with_motion` returns no Line whose total
@@ -4658,6 +6385,7 @@ mod tests {
         let mut app = create_test_app();
         let custom = ratatui::style::Color::Rgb(26, 27, 38);
         app.ui_theme = app.ui_theme.with_background_color(custom);
+        app.ocean_treatment = crate::tui::ocean::OceanTreatment::Flat;
         app.add_message(HistoryCell::Assistant {
             content: "ready".to_string(),
             streaming: false,
@@ -4933,6 +6661,112 @@ mod tests {
             let mut buf = Buffer::empty(area);
             widget.render(area, &mut buf);
         }
+    }
+
+    #[test]
+    fn approval_inline_band_caps_at_half_the_viewport_and_keeps_actions_visible() {
+        let command = (0..24)
+            .map(|index| format!("printf command-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let request = crate::tui::approval::ApprovalRequest::new(
+            "approval-long",
+            "exec_shell",
+            "Run a long shell command",
+            &serde_json::json!({ "command": command }),
+            "exec_shell:long",
+        );
+        let view = crate::tui::approval::ApprovalView::new(request.clone());
+        let widget = ApprovalWidget::new(&request, &view);
+        let area = Rect::new(0, 0, 100, 30);
+        let region = widget.inline_region(area);
+
+        assert_eq!(region.bottom(), area.bottom());
+        assert!(region.height <= area.height.div_ceil(2), "{region:?}");
+
+        let mut buf = Buffer::empty(area);
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+        assert!(rendered.contains("[1 / y]"), "{rendered}");
+        assert!(rendered.contains("[Esc]"), "{rendered}");
+        assert!(rendered.contains("truncated"), "{rendered}");
+    }
+
+    #[test]
+    fn approval_compact_tiers_preserve_command_before_falling_back_to_details() {
+        let request = crate::tui::approval::ApprovalRequest::new(
+            "approval-tiers",
+            "exec_shell",
+            "Print a localized verification marker",
+            &serde_json::json!({ "command": "printf '安全確認'" }),
+            "exec_shell:printf",
+        );
+        let view = crate::tui::approval::ApprovalView::new(request.clone());
+        let widget = ApprovalWidget::new(&request, &view);
+
+        for area in [Rect::new(0, 0, 80, 24), Rect::new(0, 0, 60, 16)] {
+            let region = widget.inline_region(area);
+            assert_eq!(region.bottom(), area.bottom());
+            assert!(region.height < area.height, "{area:?}: {region:?}");
+
+            let mut buf = Buffer::empty(area);
+            widget.render(area, &mut buf);
+            let rendered = buffer_text(&buf, area);
+            assert!(rendered.contains("Command:"), "{area:?}: {rendered}");
+            for marker in ['安', '全', '確', '認'] {
+                assert!(rendered.contains(marker), "{area:?}: {rendered}");
+            }
+            assert!(rendered.contains("[1 / y]"), "{area:?}: {rendered}");
+            assert!(rendered.contains("[Esc]"), "{area:?}: {rendered}");
+        }
+
+        let tiny = Rect::new(0, 0, 40, 12);
+        let mut buf = Buffer::empty(tiny);
+        widget.render(tiny, &mut buf);
+        let rendered = buffer_text(&buf, tiny);
+        assert!(rendered.contains("[1 / y]"), "{rendered}");
+        assert!(rendered.contains("[Esc]"), "{rendered}");
+        assert!(
+            rendered.contains(crate::tui::shell_key_routing::tool_details_chord().as_ref()),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn approval_truncation_hint_uses_platform_details_chord_in_every_locale() {
+        let details = crate::tui::shell_key_routing::tool_details_chord();
+        for locale in Locale::shipped() {
+            let hint = approval_truncation_hint(*locale);
+            assert!(hint.contains(details.as_ref()), "{locale:?}: {hint}");
+            assert!(!hint.contains("[v]"), "{locale:?}: {hint}");
+        }
+    }
+
+    #[test]
+    fn repo_law_approval_has_distinct_authority_grammar() {
+        let request = crate::tui::approval::ApprovalRequest::new(
+            "approval-law",
+            "edit_file",
+            "Repo law holds this write: \"manifest review\" protects Cargo.toml (matched Cargo.toml, .codewhale/constitution.json)",
+            &serde_json::json!({ "path": "Cargo.toml", "old": "a", "new": "b" }),
+            "edit_file:Cargo.toml",
+        );
+        assert!(request.is_repo_law_prompt());
+        let view = crate::tui::approval::ApprovalView::new(request.clone());
+        let widget = ApprovalWidget::new(&request, &view);
+        let area = Rect::new(0, 0, 120, 30);
+        let mut buf = Buffer::empty(area);
+
+        widget.render(area, &mut buf);
+        let rendered = buffer_text(&buf, area);
+        assert!(rendered.contains("REPO LAW"), "{rendered}");
+        assert!(rendered.contains("Repository constitution"), "{rendered}");
+        assert!(rendered.contains("approval-gated postures"), "{rendered}");
+        assert!(rendered.contains("Cargo.toml"), "{rendered}");
+        assert!((0..area.height).any(|y| {
+            let cell = &buf[(1, y)];
+            cell.symbol() == "═" && cell.fg == palette::STATUS_WARNING
+        }));
     }
 
     #[test]
@@ -5229,7 +7063,7 @@ diff --git a/src/b.rs b/src/b.rs\n\
             "apply_patch",
             "Apply a patch",
             &serde_json::json!({
-                "changes": [
+                "replace": [
                     { "path": "src/a.rs", "content": "a" },
                     { "path": "src/b.rs", "content": "b" },
                     { "path": "src/c.rs", "content": "c" },
@@ -5339,9 +7173,15 @@ diff --git a/src/b.rs b/src/b.rs\n\
         widget.render(area, &mut buf);
         let rendered = buffer_text(&buf, area);
 
-        // The change preview renders (bounded), and the action row is reserved
-        // off the bottom of the band so it can never be clipped (#3799).
+        // At 20 rows the compact band preserves both a load-bearing preview
+        // row and the complete action set.
         assert!(rendered.contains("Preview:"), "{rendered}");
+        assert!(rendered.contains("+new"), "{rendered}");
+        assert!(rendered.contains("truncated"), "{rendered}");
+        assert!(
+            rendered.contains(crate::tui::shell_key_routing::tool_details_chord().as_ref()),
+            "{rendered}"
+        );
         assert!(rendered.contains("[1 / y]"), "{rendered}");
         assert!(rendered.contains("[3 / d / n]"), "{rendered}");
     }
@@ -5405,10 +7245,15 @@ diff --git a/src/b.rs b/src/b.rs\n\
             !rendered.contains("Impact: Command"),
             "command should only render in the command block:\n{rendered}"
         );
-        // The command is the prioritized body content, so it stays visible even
-        // when the band is short and secondary context scrolls away.
+        // The compact band keeps the transcript visible without hiding the
+        // load-bearing command; full content remains one details chord away.
         assert!(rendered.contains("Command:"), "{rendered}");
         assert!(rendered.contains("cargo clippy"), "{rendered}");
+        assert!(rendered.contains("truncated"), "{rendered}");
+        assert!(
+            rendered.contains(crate::tui::shell_key_routing::tool_details_chord().as_ref()),
+            "{rendered}"
+        );
         // Action row is reserved off the bottom and always visible (#3799).
         assert!(rendered.contains("[1 / y]"), "{rendered}");
         assert!(rendered.contains("[2 / a]"), "{rendered}");
@@ -5589,5 +7434,22 @@ diff --git a/src/b.rs b/src/b.rs\n\
             has_placeholder_like_text,
             "some non-empty text should render as placeholder"
         );
+    }
+
+    #[test]
+    fn receipt_settle_cascade_is_bounded_and_ordered() {
+        assert!(receipt_is_settling(0, 0));
+        assert!(!receipt_is_settling(0, 140));
+        assert!(receipt_is_settling(1, 140));
+        assert!(!receipt_is_settling(6, 560));
+        assert!(!receipt_is_settling(60, 560));
+    }
+
+    #[test]
+    fn fish_flee_is_one_shot_and_returns_to_ambient_origin() {
+        assert_eq!(fish_flee_offset(0), 0);
+        assert!(fish_flee_offset(400) >= 8);
+        assert_eq!(fish_flee_offset(800), 0);
+        assert_eq!(fish_flee_offset(8_000), 0);
     }
 }

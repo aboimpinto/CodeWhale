@@ -13,12 +13,17 @@ use uuid::Uuid;
 use crate::command_safety::{SafetyLevel, analyze_command};
 use crate::dependencies::ExternalTool;
 use crate::task_manager::{
-    NewTaskRequest, TaskArtifactRef, TaskAttemptRecord, TaskGateRecord, TaskRecord,
+    NewTaskRequest, TaskArtifactRef, TaskAttemptRecord, TaskCancelDisposition, TaskGateRecord,
+    TaskRecord,
 };
 use crate::tools::shell::{ExecShellTool, ShellWaitTool};
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_bool, optional_str, optional_u64, required_str,
+};
+use crate::work_graph::{
+    CancelOutcome, OperationIntent, OperationObservation, OperationOwnerSnapshot, OwnerState,
+    task_owner_snapshot,
 };
 
 const MAX_SUMMARY_CHARS: usize = 900;
@@ -98,8 +103,9 @@ impl ToolSpec for TaskCreateTool {
         let workspace = optional_str(&input, "workspace")
             .map(PathBuf::from)
             .unwrap_or_else(|| context.workspace.clone());
+        let prompt = required_str(&input, "prompt")?.to_string();
         let req = NewTaskRequest {
-            prompt: required_str(&input, "prompt")?.to_string(),
+            prompt: prompt.clone(),
             model: optional_str(&input, "model").map(ToString::to_string),
             workspace: Some(workspace),
             mode: optional_str(&input, "mode").map(ToString::to_string),
@@ -107,11 +113,42 @@ impl ToolSpec for TaskCreateTool {
             trust_mode: input.get("trust_mode").and_then(Value::as_bool),
             auto_approve: input.get("auto_approve").and_then(Value::as_bool),
         };
-        let task = manager
-            .add_task(req)
-            .await
-            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        task_result("task_create", &task)
+        let task_id = crate::task_manager::TaskManager::new_task_id();
+        if let Some(work) = context.runtime.work.as_ref() {
+            work.register_operation(
+                &context.state_namespace,
+                OperationIntent::new(
+                    format!("task:{task_id}"),
+                    prompt,
+                    true,
+                    "task_create",
+                    &task_id,
+                ),
+            )
+            .map_err(ToolError::execution_failed)?;
+        }
+        let task = match manager.add_task_with_id(req, task_id.clone()).await {
+            Ok(task) => task,
+            Err(err) => {
+                if let Some(work) = context.runtime.work.as_ref() {
+                    let _ = work.reconcile_operation(
+                        &context.state_namespace,
+                        OperationOwnerSnapshot::new(
+                            format!("task:{task_id}"),
+                            OwnerState::Failed,
+                            1,
+                            Utc::now().timestamp_millis(),
+                        ),
+                    );
+                }
+                return Err(ToolError::execution_failed(err.to_string()));
+            }
+        };
+        let lifecycle_warning = reconcile_task_record(context, &task).err().map(|err| {
+            tracing::warn!(task_id = %task.id, error = %err, "task was created but Work lifecycle reconciliation failed");
+            err.to_string()
+        });
+        task_result_with_lifecycle_warning("task_create", &task, lifecycle_warning.as_deref())
     }
 }
 
@@ -237,12 +274,64 @@ impl ToolSpec for TaskCancelTool {
             .task_manager
             .as_ref()
             .ok_or_else(|| ToolError::not_available("TaskManager is not attached"))?;
-        let task = manager
+        let cancellation = manager
             .cancel_task(required_str(&input, "task_id")?)
             .await
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
-        task_result("task_cancel", &task)
+        let task = cancellation.task;
+        let cancel_outcome = match cancellation.disposition {
+            TaskCancelDisposition::Forced => CancelOutcome::Forced,
+            TaskCancelDisposition::Requested => CancelOutcome::Requested,
+            TaskCancelDisposition::AlreadyFinished => CancelOutcome::AlreadyFinished,
+        };
+        let mut lifecycle_warnings = Vec::new();
+        if let Some(work) = context.runtime.work.as_ref() {
+            let external = format!("task:{}", task.id);
+            if work.has_operation_binding(Some(&context.state_namespace), &external)
+                && let Err(err) = work.reconcile_observation(
+                    &context.state_namespace,
+                    &external,
+                    OperationObservation::CancelUpdate {
+                        outcome: cancel_outcome,
+                        at: Utc::now().timestamp_millis(),
+                    },
+                )
+            {
+                tracing::warn!(task_id = %task.id, error = %err, "task was cancelled but Work cancel reconciliation failed");
+                lifecycle_warnings.push(err);
+            }
+        }
+        if let Err(err) = reconcile_task_record(context, &task) {
+            tracing::warn!(task_id = %task.id, error = %err, "task cancellation succeeded but owner-state reconciliation failed");
+            lifecycle_warnings.push(err.to_string());
+        }
+        let lifecycle_warning =
+            (!lifecycle_warnings.is_empty()).then(|| lifecycle_warnings.join("; "));
+        task_result_with_lifecycle_warning("task_cancel", &task, lifecycle_warning.as_deref())
     }
+}
+
+fn reconcile_task_record(context: &ToolContext, task: &TaskRecord) -> Result<(), ToolError> {
+    let Some(work) = context.runtime.work.as_ref() else {
+        return Ok(());
+    };
+    let external = format!("task:{}", task.id);
+    if !work.has_operation_binding(Some(&context.state_namespace), &external) {
+        return Ok(());
+    }
+    work.reconcile_operation(
+        &context.state_namespace,
+        task_owner_snapshot(
+            &task.id,
+            task.status,
+            task.lifecycle_seq,
+            task.created_at,
+            task.started_at,
+            task.ended_at,
+        ),
+    )
+    .map(|_| ())
+    .map_err(ToolError::execution_failed)
 }
 
 #[async_trait]
@@ -353,7 +442,7 @@ impl ToolSpec for TaskGateRunTool {
             "failed"
         };
         let classification = classify_gate_failure(&gate, status, timed_out, &stderr, &stdout);
-        let log_path = write_runtime_artifact(context, "gate", &full_log)?;
+        let log_path = write_runtime_artifact(context, "gate", &full_log).await?;
         let gate_record = TaskGateRecord {
             id: format!("gate_{}", &Uuid::new_v4().to_string()[..8]),
             gate: gate.clone(),
@@ -521,7 +610,7 @@ impl ToolSpec for TaskShellWaitTool {
             .and_then(Value::as_u64)
             .unwrap_or_default();
         let command = optional_str(&input, "command").unwrap_or("(background shell)");
-        let log_path = write_runtime_artifact(context, "background_gate", &result.content)?;
+        let log_path = write_runtime_artifact(context, "background_gate", &result.content).await?;
         let gate_status = if exit_code == Some(0) {
             "passed"
         } else if status == "TimedOut" {
@@ -594,21 +683,26 @@ impl ToolSpec for PrAttemptRecordTool {
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
         let task_id = task_id_from_input_or_context(&input, context)?;
-        let base_sha = git_output(&context.workspace, &["rev-parse", "HEAD"]).ok();
+        let base_sha = git_output(&context.workspace, &["rev-parse", "HEAD"])
+            .await
+            .ok();
         let head_sha = base_sha.clone();
-        let branch = git_output(&context.workspace, &["rev-parse", "--abbrev-ref", "HEAD"]).ok();
-        let diff = git_output(&context.workspace, &["diff", "--binary", "--no-color"])?;
+        let branch = git_output(&context.workspace, &["rev-parse", "--abbrev-ref", "HEAD"])
+            .await
+            .ok();
+        let diff = git_output(&context.workspace, &["diff", "--binary", "--no-color"]).await?;
         if diff.trim().is_empty() {
             return Ok(ToolResult::error(
                 "No working-tree diff to record as an attempt.",
             ));
         }
-        let changed_files = git_output(&context.workspace, &["diff", "--name-only"])?
+        let changed_files = git_output(&context.workspace, &["diff", "--name-only"])
+            .await?
             .lines()
             .filter(|line| !line.trim().is_empty())
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        let patch_path = write_task_artifact_for(context, &task_id, "attempt_patch", &diff)?;
+        let patch_path = write_task_artifact_for(context, &task_id, "attempt_patch", &diff).await?;
         let attempt = TaskAttemptRecord {
             id: format!("attempt_{}", &Uuid::new_v4().to_string()[..8]),
             attempt_group_id: optional_str(&input, "attempt_group_id")
@@ -776,6 +870,9 @@ impl ToolSpec for PrAttemptPreflightTool {
         })
         .await
         .map_err(|join_err| {
+            // Surface the otherwise-discarded join error for debugging; the
+            // returned ToolError (and thus user-facing behavior) is unchanged.
+            tracing::debug!(error = %join_err, "git apply --check spawn_blocking task failed to join");
             ToolError::execution_failed(format!("git apply --check panicked: {join_err}"))
         })?
         .map_err(|e| ToolError::execution_failed(format!("git apply --check failed: {e}")))?;
@@ -795,9 +892,18 @@ impl ToolSpec for PrAttemptPreflightTool {
 }
 
 fn task_result(label: &str, task: &TaskRecord) -> Result<ToolResult, ToolError> {
+    task_result_with_lifecycle_warning(label, task, None)
+}
+
+fn task_result_with_lifecycle_warning(
+    label: &str,
+    task: &TaskRecord,
+    lifecycle_warning: Option<&str>,
+) -> Result<ToolResult, ToolError> {
     ToolResult::json(&json!({
         "summary": format!("{label}: {} ({:?})", task.id, task.status),
         "task": task,
+        "lifecycle_warning": lifecycle_warning,
     }))
     .map_err(|e| ToolError::execution_failed(e.to_string()))
 }
@@ -818,7 +924,7 @@ fn resolve_cwd(context: &ToolContext, raw: Option<&str>) -> Result<PathBuf, Tool
     }
 }
 
-fn write_runtime_artifact(
+async fn write_runtime_artifact(
     context: &ToolContext,
     label: &str,
     content: &str,
@@ -837,16 +943,27 @@ fn write_runtime_artifact(
         return Ok(None);
     };
     let artifact_dir = data_dir.join("artifacts").join(task_id);
-    std::fs::create_dir_all(&artifact_dir)
-        .map_err(|e| ToolError::execution_failed(format!("create artifact dir: {e}")))?;
     let filename = format!(
         "{}_{}.txt",
         Utc::now().format("%Y%m%dT%H%M%S%.3fZ"),
         sanitize_filename(label)
     );
     let absolute = artifact_dir.join(filename);
-    std::fs::write(&absolute, content)
-        .map_err(|e| ToolError::execution_failed(format!("write artifact: {e}")))?;
+    let content_owned = content.to_owned();
+    let abs = absolute.clone();
+    tokio::task::spawn_blocking(move || {
+        std::fs::create_dir_all(&artifact_dir)?;
+        std::fs::write(&abs, content_owned)?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .map_err(|e| {
+        // Surface the otherwise-discarded join error for debugging; the
+        // returned ToolError (and thus user-facing behavior) is unchanged.
+        tracing::debug!(error = %e, "artifact write spawn_blocking task failed to join");
+        ToolError::execution_failed(format!("artifact write task panicked: {e}"))
+    })?
+    .map_err(|e| ToolError::execution_failed(format!("write artifact: {e}")))?;
     Ok(Some(
         absolute
             .strip_prefix(data_dir)
@@ -855,7 +972,7 @@ fn write_runtime_artifact(
     ))
 }
 
-fn write_task_artifact_for(
+async fn write_task_artifact_for(
     context: &ToolContext,
     task_id: &str,
     label: &str,
@@ -870,7 +987,7 @@ fn write_task_artifact_for(
     if context.runtime.active_task_id.as_deref() != Some(task_id) {
         return Ok(None);
     }
-    write_runtime_artifact(context, label, content)
+    write_runtime_artifact(context, label, content).await
 }
 
 fn artifact_updates(label: &str, path: Option<PathBuf>, summary: &str) -> Value {
@@ -923,9 +1040,21 @@ fn task_id_schema() -> Value {
     })
 }
 
-fn git_output(workspace: &Path, args: &[&str]) -> Result<String, ToolError> {
-    let out = crate::dependencies::Git::output(args, workspace)
-        .map_err(|e| ToolError::execution_failed(format!("failed to run git: {e}")))?;
+async fn git_output(workspace: &Path, args: &[&str]) -> Result<String, ToolError> {
+    let args_owned: Vec<String> = args.iter().map(|s| (*s).to_owned()).collect();
+    let cwd = workspace.to_path_buf();
+    let out = tokio::task::spawn_blocking(move || {
+        let arg_refs: Vec<&str> = args_owned.iter().map(String::as_str).collect();
+        crate::dependencies::Git::output(&arg_refs, &cwd)
+    })
+    .await
+    .map_err(|e| {
+        // Surface the otherwise-discarded join error for debugging; the
+        // returned ToolError (and thus user-facing behavior) is unchanged.
+        tracing::debug!(error = %e, "git spawn_blocking task failed to join");
+        ToolError::execution_failed(format!("git task panicked: {e}"))
+    })?
+    .map_err(|e| ToolError::execution_failed(format!("failed to run git: {e}")))?;
     if !out.status.success() {
         return Err(ToolError::execution_failed(format!(
             "git {} failed: {}",

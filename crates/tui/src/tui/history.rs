@@ -14,6 +14,7 @@ use crate::tools::plan::PlanSnapshot;
 use crate::tools::review::ReviewOutput;
 use crate::tui::app::TranscriptSpacing;
 use crate::tui::diff_render;
+use crate::tui::ui_text::CopyLineSeparator;
 
 mod agent_activity;
 mod archived_context;
@@ -34,9 +35,9 @@ use checklist::{
 #[cfg(test)]
 use checklist::{ChecklistChange, ChecklistItemSnapshot, ChecklistSnapshot};
 use constants::{
-    ASSISTANT_GLYPH, TOOL_CARD_SUMMARY_LINES, TOOL_COMMAND_LINE_LIMIT, TOOL_DONE_SYMBOL,
-    TOOL_FAILED_SYMBOL, TOOL_HEADER_SUMMARY_LIMIT, TOOL_OUTPUT_LINE_LIMIT, TRANSCRIPT_RAIL,
-    USER_GLYPH,
+    ASSISTANT_GLYPH, FOREGROUND_SHELL_WAIT_HINT, TOOL_CARD_SUMMARY_LINES, TOOL_COMMAND_LINE_LIMIT,
+    TOOL_DONE_SYMBOL, TOOL_FAILED_SYMBOL, TOOL_HEADER_SUMMARY_LIMIT, TOOL_OUTPUT_LINE_LIMIT,
+    TRANSCRIPT_RAIL, USER_GLYPH,
 };
 #[cfg(test)]
 use constants::{TOOL_RUNNING_SYMBOLS, TOOL_STATUS_SYMBOL_MS};
@@ -55,7 +56,9 @@ pub use plan::PlanUpdateCell;
 use thinking::extract_reasoning_summary;
 #[cfg(test)]
 use tool_run::ToolRunActivitySummary;
-pub use tool_run::{ToolRun, detect_tool_runs, detect_tool_runs_from_slices, tool_run_summary};
+#[cfg(test)]
+pub use tool_run::detect_tool_runs;
+pub use tool_run::{ToolRun, detect_tool_runs_from_slices, tool_run_summary};
 
 #[cfg(test)]
 use thinking::{REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL};
@@ -239,6 +242,7 @@ impl HistoryCell {
         }
     }
 
+    #[allow(dead_code)] // retained for focused/detail renderers and direct rendering tests
     pub fn lines_with_options(
         &self,
         width: u16,
@@ -357,6 +361,19 @@ impl HistoryCell {
                     width,
                 )
             }
+            HistoryCell::Tool(_) => self
+                .lines_with_options_folded(width, options, folded)
+                .into_iter()
+                .map(|line| {
+                    let copy_prefix_width = tool_copy_prefix_width(&line);
+                    RenderedTranscriptLine {
+                        line,
+                        links: Vec::new(),
+                        copy_prefix_width,
+                        copy_separator_after: CopyLineSeparator::Newline,
+                    }
+                })
+                .collect(),
             _ => hard_break_copy_lines(self.lines_with_options_folded(width, options, folded)),
         }
     }
@@ -430,11 +447,23 @@ impl HistoryCell {
 /// Convert a message into history cells for rendering.
 #[must_use]
 pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
+    if let Some(display) = crate::runtime_handoff::restored_subagent_checkpoint_display(msg) {
+        return vec![HistoryCell::System {
+            content: display.to_string(),
+        }];
+    }
+
     let mut cells = Vec::new();
 
     for block in &msg.content {
         match block {
             ContentBlock::Text { text, .. } => {
+                if text.starts_with("[tool_history_repair]") {
+                    cells.push(HistoryCell::System {
+                        content: text.clone(),
+                    });
+                    continue;
+                }
                 // Check if this is an `<archived_context>` block.
                 if msg.role == "assistant"
                     && let Some(archived) = parse_archived_context(text)
@@ -656,6 +685,13 @@ impl ExecCell {
         self.render(width, low_motion, RenderMode::Live)
     }
 
+    /// Foreground `exec_shell` blocking the turn — eligible for Ctrl+B detach.
+    fn is_foreground_shell_wait(&self) -> bool {
+        self.status == ToolStatus::Running
+            && self.source == ExecSource::Assistant
+            && self.interaction.is_none()
+    }
+
     pub(super) fn render(
         &self,
         width: u16,
@@ -664,10 +700,14 @@ impl ExecCell {
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         let command_summary = command_header_summary(&self.command);
-        let header_summary = self
-            .interaction
-            .as_deref()
-            .or(Some(command_summary.as_str()));
+        let compact_foreground_wait = self.is_foreground_shell_wait();
+        let header_summary = if compact_foreground_wait {
+            Some(FOREGROUND_SHELL_WAIT_HINT)
+        } else {
+            self.interaction
+                .as_deref()
+                .or(Some(command_summary.as_str()))
+        };
         lines.push(render_tool_header_with_summary(
             "Shell",
             header_summary,
@@ -676,6 +716,14 @@ impl ExecCell {
             self.started_at,
             low_motion,
         ));
+
+        // Foreground shell waits block the turn but do not need a verbose
+        // transcript card — spinner + running badge + Ctrl+B hint only.
+        // Command, live output, and artifact paths belong in the Activity sidebar
+        // and `/jobs` detail surfaces.
+        if compact_foreground_wait {
+            return wrap_card_rail(lines);
+        }
 
         // A successful shell call is rarely worth its full body — collapse it
         // to the single header line in live mode. The bottom shell strip owns
@@ -806,14 +854,23 @@ impl ExploringCell {
             ToolStatus::Running
         };
         let header_summary = exploring_header_summary(&self.entries);
-        lines.push(render_tool_header_with_summary(
-            "Workspace",
+        let multi_entry = self.entries.len() > 1;
+        let header_state = if multi_entry {
+            ""
+        } else if all_done {
+            tool_status_label(status)
+        } else {
+            "running"
+        };
+        // Search-only exploration cards read with the `find` verb so a
+        // completed grep renders `find done · Searching for …` instead of the
+        // incoherent `read done · Searching …` (#4145). Read/list or mixed
+        // cards keep the neutral `read` verb the Workspace card has always used.
+        let family = exploring_card_family(&self.entries);
+        lines.push(render_tool_header_with_family_and_summary(
+            family,
             header_summary.as_deref(),
-            if all_done {
-                tool_status_label(status)
-            } else {
-                "running"
-            },
+            header_state,
             status,
             None,
             low_motion,
@@ -849,23 +906,32 @@ impl ExploringCell {
             );
             lines.push(Line::styled(
                 format!("  {dots}  {counts}"),
-                Style::default().fg(palette::DEEPSEEK_SKY),
+                Style::default().fg(palette::WHALE_INFO),
             ));
         }
 
         for entry in &self.entries {
-            let prefix = match entry.status {
-                ToolStatus::Running => "live",
-                ToolStatus::Success => "done",
-                ToolStatus::Hydrated => "loaded",
-                ToolStatus::Failed => "issue",
-            };
-            lines.extend(render_compact_kv(
-                prefix,
-                &entry.label,
-                tool_value_style(),
-                width,
-            ));
+            if multi_entry {
+                lines.extend(render_card_detail_line(
+                    None,
+                    &entry.label,
+                    tool_value_style(),
+                    width,
+                ));
+            } else {
+                let prefix = match entry.status {
+                    ToolStatus::Running => "live",
+                    ToolStatus::Success => "done",
+                    ToolStatus::Hydrated => "loaded",
+                    ToolStatus::Failed => "issue",
+                };
+                lines.extend(render_compact_kv(
+                    prefix,
+                    &entry.label,
+                    tool_value_style(),
+                    width,
+                ));
+            }
         }
         lines
     }
@@ -998,7 +1064,7 @@ impl ReviewCell {
         lines.push(Line::from(Span::styled(
             "Issues",
             Style::default()
-                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .fg(palette::WHALE_ACTION)
                 .add_modifier(Modifier::BOLD),
         )));
         if output.issues.is_empty() {
@@ -1032,7 +1098,7 @@ impl ReviewCell {
         lines.push(Line::from(Span::styled(
             "Suggestions",
             Style::default()
-                .fg(palette::WHALE_ACCENT_PRIMARY)
+                .fg(palette::WHALE_ACTION)
                 .add_modifier(Modifier::BOLD),
         )));
         if output.suggestions.is_empty() {
@@ -1182,6 +1248,9 @@ pub struct WebSearchCell {
     pub query: String,
     pub status: ToolStatus,
     pub summary: Option<String>,
+    pub source: Option<String>,
+    pub degraded: Option<String>,
+    pub ref_count: usize,
 }
 
 impl WebSearchCell {
@@ -1202,6 +1271,30 @@ impl WebSearchCell {
             tool_value_style(),
             width,
         ));
+        if let Some(source) = self.source.as_ref() {
+            lines.extend(render_compact_kv(
+                "source",
+                source,
+                tool_value_style(),
+                width,
+            ));
+        }
+        if let Some(degraded) = self.degraded.as_ref() {
+            lines.extend(render_compact_kv(
+                "degraded",
+                degraded,
+                tool_value_style(),
+                width,
+            ));
+        }
+        if self.ref_count > 0 {
+            lines.extend(render_compact_kv(
+                "citations",
+                &self.ref_count.to_string(),
+                tool_value_style(),
+                width,
+            ));
+        }
         if let Some(summary) = self.summary.as_ref() {
             lines.extend(render_compact_kv(
                 "result",
@@ -1272,15 +1365,43 @@ impl GenericToolCell {
             return lines;
         }
 
+        // #4038 / #4122: purpose-built workflow run card (compact in live,
+        // expanded in transcript) shared with the WorkflowPanel state machine.
+        if let Some(lines) = self.try_render_as_workflow(width, low_motion, mode) {
+            return lines;
+        }
+
         // Sub-agent launch already gets a dedicated `DelegateCard`
-        // that owns the live action tree, status, and final summary. The
-        // generic tool block for the same call duplicates that signal at
-        // 3-4 lines per spawn — N parallel spawns multiply the noise. In
-        // live mode, render one compact summary line and let the
-        // DelegateCard be the source of truth. Transcript mode keeps the
-        // full block so session replay remains complete.
-        if matches!(mode, RenderMode::Live) && self.name == "agent" {
-            return agent_activity::render_agent_compact(self, low_motion);
+        // that owns the live action tree, status, and final summary (#4133).
+        // Spawns therefore render nothing here in either mode — one visible
+        // artifact per delegated unit. Inspection/join calls (peek/status/
+        // wait) stay as a single compact line (#4112 dogfood A5).
+        if self.name == "agent" {
+            if agent_activity::is_agent_inspection(self) {
+                return agent_activity::render_agent_compact(self, low_motion);
+            }
+            // Spawn / start / run: suppress the generic tool card entirely.
+            return Vec::new();
+        }
+
+        // A call to a tool that doesn't exist carries exactly one useful
+        // fact: the catalog error. The full name:/args:/result: block turns
+        // each model slip into a four-line card (dogfood A5) — collapse it
+        // to a single header line in both render modes.
+        if self.status == ToolStatus::Failed
+            && let Some(output) = self.output.as_deref()
+            && output.contains("is not available in the current tool catalog")
+        {
+            let family = crate::tui::widgets::tool_card::tool_family_for_name(&self.name);
+            let summary = truncate_text(output.trim(), 200);
+            return wrap_card_rail(vec![render_tool_header_with_family_and_summary(
+                family,
+                Some(summary.as_str()),
+                tool_status_label(self.status),
+                self.status,
+                None,
+                low_motion,
+            )]);
         }
 
         // Live mode stays calm: successful tool calls collapse to one header
@@ -1449,6 +1570,140 @@ impl GenericToolCell {
             mode,
         ))
     }
+
+    /// Render the `workflow` tool via the shared WorkflowPanel history-card
+    /// renderer (#4122). Live mode stays compact (lifecycle, children, phases,
+    /// failures, elapsed); transcript mode expands phase/child summaries,
+    /// artifact/transcript links, final result, and failure details.
+    /// Status-list payloads keep a multi-run summary card.
+    fn try_render_as_workflow(
+        &self,
+        width: u16,
+        low_motion: bool,
+        mode: RenderMode,
+    ) -> Option<Vec<Line<'static>>> {
+        if self.name != "workflow" {
+            return None;
+        }
+        let output = self.output.as_ref()?;
+        let value: serde_json::Value = serde_json::from_str(output).ok()?;
+        let is_status_list =
+            value.get("action").and_then(serde_json::Value::as_str) == Some("status");
+        if value.get("run_id").is_none() && !is_status_list {
+            return None;
+        }
+        let family = crate::tui::widgets::tool_card::tool_family_for_name("workflow");
+        let mut lines = Vec::new();
+
+        if is_status_list {
+            let runs = value.get("runs").and_then(serde_json::Value::as_array);
+            let count = value
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_else(|| runs.map(|r| r.len() as u64).unwrap_or(0));
+            let header = format!("{count} run(s)");
+            lines.push(render_tool_header_with_family_and_summary(
+                family,
+                Some(header.as_str()),
+                tool_status_label(self.status),
+                self.status,
+                None,
+                low_motion,
+            ));
+            if let Some(runs) = runs {
+                for run in runs {
+                    let run_id = run
+                        .get("run_id")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let status = run
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("?");
+                    let children = run
+                        .get("child_count")
+                        .and_then(serde_json::Value::as_u64)
+                        .or_else(|| {
+                            run.get("child_ids")
+                                .and_then(serde_json::Value::as_array)
+                                .map(|a| a.len() as u64)
+                        })
+                        .unwrap_or(0);
+                    lines.extend(render_card_detail_line(
+                        None,
+                        &format!("{run_id} · {status} · {children} child(ren)"),
+                        tool_value_style(),
+                        width,
+                    ));
+                }
+            }
+            return Some(wrap_card_rail(lines));
+        }
+
+        use crate::tui::widgets::workflow_panel::{WorkflowHistoryExtras, WorkflowPanel};
+        let panel = WorkflowPanel::from_run_json(&value)?;
+        // Prefer the panel's lifecycle-aware status label when the tool cell
+        // is still marked running but the snapshot already terminal (or vice
+        // versa during live streaming).
+        let header_status = match panel.lifecycle {
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Failed
+            | crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Cancelled => {
+                ToolStatus::Failed
+            }
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Succeeded => {
+                ToolStatus::Success
+            }
+            crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Pending
+            | crate::tui::widgets::workflow_panel::WorkflowPanelLifecycle::Running => {
+                if self.status == ToolStatus::Failed {
+                    ToolStatus::Failed
+                } else if self.status == ToolStatus::Success {
+                    ToolStatus::Success
+                } else {
+                    ToolStatus::Running
+                }
+            }
+        };
+        let summary = panel.history_header_summary(usize::from(width).saturating_sub(18));
+        lines.push(render_tool_header_with_family_and_summary(
+            family,
+            Some(summary.as_str()),
+            tool_status_label(header_status),
+            header_status,
+            None,
+            low_motion,
+        ));
+        let expanded = matches!(mode, RenderMode::Transcript);
+        if expanded {
+            let extras = WorkflowHistoryExtras {
+                result_summary: panel.result_summary.clone(),
+                source_path: panel.source_path.clone().or_else(|| {
+                    value
+                        .get("source_path")
+                        .and_then(serde_json::Value::as_str)
+                        .map(std::path::PathBuf::from)
+                }),
+                spillover_path: self.spillover_path.clone(),
+                verification_summary: value
+                    .get("verification")
+                    .and_then(|v| v.get("summary"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string),
+            };
+            for detail in panel.history_expanded_lines(width, &extras) {
+                // history_expanded_lines omit the leading indent; re-use the
+                // card detail path so rails and spacing stay consistent.
+                let text: String = detail.spans.iter().map(|s| s.content.as_ref()).collect();
+                lines.extend(render_card_detail_line(
+                    None,
+                    &text,
+                    tool_value_style(),
+                    width,
+                ));
+            }
+        }
+        Some(wrap_card_rail(lines))
+    }
 }
 
 /// Render the inline annotation for a tool cell whose full output was
@@ -1519,6 +1774,24 @@ fn exploring_header_summary(entries: &[ExploringEntry]) -> Option<String> {
     }
 }
 
+/// Choose the verb family for an exploring card's header. A card whose entries
+/// are all searches reads with the `find` verb so the completed action agrees
+/// with its `Searching for …` labels (#4145); every other exploration mix keeps
+/// the neutral `read` verb the Workspace card uses. The search signal is the
+/// English label prefix produced by `exploring_label` in `tool_routing`.
+fn exploring_card_family(entries: &[ExploringEntry]) -> crate::tui::widgets::tool_card::ToolFamily {
+    use crate::tui::widgets::tool_card::ToolFamily;
+    let all_search = !entries.is_empty()
+        && entries
+            .iter()
+            .all(|entry| entry.label.starts_with("Searching"));
+    if all_search {
+        ToolFamily::Find
+    } else {
+        ToolFamily::Read
+    }
+}
+
 fn render_compact_kv(label: &str, value: &str, style: Style, width: u16) -> Vec<Line<'static>> {
     render_card_detail_line(Some(label.trim_end_matches(':')), value, style, width)
 }
@@ -1546,6 +1819,69 @@ fn wrap_card_rail(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
         line.spans.insert(0, Span::raw(rail));
     }
     lines
+}
+
+/// Return the width of tool-cell chrome that remains after the transcript
+/// cache removes the cell-local card rail. Tool headers have two additional
+/// visual tokens (`✓`/spinner and the family glyph); detail rows have the
+/// thin transcript rail. Keeping this width with the rendered line avoids
+/// making selection copy infer chrome from glyph ranges, which can consume
+/// real code or CJK text that happens to begin with a box-drawing character.
+fn tool_copy_prefix_width(line: &Line<'static>) -> usize {
+    let spans = line.spans.as_slice();
+    let mut index = 0;
+
+    // The cache removes these exact local card rails before flattening.
+    if spans
+        .first()
+        .is_some_and(|span| matches!(span.content.as_ref(), "─ " | "╭ " | "│ " | "╰ "))
+    {
+        index = 1;
+    }
+
+    // Detail rows and pager affordances use the transcript rail as their
+    // first span. The live transcript's general rail accounting removes it;
+    // do not report it again as cell-local copy chrome.
+    if spans
+        .get(index)
+        .is_some_and(|span| span.content.as_ref() == TRANSCRIPT_RAIL)
+    {
+        return 0;
+    }
+
+    // A tool header starts with `<status> <family> `. Only consume this
+    // pair when both tokens are present, so output beginning with `✓` or a
+    // braille character remains copyable content.
+    let Some(status) = spans.get(index).map(|span| span.content.as_ref()) else {
+        return 0;
+    };
+    let Some(family) = spans.get(index + 1).map(|span| span.content.as_ref()) else {
+        return 0;
+    };
+    if !status.ends_with(' ')
+        || !is_tool_status_glyph(status.trim_end())
+        || !family.ends_with(' ')
+        || UnicodeWidthStr::width(family.trim_end()) != 1
+    {
+        return 0;
+    }
+
+    UnicodeWidthStr::width(status) + UnicodeWidthStr::width(family)
+}
+
+fn is_tool_status_glyph(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(ch) = chars.next() else {
+        return false;
+    };
+    chars.next().is_none()
+        && matches!(
+            ch,
+            '\u{2713}' // ✓
+                | '\u{2715}' // ✕
+                | '\u{00B7}' // ·
+                | '\u{2800}'..='\u{28FF}' // braille spinner frames
+        )
 }
 
 fn review_severity_color(severity: &str) -> Color {
@@ -1577,7 +1913,7 @@ fn is_cycle_boundary(content: &str) -> bool {
 /// horizontal rule above for visual separation.
 fn render_cycle_boundary(content: &str, width: u16) -> Vec<Line<'static>> {
     let style = Style::default()
-        .fg(palette::WHALE_ACCENT_PRIMARY)
+        .fg(palette::WHALE_ACTION)
         .add_modifier(Modifier::BOLD);
     let rule_style = Style::default().fg(palette::TEXT_DIM);
     let content_width = usize::from(width.saturating_sub(2).max(1));
@@ -1602,8 +1938,16 @@ fn render_cycle_boundary(content: &str, width: u16) -> Vec<Line<'static>> {
     lines
 }
 
-fn status_symbol(started_at: Option<Instant>, status: ToolStatus, low_motion: bool) -> String {
+fn status_symbol(
+    started_at: Option<Instant>,
+    status: ToolStatus,
+    low_motion: bool,
+    family: crate::tui::widgets::tool_card::ToolFamily,
+) -> String {
     match status {
+        ToolStatus::Running if family == crate::tui::widgets::tool_card::ToolFamily::Verify => {
+            crate::tui::spinner::verification_tick_frame(started_at, low_motion).to_string()
+        }
         ToolStatus::Running => {
             crate::tui::spinner::braille_spinner_frame(started_at, low_motion).to_string()
         }
@@ -1732,7 +2076,7 @@ fn render_tool_header_with_family_and_summary(
 
     let mut spans = vec![
         Span::styled(
-            format!("{} ", status_symbol(started_at, status, low_motion)),
+            format!("{} ", status_symbol(started_at, status, low_motion, family)),
             Style::default().fg(tool_state_color(status)),
         ),
         Span::styled(
@@ -1744,7 +2088,14 @@ fn render_tool_header_with_family_and_summary(
         Span::styled(state_owned, tool_status_style(status)),
     ];
 
-    if let Some(summary) = summary.and_then(normalize_header_summary) {
+    // #4148: don't let the summary echo the verb it sits next to — an
+    // identity/summary that resolves to the family word itself would render a
+    // duplicate like "delegate · delegate". When the summary collapses to the
+    // verb, the verb already carries the signal, so drop the redundant tail.
+    if let Some(summary) = summary
+        .and_then(normalize_header_summary)
+        .filter(|summary| !summary.eq_ignore_ascii_case(verb))
+    {
         spans.push(Span::styled(" · ", Style::default().fg(palette::TEXT_DIM)));
         spans.push(Span::styled(
             truncate_text(&summary, TOOL_HEADER_SUMMARY_LIMIT),

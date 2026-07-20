@@ -18,16 +18,18 @@ export interface RepoFacts {
 }
 
 export const FACTS: RepoFacts = {
-  "generatedAt": "2026-06-30T05:41:26.332Z",
-  "version": "0.8.66",
+  "generatedAt": "2026-07-17T06:07:26.812Z",
+  "version": "0.9.1",
   "crates": [
     "agent",
     "app-server",
+    "build-support",
     "cli",
     "config",
     "core",
     "execpolicy",
     "hooks",
+    "lane",
     "mcp",
     "protocol",
     "release",
@@ -35,7 +37,8 @@ export const FACTS: RepoFacts = {
     "state",
     "tools",
     "tui",
-    "whaleflow"
+    "workflow",
+    "workflow-js"
   ],
   "sandboxBackends": [
     "bwrap",
@@ -88,7 +91,7 @@ export const FACTS: RepoFacts = {
     {
       "id": "xiaomi-mimo",
       "label": "Xiaomi MiMo",
-      "env": "XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY"
+      "env": "XIAOMI_MIMO_TOKEN_PLAN_API_KEY / MIMO_TOKEN_PLAN_API_KEY / XIAOMI_MIMO_API_KEY / XIAOMI_API_KEY / MIMO_API_KEY"
     },
     {
       "id": "novita",
@@ -181,6 +184,11 @@ export const FACTS: RepoFacts = {
       "env": "MINIMAX_API_KEY"
     },
     {
+      "id": "minimax-anthropic",
+      "label": "MiniMax (Anthropic-compatible)",
+      "env": "MINIMAX_API_KEY"
+    },
+    {
       "id": "deepinfra",
       "label": "DeepInfra",
       "env": "DEEPINFRA_API_KEY / DEEPINFRA_TOKEN"
@@ -189,11 +197,31 @@ export const FACTS: RepoFacts = {
       "id": "sakana",
       "label": "Sakana AI",
       "env": "FUGU_API_KEY / SAKANA_API_KEY"
+    },
+    {
+      "id": "longcat",
+      "label": "Meituan LongCat",
+      "env": "LONGCAT_API_KEY"
+    },
+    {
+      "id": "opencode-go",
+      "label": "OpenCode Go",
+      "env": "OPENCODE_GO_API_KEY"
+    },
+    {
+      "id": "meta",
+      "label": "Meta Model API",
+      "env": "META_MODEL_API_KEY / MODEL_API_KEY"
+    },
+    {
+      "id": "xai",
+      "label": "xAI",
+      "env": "XAI_API_KEY"
     }
   ],
   "defaultModel": "deepseek-v4-pro",
   "nodeEngines": ">=18",
-  "toolCount": 78,
+  "toolCount": 85,
   "license": "MIT",
   "latestRelease": null
 };

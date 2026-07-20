@@ -568,12 +568,22 @@ pub fn run_stdio_server(
             .as_deref()
             .is_some_and(|version| version != "2.0")
         {
-            let response = jsonrpc_error(
-                request.id,
-                JsonRpcError::invalid_request("jsonrpc version must be 2.0"),
-            );
-            writeln!(stdout, "{response}")?;
-            stdout.flush()?;
+            if should_respond_to_jsonrpc(&request.id) {
+                let response = jsonrpc_error(
+                    request.id,
+                    JsonRpcError::invalid_request("jsonrpc version must be 2.0"),
+                );
+                writeln!(stdout, "{response}")?;
+                stdout.flush()?;
+            }
+            continue;
+        }
+
+        if !should_respond_to_jsonrpc(&request.id) {
+            match dispatch_stdio_request(&mut state, &request.method, request.params) {
+                Ok((_, should_exit)) if should_exit => break,
+                Ok(_) | Err(_) => {}
+            }
             continue;
         }
 
@@ -938,6 +948,10 @@ fn jsonrpc_result(id: Option<Value>, result: Value) -> Value {
     })
 }
 
+fn should_respond_to_jsonrpc(id: &Option<Value>) -> bool {
+    id.is_some()
+}
+
 fn jsonrpc_error(id: Option<Value>, err: JsonRpcError) -> Value {
     json!({
         "jsonrpc": "2.0",
@@ -995,6 +1009,29 @@ impl JsonRpcError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EchoMcpClient;
+
+    impl McpManagedClient for EchoMcpClient {
+        fn list_tools(&self) -> Result<Vec<McpToolDescriptor>> {
+            Ok(vec![])
+        }
+
+        fn call_tool(&self, tool_name: &str, arguments: Value) -> Result<Value> {
+            if tool_name == "error" {
+                bail!("intentional error for testing");
+            }
+            Ok(arguments)
+        }
+
+        fn list_resources(&self) -> Result<Vec<McpResourceDescriptor>> {
+            Ok(vec![])
+        }
+
+        fn read_resource(&self, _uri: &str) -> Result<Value> {
+            bail!("not supported")
+        }
+    }
 
     // ── InMemoryMcpClient ──────────────────────────────────────────────
 
@@ -1160,6 +1197,31 @@ mod tests {
         );
         let result = manager.call_tool("s1", "t", json!({})).unwrap();
         assert_eq!(result["v"], 42);
+    }
+
+    #[test]
+    fn manager_call_tool_passes_arguments_to_client() {
+        let mut manager = McpManager::default();
+        manager.register_server(
+            make_server_config("s1"),
+            ToolFilter::default(),
+            Box::new(EchoMcpClient),
+        );
+        let args = json!({"hello": "world", "num": 100});
+        let result = manager.call_tool("s1", "echo", args.clone()).unwrap();
+        assert_eq!(result, args);
+    }
+
+    #[test]
+    fn manager_call_tool_propagates_client_error() {
+        let mut manager = McpManager::default();
+        manager.register_server(
+            make_server_config("s1"),
+            ToolFilter::default(),
+            Box::new(EchoMcpClient),
+        );
+        let err = manager.call_tool("s1", "error", json!({})).unwrap_err();
+        assert!(err.to_string().contains("intentional error for testing"));
     }
 
     #[test]
@@ -1382,6 +1444,12 @@ mod tests {
         assert_eq!(err["jsonrpc"], "2.0");
         assert_eq!(err["id"], 2);
         assert_eq!(err["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn jsonrpc_notifications_do_not_require_responses() {
+        assert!(!should_respond_to_jsonrpc(&None));
+        assert!(should_respond_to_jsonrpc(&Some(json!(1))));
     }
 
     // ── McpServerConfig serialization ──────────────────────────────────

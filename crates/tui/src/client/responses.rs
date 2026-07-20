@@ -18,13 +18,16 @@ use crate::models::{
 };
 use crate::tools::schema_sanitize;
 
-use super::{DeepSeekClient, ERROR_BODY_MAX_BYTES, bounded_error_text, system_to_instructions};
+use super::{
+    DeepSeekClient, ERROR_BODY_MAX_BYTES, bounded_error_text, from_api_tool_name,
+    system_to_instructions, to_api_tool_name,
+};
 
 /// Base URL path for the Codex Responses endpoint.
 const CODEX_RESPONSES_PATH: &str = "/codex/responses";
 
 /// Build the Responses API request body from a `MessageRequest`.
-fn build_responses_body(request: &MessageRequest) -> Value {
+pub(super) fn build_responses_body(request: &MessageRequest) -> Value {
     let model = &request.model;
     let mut body = json!({
         "model": model,
@@ -87,7 +90,9 @@ impl DeepSeekClient {
         // so it must not be set again here or it would be duplicated. The
         // ChatGPT backend additionally requires the account id and the
         // experimental Responses beta opt-in.
-        let account_id = crate::oauth::codex_account_id();
+        let account_id = self.codex_account_id.clone();
+        let request_body =
+            serde_json::to_vec(&body).context("Failed to serialize Responses API request body")?;
         let response = self
             .send_with_retry(|| {
                 let mut builder = self
@@ -100,7 +105,7 @@ impl DeepSeekClient {
                 if let Some(account_id) = &account_id {
                     builder = builder.header("chatgpt-account-id", account_id);
                 }
-                builder.json(&body)
+                builder.body(request_body.clone())
             })
             .await
             .context("Responses API request failed")?;
@@ -133,6 +138,11 @@ impl DeepSeekClient {
             });
 
             let mut current_block_index: Option<u32> = None;
+            // Whether reasoning text has already been emitted for the current
+            // reasoning block. Used to insert a paragraph break between
+            // consecutive summary parts, which the wire protocol delivers
+            // back-to-back with no separator.
+            let mut reasoning_text_emitted = false;
             let mut saw_tool_call = false;
             let mut usage_data: Option<Usage> = None;
             // Raw byte buffer: decode only COMPLETE lines so a multi-byte
@@ -235,7 +245,7 @@ impl DeepSeekClient {
                                                 content_block:
                                                     ContentBlockStart::ToolUse {
                                                         id: composite_id,
-                                                        name,
+                                                        name: from_api_tool_name(&name),
                                                         input: json!({}),
                                                         caller: None,
                                                     },
@@ -244,6 +254,7 @@ impl DeepSeekClient {
                                                 Some(content_block_counter - 1);
                                         }
                                         "reasoning" => {
+                                            reasoning_text_emitted = false;
                                             content_block_counter += 1;
                                             yield Ok(StreamEvent::ContentBlockStart {
                                                 index: content_block_counter - 1,
@@ -291,10 +302,30 @@ impl DeepSeekClient {
                                     event.get("delta").and_then(|d| d.as_str())
                                     && let Some(idx) = current_block_index
                                 {
+                                    if !delta_text.is_empty() {
+                                        reasoning_text_emitted = true;
+                                    }
                                     yield Ok(StreamEvent::ContentBlockDelta {
                                         index: idx,
                                         delta: Delta::ThinkingDelta {
                                             thinking: delta_text.to_string(),
+                                        },
+                                    });
+                                }
+                            }
+                            "response.reasoning_summary_part.added" => {
+                                // Consecutive summary parts arrive with no
+                                // separator in the text deltas, so without a
+                                // boundary they concatenate as
+                                // "…done.**Next Phase**…". Insert a paragraph
+                                // break before every part after the first.
+                                if reasoning_text_emitted
+                                    && let Some(idx) = current_block_index
+                                {
+                                    yield Ok(StreamEvent::ContentBlockDelta {
+                                        index: idx,
+                                        delta: Delta::ThinkingDelta {
+                                            thinking: "\n\n".to_string(),
                                         },
                                     });
                                 }
@@ -546,7 +577,7 @@ fn convert_messages_to_responses_input(request: &MessageRequest) -> Vec<Value> {
                             items.push(json!({
                                 "type": "function_call",
                                 "call_id": call_id,
-                                "name": name,
+                                "name": to_api_tool_name(name),
                                 "arguments": serde_json::to_string(input).unwrap_or_default(),
                             }));
                         }
@@ -598,7 +629,7 @@ fn tool_to_responses_function(tool: &Tool) -> Value {
     };
     json!({
         "type": "function",
-        "name": tool.name,
+        "name": to_api_tool_name(&tool.name),
         "description": description,
         "parameters": parameters,
         "strict": false,
@@ -702,6 +733,7 @@ fn parse_responses_usage(val: &Value) -> Usage {
         output_tokens: output,
         prompt_cache_hit_tokens,
         prompt_cache_miss_tokens,
+        prompt_cache_write_tokens: None,
         reasoning_tokens,
         reasoning_replay_tokens: None,
         server_tool_use: None,
@@ -931,6 +963,61 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn responses_stream_inserts_boundary_between_reasoning_summary_parts() {
+        let server = MockServer::start().await;
+        let sse_body = concat!(
+            "data: {\"type\":\"response.output_item.added\",\"item\":{\"type\":\"reasoning\",\"id\":\"rs_1\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"item_id\":\"rs_1\",\"summary_index\":0,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"partA\"}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_part.added\",\"item_id\":\"rs_1\",\"summary_index\":1,\"part\":{\"type\":\"summary_text\",\"text\":\"\"}}\n\n",
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"partB\"}\n\n",
+            "data: {\"type\":\"response.output_item.done\"}\n\n",
+            "data: [DONE]\n\n",
+        );
+        Mock::given(method("POST"))
+            .and(path(CODEX_RESPONSES_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", "text/event-stream")
+                    .set_body_string(sse_body),
+            )
+            .mount(&server)
+            .await;
+
+        let client = {
+            let _env_lock = crate::test_support::lock_test_env();
+            let _codex_token =
+                crate::test_support::EnvVarGuard::set("OPENAI_CODEX_ACCESS_TOKEN", "test-token");
+            let _legacy_codex_token =
+                crate::test_support::EnvVarGuard::remove("CODEX_ACCESS_TOKEN");
+            DeepSeekClient::new(&test_codex_config(&server)).unwrap()
+        };
+        let mut stream = client
+            .handle_responses_stream(minimal_responses_request())
+            .await
+            .unwrap();
+
+        let mut thinking = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(event) = stream.next().await {
+                if let StreamEvent::ContentBlockDelta {
+                    delta: Delta::ThinkingDelta { thinking: chunk },
+                    ..
+                } = event.unwrap()
+                {
+                    thinking.push_str(&chunk);
+                }
+            }
+        })
+        .await
+        .expect("Responses reasoning stream should finish after [DONE]");
+
+        // The second summary part must be separated from the first by a
+        // paragraph break, and no separator may precede the first part.
+        assert_eq!(thinking, "partA\n\npartB");
+    }
+
     #[test]
     fn codex_reasoning_effort_uses_responses_labels() {
         assert_eq!(codex_responses_reasoning_effort("max"), Some("xhigh"));
@@ -1087,25 +1174,59 @@ mod tests {
 
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[0]["call_id"], "call_abc");
+        assert_eq!(input[0]["name"], "checklist_write");
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call_abc");
         assert_eq!(input[1]["output"], "<6 items>");
     }
 
     #[test]
+    fn responses_input_encodes_tool_call_names() {
+        let request = MessageRequest {
+            model: "gpt-5.5".to_string(),
+            messages: vec![Message {
+                role: "assistant".to_string(),
+                content: vec![ContentBlock::ToolUse {
+                    id: "call_abc|fc_123".to_string(),
+                    name: "web.run".to_string(),
+                    input: json!({}),
+                    caller: None,
+                }],
+            }],
+            max_tokens: 128,
+            system: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            thinking: None,
+            reasoning_effort: None,
+            stream: None,
+            temperature: None,
+            top_p: None,
+        };
+
+        let input = convert_messages_to_responses_input(&request);
+
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[0]["name"], to_api_tool_name("web.run"));
+    }
+
+    #[test]
     fn responses_function_tool_sanitizes_root_composition_schema() {
         let tool = Tool {
             tool_type: None,
-            name: "apply_patch".to_string(),
+            name: "web.run".to_string(),
             description: "Apply patch".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "patch": {"type": "string"},
+                    "replace": {"type": "array"},
                     "changes": {"type": "array"}
                 },
                 "oneOf": [
                     {"required": ["patch"]},
+                    {"required": ["replace"]},
                     {"required": ["changes"]}
                 ]
             }),
@@ -1119,6 +1240,7 @@ mod tests {
         let payload = tool_to_responses_function(&tool);
         let parameters = &payload["parameters"];
 
+        assert_eq!(payload["name"], to_api_tool_name("web.run"));
         assert_eq!(parameters["type"], "object");
         assert!(parameters.get("oneOf").is_none());
         assert!(parameters.get("anyOf").is_none());
@@ -1126,10 +1248,11 @@ mod tests {
         assert!(parameters.get("enum").is_none());
         assert!(parameters.get("not").is_none());
         assert!(parameters["properties"].get("patch").is_some());
+        assert!(parameters["properties"].get("replace").is_some());
         assert!(parameters["properties"].get("changes").is_some());
         assert_eq!(
             payload["description"],
-            "Apply patch\n\nExactly one of these parameter groups must be provided: `changes` | `patch`."
+            "Apply patch\n\nExactly one of these parameter groups must be provided: `changes` | `patch` | `replace`."
         );
         assert!(tool.input_schema.get("oneOf").is_some());
     }
@@ -1144,10 +1267,12 @@ mod tests {
                 "type": "object",
                 "properties": {
                     "patch": {"type": "string"},
+                    "replace": {"type": "array"},
                     "changes": {"type": "array"}
                 },
                 "oneOf": [
                     {"required": ["patch"]},
+                    {"required": ["replace"]},
                     {"required": ["changes"]}
                 ]
             }),
@@ -1162,7 +1287,7 @@ mod tests {
 
         assert_eq!(
             payload["description"],
-            "Apply patch\n\nExactly one of these parameter groups must be provided: `changes` | `patch`."
+            "Apply patch\n\nExactly one of these parameter groups must be provided: `changes` | `patch` | `replace`."
         );
     }
 

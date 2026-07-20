@@ -7,6 +7,10 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+#[cfg(target_os = "android")]
+use std::ffi::CStr;
+#[cfg(any(target_os = "android", all(test, unix)))]
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow, bail};
@@ -24,14 +28,17 @@ const GITHUB_RELEASE_DOWNLOAD_BASE_URL: &str =
     "https://github.com/Hmbown/CodeWhale/releases/download";
 const UPDATE_HTTP_ATTEMPTS: usize = 3;
 const UPDATE_HTTP_RETRY_DELAY_MS: u64 = 100;
+#[cfg(target_os = "android")]
+const ANDROID_PROC_SELF_MAPS: &str = "/proc/self/maps";
 
 /// Run the self-update workflow.
 ///
 /// OpenHarmony (HarmonyOS) won't compile this file, so no need to handle
 pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Result<()> {
-    let current_exe =
-        std::env::current_exe().context("failed to determine current executable path")?;
+    let executable_identity = update_executable_identity()?;
+    let current_exe = executable_identity.path.clone();
     let legacy_binary = is_legacy_binary(&current_exe);
+    ensure_supported_release_target(std::env::consts::OS, std::env::consts::ARCH)?;
 
     let targets = update_targets_for_exe(&current_exe);
     let channel = ReleaseChannel::from_beta_flag(beta);
@@ -156,10 +163,12 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
         println!("SHA256 checksum verified.");
     }
 
-    // Step 4: Replace binaries atomically after all downloads verify.
-    for (path, _, bytes) in downloads.iter().rev() {
-        replace_binary(path, bytes)?;
-    }
+    // Step 4: Replace binaries only after all downloads and the primary
+    // executable identity verify. The preflight happens before a colocated
+    // sibling can change, then the primary is checked again just in time.
+    replace_verified_downloads(&downloads, || {
+        validate_primary_update_identity(&executable_identity)
+    })?;
 
     println!(
         "\n✅ Successfully updated to {latest_tag}!\n\
@@ -176,6 +185,378 @@ pub fn run_update(beta: bool, check_only: bool, proxy_arg: Option<String>) -> Re
     Ok(())
 }
 
+/// Resolve the executable that the updater is allowed to replace.
+///
+/// Android's `std::env::current_exe()`, `AT_EXECFN`, and `/proc/self/exe` can
+/// all identify Bionic's runtime linker rather than the launched program. On
+/// Android, locate a marker compiled into this executable with `dladdr`, then
+/// require the executable `/proc/self/maps` row containing that same address
+/// to agree by canonical path, device, and inode.
+#[derive(Debug, Clone)]
+struct UpdateExecutableIdentity {
+    path: PathBuf,
+    #[cfg(target_os = "android")]
+    android_proof: AndroidExecutableProof,
+}
+
+#[cfg(not(target_os = "android"))]
+fn update_executable_identity() -> Result<UpdateExecutableIdentity> {
+    let path = std::env::current_exe().context("failed to determine current executable path")?;
+    Ok(UpdateExecutableIdentity { path })
+}
+
+#[cfg(target_os = "android")]
+fn update_executable_identity() -> Result<UpdateExecutableIdentity> {
+    let android_proof = android_loaded_executable_proof()?;
+    Ok(UpdateExecutableIdentity {
+        path: android_proof.path.clone(),
+        android_proof,
+    })
+}
+
+#[cfg(target_os = "android")]
+#[inline(never)]
+extern "C" fn android_update_image_marker() -> usize {
+    android_update_image_marker as *const () as usize
+}
+
+#[cfg(target_os = "android")]
+fn android_loaded_executable_proof() -> Result<AndroidExecutableProof> {
+    let marker = android_update_image_marker as *const () as usize as u64;
+    let dladdr_path = android_dladdr_path(android_update_image_marker as *const libc::c_void)?;
+    let maps = std::fs::read_to_string(ANDROID_PROC_SELF_MAPS)
+        .context("failed to read Android executable mappings from /proc/self/maps")?;
+    android_loaded_executable_proof_report(&maps, marker, &dladdr_path)
+}
+
+#[cfg(target_os = "android")]
+fn android_dladdr_path(marker: *const libc::c_void) -> Result<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut info = std::mem::MaybeUninit::<libc::Dl_info>::zeroed();
+    // SAFETY: `marker` points to a function in this loaded image and `info`
+    // points to writable storage for the duration of the call.
+    let found = unsafe { libc::dladdr(marker, info.as_mut_ptr()) };
+    if found == 0 {
+        bail!("Android dladdr could not locate the updater's loaded image");
+    }
+    // SAFETY: A non-zero dladdr result initializes `info`.
+    let info = unsafe { info.assume_init() };
+    if info.dli_fname.is_null() {
+        bail!("Android dladdr returned an empty loaded-image path");
+    }
+    // SAFETY: `dli_fname` is a NUL-terminated string owned by the dynamic
+    // loader and remains valid while this image is loaded.
+    let bytes = unsafe { CStr::from_ptr(info.dli_fname) }.to_bytes();
+    if bytes.is_empty() {
+        bail!("Android dladdr returned an empty loaded-image path");
+    }
+    Ok(PathBuf::from(OsStr::from_bytes(bytes)))
+}
+
+#[cfg(any(target_os = "android", all(test, unix)))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AndroidImageMapping {
+    start: u64,
+    end: u64,
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+    path: PathBuf,
+}
+
+#[cfg(any(target_os = "android", all(test, unix)))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AndroidExecutableProofKind {
+    DladdrAndProcMaps,
+}
+
+#[cfg(any(target_os = "android", all(test, unix)))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AndroidExecutableProof {
+    path: PathBuf,
+    device_major: u32,
+    device_minor: u32,
+    inode: u64,
+    proof_kind: AndroidExecutableProofKind,
+}
+
+#[cfg(any(target_os = "android", all(test, unix)))]
+fn parse_android_image_mapping(maps: &str, marker: u64) -> Result<AndroidImageMapping> {
+    let mut matching = None;
+    for (line_index, line) in maps.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let mut fields = line.split_whitespace();
+        let range = fields
+            .next()
+            .with_context(|| format!("malformed /proc/self/maps line {}", line_index + 1))?;
+        let (start, end) = range
+            .split_once('-')
+            .with_context(|| format!("malformed mapping range `{range}`"))?;
+        let start = u64::from_str_radix(start, 16)
+            .with_context(|| format!("invalid mapping start `{start}`"))?;
+        let end =
+            u64::from_str_radix(end, 16).with_context(|| format!("invalid mapping end `{end}`"))?;
+        if !(start <= marker && marker < end) {
+            continue;
+        }
+
+        let permissions = fields
+            .next()
+            .context("loaded-image mapping is missing permissions")?;
+        let _offset = fields
+            .next()
+            .context("loaded-image mapping is missing its file offset")?;
+        let device = fields
+            .next()
+            .context("loaded-image mapping is missing its device")?;
+        let inode = fields
+            .next()
+            .context("loaded-image mapping is missing its inode")?
+            .parse::<u64>()
+            .context("loaded-image mapping has an invalid inode")?;
+        let path = fields.collect::<Vec<_>>().join(" ");
+
+        if permissions.as_bytes().get(2) != Some(&b'x') {
+            bail!("loaded-image mapping for updater marker is not executable");
+        }
+        if inode == 0 {
+            bail!("loaded-image mapping for updater marker has no file inode");
+        }
+        let (device_major, device_minor) = device
+            .split_once(':')
+            .context("loaded-image mapping has an invalid device")?;
+        let device_major = u32::from_str_radix(device_major, 16)
+            .context("loaded-image mapping has an invalid device major number")?;
+        let device_minor = u32::from_str_radix(device_minor, 16)
+            .context("loaded-image mapping has an invalid device minor number")?;
+        if path.is_empty() {
+            bail!("loaded-image mapping for updater marker has no pathname");
+        }
+
+        let mapping = AndroidImageMapping {
+            start,
+            end,
+            device_major,
+            device_minor,
+            inode,
+            path: PathBuf::from(path),
+        };
+        if matching.replace(mapping).is_some() {
+            bail!("multiple /proc/self/maps rows contain the updater marker");
+        }
+    }
+
+    matching.ok_or_else(|| anyhow!("no /proc/self/maps row contains the updater marker"))
+}
+
+#[cfg(all(test, unix))]
+fn resolve_android_loaded_executable_report(
+    maps: &str,
+    marker: u64,
+    dladdr_path: &Path,
+) -> Result<PathBuf> {
+    Ok(android_loaded_executable_proof_report(maps, marker, dladdr_path)?.path)
+}
+
+#[cfg(any(target_os = "android", all(test, unix)))]
+fn android_loaded_executable_proof_report(
+    maps: &str,
+    marker: u64,
+    dladdr_path: &Path,
+) -> Result<AndroidExecutableProof> {
+    let mapping = parse_android_image_mapping(maps, marker)?;
+    validate_android_reported_path("dladdr", dladdr_path)?;
+    validate_android_reported_path("/proc/self/maps", &mapping.path)?;
+
+    let resolved_dladdr = dladdr_path.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize Android dladdr path {}",
+            dladdr_path.display()
+        )
+    })?;
+    let resolved_mapping = mapping.path.canonicalize().with_context(|| {
+        format!(
+            "failed to canonicalize Android loaded-image mapping {}",
+            mapping.path.display()
+        )
+    })?;
+    if resolved_dladdr != resolved_mapping {
+        bail!(
+            "Android loaded-image authorities disagree: dladdr resolved to {}, but /proc/self/maps resolved to {}",
+            resolved_dladdr.display(),
+            resolved_mapping.display()
+        );
+    }
+    if is_android_linker_name(&resolved_mapping) {
+        bail!(
+            "Android loaded-image authorities resolved to runtime linker {}; refusing to use the linker as an update target",
+            resolved_mapping.display()
+        );
+    }
+    if !is_executable_file(&resolved_mapping) {
+        bail!(
+            "Android loaded image `{}` is not an executable regular file; refusing to select an update target",
+            resolved_mapping.display()
+        );
+    }
+
+    validate_android_mapping_identity(&mapping, &resolved_mapping)?;
+    Ok(AndroidExecutableProof {
+        path: resolved_mapping,
+        device_major: mapping.device_major,
+        device_minor: mapping.device_minor,
+        inode: mapping.inode,
+        proof_kind: AndroidExecutableProofKind::DladdrAndProcMaps,
+    })
+}
+
+#[cfg(any(target_os = "android", all(test, unix)))]
+fn validate_android_reported_path(authority: &str, path: &Path) -> Result<()> {
+    if !path.is_absolute() {
+        bail!(
+            "Android {authority} reported non-absolute loaded-image path `{}`",
+            path.display()
+        );
+    }
+    if path.to_string_lossy().ends_with(" (deleted)") {
+        bail!(
+            "Android {authority} reported deleted loaded image `{}`",
+            path.display()
+        );
+    }
+    if is_android_linker_name(path) {
+        bail!(
+            "Android {authority} identifies runtime linker `{}`; refusing to use the linker as an update target",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", all(test, unix)))]
+fn validate_android_mapping_identity(
+    mapping: &AndroidImageMapping,
+    candidate: &Path,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+
+    let candidate_metadata = std::fs::metadata(candidate).with_context(|| {
+        format!(
+            "failed to stat Android update target {}",
+            candidate.display()
+        )
+    })?;
+    let (candidate_major, candidate_minor) = android_device_parts(candidate_metadata.dev());
+    let identity_matches = mapping.device_major == candidate_major
+        && mapping.device_minor == candidate_minor
+        && mapping.inode == candidate_metadata.ino();
+    if !identity_matches {
+        bail!(
+            "Android loaded-image identity changed: /proc/self/maps has device/inode {:x}:{:x}:{}, but update target {} is {:x}:{:x}:{}; refusing to replace it",
+            mapping.device_major,
+            mapping.device_minor,
+            mapping.inode,
+            candidate.display(),
+            candidate_major,
+            candidate_minor,
+            candidate_metadata.ino()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", all(test, unix)))]
+fn android_device_parts(device: u64) -> (u32, u32) {
+    // Linux/Bionic's dev_t encoding, matching makedev(3), major(3), and
+    // minor(3). `/proc/self/maps` renders these components in hexadecimal.
+    let major = ((device >> 8) & 0xfff) as u32;
+    let minor = ((device & 0xff) | ((device >> 12) & 0xfff00)) as u32;
+    (major, minor)
+}
+
+fn validate_primary_update_identity(identity: &UpdateExecutableIdentity) -> Result<()> {
+    #[cfg(target_os = "android")]
+    {
+        let fresh = android_loaded_executable_proof()?;
+        if fresh != identity.android_proof {
+            bail!(
+                "Android loaded-image proof changed from {:?} to {:?}; refusing to replace the update target",
+                identity.android_proof,
+                fresh
+            );
+        }
+        return Ok(());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
+        let _ = identity;
+        Ok(())
+    }
+}
+
+fn replace_verified_downloads<F>(
+    downloads: &[(PathBuf, String, Vec<u8>)],
+    validate_primary_identity: F,
+) -> Result<()>
+where
+    F: Fn() -> Result<()>,
+{
+    // Fail before mutating a sibling if the primary pathname no longer names
+    // the process image that initiated this update.
+    validate_primary_identity()?;
+    for (path, _, bytes) in downloads.iter().rev() {
+        replace_binary_with_validation(path, bytes, || {
+            // Re-check after each temp file is fully staged and immediately
+            // before every destructive rename. This protects paired installs
+            // before the sibling as well as just in time for the primary.
+            validate_primary_identity()
+        })?;
+    }
+    Ok(())
+}
+
+#[cfg(any(target_os = "android", all(test, unix)))]
+fn is_android_linker_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(OsStr::to_str)
+        .is_some_and(|name| {
+            matches!(
+                name,
+                "linker"
+                    | "linker64"
+                    | "linker_asan"
+                    | "linker_asan64"
+                    | "linker_hwasan"
+                    | "linker_hwasan64"
+            )
+        })
+}
+
+#[cfg(any(target_os = "android", all(test, unix)))]
+fn is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return false;
+    };
+    if !metadata.is_file() {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o111 != 0
+    }
+
+    #[cfg(not(unix))]
+    {
+        true
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FetchedRelease {
     release: Release,
@@ -186,6 +567,17 @@ struct FetchedRelease {
 enum UpdateReleaseSource {
     GitHub,
     Mirror { base_url: String },
+}
+
+fn ensure_supported_release_target(os: &str, arch: &str) -> Result<()> {
+    if os == "linux" && arch == "riscv64" {
+        bail!(
+            "Linux riscv64 release assets are temporarily unavailable because \
+             rquickjs-sys 0.12.0 does not ship riscv64gc-unknown-linux-gnu bindings. \
+             See docs/INSTALL.md for the current platform matrix."
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn release_arch_for_rust_arch(arch: &str) -> &str {
@@ -212,7 +604,7 @@ fn legacy_binary_message(current_exe: &Path) -> String {
 this binary ({exe}) is using the legacy deepseek/deepseek-tui command name.
 
 The package has been renamed to `codewhale`. This update will install canonical
-CodeWhale binaries (`codewhale` and, when present, `codewhale-tui`) beside the
+Codewhale binaries (`codewhale` and, when present, `codewhale-tui`) beside the
 legacy command when the install directory is writable. DeepSeek provider support
 is unchanged.
 
@@ -458,9 +850,7 @@ pub(crate) fn validate_and_build_proxy(proxy_str: &str) -> Result<Proxy> {
 }
 
 fn update_http_client(proxy: Option<&Proxy>) -> Result<reqwest::blocking::Client> {
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
-    let mut builder = reqwest::blocking::Client::builder();
+    let mut builder = codewhale_release::platform_blocking_http_client_builder();
     if let Some(proxy) = proxy {
         builder = builder.proxy(proxy.clone());
     }
@@ -705,7 +1095,7 @@ fn release_tag_from_github_release_html(body: &str) -> Option<String> {
 
 fn fetch_latest_beta_release_from_url(url: &str, proxy: Option<&Proxy>) -> Result<Release> {
     let body = fetch_release_json(url, "release list", proxy)?;
-    // GitHub caps this endpoint at 100 releases per page. CodeWhale uses the
+    // GitHub caps this endpoint at 100 releases per page. Codewhale uses the
     // first page as the latest-beta search window, matching GitHub's ordering.
     let releases: Vec<Release> = serde_json::from_str(&body).with_context(|| {
         format!("failed to parse release list JSON from GitHub API. Response: {body}")
@@ -857,6 +1247,9 @@ fn glibc_check_disabled() -> bool {
 }
 
 fn preflight_downloaded_binary(asset_name: &str, bytes: &[u8]) -> Result<()> {
+    // GNU libc preflight is Linux-only (#4241). Rust treats `target_os = "android"`
+    // as distinct from `"linux"`, so Termux/Android builds skip this check entirely
+    // — Android uses Bionic libc, not glibc.
     if !cfg!(target_os = "linux") || glibc_check_disabled() {
         return Ok(());
     }
@@ -915,7 +1308,7 @@ fn glibc_compatibility_message(
     };
     format!(
         "\
-Prebuilt CodeWhale asset `{asset_name}` requires GLIBC_{required}, but {host_line}
+Prebuilt Codewhale asset `{asset_name}` requires GLIBC_{required}, but {host_line}
 
 Official Linux release binaries are GNU libc builds. Ubuntu 22.04 ships glibc
 2.35, so it cannot run a binary that was built against Ubuntu 24.04/glibc 2.39.
@@ -938,7 +1331,19 @@ bypass this preflight at your own risk.",
 /// installs it in place. Unix can atomically replace the executable path. On
 /// Windows, replacing a running executable can fail, so rename the current file
 /// out of the way before moving the new binary into the original path.
+#[cfg(test)]
 fn replace_binary(target: &Path, new_bytes: &[u8]) -> Result<()> {
+    replace_binary_with_validation(target, new_bytes, || Ok(()))
+}
+
+fn replace_binary_with_validation<F>(
+    target: &Path,
+    new_bytes: &[u8],
+    validate_before_replace: F,
+) -> Result<()>
+where
+    F: FnOnce() -> Result<()>,
+{
     let parent = target
         .parent()
         .filter(|path| !path.as_os_str().is_empty())
@@ -963,6 +1368,8 @@ fn replace_binary(target: &Path, new_bytes: &[u8]) -> Result<()> {
             let _ = std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o755));
         }
     }
+
+    validate_before_replace()?;
 
     #[cfg(windows)]
     {
@@ -1027,6 +1434,13 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
 
+    #[cfg(unix)]
+    fn write_test_executable(path: &Path) {
+        std::fs::write(path, b"test executable").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
     /// Verify the arch mapping used when constructing asset names.
     /// The mapping must use release-asset naming (arm64/x64), not Rust
     /// stdlib constants (aarch64/x86_64).
@@ -1043,6 +1457,470 @@ mod tests {
         assert!(
             !asset_arch.contains("aarch64") && !asset_arch.contains("x86_64"),
             "asset arch '{asset_arch}' still uses raw Rust constant name"
+        );
+    }
+
+    #[test]
+    fn linux_riscv64_update_is_explicitly_unsupported() {
+        let err = ensure_supported_release_target("linux", "riscv64")
+            .expect_err("linux riscv64 should not claim a release asset");
+        let message = err.to_string();
+        assert!(message.contains("Linux riscv64 release assets are temporarily unavailable"));
+        assert!(message.contains("rquickjs-sys 0.12.0"));
+        ensure_supported_release_target("linux", "aarch64").unwrap();
+        ensure_supported_release_target("macos", "aarch64").unwrap();
+    }
+
+    #[cfg(unix)]
+    const TEST_ANDROID_MARKER: u64 = 0x1800;
+
+    #[cfg(unix)]
+    fn test_android_mapping_line(path: &Path, permissions: &str) -> String {
+        use std::os::unix::fs::MetadataExt;
+
+        let metadata = std::fs::metadata(path).unwrap();
+        let (device_major, device_minor) = android_device_parts(metadata.dev());
+        format!(
+            "1000-2000 {permissions} 00000000 {:x}:{:x} {} {}\n",
+            device_major,
+            device_minor,
+            metadata.ino(),
+            path.display()
+        )
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_loaded_image_resolves_agreed_mapping() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let executable = dir.path().join("codewhale");
+        write_test_executable(&executable);
+        let maps = test_android_mapping_line(&executable, "r-xp");
+
+        let resolved =
+            resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &executable)
+                .unwrap();
+
+        assert_eq!(resolved, executable.canonicalize().unwrap());
+        assert_eq!(update_targets_for_exe(&resolved)[0].path, resolved);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_loaded_image_canonicalizes_symlink_and_sibling_policy() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let canonical_dir = dir.path().join("canonical");
+        let install_dir = dir.path().join("install");
+        std::fs::create_dir(&canonical_dir).unwrap();
+        std::fs::create_dir(&install_dir).unwrap();
+        let canonical_dispatcher = canonical_dir.join("codewhale");
+        let canonical_tui = canonical_dir.join("codewhale-tui");
+        let invoked = install_dir.join("codewhale");
+        write_test_executable(&canonical_dispatcher);
+        write_test_executable(&canonical_tui);
+        symlink(&canonical_dispatcher, &invoked).unwrap();
+        let maps = test_android_mapping_line(&invoked, "r-xp");
+
+        let resolved =
+            resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &invoked).unwrap();
+        let target_paths = update_targets_for_exe(&resolved)
+            .into_iter()
+            .map(|target| target.path)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            target_paths,
+            vec![
+                canonical_dispatcher.canonicalize().unwrap(),
+                canonical_tui.canonicalize().unwrap()
+            ]
+        );
+        assert!(!target_paths.contains(&invoked));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_loaded_image_requires_marker_mapping() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let executable = dir.path().join("codewhale");
+        write_test_executable(&executable);
+        let maps = test_android_mapping_line(&executable, "r-xp");
+
+        let error = resolve_android_loaded_executable_report(&maps, 0x3000, &executable)
+            .expect_err("a marker outside every mapping must fail closed");
+
+        assert!(
+            error.to_string().contains("no /proc/self/maps row"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_loaded_image_requires_executable_mapping() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let executable = dir.path().join("codewhale");
+        write_test_executable(&executable);
+        let maps = test_android_mapping_line(&executable, "rw-p");
+
+        let error =
+            resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &executable)
+                .expect_err("a non-executable marker mapping must fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("mapping for updater marker is not executable"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_loaded_image_rejects_anonymous_mapping() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let executable = dir.path().join("codewhale");
+        write_test_executable(&executable);
+        let maps = "1000-2000 r-xp 00000000 00:00 0\n";
+
+        let error =
+            resolve_android_loaded_executable_report(maps, TEST_ANDROID_MARKER, &executable)
+                .expect_err("an anonymous marker mapping must fail closed");
+
+        assert!(
+            error.to_string().contains("has no file inode"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_loaded_image_rejects_relative_or_deleted_paths() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let executable = dir.path().join("codewhale");
+        write_test_executable(&executable);
+        let metadata = std::fs::metadata(&executable).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let (device_major, device_minor) = android_device_parts(metadata.dev());
+        let relative_maps = format!(
+            "1000-2000 r-xp 00000000 {:x}:{:x} {} codewhale\n",
+            device_major,
+            device_minor,
+            metadata.ino()
+        );
+        let deleted = PathBuf::from(format!("{} (deleted)", executable.display()));
+
+        let relative_error = resolve_android_loaded_executable_report(
+            &relative_maps,
+            TEST_ANDROID_MARKER,
+            &executable,
+        )
+        .expect_err("a relative maps pathname must fail closed");
+        let deleted_error = resolve_android_loaded_executable_report(
+            &test_android_mapping_line(&executable, "r-xp"),
+            TEST_ANDROID_MARKER,
+            &deleted,
+        )
+        .expect_err("a deleted dladdr pathname must fail closed");
+
+        assert!(relative_error.to_string().contains("non-absolute"));
+        assert!(deleted_error.to_string().contains("deleted loaded image"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_loaded_image_rejects_linker_and_symlink_to_linker() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let runtime_linker = dir.path().join("linker64");
+        let invoked = dir.path().join("codewhale");
+        write_test_executable(&runtime_linker);
+        symlink(&runtime_linker, &invoked).unwrap();
+        let maps = test_android_mapping_line(&invoked, "r-xp");
+
+        let direct_error = resolve_android_loaded_executable_report(
+            &maps,
+            TEST_ANDROID_MARKER,
+            Path::new("/system/bin/linker64"),
+        )
+        .expect_err("a directly reported Bionic linker must fail closed");
+        let symlink_error =
+            resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &invoked)
+                .expect_err("a symlink to a linker must fail closed");
+
+        assert!(
+            direct_error
+                .to_string()
+                .contains("identifies runtime linker")
+        );
+        assert!(
+            symlink_error
+                .to_string()
+                .contains("resolved to runtime linker")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_linker_name_recognizes_bionic_loader_variants() {
+        for name in [
+            "linker",
+            "linker64",
+            "linker_asan",
+            "linker_asan64",
+            "linker_hwasan",
+            "linker_hwasan64",
+        ] {
+            assert!(
+                is_android_linker_name(
+                    Path::new("/apex/com.android.runtime/bin")
+                        .join(name)
+                        .as_path()
+                ),
+                "{name} must never become an updater target"
+            );
+        }
+        assert!(!is_android_linker_name(Path::new("codewhale")));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_loaded_image_rejects_authority_disagreement() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let mapped = dir.path().join("mapped-codewhale");
+        let dladdr = dir.path().join("dladdr-codewhale");
+        write_test_executable(&mapped);
+        write_test_executable(&dladdr);
+        let maps = test_android_mapping_line(&mapped, "r-xp");
+
+        let error = resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &dladdr)
+            .expect_err("dladdr and maps path disagreement must fail closed");
+
+        assert!(
+            error.to_string().contains("authorities disagree"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_loaded_image_rejects_non_executable_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let executable = dir.path().join("codewhale");
+        std::fs::write(&executable, b"not executable").unwrap();
+        let maps = test_android_mapping_line(&executable, "r-xp");
+
+        let error =
+            resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &executable)
+                .expect_err("a non-executable target file must fail closed");
+
+        assert!(
+            error.to_string().contains("not an executable regular file"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_loaded_image_rejects_device_inode_mismatch() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let executable = dir.path().join("codewhale");
+        write_test_executable(&executable);
+        let metadata = std::fs::metadata(&executable).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let (device_major, device_minor) = android_device_parts(metadata.dev());
+        let maps = format!(
+            "1000-2000 r-xp 00000000 {:x}:{:x} {} {}\n",
+            device_major,
+            device_minor,
+            metadata.ino() + 1,
+            executable.display()
+        );
+
+        let error =
+            resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &executable)
+                .expect_err("a different maps device/inode must fail closed");
+
+        assert!(
+            error.to_string().contains("loaded-image identity changed"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_loaded_image_recheck_detects_pre_replace_swap() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let candidate = dir.path().join("codewhale");
+        let replacement = dir.path().join("replacement");
+        write_test_executable(&candidate);
+        let maps = test_android_mapping_line(&candidate, "r-xp");
+
+        write_test_executable(&replacement);
+        std::fs::rename(&replacement, &candidate).unwrap();
+        let error =
+            resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &candidate)
+                .expect_err("a path swap after download must fail before replacement");
+
+        assert!(
+            error.to_string().contains("loaded-image identity changed"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_identity_preflight_prevents_all_paired_replacements() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = dir.path().join("codewhale");
+        let sibling = dir.path().join("codewhale-tui");
+        let swapped_primary = dir.path().join("swapped-primary");
+
+        write_test_executable(&primary);
+        std::fs::write(&primary, b"original running primary").unwrap();
+        let maps = test_android_mapping_line(&primary, "r-xp");
+        write_test_executable(&sibling);
+        std::fs::write(&sibling, b"original sibling").unwrap();
+        write_test_executable(&swapped_primary);
+        std::fs::write(&swapped_primary, b"externally swapped primary").unwrap();
+        std::fs::rename(&swapped_primary, &primary).unwrap();
+
+        let downloads = vec![
+            (
+                primary.clone(),
+                "codewhale-android-arm64".to_string(),
+                b"downloaded primary".to_vec(),
+            ),
+            (
+                sibling.clone(),
+                "codewhale-tui-android-arm64".to_string(),
+                b"downloaded sibling".to_vec(),
+            ),
+        ];
+        let error = replace_verified_downloads(&downloads, || {
+            resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &primary)
+                .map(|_| ())
+        })
+        .expect_err("identity mismatch must fail before either binary changes");
+
+        assert!(
+            error.to_string().contains("loaded-image identity changed"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            b"externally swapped primary"
+        );
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"original sibling");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_identity_recheck_before_sibling_prevents_pair_split() {
+        use std::cell::Cell;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = dir.path().join("codewhale");
+        let sibling = dir.path().join("codewhale-tui");
+        let swapped_primary = dir.path().join("swapped-primary");
+        write_test_executable(&primary);
+        std::fs::write(&primary, b"original running primary").unwrap();
+        let maps = test_android_mapping_line(&primary, "r-xp");
+        write_test_executable(&sibling);
+        std::fs::write(&sibling, b"original sibling").unwrap();
+        write_test_executable(&swapped_primary);
+        std::fs::write(&swapped_primary, b"externally swapped primary").unwrap();
+
+        let downloads = vec![
+            (
+                primary.clone(),
+                "codewhale-android-arm64".to_string(),
+                b"downloaded primary".to_vec(),
+            ),
+            (
+                sibling.clone(),
+                "codewhale-tui-android-arm64".to_string(),
+                b"downloaded sibling".to_vec(),
+            ),
+        ];
+        let validation_calls = Cell::new(0);
+        let error = replace_verified_downloads(&downloads, || {
+            let call = validation_calls.get() + 1;
+            validation_calls.set(call);
+            if call == 1 {
+                return Ok(());
+            }
+            std::fs::rename(&swapped_primary, &primary).unwrap();
+            resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &primary)
+                .map(|_| ())
+        })
+        .expect_err("identity mismatch must fail before the staged sibling persists");
+
+        assert_eq!(validation_calls.get(), 2);
+        assert!(
+            error.to_string().contains("loaded-image identity changed"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            b"externally swapped primary"
+        );
+        assert_eq!(std::fs::read(&sibling).unwrap(), b"original sibling");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn android_identity_jit_recheck_runs_after_staging_before_persist() {
+        use std::cell::Cell;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let primary = dir.path().join("codewhale");
+        let swapped_primary = dir.path().join("swapped-primary");
+        write_test_executable(&primary);
+        std::fs::write(&primary, b"original running primary").unwrap();
+        let maps = test_android_mapping_line(&primary, "r-xp");
+        write_test_executable(&swapped_primary);
+        std::fs::write(&swapped_primary, b"externally swapped primary").unwrap();
+
+        let downloads = vec![(
+            primary.clone(),
+            "codewhale-android-arm64".to_string(),
+            b"downloaded primary".to_vec(),
+        )];
+        let validation_calls = Cell::new(0);
+        let error = replace_verified_downloads(&downloads, || {
+            let call = validation_calls.get() + 1;
+            validation_calls.set(call);
+            if call == 1 {
+                return Ok(());
+            }
+            std::fs::rename(&swapped_primary, &primary).unwrap();
+            resolve_android_loaded_executable_report(&maps, TEST_ANDROID_MARKER, &primary)
+                .map(|_| ())
+        })
+        .expect_err("the post-staging identity swap must fail before persist");
+
+        assert_eq!(validation_calls.get(), 2);
+        assert!(
+            error.to_string().contains("loaded-image identity changed"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(
+            std::fs::read(&primary).unwrap(),
+            b"externally swapped primary"
+        );
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().all(|entry| {
+                !entry
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".codewhale-update-")
+            }),
+            "failed validation must clean the staged temp file"
         );
     }
 
@@ -1200,6 +2078,7 @@ mod tests {
             ("codewhale", "macos", "x86_64", "codewhale-macos-x64"),
             ("codewhale", "linux", "x86_64", "codewhale-linux-x64"),
             ("codewhale", "windows", "x86_64", "codewhale-windows-x64"),
+            ("codewhale", "windows", "aarch64", "codewhale-windows-arm64"),
             (
                 "codewhale-tui",
                 "macos",
@@ -1374,7 +2253,7 @@ mod tests {
             Some(GlibcVersion::new(2, 35, 0)),
         );
 
-        assert!(message.contains("Prebuilt CodeWhale asset `codewhale-linux-x64`"));
+        assert!(message.contains("Prebuilt Codewhale asset `codewhale-linux-x64`"));
         assert!(message.contains("requires GLIBC_2.39"));
         assert!(message.contains("this system has glibc 2.35"));
         assert!(message.contains("cargo install codewhale-cli --locked"));
@@ -1459,10 +2338,12 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             { "name": "codewhale-macos-arm64",        "browser_download_url": "https://example.invalid/codewhale-macos-arm64" },
             { "name": "codewhale-windows-x64.exe",    "browser_download_url": "https://example.invalid/codewhale-windows-x64.exe" },
             { "name": "codewhale-windows-x64.exe.sha256", "browser_download_url": "https://example.invalid/codewhale-windows-x64.exe.sha256" },
+            { "name": "codewhale-windows-arm64.exe",  "browser_download_url": "https://example.invalid/codewhale-windows-arm64.exe" },
             { "name": "codewhale-tui-linux-x64",      "browser_download_url": "https://example.invalid/codewhale-tui-linux-x64" },
             { "name": "codewhale-tui-macos-x64",      "browser_download_url": "https://example.invalid/codewhale-tui-macos-x64" },
             { "name": "codewhale-tui-macos-arm64",    "browser_download_url": "https://example.invalid/codewhale-tui-macos-arm64" },
-            { "name": "codewhale-tui-windows-x64.exe","browser_download_url": "https://example.invalid/codewhale-tui-windows-x64.exe" }
+            { "name": "codewhale-tui-windows-x64.exe","browser_download_url": "https://example.invalid/codewhale-tui-windows-x64.exe" },
+            { "name": "codewhale-tui-windows-arm64.exe","browser_download_url": "https://example.invalid/codewhale-tui-windows-arm64.exe" }
           ]
         }"#;
         serde_json::from_str(json).expect("mock release JSON")
@@ -1476,6 +2357,7 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
             ("macos", "x86_64", "codewhale-macos-x64"),
             ("linux", "x86_64", "codewhale-linux-x64"),
             ("windows", "x86_64", "codewhale-windows-x64.exe"),
+            ("windows", "aarch64", "codewhale-windows-arm64.exe"),
         ];
 
         for (os, arch, expected) in cases {
@@ -1496,6 +2378,48 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         );
         let asset = select_platform_asset(&release, &stem).expect("TUI platform asset");
         assert_eq!(asset.name, "codewhale-tui-macos-arm64");
+
+        let windows_stem =
+            release_asset_stem_for(Path::new("C:\\codewhale-tui.exe"), "windows", "aarch64");
+        let windows_asset =
+            select_platform_asset(&release, &windows_stem).expect("Windows ARM64 TUI asset");
+        assert_eq!(windows_asset.name, "codewhale-tui-windows-arm64.exe");
+    }
+
+    #[test]
+    fn android_arm64_maps_to_android_release_assets() {
+        // The generic format!("{prefix}-{os}-{arch}") path naturally produces
+        // Android asset stems. Verify the full stem for both dispatcher and TUI
+        // binaries so `codewhale update` on Termux requests Android assets, not
+        // linux-arm64 (#4241).
+        assert_eq!(
+            release_asset_stem_for_prefix("codewhale", "android", "aarch64"),
+            "codewhale-android-arm64"
+        );
+        assert_eq!(
+            release_asset_stem_for_prefix("codewhale-tui", "android", "aarch64"),
+            "codewhale-tui-android-arm64"
+        );
+        assert_eq!(
+            release_asset_stem_for_prefix("codew", "android", "aarch64"),
+            "codew-android-arm64"
+        );
+    }
+
+    #[test]
+    fn ensure_supported_release_target_accepts_android() {
+        // Android/Termux is a supported release target (#4241).
+        assert!(ensure_supported_release_target("android", "aarch64").is_ok());
+    }
+
+    #[test]
+    fn android_release_assets_never_select_linux_arm64() {
+        // Sanity: the stem formatter must never produce a linux-* stem for android.
+        let stem = release_asset_stem_for_prefix("codewhale", "android", "aarch64");
+        assert!(
+            !stem.contains("linux"),
+            "android stem must not contain linux: {stem}"
+        );
     }
 
     #[test]
@@ -1544,6 +2468,17 @@ E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855  *codewhale-win
         assert!(
             select_platform_asset(&release, "codewhale-tui-windows-x64")
                 .is_some_and(|asset| asset.name == "codewhale-tui-windows-x64.exe")
+        );
+
+        let arm_release = release_from_mirror_base_url(
+            "https://mirror.example/releases/v0.9.1",
+            "v0.9.1",
+            "windows",
+            "aarch64",
+        );
+        assert!(
+            select_platform_asset(&arm_release, "codewhale-windows-arm64")
+                .is_some_and(|asset| asset.name == "codewhale-windows-arm64.exe")
         );
     }
 

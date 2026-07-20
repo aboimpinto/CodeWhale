@@ -22,6 +22,7 @@
 
 use std::sync::{Mutex, OnceLock};
 
+use crate::config::ApiProvider;
 use crate::models::Usage;
 use crate::pricing::CostEstimate;
 
@@ -32,11 +33,15 @@ fn cell() -> &'static Mutex<CostEstimate> {
 }
 
 /// Background callers report their LLM usage here. Computes the
-/// cost via [`crate::pricing::calculate_turn_cost_estimate_from_usage`] and
+/// cost via [`crate::pricing::calculate_turn_cost_estimate_for_provider`] and
 /// adds it to the pending pool. Cheap; takes a short-lived lock
-/// and returns. No-op on models the pricing table doesn't know.
-pub fn report(model: &str, usage: &Usage) {
-    let Some(cost) = crate::pricing::calculate_turn_cost_estimate_from_usage(model, usage) else {
+/// and returns. No-op when the provider does not expose authoritative runtime
+/// pricing (for example ChatGPT/Codex OAuth), needs route provenance that this
+/// side channel does not carry (StepFun PAYG vs Plan), or the model is unknown.
+pub fn report(provider: ApiProvider, model: &str, usage: &Usage) {
+    let Some(cost) =
+        crate::pricing::calculate_turn_cost_estimate_for_provider(provider, model, usage)
+    else {
         return;
     };
     if !cost.is_positive() {
@@ -94,7 +99,7 @@ mod tests {
     fn report_adds_to_pool_and_drain_returns_then_resets() {
         let _g = serial_lock();
         reset_for_tests();
-        report("deepseek-v4-flash", &small_usage());
+        report(ApiProvider::Deepseek, "deepseek-v4-flash", &small_usage());
         let first = drain();
         assert!(first.usd > 0.0, "expected positive USD cost, got {first:?}");
         assert!(first.cny > 0.0, "expected positive CNY cost, got {first:?}");
@@ -107,7 +112,28 @@ mod tests {
         let _g = serial_lock();
         reset_for_tests();
         // NIM-hosted models intentionally have no DeepSeek pricing.
-        report("deepseek-ai/deepseek-v4-pro", &small_usage());
+        report(
+            ApiProvider::NvidiaNim,
+            "deepseek-ai/deepseek-v4-pro",
+            &small_usage(),
+        );
+        assert_eq!(drain(), CostEstimate::default());
+    }
+
+    #[test]
+    fn report_skips_codex_oauth_pricing() {
+        let _g = serial_lock();
+        reset_for_tests();
+        report(ApiProvider::OpenaiCodex, "gpt-5.5", &small_usage());
+        assert_eq!(drain(), CostEstimate::default());
+    }
+
+    #[test]
+    fn report_skips_stepfun_without_billing_surface() {
+        let _g = serial_lock();
+        reset_for_tests();
+        report(ApiProvider::Stepfun, "step-3.7-flash", &small_usage());
+        report(ApiProvider::Openrouter, "step-3.7-flash", &small_usage());
         assert_eq!(drain(), CostEstimate::default());
     }
 
@@ -115,8 +141,8 @@ mod tests {
     fn report_accumulates_across_multiple_calls() {
         let _g = serial_lock();
         reset_for_tests();
-        report("deepseek-v4-flash", &small_usage());
-        report("deepseek-v4-flash", &small_usage());
+        report(ApiProvider::Deepseek, "deepseek-v4-flash", &small_usage());
+        report(ApiProvider::Deepseek, "deepseek-v4-flash", &small_usage());
         let total = drain();
         // Two equal reports — total must be 2× a single report.
         let single = crate::pricing::calculate_turn_cost_estimate_from_usage(

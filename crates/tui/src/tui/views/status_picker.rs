@@ -19,15 +19,13 @@ use ratatui::{
 };
 
 use crate::config::{ApiProvider, StatusItem};
-use crate::localization::{Locale, MessageId, tr, truncate_to_width};
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::views::{
     ActionHint, ModalKind, ModalView, ViewAction, ViewEvent, centered_modal_area,
     render_modal_footer, render_modal_surface,
 };
 use unicode_width::UnicodeWidthStr;
-
-const STATUS_PICKER_SELECTION_BG: ratatui::style::Color = ratatui::style::Color::Rgb(54, 72, 104);
 
 /// Picker state. We hold both the user's working selection AND the original
 /// snapshot so Esc can perfectly revert the live preview.
@@ -184,12 +182,12 @@ impl ModalView for StatusPickerView {
             .title(Line::from(Span::styled(
                 tr(self.locale, MessageId::StatusPickerTitle),
                 Style::default()
-                    .fg(palette::DEEPSEEK_SKY)
+                    .fg(palette::WHALE_INFO)
                     .add_modifier(Modifier::BOLD),
             )))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK))
+            .style(Style::default().bg(palette::WHALE_BG))
             .padding(Padding::uniform(1));
 
         let inner = block.inner(popup_area);
@@ -248,23 +246,32 @@ impl ModalView for StatusPickerView {
             } else {
                 Style::default().fg(palette::TEXT_DIM)
             };
-            let pointer = if is_cursor { "▸" } else { " " };
+            let pointer = crate::tui::glyphs::selection_marker(is_cursor);
 
             if is_cursor {
                 let selected_style = Style::default()
                     .fg(palette::SELECTION_TEXT)
-                    .bg(STATUS_PICKER_SELECTION_BG)
+                    .bg(palette::SELECTION_BG)
                     .add_modifier(Modifier::BOLD);
                 let line = status_row_text(pointer, mark, item, content.width as usize);
                 lines.push(Line::from(Span::styled(line, selected_style)));
             } else {
+                let label = item.label();
+                let hint = item.hint();
+                let prefix = format!(" {pointer} {mark} {label}  (");
+                let truncated_hint = crate::tui::ui_text::semantic_truncate_between_affixes(
+                    &prefix,
+                    hint,
+                    ")",
+                    usize::from(content.width),
+                );
                 lines.push(Line::from(vec![
                     Span::styled(format!(" {pointer} "), row_style),
                     Span::styled(mark.to_string(), row_style),
                     Span::styled(" ", row_style),
-                    Span::styled(item.label().to_string(), row_style),
+                    Span::styled(label.to_string(), row_style),
                     Span::styled("  ", row_style),
-                    Span::styled(format!("({})", item.hint()), hint_style),
+                    Span::styled(format!("({})", truncated_hint), hint_style),
                 ]));
             }
         }
@@ -285,8 +292,9 @@ fn visible_row_start(total_rows: usize, cursor: usize, visible_rows: usize) -> u
 }
 
 fn status_row_text(pointer: &str, mark: &str, item: &StatusItem, width: usize) -> String {
-    let text = format!(" {pointer} {mark} {}  ({})", item.label(), item.hint());
-    let mut text = truncate_to_width(&text, width);
+    let prefix = format!(" {pointer} {mark} {}  (", item.label());
+    let mut text =
+        crate::tui::ui_text::semantic_truncate_with_affixes(&prefix, item.hint(), ")", width);
     let current_width = text.width();
     if current_width < width {
         text.push_str(&" ".repeat(width - current_width));
@@ -401,6 +409,14 @@ mod tests {
     }
 
     #[test]
+    fn selected_row_text_semantically_truncates_hint_at_narrow_width() {
+        let text = status_row_text("▸", "[ ]", &StatusItem::LastToolElapsed, 49);
+        assert_eq!(text.width(), 49);
+        assert!(text.contains("ms of the most…"), "{text:?}");
+        assert!(!text.contains("ms of the most r"), "{text:?}");
+    }
+
+    #[test]
     fn balance_excluded_for_non_deepseek_provider() {
         let active = StatusItem::default_footer();
         let view = StatusPickerView::new(&active, ApiProvider::Openrouter, Locale::En);
@@ -455,7 +471,7 @@ mod tests {
             );
             assert_eq!(
                 buf[(w / 2, h / 2)].bg,
-                palette::DEEPSEEK_INK,
+                palette::WHALE_BG,
                 "{w}x{h}: modal interior must be opaque"
             );
             for (y, row) in rows.iter().enumerate() {

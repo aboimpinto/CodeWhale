@@ -10,7 +10,9 @@ use crate::tui::app::{App, TaskPanelEntryKind};
 use crate::tui::format_helpers;
 use crate::tui::history::{HistoryCell, ToolCell, ToolStatus, summarize_tool_output};
 use crate::tui::key_shortcuts;
-use crate::tui::subagent_routing::{active_fanout_counts, running_agent_count};
+use crate::tui::subagent_routing::{
+    active_fanout_counts, agents_sidebar_surface_visible, running_agent_count,
+};
 use crate::tui::ui::{
     active_foreground_shell_running, context_usage_snapshot, selected_detail_footer_label,
     status_color,
@@ -51,10 +53,9 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
         })
     });
 
-    // Drive every cluster from the user's configured `status_items`. Mode
-    // and Model are always rendered by `FooterProps` itself (their position
-    // is structural — cluster gating is handled by the widget), so we only
-    // gate the optional clusters here. If a variant is missing from
+    // Drive every cluster from the user's configured `status_items`. The
+    // header owns mode and model; the footer only owns turn state, cost, and
+    // stable session/action chips. If a variant is missing from
     // `status_items`, its span vec stays empty and the footer hides it.
     let mut props = render_footer_from(app, &app.status_items, toast);
     // FooterProps is mut so the working-strip animation can layer on top.
@@ -70,35 +71,51 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
         let dot_frame = footer_working_label_frame(now_ms, app.fancy_animations);
-        // Surface one compact live status row in the footer whenever a turn
-        // is live. Tool turns get the current action plus active/done counts;
-        // non-tool work falls back to a descriptive label with elapsed time.
+        // Header ● Live owns coarse turn state; footer shows action detail only.
         let elapsed_secs = app
             .turn_started_at
             .map(|t| t.elapsed().as_secs())
             .unwrap_or(0);
         let active_subagent_label = active_subagent_status_label(app);
-        let mut label = active_subagent_label
-            .clone()
-            .or_else(|| active_tool_status_label(app))
-            .unwrap_or_else(|| {
-                // Show the working label during active turns (loading, compacting, etc.).
-                let base = crate::tui::widgets::footer_working_label(dot_frame, app.ui_locale);
-                if elapsed_secs > 0 {
-                    format!("{base} ({elapsed_secs}s)")
+        let mut label = if header_owns_live_pulse(app) {
+            active_subagent_label
+                .clone()
+                .or_else(|| active_tool_status_label(app, false))
+                .or_else(|| stall_reason(app))
+                .unwrap_or_default()
+        } else {
+            active_subagent_label
+                .clone()
+                .or_else(|| active_tool_status_label(app, true))
+                .unwrap_or_else(|| {
+                    let base = crate::tui::widgets::footer_working_label(dot_frame, app.ui_locale);
+                    if elapsed_secs > 0 {
+                        format!("{base} ({elapsed_secs}s)")
+                    } else {
+                        base.to_string()
+                    }
+                })
+        };
+        if header_owns_live_pulse(app) {
+            if let Some(reason) = stall_reason(app)
+                && !label.contains(&reason)
+            {
+                label = if label.is_empty() {
+                    reason
                 } else {
-                    base.to_string()
-                }
-            });
-        // Append stall reason when the turn has been running > 30 s.
-        if let Some(reason) = stall_reason(app) {
+                    format!("{label}  ({reason})")
+                };
+            }
+        } else if let Some(reason) = stall_reason(app) {
             label = format!("{label}  ({reason})");
         }
-        props.state_label = label;
+        if !label.is_empty() {
+            props.state_label = label;
+            props.state_color = palette::WHALE_INFO;
+        }
         if active_subagent_label.is_some() {
             props.agents.clear();
         }
-        props.state_color = palette::DEEPSEEK_SKY;
 
         // Water-spout frame source: wall-clock milliseconds. The sine-wave
         // math in `footer_working_strip_glyph_at` was tuned for this cadence
@@ -238,7 +255,7 @@ pub(crate) fn maybe_log_provider_wait_incident(app: &mut App) {
          idle_secs={} stream_idle_budget_secs={} max_subagents={} \
          fanout_running={fanout_running} fanout_total={fanout_total} \
          running_agents={} pending_dispatch={pending_dispatch}",
-        app.api_provider.as_str(),
+        app.provider_identity_for_persistence(),
         app.model,
         provider_wait_idle_secs(app),
         app.stream_chunk_timeout_secs,
@@ -255,6 +272,11 @@ pub(crate) fn maybe_log_provider_wait_incident(app: &mut App) {
 /// itself still being in flight via `runtime_turn_status == "in_progress"`.
 /// Without that, the user sees the strip vanish for seconds at a time even
 /// though the agent is still working.
+/// Header `● Live` owns coarse turn liveness; footer defers to action detail.
+pub(crate) fn header_owns_live_pulse(app: &App) -> bool {
+    app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
+}
+
 pub(crate) fn footer_working_strip_active(app: &App) -> bool {
     let turn_in_progress = app.runtime_turn_status.as_deref() == Some("in_progress");
     app.is_loading
@@ -272,7 +294,7 @@ pub(crate) fn footer_working_label_frame(now_ms: u64, fancy_animations: bool) ->
 mod tests {
     use super::{
         active_subagent_status_label, footer_state_label, footer_working_label_frame,
-        one_line_summary,
+        one_line_summary, render_footer_from,
     };
     use crate::config::Config;
     use crate::tui::app::{App, TuiOptions};
@@ -330,7 +352,11 @@ mod tests {
             resume_session_id: None,
             initial_input: None,
         };
-        App::new(options, &Config::default())
+        // Pin sidebar so dogfood machines with Agents-visible settings.toml
+        // do not hide the footer agents chip this test asserts.
+        let mut app = App::new(options, &Config::default());
+        app.sidebar_focus = crate::tui::app::SidebarFocus::Hidden;
+        app
     }
 
     #[test]
@@ -362,17 +388,14 @@ mod tests {
     }
 
     #[test]
-    fn footer_state_label_prefers_busy_while_pausing_and_loading() {
-        // While the turn is still draining the pause request, the coarse
-        // footer stays "busy"; the finer Pausing/Paused split lives in the
-        // sidebar. This guards against reintroducing a redundant vocabulary.
+    fn footer_state_label_defers_coarse_busy_to_header_during_live_turns() {
         let mut app = create_test_app();
         app.is_loading = true;
         app.paused = true;
         app.paused_quarry = Some("Deploy to staging".to_string());
 
         let (label, _) = footer_state_label(&app);
-        assert_eq!(label, "busy");
+        assert_eq!(label, "ready");
     }
 
     #[test]
@@ -380,6 +403,15 @@ mod tests {
         let app = create_test_app();
         let (label, _) = footer_state_label(&app);
         assert_eq!(label, "idle");
+    }
+
+    #[test]
+    fn production_footer_does_not_repeat_header_model_or_mode() {
+        let app = create_test_app();
+        let props = render_footer_from(&app, &app.status_items, None);
+        assert!(props.model.is_empty());
+        assert!(props.mode_label.is_empty());
+        assert_eq!(props.state_label, "idle");
     }
 
     // #3189: provider-wait reason thresholds
@@ -472,6 +504,9 @@ pub(crate) fn friendly_subagent_progress(app: &App, id: &str, status: &str) -> S
 }
 
 pub(crate) fn active_subagent_status_label(app: &App) -> Option<String> {
+    if agents_sidebar_surface_visible(app) {
+        return None;
+    }
     let running = running_agent_count(app);
     let fanout = active_fanout_counts(app);
     let (display_running, total) = if let Some((fanout_running, fanout_total)) = fanout {
@@ -539,7 +574,7 @@ impl ActiveToolStatusSnapshot {
     }
 }
 
-pub(crate) fn active_tool_status_label(app: &App) -> Option<String> {
+pub(crate) fn active_tool_status_label(app: &App, include_counts: bool) -> Option<String> {
     let active = app.active_cell.as_ref()?;
     if active.is_empty() {
         return None;
@@ -563,11 +598,11 @@ pub(crate) fn active_tool_status_label(app: &App) -> Option<String> {
         .or(app.turn_started_at)
         .map(|started| format!("{}s", started.elapsed().as_secs()));
 
-    let mut parts = vec![
-        primary,
-        format!("{} active", snapshot.running),
-        format!("{} done", snapshot.completed),
-    ];
+    let mut parts = vec![primary];
+    if include_counts {
+        parts.push(format!("{} active", snapshot.running));
+        parts.push(format!("{} done", snapshot.completed));
+    }
     if let Some(elapsed) = elapsed {
         parts.push(elapsed);
     }
@@ -602,7 +637,7 @@ fn collect_active_tool_status(
             }
         }
         ToolCell::PlanUpdate(plan) => {
-            snapshot.record("update plan".to_string(), plan.status, None);
+            snapshot.record("update Strategy".to_string(), plan.status, None);
         }
         ToolCell::PatchSummary(patch) => {
             snapshot.record(format!("patch {}", patch.path), patch.status, None);
@@ -657,11 +692,9 @@ pub(crate) fn one_line_summary(text: &str, max_width: usize) -> String {
 
 /// Build [`FooterProps`] from a user-configured `status_items` slice.
 ///
-/// Variants are routed to their structural cluster: `Mode` and `Model` are
-/// always emitted (the widget needs them to lay out the line correctly even
-/// when the user toggled them off the picker — we honour the toggle by
-/// blanking their visible content rather than collapsing the layout).
-/// `Cost` and `Status` belong in the left cluster; the rest in the right.
+/// Variants are routed to their structural cluster. Header-owned `Mode` and
+/// `Model` remain blank here; `Cost` and `Status` belong in the left cluster,
+/// and the rest in the right.
 ///
 /// A variant absent from `items` produces an empty span vec, which the
 /// footer widget already hides cleanly. This keeps the renderer fully
@@ -682,7 +715,7 @@ pub(crate) fn render_footer_from(
         ("ready", app.ui_theme.text_muted)
     };
 
-    let agents = if has(S::Agents) {
+    let agents = if has(S::Agents) && !agents_sidebar_surface_visible(app) {
         crate::tui::widgets::footer_agents_chip(running_agent_count(app), app.ui_locale)
     } else {
         Vec::new()
@@ -714,9 +747,8 @@ pub(crate) fn render_footer_from(
         Vec::new()
     };
 
-    // Build the props; `Mode` and `Model` toggles modulate downstream by
-    // blanking the rendered text rather than restructuring the widget — the
-    // user is opting out of the chip, not destroying the bar.
+    // Build the props, then remove header-owned facts so the footer cannot
+    // repeat them even when an older status_items list still contains Model.
     let mut props = FooterProps::from_app(
         app,
         toast,
@@ -728,12 +760,8 @@ pub(crate) fn render_footer_from(
         cost,
         balance,
     );
-    if !has(S::Mode) {
-        props.mode_label = "";
-    }
-    if !has(S::Model) {
-        props.model.clear();
-    }
+    props.model.clear();
+    props.mode_label = "";
 
     // Shell-running chip: visible whenever foreground or background shell work
     // is active, regardless of user-configured status items.
@@ -873,17 +901,28 @@ pub(crate) fn footer_context_percent_spans(app: &App) -> Vec<Span<'static>> {
 
 pub(crate) fn footer_cost_spans(app: &App) -> Vec<Span<'static>> {
     let displayed_cost = app.displayed_session_cost_for_currency(app.cost_currency);
-    if !should_show_footer_cost(displayed_cost) {
+    let chip = crate::route_billing::usage_chip(
+        app.billing_presentation,
+        app.api_provider,
+        &app.model,
+        displayed_cost,
+        app.cost_display_currency(app.cost_currency),
+        None,
+    );
+    // Footer only owns positive metered spend. Allowance/local/unknown live
+    // on the context panel so the chrome stays calm and never invents $0.00.
+    let crate::route_billing::UsageChip::Money(amount) = chip else {
         return Vec::new();
-    }
+    };
     let mut spans = vec![Span::styled(
-        app.format_cost_amount(displayed_cost),
+        amount,
         Style::default().fg(palette::TEXT_MUTED),
     )];
     // Append cache-savings hint when the last turn had cache hits that
     // saved money (#2038).
     if let Some(saved) = app.last_turn_cache_savings()
         && saved > 0.0
+        && app.billing_presentation.shows_money()
     {
         spans.push(Span::styled(
             format!(" · saved {}", app.format_cost_amount(saved)),
@@ -924,6 +963,7 @@ pub(crate) fn footer_balance_spans(app: &App) -> Vec<Span<'static>> {
     )]
 }
 
+#[allow(dead_code)] // positive-spend gate shared with billing chip helpers (TUI-DOG-010)
 pub(crate) fn should_show_footer_cost(displayed_cost: f64) -> bool {
     displayed_cost.is_finite() && displayed_cost > 0.0
 }
@@ -1081,34 +1121,23 @@ pub(crate) fn footer_status_line_spans(app: &App, max_width: usize) -> Vec<Span<
         return Vec::new();
     }
 
-    let (mode_label, mode_color) = footer_mode_style(app);
     let (status_label, status_color) = footer_state_label(app);
     let sep = " \u{00B7} ";
     let show_status = status_label != "ready";
 
-    let fixed_width = mode_label.width()
-        + sep.width()
-        + if show_status {
-            sep.width() + status_label.width()
-        } else {
-            0
-        };
-
-    if max_width <= mode_label.width() {
-        return vec![Span::styled(
-            truncate_line_to_width(mode_label, max_width),
-            Style::default().fg(mode_color),
-        )];
-    }
+    let fixed_width = if show_status {
+        sep.width() + status_label.width()
+    } else {
+        0
+    };
 
     let model_budget = max_width.saturating_sub(fixed_width).max(1);
     let model_label = truncate_line_to_width(&app.model, model_budget);
 
-    let mut spans = vec![
-        Span::styled(mode_label.to_string(), Style::default().fg(mode_color)),
-        Span::styled(sep.to_string(), Style::default().fg(app.ui_theme.text_dim)),
-        Span::styled(model_label, Style::default().fg(app.ui_theme.text_hint)),
-    ];
+    let mut spans = vec![Span::styled(
+        model_label,
+        Style::default().fg(app.ui_theme.text_hint),
+    )];
 
     if show_status {
         spans.push(Span::styled(
@@ -1134,8 +1163,8 @@ pub(crate) fn footer_state_label(app: &App) -> (&'static str, ratatui::style::Co
     if app.is_purging {
         return ("purging \u{238B}", app.ui_theme.status_warning);
     }
-    if app.is_loading || matches!(app.runtime_turn_status.as_deref(), Some("in_progress")) {
-        return ("busy", app.ui_theme.status_working);
+    if header_owns_live_pulse(app) {
+        return ("ready", app.ui_theme.text_muted);
     }
     // Note: we deliberately do NOT show a "thinking" label for live turns.
     // Busy can mean model bytes, tool calls, approval waits, or sub-agents;
@@ -1171,18 +1200,6 @@ pub(crate) fn footer_state_label(app: &App) -> (&'static str, ratatui::style::Co
     }
 
     ("idle", app.ui_theme.status_ready)
-}
-
-#[cfg(test)]
-pub(crate) fn footer_mode_style(app: &App) -> (&'static str, ratatui::style::Color) {
-    let label = app.mode.as_setting();
-    let color = match app.mode {
-        crate::tui::app::AppMode::Agent => app.ui_theme.mode_agent,
-        crate::tui::app::AppMode::Auto => app.ui_theme.mode_agent,
-        crate::tui::app::AppMode::Yolo => app.ui_theme.mode_yolo,
-        crate::tui::app::AppMode::Plan => app.ui_theme.mode_plan,
-    };
-    (label, color)
 }
 
 pub(crate) fn format_token_count_compact(tokens: u64) -> String {

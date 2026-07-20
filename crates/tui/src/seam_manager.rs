@@ -315,7 +315,11 @@ impl SeamManager {
         // Seam recompaction calls are billed; route through the
         // side-channel (#526) so the footer total matches the
         // DeepSeek website.
-        crate::cost_status::report(&response.model, &response.usage);
+        crate::cost_status::report(
+            self.flash_client.api_provider(),
+            &response.model,
+            &response.usage,
+        );
         let summary = response
             .content
             .iter()
@@ -436,7 +440,11 @@ impl SeamManager {
         // Seam recompaction calls are billed; route through the
         // side-channel (#526) so the footer total matches the
         // DeepSeek website.
-        crate::cost_status::report(&response.model, &response.usage);
+        crate::cost_status::report(
+            self.flash_client.api_provider(),
+            &response.model,
+            &response.usage,
+        );
         let summary = response
             .content
             .iter()

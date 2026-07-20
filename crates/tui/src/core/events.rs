@@ -5,8 +5,10 @@
 
 use std::{path::PathBuf, sync::Arc};
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 
+use crate::config::ApiProvider;
 use crate::error_taxonomy::ErrorEnvelope;
 use crate::models::{Message, SystemPrompt, Tool, Usage};
 use crate::tools::goal::GoalSnapshot;
@@ -20,6 +22,21 @@ pub enum TurnOutcomeStatus {
     Completed,
     Interrupted,
     Failed,
+}
+
+/// Provider/model route resolved for a model-backed turn.
+///
+/// Carried with `TurnStarted` so hosts can retain provenance until the matching
+/// `TurnComplete` without relying on mutable global selection state. Non-model
+/// turns such as composer `!` shell commands use no route.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TurnRoute {
+    pub provider: ApiProvider,
+    /// Exact non-secret configured route key. Named custom providers all map
+    /// to [`ApiProvider::Custom`], so the enum alone is not provenance.
+    pub provider_identity: String,
+    pub model: String,
+    pub auto_model: bool,
 }
 
 /// Events emitted by the engine to update the UI.
@@ -72,6 +89,13 @@ pub enum Event {
         input: Value,
     },
 
+    /// Best-effort liveness pulse while a tool future remains pending.
+    ///
+    /// This carries no output and must not change user-visible status or the
+    /// transcript. It only prevents the TUI from declaring a healthy,
+    /// deliberately long-running tool turn stale.
+    ToolCallHeartbeat,
+
     /// Tool call completed
     ToolCallComplete {
         id: String,
@@ -81,7 +105,11 @@ pub enum Event {
 
     // === Turn Lifecycle ===
     /// A new turn has started (user sent a message)
-    TurnStarted { turn_id: String },
+    TurnStarted {
+        turn_id: String,
+        created_at: DateTime<Utc>,
+        route: Option<TurnRoute>,
+    },
 
     /// The turn is complete (no more tool calls)
     TurnComplete {
@@ -116,6 +144,12 @@ pub enum Event {
         /// Number of messages after compaction.
         #[allow(dead_code)]
         messages_after: Option<usize>,
+        /// Rendered text of the accumulated compaction summary prompt, if any.
+        /// Host layers (e.g. the /v1 runtime) persist this into the thread
+        /// record so the summary survives engine reloads — without it the
+        /// summary lives only in engine memory and is lost on LRU eviction
+        /// or restart (SyncSession re-extracts it from the record prompt).
+        summary_prompt: Option<String>,
     },
 
     /// Context purge started.
@@ -177,6 +211,16 @@ pub enum Event {
     SubAgentMailbox {
         seq: u64,
         message: crate::tools::subagent::MailboxMessage,
+    },
+
+    /// Live workflow UI event (#4122). Mirrors a typed `WorkflowUiEvent` JSON
+    /// object so the TUI can advance the WorkflowPanel and the compact history
+    /// card while a run is still in flight (not only on tool complete).
+    WorkflowUi {
+        run_id: String,
+        /// Flattened event JSON: `{"type":"task_started", "at_ms":…, …}`.
+        /// Callers inject `run_id` on the object when available.
+        event: Value,
     },
 
     // === System Events ===
@@ -252,6 +296,14 @@ pub enum Event {
         denial_reason: String,
         blocked_network: bool,
         blocked_write: bool,
+    },
+
+    /// Observable LSP repair-loop update for the Turn Inspector (#4107).
+    /// Carries only summary counts/state — never raw prompt internals.
+    LspRepairUpdate {
+        diagnostics_found: usize,
+        files: usize,
+        injected: bool,
     },
 
     // === Prefix-Cache Stability Events ===

@@ -155,10 +155,25 @@ impl PtySession {
         PtySessionBuilder::new(program)
     }
 
+    pub fn pid(&self) -> Option<u32> {
+        self.child.process_id()
+    }
+
     pub fn write_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         self.writer.write_all(bytes).context("pty write")?;
         self.writer.flush().context("pty flush")?;
         Ok(())
+    }
+
+    pub fn resize(&self, rows: u16, cols: u16) -> Result<()> {
+        self.master
+            .resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .context("pty resize")
     }
 
     /// Drain any bytes the reader thread has pushed into the buffer. Returns

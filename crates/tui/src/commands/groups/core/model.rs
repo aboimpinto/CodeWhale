@@ -8,8 +8,8 @@ use super::CommandResult;
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "model",
-    aliases: &["moxing"],
-    usage: "/model [name]",
+    aliases: &["moxing", "route"],
+    usage: "/model [name|refresh]",
     description_id: MessageId::CmdModelDescription,
 };
 

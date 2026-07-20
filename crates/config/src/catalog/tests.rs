@@ -27,8 +27,11 @@ const FIXTURE: &str = r#"{
           "id": "glm-5.2",
           "family": "glm",
           "default": true,
+          "attachment": false,
           "reasoning": true,
           "reasoning_options": [{ "type": "effort", "values": ["high", "max"] }],
+          "tool_call": true,
+          "structured_output": true,
           "modalities": { "input": ["text"], "output": ["text"] },
           "limit": { "context": 1000000, "output": 131072 },
           "cost": { "input": 1.4, "output": 4.4, "cache_read": 0.26 }
@@ -76,6 +79,9 @@ fn hydrates_models_dev_offerings_preserving_offering_facts() {
     assert!(glm.default_for_provider);
     assert_eq!(glm.family.as_deref(), Some("glm"));
     assert_eq!(glm.reasoning, Some(true));
+    assert_eq!(glm.attachment, Some(false));
+    assert_eq!(glm.tool_call, Some(true));
+    assert_eq!(glm.structured_output, Some(true));
     // Provider-scoped reasoning options are preserved, not collapsed.
     assert_eq!(glm.reasoning_options.len(), 1);
     assert_eq!(glm.limit.as_ref().and_then(|l| l.context), Some(1_000_000));
@@ -109,6 +115,26 @@ fn to_offering_projects_routing_identity_and_limits() {
     assert_eq!(glm.endpoint_key, "chat");
     assert_eq!(glm.limits.context_tokens, Some(1_000_000));
     assert_eq!(glm.limits.output_tokens, Some(131_072));
+    assert_eq!(
+        glm.capabilities.attachments,
+        crate::route::CapabilityState::Unsupported
+    );
+    assert_eq!(
+        glm.capabilities.reasoning,
+        crate::route::CapabilityState::Supported
+    );
+    assert_eq!(
+        glm.capabilities.native_tool_calls,
+        crate::route::CapabilityState::Supported
+    );
+    assert_eq!(
+        glm.capabilities.structured_output,
+        crate::route::CapabilityState::Supported
+    );
+    assert_eq!(
+        glm.capabilities.streaming,
+        crate::route::CapabilityState::Unknown
+    );
 }
 
 #[test]
@@ -497,6 +523,12 @@ fn all_fresh_offerings_spans_providers_and_skips_stale() {
     let fresh = cache.all_fresh_offerings(1_100);
     assert_eq!(fresh.len(), 1);
     assert_eq!(fresh[0].wire_model_id, "fresh-row");
+
+    // #4139: pickers still see stale rows; only the fresh helper drops them.
+    let visible = cache.all_visible_offerings(1_100);
+    assert_eq!(visible.len(), 2);
+    assert!(visible.iter().any(|row| row.wire_model_id == "fresh-row"));
+    assert!(visible.iter().any(|row| row.wire_model_id == "stale-row"));
 }
 
 #[test]
@@ -521,7 +553,7 @@ fn snapshot_feeds_route_resolver_offerings() {
 }
 
 // ---------------------------------------------------------------------------
-// #3385: the committed bundled Models.dev asset.
+// #3385 / #4188: the committed offline/stale bundled Models.dev asset.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -540,6 +572,30 @@ fn bundled_asset_parses() {
 }
 
 #[test]
+fn bundled_asset_meta_describes_offline_fallback_not_competing_truth() {
+    // #4188: the asset must document itself as offline/stale fallback, not a
+    // competing curated source of truth alongside live Models.dev.
+    let raw: serde_json::Value =
+        serde_json::from_str(BUNDLED_MODELS_DEV_JSON).expect("bundled JSON");
+    let meta = raw
+        .get("_meta")
+        .and_then(|m| m.as_object())
+        .expect("_meta object");
+    let role = meta
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        role.to_ascii_lowercase().contains("not a competing"),
+        "_meta.role must demote the bundled asset: {role}"
+    );
+    assert!(
+        role.to_ascii_lowercase().contains("live"),
+        "_meta.role must point at live Models.dev preference: {role}"
+    );
+}
+
+#[test]
 fn bundled_asset_yields_real_chat_offerings_for_key_models() {
     let rows = bundled_catalog_offerings();
     assert!(
@@ -554,8 +610,60 @@ fn bundled_asset_yields_real_chat_offerings_for_key_models() {
     assert_eq!(glm.limit.as_ref().and_then(|l| l.context), Some(1_000_000));
     assert!(glm.default_for_provider);
 
-    let kimi = find(&rows, "moonshot", "kimi-k2.7-code");
-    assert_eq!(kimi.limit.as_ref().and_then(|l| l.context), Some(262_144));
+    let kimi_k27 = find(&rows, "moonshot", "kimi-k2.7-code");
+    assert_eq!(
+        kimi_k27.limit.as_ref().and_then(|l| l.context),
+        Some(262_144)
+    );
+
+    let kimi_k3 = find(&rows, "moonshot", "kimi-k3");
+    assert_eq!(
+        kimi_k3.limit.as_ref().and_then(|l| l.context),
+        Some(1_048_576)
+    );
+    assert_eq!(kimi_k3.limit.as_ref().and_then(|l| l.output), Some(131_072));
+    let kimi_k3_input_modalities = kimi_k3
+        .modalities
+        .as_ref()
+        .expect("K3 modalities")
+        .input
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(kimi_k3_input_modalities, ["text", "image", "video"]);
+
+    let minimax_m3 = find(&rows, "minimax-anthropic", "MiniMax-M3");
+    assert_eq!(
+        minimax_m3.limit.as_ref().and_then(|limit| limit.context),
+        Some(1_000_000)
+    );
+    let input_modalities = minimax_m3
+        .modalities
+        .as_ref()
+        .expect("M3 modalities")
+        .input
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    assert_eq!(input_modalities, ["text", "image", "video"]);
+    assert_eq!(
+        minimax_m3.reasoning_options[0]
+            .get("default")
+            .and_then(serde_json::Value::as_str),
+        Some("disabled")
+    );
+
+    let minimax_m2_7 = find(&rows, "minimax-anthropic", "MiniMax-M2.7");
+    assert_eq!(
+        minimax_m2_7.limit.as_ref().and_then(|limit| limit.context),
+        Some(204_800)
+    );
+    assert_eq!(
+        minimax_m2_7.reasoning_options[0]
+            .get("default")
+            .and_then(serde_json::Value::as_str),
+        Some("always_on")
+    );
 
     // Audio/TTS rows are absent (the asset only ships chat models, but assert
     // the filter contract anyway).
@@ -592,9 +700,86 @@ fn bundled_asset_pricing_is_honest() {
         }
     }
 
-    // A sampled priced row matches the in-repo USD table (crates/tui pricing).
+    // A sampled priced row matches the in-repo USD table (crates/tui pricing):
+    // GLM-5.1 at the 2026-07-09 Z.ai published rates.
     let glm51 = find(&rows, "zai", "glm-5.1");
     let cost = glm51.cost.as_ref().expect("glm-5.1 is priced");
-    assert_eq!(cost.input, Some(0.98));
-    assert_eq!(cost.output, Some(3.08));
+    assert_eq!(cost.input, Some(1.40));
+    assert_eq!(cost.output, Some(4.40));
+    assert_eq!(cost.cache_read, Some(0.26));
+
+    // M3 has input-length and service tiers that the flat catalog cost shape
+    // cannot represent, so the bundled route row stays honestly unpriced.
+    let minimax_m3 = find(&rows, "minimax-anthropic", "MiniMax-M3");
+    assert!(minimax_m3.cost.is_none());
+
+    let minimax_m2_7 = find(&rows, "minimax-anthropic", "MiniMax-M2.7");
+    let cost = minimax_m2_7.cost.as_ref().expect("M2.7 is priced");
+    assert_eq!(cost.input, Some(0.30));
+    assert_eq!(cost.output, Some(1.20));
+    assert_eq!(cost.cache_read, Some(0.06));
+    assert_eq!(cost.cache_write, Some(0.375));
+}
+
+#[test]
+fn live_offerings_normalize_models_dev_provider_aliases() {
+    // Live Models.dev ids that must map onto CodeWhale kinds (#4186/#4187).
+    let raw = r#"{
+      "models": {},
+      "providers": {
+        "moonshotai": {
+          "id": "moonshotai",
+          "models": {
+            "kimi-k2.5": {
+              "id": "kimi-k2.5",
+              "modalities": { "input": ["text"], "output": ["text"] }
+            }
+          }
+        },
+        "togetherai": {
+          "id": "togetherai",
+          "models": {
+            "deepseek-ai/DeepSeek-V4-Pro": {
+              "id": "deepseek-ai/DeepSeek-V4-Pro",
+              "modalities": { "input": ["text"], "output": ["text"] }
+            }
+          }
+        },
+        "zhipuai": {
+          "id": "zhipuai",
+          "models": {
+            "glm-5.2": {
+              "id": "glm-5.2",
+              "modalities": { "input": ["text"], "output": ["text"] }
+            }
+          }
+        },
+        "brand-new-gateway": {
+          "id": "brand-new-gateway",
+          "models": {
+            "x-1": {
+              "id": "x-1",
+              "modalities": { "input": ["text"], "output": ["text"] }
+            }
+          }
+        }
+      }
+    }"#;
+    let catalog = ModelsDevCatalog::parse_json(raw).expect("fixture parses");
+    let rows = live_offerings_from_models_dev(&catalog, "fp-models-dev", 1_700);
+
+    assert_eq!(
+        find(&rows, "moonshot", "kimi-k2.5").source,
+        CatalogSource::Live {
+            base_url_fingerprint: "fp-models-dev".into(),
+            fetched_at: 1_700,
+        }
+    );
+    find(&rows, "together", "deepseek-ai/DeepSeek-V4-Pro");
+    find(&rows, "zai", "glm-5.2");
+    // Unknown upstream providers keep their Models.dev id.
+    find(&rows, "brand-new-gateway", "x-1");
+    assert!(rows.iter().all(|r| r.provider != "moonshotai"));
+    assert!(rows.iter().all(|r| r.provider != "togetherai"));
+    assert!(rows.iter().all(|r| r.provider != "zhipuai"));
 }

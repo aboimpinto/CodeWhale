@@ -10,6 +10,7 @@ use ratatui::{
 };
 
 use crate::config::Config;
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::tui::app::App;
 use crate::tui::views::{
@@ -17,6 +18,8 @@ use crate::tui::views::{
     centered_modal_area, render_modal_footer, render_modal_surface,
 };
 
+#[cfg(test)]
+use super::actions::HotbarRecommendation;
 use super::actions::{
     HotbarActionCategory, HotbarActionMetadata, HotbarArgsBehavior, HotbarRecommendationOptions,
     HotbarSafetyClass, recommend_hotbar_actions,
@@ -29,19 +32,58 @@ pub struct HotbarSetupActionRow {
 }
 
 impl HotbarSetupActionRow {
-    fn status_label(&self) -> &'static str {
-        if self.disabled_reason.is_some() {
-            "disabled"
-        } else if matches!(self.metadata.args, HotbarArgsBehavior::Required) {
-            "prefill"
-        } else {
-            "ready"
-        }
+    fn status_label(&self, locale: Locale) -> String {
+        tr(
+            locale,
+            if self.disabled_reason.is_some() {
+                MessageId::HotbarSetupStatusDisabled
+            } else if matches!(self.metadata.args, HotbarArgsBehavior::Required) {
+                MessageId::HotbarSetupStatusPrefill
+            } else {
+                MessageId::HotbarSetupStatusReady
+            },
+        )
+        .into_owned()
     }
+}
+
+fn hotbar_setup_source_label(locale: Locale, source: HotbarActionCategory) -> String {
+    let id = match source {
+        HotbarActionCategory::App => MessageId::HotbarSetupSourceApp,
+        HotbarActionCategory::Slash => MessageId::HotbarSetupSourceSlash,
+        HotbarActionCategory::Mcp => MessageId::HotbarSetupSourceMcp,
+        HotbarActionCategory::Skill => MessageId::HotbarSetupSourceSkill,
+        HotbarActionCategory::Plugin => MessageId::HotbarSetupSourcePlugin,
+        // `Route` is a source category introduced after PR #3785; it has no
+        // dedicated localization key, so fall back to its canonical English label.
+        HotbarActionCategory::Route => return source.as_str().to_string(),
+    };
+    tr(locale, id).into_owned()
+}
+
+fn tr_hotbar_setup(locale: Locale, id: MessageId, replacements: &[(&str, String)]) -> String {
+    let mut message = tr(locale, id).into_owned();
+    for (placeholder, value) in replacements {
+        message = message.replace(placeholder, value);
+    }
+    message
+}
+
+fn hotbar_setup_dirty_label(locale: Locale, is_dirty: bool) -> String {
+    tr(
+        locale,
+        if is_dirty {
+            MessageId::HotbarSetupDirtyModified
+        } else {
+            MessageId::HotbarSetupDirtyClean
+        },
+    )
+    .into_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HotbarSetupView {
+    locale: Locale,
     sources: Vec<HotbarActionCategory>,
     actions: Vec<HotbarSetupActionRow>,
     selected_source_idx: usize,
@@ -118,6 +160,7 @@ impl HotbarSetupView {
             .collect::<BTreeMap<_, _>>();
 
         Self {
+            locale: app.ui_locale,
             sources,
             actions,
             selected_source_idx: 0,
@@ -201,12 +244,26 @@ impl HotbarSetupView {
         if let Some(error) = self.validation_errors.last() {
             return error.clone();
         }
-        let dirty = if self.is_dirty() { "modified" } else { "clean" };
+        let dirty = hotbar_setup_dirty_label(self.locale, self.is_dirty());
         let action = self
             .selected_action()
-            .map(|row| format!("{} ({})", row.metadata.display_name, row.status_label()))
-            .unwrap_or_else(|| "No action".to_string());
-        format!("slot {} | {action} | {dirty}", self.selected_slot)
+            .map(|row| {
+                format!(
+                    "{} ({})",
+                    row.metadata.display_name,
+                    row.status_label(self.locale)
+                )
+            })
+            .unwrap_or_else(|| tr(self.locale, MessageId::HotbarSetupNoAction).into_owned());
+        tr_hotbar_setup(
+            self.locale,
+            MessageId::HotbarSetupStatusLine,
+            &[
+                ("{slot}", self.selected_slot.to_string()),
+                ("{action}", action),
+                ("{dirty}", dirty),
+            ],
+        )
     }
 
     #[cfg(test)]
@@ -242,9 +299,13 @@ impl HotbarSetupView {
 
     pub fn select_slot(&mut self, slot: u8) -> bool {
         if !(1..=codewhale_config::HOTBAR_SLOT_COUNT).contains(&slot) {
-            self.validation_errors = vec![format!(
-                "Hotbar slot {slot} is outside 1-{}",
-                codewhale_config::HOTBAR_SLOT_COUNT
+            self.validation_errors = vec![tr_hotbar_setup(
+                self.locale,
+                MessageId::HotbarSetupSlotOutOfRange,
+                &[
+                    ("{slot}", slot.to_string()),
+                    ("{max}", codewhale_config::HOTBAR_SLOT_COUNT.to_string()),
+                ],
             )];
             return false;
         }
@@ -255,13 +316,18 @@ impl HotbarSetupView {
 
     pub fn assign_selected_action(&mut self) -> bool {
         let Some(row) = self.selected_action().cloned() else {
-            self.validation_errors = vec!["No action selected.".to_string()];
+            self.validation_errors =
+                vec![tr(self.locale, MessageId::HotbarSetupNoActionSelected).into_owned()];
             return false;
         };
         if let Some(reason) = row.disabled_reason {
-            self.validation_errors = vec![format!(
-                "{} cannot be assigned: {reason}",
-                row.metadata.display_name
+            self.validation_errors = vec![tr_hotbar_setup(
+                self.locale,
+                MessageId::HotbarSetupCannotAssign,
+                &[
+                    ("{action}", row.metadata.display_name),
+                    ("{reason}", reason),
+                ],
             )];
             return false;
         }
@@ -310,7 +376,7 @@ impl HotbarSetupView {
             .iter()
             .filter(|row| {
                 row.metadata.category == source
-                    && (query.is_empty() || action_matches_query(row, &query))
+                    && (query.is_empty() || action_matches_query(row, self.locale, &query))
             })
             .collect()
     }
@@ -387,12 +453,14 @@ impl HotbarSetupView {
         lines.extend(self.header_lines());
 
         let Some(source) = self.selected_source() else {
-            lines.push(Line::from("No hotbar actions are available."));
+            lines.push(Line::from(
+                tr(self.locale, MessageId::HotbarSetupNoActions).into_owned(),
+            ));
             return lines;
         };
 
         for (idx, row) in self.actions_for_source(source).iter().enumerate() {
-            lines.push(self.action_row_line(source, idx, row));
+            lines.push(self.action_row_line(source, idx, row, 80));
         }
 
         lines.push(Line::from(""));
@@ -427,10 +495,11 @@ impl HotbarSetupView {
                 spans.push(Span::raw("  "));
             }
             let count = self.unfiltered_actions_for_source(*source).len();
+            let name = hotbar_setup_source_label(self.locale, *source);
             let label = if Some(*source) == self.selected_source() {
-                format!("[{} {count}]", source.as_str())
+                format!("[{name} {count}]")
             } else {
-                format!("{} {count}", source.as_str())
+                format!("{name} {count}")
             };
             spans.push(Span::styled(
                 label,
@@ -465,7 +534,7 @@ impl HotbarSetupView {
             Span::styled(
                 value,
                 Style::default().fg(if self.filter_focused {
-                    palette::DEEPSEEK_SKY
+                    palette::WHALE_INFO
                 } else {
                     palette::TEXT_PRIMARY
                 }),
@@ -480,7 +549,9 @@ impl HotbarSetupView {
                     .draft_bindings
                     .get(&slot)
                     .map(|binding| compact_action_id(&binding.action))
-                    .unwrap_or_else(|| "empty".to_string());
+                    .unwrap_or_else(|| {
+                        tr(self.locale, MessageId::HotbarSetupEmptySlot).into_owned()
+                    });
                 if slot == self.selected_slot {
                     format!("[{slot}:{label}]")
                 } else {
@@ -497,6 +568,7 @@ impl HotbarSetupView {
         source: HotbarActionCategory,
         idx: usize,
         row: &HotbarSetupActionRow,
+        max_width: u16,
     ) -> Line<'static> {
         let selected = idx == self.selected_action_idx(source);
         let marker = if selected { ">" } else { " " };
@@ -510,27 +582,32 @@ impl HotbarSetupView {
             " "
         };
         let recommended = if self.recommended_action_ids.contains(&row.metadata.id) {
-            "rec"
+            tr(self.locale, MessageId::HotbarSetupRecommended).into_owned()
         } else {
-            ""
+            String::new()
         };
-        let mut text = format!(
-            "{marker}{checked} {:<3} {:<22} {:<8} {}",
+        let prefix = format!(
+            "{marker}{checked} {:<3} {:<22} {:<8} ",
             recommended,
             row.metadata.display_name,
-            row.status_label(),
-            row.metadata.description
+            row.status_label(self.locale)
         );
-        if let Some(reason) = row.disabled_reason.as_deref() {
-            text.push_str(" (");
-            text.push_str(reason);
-            text.push(')');
-        }
+        let suffix = if let Some(reason) = row.disabled_reason.as_deref() {
+            format!(" ({reason})")
+        } else {
+            String::new()
+        };
+        let text = crate::tui::ui_text::semantic_truncate_with_affixes(
+            &prefix,
+            &row.metadata.description,
+            &suffix,
+            usize::from(max_width),
+        );
         Line::from(Span::styled(
             text,
             Style::default()
                 .fg(if selected {
-                    palette::DEEPSEEK_SKY
+                    palette::WHALE_INFO
                 } else {
                     palette::TEXT_PRIMARY
                 })
@@ -572,8 +649,14 @@ impl HotbarSetupView {
                 .fg(palette::TEXT_MUTED)
                 .add_modifier(Modifier::BOLD),
         ))];
-        for (idx, row) in rows.iter().enumerate() {
-            lines.push(self.action_row_line(source, idx, row));
+        // Keep the focused row inside the rendered viewport. The list used to
+        // render only its first rows, so keyboard selection could advance past
+        // `/export` while the highlight stayed behind (#4418).
+        let visible_rows = usize::from(area.height.saturating_sub(1));
+        let visible_range =
+            action_list_visible_range(self.selected_action_idx(source), rows.len(), visible_rows);
+        for idx in visible_range {
+            lines.push(self.action_row_line(source, idx, rows[idx], area.width));
         }
         Paragraph::new(lines)
             .style(Style::default().fg(palette::TEXT_PRIMARY))
@@ -611,7 +694,7 @@ impl HotbarSetupView {
             )),
             Line::from(""),
             Line::from(format!("Category: {}", row.metadata.category.as_str())),
-            Line::from(format!("Status: {}", row.status_label())),
+            Line::from(format!("Status: {}", row.status_label(self.locale))),
             Line::from(format!("Safety: {}", safety_label(row.metadata.safety))),
             Line::from(format!("Arguments: {}", args_label(row.metadata.args))),
             Line::from(format!(
@@ -644,7 +727,7 @@ impl HotbarSetupView {
 
     fn selected_slot_binding_label(&self) -> String {
         let Some(binding) = self.draft_bindings.get(&self.selected_slot) else {
-            return "empty".to_string();
+            return tr(self.locale, MessageId::HotbarSetupEmptySlot).into_owned();
         };
         self.actions
             .iter()
@@ -792,10 +875,15 @@ impl ModalView for HotbarSetupView {
         let popup_area = centered_modal_area(area, 118, 28, 72, 12);
         render_modal_surface(area, popup_area, buf);
         let block = Block::default()
-            .title(" Hotbar setup ")
+            .title(Line::from(Span::styled(
+                tr(self.locale, MessageId::HotbarSetupTitle),
+                Style::default()
+                    .fg(palette::WHALE_INFO)
+                    .add_modifier(Modifier::BOLD),
+            )))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::DEEPSEEK_INK));
+            .style(Style::default().bg(palette::WHALE_BG));
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
@@ -848,13 +936,28 @@ fn wrap_index(current: usize, len: usize, delta: isize) -> usize {
     usize::try_from((current + delta).rem_euclid(len)).expect("wrapped index fits")
 }
 
-fn action_matches_query(row: &HotbarSetupActionRow, query: &str) -> bool {
+fn action_list_visible_range(
+    selected_idx: usize,
+    row_count: usize,
+    visible_rows: usize,
+) -> std::ops::Range<usize> {
+    if row_count == 0 || visible_rows == 0 {
+        return 0..0;
+    }
+    let selected_idx = selected_idx.min(row_count.saturating_sub(1));
+    let start = selected_idx.saturating_add(1).saturating_sub(visible_rows);
+    let end = start.saturating_add(visible_rows).min(row_count);
+    start..end
+}
+
+fn action_matches_query(row: &HotbarSetupActionRow, locale: Locale, query: &str) -> bool {
+    let status = row.status_label(locale);
     [
         row.metadata.id.as_str(),
         row.metadata.display_name.as_str(),
         row.metadata.description.as_str(),
         row.metadata.category.as_str(),
-        row.status_label(),
+        status.as_str(),
         row.disabled_reason.as_deref().unwrap_or_default(),
     ]
     .into_iter()
@@ -901,7 +1004,9 @@ fn compact_action_id(action_id: &str) -> String {
 mod tests {
     use super::*;
     use crate::config::{ApiProvider, Config};
+    use crate::localization::{Locale, MessageId, tr};
     use crate::tui::app::TuiOptions;
+    use crate::tui::hotbar::HotbarActionRegistry;
     use crossterm::event::KeyModifiers;
     use std::path::PathBuf;
 
@@ -928,7 +1033,13 @@ mod tests {
             initial_input: None,
         };
         let mut app = App::new(options, config);
-        app.ui_locale = crate::localization::Locale::En;
+        app.ui_locale = Locale::En;
+        app
+    }
+
+    fn test_app_with_locale(locale: Locale) -> App {
+        let mut app = test_app();
+        app.ui_locale = locale;
         app
     }
 
@@ -940,24 +1051,192 @@ mod tests {
         KeyEvent::new(code, KeyModifiers::NONE)
     }
 
+    fn rendered_text_at(view: &HotbarSetupView, width: u16, height: u16) -> String {
+        let area = Rect::new(0, 0, width, height);
+        let mut buf = Buffer::empty(area);
+        view.render(area, &mut buf);
+
+        let mut out = String::new();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn rendered_text(view: &HotbarSetupView) -> String {
+        rendered_text_at(view, 140, 36)
+    }
+
     #[test]
     fn wizard_sources_follow_registered_action_categories() {
         let app = test_app();
         let view = HotbarSetupView::new(&app, &Config::default());
 
-        assert_eq!(
-            view.source_categories(),
-            &[
+        // Skills are registered from whatever the startup skill cache
+        // discovered, so only the always-present categories are asserted
+        // in order here (see wizard_lists_skill_and_mcp_sources_when_registered
+        // for the injected-source coverage).
+        assert!(
+            view.source_categories().starts_with(&[
                 HotbarActionCategory::App,
                 HotbarActionCategory::Route,
                 HotbarActionCategory::Slash,
-            ]
+            ]),
+            "unexpected wizard sources: {:?}",
+            view.source_categories()
+        );
+        // MCP tools only appear after a live discovery snapshot lands, and
+        // plugins stay a deferred source.
+        assert!(
+            !view
+                .source_categories()
+                .contains(&HotbarActionCategory::Mcp)
+        );
+        assert!(
+            !view
+                .source_categories()
+                .contains(&HotbarActionCategory::Plugin)
         );
         assert_eq!(view.selected_source(), Some(HotbarActionCategory::App));
         assert!(view.recommended_action_ids().contains("mode.agent"));
         // #3807: a fresh config seeds no bindings, so the wizard opens with
         // nothing checked until the user opts in.
         assert!(view.checked_action_ids().is_empty());
+    }
+
+    #[test]
+    fn wizard_lists_skill_and_mcp_sources_when_registered() {
+        let mut app = test_app();
+        let mut registry = HotbarActionRegistry::with_builtins();
+        registry.register_skills(&[("demo".to_string(), "Demo skill".to_string())]);
+        registry.replace_mcp_tools(Some(&crate::mcp::McpManagerSnapshot {
+            config_path: PathBuf::from("mcp.json"),
+            config_exists: true,
+            reload_required: false,
+            servers: vec![crate::mcp::McpServerSnapshot {
+                name: "search".to_string(),
+                enabled: true,
+                required: false,
+                transport: "stdio".to_string(),
+                command_or_url: "search-server".to_string(),
+                connect_timeout: 5,
+                execute_timeout: 5,
+                read_timeout: 5,
+                connected: true,
+                error: None,
+                tools: vec![crate::mcp::McpDiscoveredItem {
+                    name: "web_search".to_string(),
+                    model_name: "mcp_search_web_search".to_string(),
+                    description: Some("Search the web".to_string()),
+                }],
+                resources: Vec::new(),
+                prompts: Vec::new(),
+            }],
+        }));
+        app.hotbar_actions = registry;
+        let mut view = HotbarSetupView::new(&app, &Config::default());
+
+        assert!(
+            view.source_categories()
+                .contains(&HotbarActionCategory::Skill)
+        );
+        assert!(
+            view.source_categories()
+                .contains(&HotbarActionCategory::Mcp)
+        );
+
+        // Skills assign like any direct action; MCP tools stay assignable as
+        // composer-prefill actions.
+        assert!(view.select_slot(4));
+        assert!(view.select_action_by_id("skill.demo"));
+        assert!(view.assign_selected_action());
+        assert_eq!(
+            view.binding_for_slot(4)
+                .map(|binding| binding.action.as_str()),
+            Some("skill.demo")
+        );
+
+        assert!(view.select_action_by_id("mcp.search.web_search"));
+        assert!(
+            view.status_text().contains("prefill"),
+            "MCP tools must be labeled as prefill actions: {}",
+            view.status_text()
+        );
+        assert!(view.select_slot(5));
+        assert!(view.assign_selected_action());
+        assert_eq!(
+            view.binding_for_slot(5)
+                .map(|binding| binding.action.as_str()),
+            Some("mcp.search.web_search")
+        );
+    }
+
+    #[test]
+    fn wizard_chrome_uses_non_english_locale() {
+        let app = test_app_with_locale(Locale::ZhHant);
+        let mut view = HotbarSetupView::new(&app, &Config::default());
+        view.clear_selected_slot();
+        view.handle_key(key(KeyCode::Char('?')));
+
+        let status = view.status_text();
+        assert!(status.contains("槽位 1"), "status was {status:?}");
+        // `Config::default()` ships no default bindings, so a freshly-cleared slot
+        // is clean; assert the localized clean label (dirty localization is covered
+        // by the wider render checks below) and that no English chrome leaks.
+        assert!(
+            status.contains(tr(Locale::ZhHant, MessageId::HotbarSetupDirtyClean).as_ref()),
+            "status was {status:?}"
+        );
+        assert!(!status.contains("slot 1 |"), "status was {status:?}");
+        assert!(!status.contains("clean"), "status was {status:?}");
+
+        let rendered = rendered_text(&view);
+        let compact_rendered = rendered.replace(' ', "");
+        // Localized chrome the PR routes through message IDs: title, source tabs
+        // (the selected tab is bracketed and now carries a count from PR #3987),
+        // status line, and localized built-in action names.
+        for expected in [
+            "Hotbar設定",
+            "[應用",
+            "命令",
+            "就緒",
+            "槽位",
+            "Act模式",
+            "命令面板",
+            "切換側邊欄",
+        ] {
+            assert!(
+                compact_rendered.contains(expected),
+                "missing {expected:?} in render:\n{rendered}"
+            );
+        }
+        assert!(
+            compact_rendered.contains(":空"),
+            "missing localized empty slot:\n{rendered}"
+        );
+
+        // English must not leak on the surfaces the PR localizes. The keybinding
+        // footer, filter row, and detail labels are English scaffolding added by
+        // PR #3987 after this contribution and are intentionally out of scope.
+        for leaked in [
+            "Hotbar setup",
+            "slot 1 |",
+            "ready",
+            "modified",
+            "empty",
+            "Agent mode",
+            "Command palette",
+            "Toggle sidebar",
+            "Switch the conversation",
+        ] {
+            assert!(
+                !rendered.contains(leaked),
+                "leaked {leaked:?} in render:\n{rendered}"
+            );
+        }
     }
 
     #[test]
@@ -1117,6 +1396,33 @@ mod tests {
     }
 
     #[test]
+    fn action_rows_semantically_truncate_descriptions_at_narrow_width() {
+        let app = test_app();
+        let view = HotbarSetupView::new(&app, &Config::default());
+        let row = HotbarSetupActionRow {
+            metadata: HotbarActionMetadata {
+                id: "test.long-description".to_string(),
+                source_id: "test".to_string(),
+                display_name: "Open settings row".to_string(),
+                compact_label: "test".to_string(),
+                description: "Open a detailed settings panel without clipping".to_string(),
+                category: HotbarActionCategory::App,
+                args: HotbarArgsBehavior::None,
+                safety: HotbarSafetyClass::LocalUi,
+                recommendation: HotbarRecommendation::Eligible,
+            },
+            disabled_reason: None,
+        };
+
+        let text = view
+            .action_row_line(HotbarActionCategory::App, 0, &row, 58)
+            .to_string();
+        assert!(crate::tui::ui_text::text_display_width(&text) <= 58);
+        assert!(text.contains("Open a detailed…"), "{text:?}");
+        assert!(!text.contains("Open a detailed s"), "{text:?}");
+    }
+
+    #[test]
     fn keyboard_controls_navigate_source_action_and_slot() {
         let mut config = Config {
             provider: Some(ApiProvider::Deepseek.as_str().to_string()),
@@ -1151,6 +1457,26 @@ mod tests {
         assert_eq!(view.selected_slot(), 8);
         view.handle_key(key(KeyCode::Left));
         assert_eq!(view.selected_slot(), 7);
+    }
+
+    #[test]
+    fn down_past_export_keeps_the_selected_action_visible() {
+        let app = test_app();
+        let mut view = HotbarSetupView::new(&app, &Config::default());
+        assert!(view.select_action_by_id("slash.export"));
+
+        view.handle_key(key(KeyCode::Down));
+        let selected = view.selected_action().expect("action after /export");
+        assert_ne!(selected.metadata.id, "slash.export");
+
+        let rendered = rendered_text_at(&view, 80, 24);
+        assert!(
+            rendered.lines().any(|line| {
+                line.contains('>') && line.contains(&selected.metadata.display_name)
+            }),
+            "focused action {} must remain visible after moving past /export:\n{rendered}",
+            selected.metadata.id
+        );
     }
 
     #[test]
@@ -1220,7 +1546,7 @@ mod tests {
             assert!(!text.contains('X'), "{w}x{h}: background bleed-through");
             assert_eq!(
                 buf[(w / 2, h / 2)].bg,
-                palette::DEEPSEEK_INK,
+                palette::WHALE_BG,
                 "{w}x{h}: modal interior must be opaque"
             );
 

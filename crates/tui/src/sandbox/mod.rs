@@ -81,6 +81,12 @@ pub struct CommandSpec {
     /// Optional justification for why this command needs to run.
     /// Used for logging and audit purposes.
     pub justification: Option<String>,
+
+    /// The shell command exactly as requested, before the dispatcher adds
+    /// shell-specific wrapping (encoding prefixes, exit-code capture, temp
+    /// `-File` scripts). Authoritative for display; `None` for specs built
+    /// directly from a program + args.
+    pub requested_command: Option<String>,
 }
 
 impl CommandSpec {
@@ -109,14 +115,26 @@ impl CommandSpec {
         #[cfg(not(windows))]
         let (program, args) = dispatcher.build_command_parts(command);
 
+        let env = {
+            #[cfg(windows)]
+            {
+                windows_shell_default_env()
+            }
+            #[cfg(not(windows))]
+            {
+                HashMap::new()
+            }
+        };
+
         Self {
             program,
             args,
             cwd,
-            env: HashMap::new(),
+            env,
             timeout,
             sandbox_policy: SandboxPolicy::default(),
             justification: None,
+            requested_command: Some(command.to_string()),
         }
     }
 
@@ -130,6 +148,7 @@ impl CommandSpec {
             timeout,
             sandbox_policy: SandboxPolicy::default(),
             justification: None,
+            requested_command: None,
         }
     }
 
@@ -159,6 +178,9 @@ impl CommandSpec {
 
     /// Get the original command as a single string (for display).
     pub fn display_command(&self) -> String {
+        if let Some(requested) = &self.requested_command {
+            return requested.clone();
+        }
         if self.args.len() == 2
             && self.args[0] == "-c"
             && matches!(
@@ -209,6 +231,10 @@ impl CommandSpec {
             parts.join(" ")
         }
     }
+}
+
+fn windows_shell_default_env() -> HashMap<String, String> {
+    HashMap::from([("PYTHONIOENCODING".to_string(), "utf-8".to_string())])
 }
 
 /// The type of sandbox being used for execution.
@@ -648,6 +674,7 @@ mod tests {
             timeout: Duration::from_secs(30),
             sandbox_policy: SandboxPolicy::default(),
             justification: None,
+            requested_command: None,
         };
 
         assert_eq!(spec.display_command(), "echo hello");
@@ -665,31 +692,25 @@ mod tests {
 
         let dispatcher = crate::shell_dispatcher::global_dispatcher();
         assert_eq!(spec.program, dispatcher.kind().binary());
-        if dispatcher.kind().is_powershell() {
-            assert_eq!(
-                spec.args,
-                vec![
-                    dispatcher.kind().command_flag().to_string(),
-                    "-Command".to_string(),
-                    format!("[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; {cmd}")
-                ]
-            );
-        } else {
-            let expected = if matches!(dispatcher.kind(), crate::shell_dispatcher::ShellKind::Cmd) {
-                vec!["/C".to_string(), format!("chcp 65001 >NUL & {cmd}")]
-            } else {
-                vec![
-                    dispatcher.kind().command_flag().to_string(),
-                    cmd.to_string(),
-                ]
-            };
-            assert_eq!(spec.args, expected);
-            // The quoted message is intact in a single argv slot — shell `-c`
-            // performs POSIX tokenization, yielding the correct argv:
-            // ["git","commit","-m","feat: complete sub-pages"].
-            assert_eq!(spec.args.len(), 2);
-            assert!(spec.args[1].contains(r#""feat: complete sub-pages""#));
-        }
+        // The quoted message survives in exactly ONE argv slot, regardless of
+        // which shell-specific wrapping (encoding prefix, exit-code capture)
+        // the dispatcher added around it. This single-line ASCII command never
+        // takes the temp `-File` path, so the payload stays on the argv.
+        let carriers: Vec<&String> = spec
+            .args
+            .iter()
+            .filter(|arg| arg.contains(r#""feat: complete sub-pages""#))
+            .collect();
+        assert_eq!(carriers.len(), 1, "args: {:?}", spec.args);
+        // And no argv entry is a tokenized fragment of the message.
+        assert!(
+            !spec
+                .args
+                .iter()
+                .any(|arg| arg == "feat:" || arg == "complete" || arg == "sub-pages\""),
+            "args: {:?}",
+            spec.args
+        );
         assert_eq!(spec.display_command(), cmd);
     }
 
@@ -716,6 +737,16 @@ mod tests {
         assert!(matches!(spec.sandbox_policy, SandboxPolicy::ReadOnly));
         assert_eq!(spec.env.get("FOO"), Some(&"bar".to_string()));
         assert_eq!(spec.justification, Some("Testing".to_string()));
+    }
+
+    #[test]
+    fn windows_shell_default_env_forces_python_pipe_stdio_utf8() {
+        let env = windows_shell_default_env();
+
+        assert_eq!(
+            env.get("PYTHONIOENCODING").map(String::as_str),
+            Some("utf-8")
+        );
     }
 
     #[test]
@@ -746,39 +777,14 @@ mod tests {
             .with_policy(SandboxPolicy::DangerFullAccess);
 
         let env = manager.prepare(&spec);
-        let dispatcher = crate::shell_dispatcher::global_dispatcher();
 
         assert_eq!(env.sandbox_type, SandboxType::None);
-        if dispatcher.kind().is_powershell() {
-            assert_eq!(
-                env.command,
-                vec![
-                    dispatcher.kind().binary().to_string(),
-                    dispatcher.kind().command_flag().to_string(),
-                    "-Command".to_string(),
-                    "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; echo test"
-                        .to_string(),
-                ]
-            );
-        } else if matches!(dispatcher.kind(), crate::shell_dispatcher::ShellKind::Cmd) {
-            assert_eq!(
-                env.command,
-                vec![
-                    dispatcher.kind().binary().to_string(),
-                    "/C".to_string(),
-                    "chcp 65001 >NUL & echo test".to_string(),
-                ]
-            );
-        } else {
-            assert_eq!(
-                env.command,
-                vec![
-                    dispatcher.kind().binary().to_string(),
-                    dispatcher.kind().command_flag().to_string(),
-                    "echo test".to_string(),
-                ]
-            );
-        }
+        // Unsandboxed preparation passes the spec through untouched: the
+        // command is exactly the spec's program followed by the dispatcher-
+        // built args, whatever wrapping the current shell required.
+        let mut expected = vec![spec.program.clone()];
+        expected.extend(spec.args.iter().cloned());
+        assert_eq!(env.command, expected);
         assert!(!env.is_sandboxed());
     }
 
@@ -832,9 +838,11 @@ mod tests {
 
     #[test]
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    fn test_parity_linux_landlock_available() {
-        let st = get_platform_sandbox();
-        assert!(matches!(st, Some(SandboxType::LinuxLandlock)));
+    fn test_parity_linux_landlock_detection_matches_availability() {
+        assert_eq!(
+            get_platform_sandbox(),
+            landlock::is_available().then_some(SandboxType::LinuxLandlock)
+        );
     }
 
     #[test]

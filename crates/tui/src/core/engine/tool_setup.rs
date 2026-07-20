@@ -2,55 +2,10 @@
 //!
 //! This keeps mode/feature-specific registry construction out of the send path.
 
-use std::path::Path;
-
 use super::*;
-use crate::sandbox::SandboxPolicy;
+use crate::core::authority::shell_policy_for_mode;
 use crate::tools::AgentToolSurfaceOptions;
 use crate::worker_profile::ShellPolicy;
-
-/// Pick the sandbox policy that gates shell commands for a given UI mode.
-///
-/// - **Plan** (#1077): `ReadOnly` — no writes, no network. The previous
-///   `WorkspaceWrite` policy let `python -c "open('f','w').write('x')"` mutate
-///   files inside the workspace because it whitelisted the workspace as
-///   writable. Plan mode is investigation only; if the user wants to change
-///   files they should switch to Agent.
-/// - **Agent/Auto**: `WorkspaceWrite` with workspace as writable root and
-///   network on. Approval flow gates risky individual commands; the sandbox
-///   handles the rest. Network is allowed because cargo / npm / curl-style
-///   commands are normal during agent work and DNS-deny breaks them silently.
-/// - **YOLO**: `DangerFullAccess` — explicit no-guardrails contract.
-pub(crate) fn sandbox_policy_for_mode(mode: AppMode, workspace: &Path) -> SandboxPolicy {
-    match mode {
-        AppMode::Plan => SandboxPolicy::ReadOnly,
-        AppMode::Agent | AppMode::Auto => SandboxPolicy::WorkspaceWrite {
-            writable_roots: vec![workspace.to_path_buf()],
-            network_access: true,
-            exclude_tmpdir: false,
-            exclude_slash_tmp: false,
-        },
-        AppMode::Yolo => SandboxPolicy::DangerFullAccess,
-    }
-}
-
-/// Resolve the effective shell policy for a turn from the legacy shell opt-in
-/// plus the active mode. This is the typed bridge away from passing a bare
-/// `allow_shell` boolean through the runtime.
-pub(crate) fn shell_policy_for_mode(mode: AppMode, allow_shell: bool) -> ShellPolicy {
-    if !allow_shell {
-        return ShellPolicy::None;
-    }
-    match mode {
-        // Plan is read-only planning with no shell execution. The runtime
-        // prompt already reports `shell_access="none"` for Plan, so mapping it
-        // to `ReadOnly` here created a prompt/registry inconsistency (the
-        // registry would expose `exec_shell` while the prompt said there was
-        // no shell). Keep Plan shell-free; switch to Agent to run commands.
-        AppMode::Plan => ShellPolicy::None,
-        AppMode::Agent | AppMode::Auto | AppMode::Yolo => ShellPolicy::Full,
-    }
-}
 
 fn should_register_remember_tool(memory_enabled: bool, moraine_fallback: bool) -> bool {
     memory_enabled && !moraine_fallback
@@ -84,13 +39,22 @@ impl Engine {
     ) -> ToolRegistryBuilder {
         let shell_policy = shell_policy_for_mode(mode, self.session.allow_shell);
         if mode != AppMode::Plan {
-            return ToolRegistryBuilder::new().with_agent_runtime_surface(
+            let mut builder = ToolRegistryBuilder::new().with_agent_runtime_surface(
                 self.deepseek_client.clone(),
                 self.session.model.clone(),
                 self.agent_tool_surface_options(shell_policy),
                 todo_list,
                 plan_state,
             );
+            // `start_mcp_server` belongs to every executable mode. Keep its
+            // handler aligned with the model catalog, which always loads the
+            // tool while MCP is enabled. The former early return registered
+            // it only in Plan mode, so Agent/Full Access advertised a tool
+            // that could never cross the execution boundary.
+            if let Some(ref pool) = self.mcp_pool {
+                builder = builder.with_runtime_mcp_tool(Arc::clone(pool));
+            }
+            return builder;
         }
 
         let mut builder = {
@@ -145,6 +109,13 @@ impl Engine {
         // the user's `[notifications].method` config (including `off`),
         // so there's no failure mode worth gating on.
         builder = builder.with_notify_tool();
+
+        // Register the start_mcp_server tool so LLM can dynamically start
+        // MCP servers from conversation context. Only when the pool has been
+        // initialized (lazy via ensure_mcp_pool).
+        if let Some(ref pool) = self.mcp_pool {
+            builder = builder.with_runtime_mcp_tool(Arc::clone(pool));
+        }
 
         builder
     }

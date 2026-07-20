@@ -6,7 +6,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::automation_manager::{
-    AutomationStatus, CreateAutomationRequest, UpdateAutomationRequest,
+    AutomationStatus, CreateAutomationRequest, UpdateAutomationRequest, run_now_shared,
 };
 use crate::tools::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
@@ -40,13 +40,13 @@ impl ToolSpec for AutomationCreateTool {
                 "prompt": { "type": "string" },
                 "rrule": {
                     "type": "string",
-                    "description": "Supported: FREQ=HOURLY;INTERVAL=N[;BYDAY=MO,TU] or FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30"
+                    "description": "Supported: FREQ=HOURLY;INTERVAL=N[;BYDAY=MO,TU][;BYHOUR=9][;BYMINUTE=30] or FREQ=WEEKLY;BYDAY=MO;BYHOUR=9;BYMINUTE=30. For HOURLY, BYHOUR/BYMINUTE choose the initial local wall-clock anchor and INTERVAL advances from that anchor; BYHOUR is not a daily-only filter. Anchored wall times skip nonexistent clock times and use the first occurrence of ambiguous clock times."
                 },
                 "cwds": { "type": "array", "items": { "type": "string" } },
                 "mode": { "type": "string", "description": "Task mode for scheduled runs. Defaults to agent when omitted." },
                 "allow_shell": { "type": "boolean", "default": false },
                 "trust_mode": { "type": "boolean", "default": false },
-                "auto_approve": { "type": "boolean", "default": true },
+                "auto_approve": { "type": "boolean", "default": false },
                 "paused": { "type": "boolean", "default": false }
             },
             "required": ["name", "prompt", "rrule"],
@@ -347,11 +347,15 @@ impl ToolSpec for AutomationRunTool {
             .task_manager
             .as_ref()
             .ok_or_else(|| ToolError::not_available("TaskManager is not attached"))?;
-        let manager = manager.lock().await;
-        let run = manager
-            .run_now(required_str(&input, "automation_id")?, task_manager)
-            .await
-            .map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        // run_now_shared handles its own lock phases so the manager mutex is
+        // never held across the task-manager await.
+        let run = run_now_shared(
+            manager,
+            required_str(&input, "automation_id")?,
+            task_manager,
+        )
+        .await
+        .map_err(|e| ToolError::execution_failed(e.to_string()))?;
         ToolResult::json(&run).map_err(|e| ToolError::execution_failed(e.to_string()))
     }
 }
@@ -398,5 +402,13 @@ mod tests {
         let schema = AutomationCreateTool.input_schema();
         assert!(schema["properties"]["rrule"].is_object());
         assert_eq!(schema["required"][0], "name");
+    }
+
+    #[test]
+    fn create_schema_auto_approve_defaults_to_false() {
+        let schema = AutomationCreateTool.input_schema();
+        let auto_approve = &schema["properties"]["auto_approve"];
+        assert_eq!(auto_approve["type"], "boolean");
+        assert_eq!(auto_approve["default"], false);
     }
 }

@@ -58,6 +58,11 @@ test.txt
 TODO*.md
 todo*.md
 AGENTS.md
+# …except the deliberate, maintained agent-guidance files:
+!/AGENTS.md
+!crates/tui/AGENTS.md
+!crates/tui/locales/AGENTS.md
+!web/AGENTS.md
 NEXT_SESSION.md
 AI_HANDOFF.md
 result.json
@@ -132,3 +137,9 @@ notes/
 # Agent-local roadmap and scratch (never commit — may hold unreleased plans)
 .agents/
 scratchpad/
+
+# Exploratory operations spec / prompt — never track (canonical copy lives at CW root)
+operations9.md
+OPERATIONS_0_9_0.md
+operations_0_9_0.md
+CODEWHALE_0_9_0_CUTOVER.md

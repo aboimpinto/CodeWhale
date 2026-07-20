@@ -17,6 +17,8 @@ pub use traits::CommandInfo;
 
 // Long-standing public paths that predate the group layout.
 pub use groups::project::share;
+#[cfg(test)]
+pub(crate) use groups::session::rename_with_manager as rename_session_with_manager;
 
 // Voice capture plumbing shared with the hotbar and the UI event loop.
 pub use groups::core::voice;
@@ -85,7 +87,7 @@ static REGISTRY: OnceLock<traits::CommandRegistry> = OnceLock::new();
 
 fn build_registry() -> traits::CommandRegistry {
     let mut registry = traits::CommandRegistry::empty();
-    for group in groups::all_command_groups() {
+    for &group in groups::all_command_groups() {
         registry.register_group(group);
     }
     registry
@@ -180,6 +182,9 @@ pub fn execute(cmd: &str, app: &mut App) -> CommandResult {
         ),
         "deepseek" => CommandResult::error(
             "The /deepseek command was renamed. Use /links (aliases: /dashboard, /api).",
+        ),
+        "doctor" => CommandResult::error(
+            "The /doctor command is a CLI diagnostic. Run `codewhale doctor` or `codewhale doctor --json`; use `/setup` in the TUI for readiness and verification.",
         ),
 
         _ => {
@@ -306,7 +311,6 @@ mod tests {
     use crate::tui::app::{App, AppAction, SidebarFocus, TuiOptions};
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
-    use std::sync::MutexGuard;
     use tempfile::tempdir;
 
     fn create_test_app() -> App {
@@ -430,6 +434,21 @@ mod tests {
     }
 
     #[test]
+    fn transcript_command_is_discoverable_and_opens_live_overlay() {
+        let transcript = command_infos()
+            .into_iter()
+            .find(|cmd| cmd.name == "transcript")
+            .expect("transcript command should exist");
+        assert_eq!(transcript.usage, "/transcript");
+        assert!(transcript.show_in_empty_discovery());
+
+        let mut app = create_test_app();
+        let result = execute("/transcript", &mut app);
+        assert!(!result.is_error);
+        assert!(matches!(result.action, Some(AppAction::OpenLiveTranscript)));
+    }
+
+    #[test]
     fn hf_alias_dispatches_to_concepts_helper() {
         let mut app = create_test_app();
         let result = execute("/huggingface concepts", &mut app);
@@ -438,6 +457,17 @@ mod tests {
         assert!(message.contains("Hugging Face provider route"));
         assert!(message.contains("Hugging Face MCP"));
         assert!(message.contains("Hub workflows"));
+    }
+
+    #[test]
+    fn xai_device_auth_slash_command_starts_login() {
+        let mut app = create_test_app();
+        let result = execute("/auth xai-device", &mut app);
+        assert!(!result.is_error);
+        assert!(matches!(
+            result.action,
+            Some(AppAction::StartXaiDeviceLogin)
+        ));
     }
 
     #[test]
@@ -485,9 +515,9 @@ mod tests {
                 critical_files: vec!["crates/tui/src/commands/mod.rs".to_string()],
                 constraints: vec!["Do not invent verification".to_string()],
                 verification_plan: Some("Check relay prompt assertions".to_string()),
-                handoff_packet: Some("Next thread should read the Work checklist".to_string()),
+                handoff_packet: Some("Next thread should read the To-do list".to_string()),
                 plan: vec![PlanItemArg {
-                    step: "keep checklist primary".to_string(),
+                    step: "keep To-do primary".to_string(),
                     status: StepStatus::InProgress,
                 }],
                 ..UpdatePlanArgs::default()
@@ -513,7 +543,7 @@ mod tests {
         assert!(message.contains("Requested relay focus: verify install"));
         assert!(message.contains("Goal objective: Unify the work surface"));
         assert!(message.contains("Goal token budget: 12000"));
-        assert!(message.contains("Work checklist (primary progress surface, 50% complete)"));
+        assert!(message.contains("To-do (primary progress surface, 50% complete)"));
         assert!(message.contains("#1 [completed] inspect workspace"));
         assert!(message.contains("#2 [in_progress] patch relay command"));
         assert!(message.contains("Optional strategy metadata from update_plan"));
@@ -523,8 +553,12 @@ mod tests {
         assert!(message.contains("Critical file: crates/tui/src/commands/mod.rs"));
         assert!(message.contains("Constraint: Do not invent verification"));
         assert!(message.contains("Verification plan: Check relay prompt assertions"));
-        assert!(message.contains("Handoff packet: Next thread should read the Work checklist"));
-        assert!(message.contains("[in_progress] keep checklist primary"));
+        assert!(message.contains("Handoff packet: Next thread should read the To-do list"));
+        assert!(message.contains("[in_progress] keep To-do primary"));
+        assert!(
+            !message.contains("Work checklist"),
+            "relay copy should use To-do vocabulary: {message}"
+        );
     }
 
     #[test]
@@ -605,13 +639,13 @@ mod tests {
         let mut total_commands = 0;
         let mut has_config = false;
         let mut has_debug = false;
-        for group in &groups {
+        for &group in groups {
             let commands = group.commands();
             assert!(
                 !commands.is_empty(),
                 "each group must have at least one command"
             );
-            for cmd in &commands {
+            for cmd in commands {
                 let info = cmd.info();
                 assert!(!info.name.is_empty(), "command name must not be empty");
                 assert!(
@@ -637,9 +671,9 @@ mod tests {
                 has_config = true;
                 assert_eq!(
                     commands.len(),
-                    11,
+                    12,
                     "config group (group-local metadata exception) expected \
-                     exactly 11 commands, got {}",
+                     exactly 12 commands, got {}",
                     commands.len()
                 );
             }
@@ -671,6 +705,25 @@ mod tests {
             command_infos().len(),
             "group-iterated command count must match registry infos count"
         );
+    }
+
+    #[test]
+    fn command_groups_are_cached_once() {
+        let first_groups = groups::all_command_groups();
+        let second_groups = groups::all_command_groups();
+        assert!(
+            std::ptr::eq(first_groups.as_ptr(), second_groups.as_ptr()),
+            "command group list should be cached"
+        );
+
+        for &group in first_groups {
+            let first_commands = group.commands();
+            let second_commands = group.commands();
+            assert!(
+                std::ptr::eq(first_commands.as_ptr(), second_commands.as_ptr()),
+                "command list should be cached per group"
+            );
+        }
     }
 
     #[test]
@@ -747,6 +800,25 @@ mod tests {
                     !alias.chars().any(|ch| ch.is_ascii_uppercase()),
                     "/{} alias /{alias} must not contain uppercase ASCII",
                     command.name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_discovery_tier_lists_use_canonical_registered_names() {
+        for (tier_name, names) in [
+            ("advanced", traits::ADVANCED_DISCOVERY_COMMANDS),
+            ("compatibility", traits::COMPATIBILITY_DISCOVERY_COMMANDS),
+        ] {
+            for &name in names {
+                let info = registry()
+                    .get_info(name)
+                    .unwrap_or_else(|| panic!("{tier_name} discovery entry {name:?} must resolve"));
+                assert_eq!(
+                    info.name, name,
+                    "{tier_name} discovery entry {name:?} must be canonical, not an alias for /{}",
+                    info.name
                 );
             }
         }
@@ -935,6 +1007,14 @@ mod tests {
         assert_eq!(app.sidebar_focus, SidebarFocus::Tasks);
         assert!(app.status_message.is_none());
 
+        let result = execute("/sidebar activity", &mut app);
+        assert!(!result.is_error);
+        assert_eq!(
+            app.sidebar_focus,
+            SidebarFocus::Tasks,
+            "activity is the user-facing alias for the Activity panel"
+        );
+
         let result = execute("/sidebar off", &mut app);
         assert!(!result.is_error);
         assert_eq!(app.sidebar_focus, SidebarFocus::Hidden);
@@ -976,6 +1056,12 @@ mod tests {
         for cmd in ["/links", "/dashboard", "/api", "/lianjie"] {
             let result = execute(cmd, &mut app);
             let msg = result.message.expect("links commands should return text");
+            assert!(msg.contains("https://codewhale.net/en/docs"));
+            assert!(msg.contains("https://codewhale.net/en/community"));
+            assert!(msg.contains("https://github.com/Hmbown/CodeWhale"));
+            assert!(msg.contains("https://app.codewhale.net"));
+            assert!(msg.contains("separate sign-in"));
+            assert!(msg.contains("not connected to the current local session"));
             assert!(msg.contains("https://platform.deepseek.com"));
             assert!(result.action.is_none());
         }
@@ -1017,7 +1103,7 @@ mod tests {
 
     struct ConfigPathGuard {
         previous: Option<OsString>,
-        _lock: MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl ConfigPathGuard {
@@ -1049,7 +1135,7 @@ mod tests {
     }
 
     /// Build an App scoped to an isolated tempdir so dispatch-side-effects
-    /// (e.g. `/init` writing AGENTS.md, `/export` writing chat transcripts,
+    /// (e.g. `/init` writing AGENTS.md, explicit `/export <path>` writes, or
     /// `/logout` clearing credentials) don't pollute the repo working tree or
     /// the developer's real config when the smoke tests run.
     fn create_isolated_test_app() -> (App, tempfile::TempDir, ConfigPathGuard) {
@@ -1091,10 +1177,9 @@ mod tests {
     /// command, see it autocomplete, and then get an unhelpful "did you
     /// mean" suggestion. Also catches panics in handlers because the test
     /// runner unwinds the panic and reports the offending command.
-    /// `/save` and `/export` default their output paths to `cwd`-relative
-    /// filenames when no arg is supplied, which would scribble files into
-    /// `crates/tui/` when CI runs from there. Pass an explicit tempdir-
-    /// relative path for those two so the dispatch test stays sandboxed.
+    /// `/save` still defaults its output path, while `/export` accepts a legacy
+    /// direct file path. Pass explicit tempdir paths so this smoke test covers
+    /// both file handlers without touching the developer's clipboard.
     fn invocation_for(command_name: &str, alias_or_name: &str, tmpdir: &std::path::Path) -> String {
         match command_name {
             "save" => format!("/{alias_or_name} {}", tmpdir.join("session.json").display()),
@@ -1331,5 +1416,97 @@ mod tests {
         let mut app = create_test_app();
         let result = execute("/help", &mut app);
         assert!(!result.is_error);
+    }
+
+    fn write_test_skill(root: &Path, name: &str) {
+        let skill_dir = root.join("skills").join(name);
+        std::fs::create_dir_all(&skill_dir).expect("skill directory");
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            format!(
+                "---\nname: {name}\ndescription: Test {name} skill\n---\nFollow the test instructions."
+            ),
+        )
+        .expect("skill fixture");
+    }
+
+    #[test]
+    fn task_bearing_skill_invocations_send_the_task_on_the_activated_turn() {
+        for invocation in ["$foo do X", "/foo do X", "/skill foo do X"] {
+            let (mut app, tmpdir, _guard) = create_isolated_test_app();
+            write_test_skill(tmpdir.path(), "foo");
+
+            let result = execute(invocation, &mut app);
+
+            assert!(!result.is_error, "{invocation}: {result:?}");
+            assert!(
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.contains("Skill 'foo' activated")),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                matches!(result.action, Some(AppAction::SendMessage(ref task)) if task == "do X"),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                app.active_skill
+                    .as_deref()
+                    .is_some_and(|instruction| instruction.contains("# Skill: foo")),
+                "{invocation} did not arm foo for the dispatched task"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_dollar_skill_still_arms_the_next_message() {
+        let (mut app, tmpdir, _guard) = create_isolated_test_app();
+        write_test_skill(tmpdir.path(), "foo");
+
+        let result = execute("$foo", &mut app);
+
+        assert!(!result.is_error, "{result:?}");
+        assert!(result.action.is_none());
+        assert!(
+            app.active_skill
+                .as_deref()
+                .is_some_and(|instruction| instruction.contains("# Skill: foo"))
+        );
+    }
+
+    #[test]
+    fn shorthand_can_invoke_a_skill_named_install_without_stealing_management_commands() {
+        for invocation in ["$install do X", "/install do X"] {
+            let (mut app, tmpdir, _guard) = create_isolated_test_app();
+            write_test_skill(tmpdir.path(), "install");
+
+            let result = execute(invocation, &mut app);
+
+            assert!(!result.is_error, "{invocation}: {result:?}");
+            assert!(
+                matches!(result.action, Some(AppAction::SendMessage(ref task)) if task == "do X"),
+                "{invocation}: {result:?}"
+            );
+            assert!(
+                app.active_skill
+                    .as_deref()
+                    .is_some_and(|instruction| instruction.contains("# Skill: install")),
+                "{invocation} did not activate the install skill"
+            );
+        }
+
+        let (mut app, tmpdir, _guard) = create_isolated_test_app();
+        write_test_skill(tmpdir.path(), "install");
+        let result = execute("/skill install", &mut app);
+        assert!(result.is_error, "management subcommand should show usage");
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("/skill install"))
+        );
+        assert!(result.action.is_none());
+        assert!(app.active_skill.is_none());
     }
 }

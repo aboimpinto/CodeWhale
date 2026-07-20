@@ -2,53 +2,136 @@
 //!
 //! These helpers are used by command handlers and non-command UI code, so
 //! persistence lives outside the command tree.
+//!
+//! Every `config.toml` mutation funnels through [`mutate_config_document`]:
+//! the file is edited in place with `toml_edit` so unrelated comments,
+//! ordering, and formatting survive, and the result is replaced atomically
+//! (same-directory temp file + rename) with owner-only permissions.
 
 use std::path::{Path, PathBuf};
 
-use crate::config::{ApiProvider, StatusItem, effective_home_dir, expand_path};
+use anyhow::Context;
+
+use crate::config::{ApiProvider, StatusItem, expand_path};
+
+/// Parse the TOML document at `path` (an absent or empty file yields an empty
+/// document), apply `mutate`, and atomically persist the result.
+///
+/// This is the single write path for TUI config mutations: `toml_edit` keeps
+/// user comments and formatting intact, and the temp-file + rename write can
+/// never leave a half-written config behind.
+pub(crate) fn mutate_config_document<F>(path: &Path, mutate: F) -> anyhow::Result<()>
+where
+    F: FnOnce(&mut toml_edit::DocumentMut) -> anyhow::Result<()>,
+{
+    codewhale_config::mutate_config_document(path, mutate)
+}
+
+/// Atomically replace `path` with `body` via a same-directory temp file and
+/// rename. On Unix the file lands with 0o600 permissions: config.toml can
+/// hold API keys, so this matches `ConfigStore::save` and the auth save path.
+pub(crate) fn write_config_toml_atomic(path: &Path, body: &str) -> anyhow::Result<()> {
+    codewhale_config::create_config_document(path, body)
+}
+
+/// Set the value at `segments` (parent tables plus the final key), creating
+/// missing intermediate tables. Replacing an existing value keeps its decor,
+/// so comments above the key and trailing same-line comments survive.
+///
+/// Segments are separate strings rather than one dotted key, so table names
+/// that need quoting (`[providers."my.provider"]`) resolve correctly.
+pub(crate) fn set_document_value(
+    doc: &mut toml_edit::DocumentMut,
+    segments: &[&str],
+    value: impl Into<toml_edit::Value>,
+) -> anyhow::Result<()> {
+    codewhale_config::set_config_document_value(doc, segments, value)
+}
+
+/// Remove the value at `segments`. Returns `Ok(true)` when an entry was
+/// removed; missing keys and missing (or non-table) parents are a no-op.
+pub(crate) fn unset_document_value(
+    doc: &mut toml_edit::DocumentMut,
+    segments: &[&str],
+) -> anyhow::Result<bool> {
+    codewhale_config::unset_config_document_value(doc, segments)
+}
+
+/// Remove every entry named `key` from `table` and, recursively, from nested
+/// tables, inline tables, and arrays of tables. Used by `/logout` to strip
+/// `api_key` everywhere without disturbing keys like `api_key_env`.
+pub(crate) fn remove_document_key_recursive(table: &mut dyn toml_edit::TableLike, key: &str) {
+    remove_key_preserving_leading_decor(table, key);
+    for (_, item) in table.iter_mut() {
+        if let toml_edit::Item::ArrayOfTables(tables) = item {
+            for nested in tables.iter_mut() {
+                remove_document_key_recursive(nested, key);
+            }
+        } else if let Some(nested) = item.as_table_like_mut() {
+            remove_document_key_recursive(nested, key);
+        }
+    }
+}
+
+fn remove_key_preserving_leading_decor(table: &mut dyn toml_edit::TableLike, key: &str) -> bool {
+    let mut found = false;
+    let next_key = table.iter().find_map(|(candidate, _)| {
+        if found {
+            Some(candidate.to_owned())
+        } else {
+            found = candidate == key;
+            None
+        }
+    });
+    let leading_prefix = leading_prefix_for_key(table, key);
+    if table.remove(key).is_none() {
+        return false;
+    }
+    let Some(prefix) = leading_prefix else {
+        return true;
+    };
+    let Some(next_key) = next_key else {
+        return true;
+    };
+    if prefix.as_str() == Some("") {
+        return true;
+    }
+    if let Some(mut next_key_decor) = table.key_mut(&next_key)
+        && decor_prefix_is_empty(next_key_decor.leaf_decor())
+    {
+        next_key_decor.leaf_decor_mut().set_prefix(prefix);
+    }
+    true
+}
+
+fn decor_prefix_is_empty(decor: &toml_edit::Decor) -> bool {
+    match decor.prefix() {
+        Some(prefix) => prefix.as_str() == Some(""),
+        None => true,
+    }
+}
+
+fn leading_prefix_for_key(
+    table: &dyn toml_edit::TableLike,
+    key: &str,
+) -> Option<toml_edit::RawString> {
+    table
+        .key(key)
+        .and_then(|key| key.leaf_decor().prefix().cloned())
+        .or_else(|| {
+            table
+                .get(key)
+                .and_then(|item| item.as_value())
+                .and_then(|value| value.decor().prefix().cloned())
+        })
+}
 
 pub(crate) fn persist_status_items(items: &[StatusItem]) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-    use std::fs;
-
     let path = config_toml_path(None)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
-
-    let (mut doc, original_raw) = if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config at {}", path.display()))?;
-        let doc: toml::Value = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config at {}", path.display()))?;
-        (doc, Some(raw))
-    } else {
-        (toml::Value::Table(toml::value::Table::new()), None)
-    };
-
-    let table = doc
-        .as_table_mut()
-        .context("config.toml root must be a table")?;
-    let tui_entry = table
-        .entry("tui".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-    let tui_table = tui_entry
-        .as_table_mut()
-        .context("`tui` section in config.toml must be a table")?;
-    let array = items
-        .iter()
-        .map(|item| toml::Value::String(item.key().to_string()))
-        .collect::<Vec<_>>();
-    tui_table.insert("status_items".to_string(), toml::Value::Array(array));
-
-    if let Some(raw) = original_raw {
-        save_toml_preserving_comments(&path, &doc, &raw)?;
-    } else {
-        let body = toml::to_string_pretty(&doc).context("failed to serialize config.toml")?;
-        fs::write(&path, body)
-            .with_context(|| format!("failed to write config at {}", path.display()))?;
-    }
+    let items: toml_edit::Array = items.iter().map(|item| item.key()).collect();
+    mutate_config_document(&path, |doc| {
+        set_document_value(doc, &["tui", "status_items"], items)
+    })?;
     Ok(path)
 }
 
@@ -57,35 +140,17 @@ pub(crate) fn persist_root_string_key(
     key: &str,
     value: &str,
 ) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-    use std::fs;
-
     let path = config_toml_path(config_path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
+    mutate_config_document(&path, |doc| set_document_value(doc, &[key], value))?;
+    Ok(path)
+}
 
-    let (mut doc, original_raw) = if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config at {}", path.display()))?;
-        let doc: toml::Value = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config at {}", path.display()))?;
-        (doc, Some(raw))
-    } else {
-        (toml::Value::Table(toml::value::Table::new()), None)
-    };
-    let table = doc
-        .as_table_mut()
-        .context("config.toml root must be a table")?;
-    table.insert(key.to_string(), toml::Value::String(value.to_string()));
-    if let Some(raw) = original_raw {
-        save_toml_preserving_comments(&path, &doc, &raw)?;
-    } else {
-        let body = toml::to_string_pretty(&doc).context("failed to serialize config.toml")?;
-        fs::write(&path, body)
-            .with_context(|| format!("failed to write config at {}", path.display()))?;
-    }
+pub(crate) fn persist_unset_root_key(
+    config_path: Option<&Path>,
+    key: &str,
+) -> anyhow::Result<PathBuf> {
+    let path = config_toml_path(config_path)?;
+    mutate_config_document(&path, |doc| unset_document_value(doc, &[key]).map(|_| ()))?;
     Ok(path)
 }
 
@@ -94,35 +159,8 @@ pub(crate) fn persist_root_bool_key(
     key: &str,
     value: bool,
 ) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-    use std::fs;
-
     let path = config_toml_path(config_path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
-
-    let (mut doc, original_raw) = if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config at {}", path.display()))?;
-        let doc: toml::Value = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config at {}", path.display()))?;
-        (doc, Some(raw))
-    } else {
-        (toml::Value::Table(toml::value::Table::new()), None)
-    };
-    let table = doc
-        .as_table_mut()
-        .context("config.toml root must be a table")?;
-    table.insert(key.to_string(), toml::Value::Boolean(value));
-    if let Some(raw) = original_raw {
-        save_toml_preserving_comments(&path, &doc, &raw)?;
-    } else {
-        let body = toml::to_string_pretty(&doc).context("failed to serialize config.toml")?;
-        fs::write(&path, body)
-            .with_context(|| format!("failed to write config at {}", path.display()))?;
-    }
+    mutate_config_document(&path, |doc| set_document_value(doc, &[key], value))?;
     Ok(path)
 }
 
@@ -131,43 +169,8 @@ pub(crate) fn persist_tui_integer_key(
     key: &str,
     value: u64,
 ) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-    use std::fs;
-
-    let path = config_toml_path(config_path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
-
-    let (mut doc, original_raw) = if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config at {}", path.display()))?;
-        let doc: toml::Value = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config at {}", path.display()))?;
-        (doc, Some(raw))
-    } else {
-        (toml::Value::Table(toml::value::Table::new()), None)
-    };
-    let table = doc
-        .as_table_mut()
-        .context("config.toml root must be a table")?;
-    let tui_entry = table
-        .entry("tui".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-    let tui_table = tui_entry
-        .as_table_mut()
-        .context("`tui` section in config.toml must be a table")?;
     let value = i64::try_from(value).context("integer value is too large for TOML")?;
-    tui_table.insert(key.to_string(), toml::Value::Integer(value));
-    if let Some(raw) = original_raw {
-        save_toml_preserving_comments(&path, &doc, &raw)?;
-    } else {
-        let body = toml::to_string_pretty(&doc).context("failed to serialize config.toml")?;
-        fs::write(&path, body)
-            .with_context(|| format!("failed to write config at {}", path.display()))?;
-    }
-    Ok(path)
+    persist_table_value_key(config_path, "tui", key, value.into())
 }
 
 pub(crate) fn persist_subagents_bool_key(
@@ -175,7 +178,7 @@ pub(crate) fn persist_subagents_bool_key(
     key: &str,
     value: bool,
 ) -> anyhow::Result<PathBuf> {
-    persist_subagents_value_key(config_path, key, toml::Value::Boolean(value))
+    persist_table_value_key(config_path, "subagents", key, value.into())
 }
 
 pub(crate) fn persist_subagents_integer_key(
@@ -183,54 +186,8 @@ pub(crate) fn persist_subagents_integer_key(
     key: &str,
     value: u64,
 ) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-
     let value = i64::try_from(value).context("integer value is too large for TOML")?;
-    persist_subagents_value_key(config_path, key, toml::Value::Integer(value))
-}
-
-fn persist_subagents_value_key(
-    config_path: Option<&Path>,
-    key: &str,
-    value: toml::Value,
-) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-    use std::fs;
-
-    let path = config_toml_path(config_path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
-
-    let (mut doc, original_raw) = if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config at {}", path.display()))?;
-        let doc: toml::Value = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config at {}", path.display()))?;
-        (doc, Some(raw))
-    } else {
-        (toml::Value::Table(toml::value::Table::new()), None)
-    };
-    let table = doc
-        .as_table_mut()
-        .context("config.toml root must be a table")?;
-    let subagents_entry = table
-        .entry("subagents".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-    let subagents_table = subagents_entry
-        .as_table_mut()
-        .context("`subagents` section in config.toml must be a table")?;
-    subagents_table.insert(key.to_string(), value);
-
-    if let Some(raw) = original_raw {
-        save_toml_preserving_comments(&path, &doc, &raw)?;
-    } else {
-        let body = toml::to_string_pretty(&doc).context("failed to serialize config.toml")?;
-        fs::write(&path, body)
-            .with_context(|| format!("failed to write config at {}", path.display()))?;
-    }
-    Ok(path)
+    persist_table_value_key(config_path, "subagents", key, value.into())
 }
 
 pub(crate) fn persist_table_bool_key(
@@ -239,7 +196,7 @@ pub(crate) fn persist_table_bool_key(
     key: &str,
     value: bool,
 ) -> anyhow::Result<PathBuf> {
-    persist_table_value_key(config_path, table_name, key, toml::Value::Boolean(value))
+    persist_table_value_key(config_path, table_name, key, value.into())
 }
 
 pub(crate) fn persist_table_string_key(
@@ -248,56 +205,19 @@ pub(crate) fn persist_table_string_key(
     key: &str,
     value: &str,
 ) -> anyhow::Result<PathBuf> {
-    persist_table_value_key(
-        config_path,
-        table_name,
-        key,
-        toml::Value::String(value.to_string()),
-    )
+    persist_table_value_key(config_path, table_name, key, value.into())
 }
 
 fn persist_table_value_key(
     config_path: Option<&Path>,
     table_name: &str,
     key: &str,
-    value: toml::Value,
+    value: toml_edit::Value,
 ) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-    use std::fs;
-
     let path = config_toml_path(config_path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
-
-    let (mut doc, original_raw) = if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config at {}", path.display()))?;
-        let doc: toml::Value = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config at {}", path.display()))?;
-        (doc, Some(raw))
-    } else {
-        (toml::Value::Table(toml::value::Table::new()), None)
-    };
-    let root = doc
-        .as_table_mut()
-        .context("config.toml root must be a table")?;
-    let section = root
-        .entry(table_name.to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()));
-    let section_table = section
-        .as_table_mut()
-        .with_context(|| format!("`{table_name}` section in config.toml must be a table"))?;
-    section_table.insert(key.to_string(), value);
-
-    if let Some(raw) = original_raw {
-        save_toml_preserving_comments(&path, &doc, &raw)?;
-    } else {
-        let body = toml::to_string_pretty(&doc).context("failed to serialize config.toml")?;
-        fs::write(&path, body)
-            .with_context(|| format!("failed to write config at {}", path.display()))?;
-    }
+    mutate_config_document(&path, |doc| {
+        set_document_value(doc, &[table_name, key], value)
+    })?;
     Ok(path)
 }
 
@@ -306,50 +226,43 @@ pub(crate) fn persist_provider_base_url_key(
     provider: ApiProvider,
     value: &str,
 ) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-    use std::fs;
-
-    let path = config_toml_path(config_path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
-
-    let (mut doc, original_raw) = if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config at {}", path.display()))?;
-        let doc: toml::Value = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config at {}", path.display()))?;
-        (doc, Some(raw))
-    } else {
-        (toml::Value::Table(toml::value::Table::new()), None)
-    };
-    let table = doc
-        .as_table_mut()
-        .context("config.toml root must be a table")?;
-    let providers = table
-        .entry("providers".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
-        .as_table_mut()
-        .context("`providers` must be a table")?;
     let provider_key = provider_base_url_table_key(provider)?;
-    let entry = providers
-        .entry(provider_key.to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
-        .as_table_mut()
-        .with_context(|| format!("`providers.{provider_key}` must be a table"))?;
-    entry.insert(
-        "base_url".to_string(),
-        toml::Value::String(value.to_string()),
-    );
+    let path = config_toml_path(config_path)?;
+    mutate_config_document(&path, |doc| {
+        set_document_value(doc, &["providers", provider_key, "base_url"], value)
+    })?;
+    Ok(path)
+}
 
-    if let Some(raw) = original_raw {
-        save_toml_preserving_comments(&path, &doc, &raw)?;
-    } else {
-        let body = toml::to_string_pretty(&doc).context("failed to serialize config.toml")?;
-        fs::write(&path, body)
-            .with_context(|| format!("failed to write config at {}", path.display()))?;
+/// Persist the model for one exact provider route without rewriting the
+/// legacy root DeepSeek fallback used by unrelated providers.
+///
+/// First-party DeepSeek retains its historical `default_text_model` root key.
+/// Every other built-in provider writes to its typed `[providers.<name>]`
+/// table, while named custom routes use their exact user-owned table id.
+pub(crate) fn persist_provider_model_key(
+    config_path: Option<&Path>,
+    provider: ApiProvider,
+    provider_identity: &str,
+    value: &str,
+) -> anyhow::Result<PathBuf> {
+    if matches!(provider, ApiProvider::Deepseek | ApiProvider::DeepseekCN) {
+        return persist_root_string_key(config_path, "default_text_model", value);
     }
+
+    let provider_key = if provider == ApiProvider::Custom {
+        normalize_custom_provider_id(provider_identity)?
+    } else {
+        provider
+            .metadata()
+            .context("provider config metadata")?
+            .provider_config_key()
+            .to_string()
+    };
+    let path = config_toml_path(config_path)?;
+    mutate_config_document(&path, |doc| {
+        set_document_value(doc, &["providers", &provider_key, "model"], value)
+    })?;
     Ok(path)
 }
 
@@ -384,7 +297,12 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::Zai => Ok("zai"),
         ApiProvider::Stepfun => Ok("stepfun"),
         ApiProvider::Minimax => Ok("minimax"),
+        ApiProvider::MinimaxAnthropic => Ok("minimax_anthropic"),
         ApiProvider::Sakana => Ok("sakana"),
+        ApiProvider::LongCat => Ok("longcat"),
+        ApiProvider::OpencodeGo => Ok("opencode_go"),
+        ApiProvider::Meta => Ok("meta"),
+        ApiProvider::Xai => Ok("xai"),
         // Custom providers live under a user-chosen `[providers.<name>]` table,
         // not a fixed key. Persisting base_url through this static-key path is
         // out of scope for the #1519 constrained slice; users edit the named
@@ -402,70 +320,31 @@ pub(crate) fn persist_custom_provider(
     model: Option<&str>,
     api_key_env: Option<&str>,
 ) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-    use std::fs;
-
     let provider_id = normalize_custom_provider_id(provider_id)?;
     let base_url = normalize_custom_provider_base_url(base_url)?;
     let model = model.and_then(normalize_optional_custom_provider_field);
     let api_key_env = api_key_env.and_then(normalize_optional_custom_provider_field);
 
     let path = config_toml_path(config_path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
-
-    let (mut doc, original_raw) = if path.exists() {
-        let raw = fs::read_to_string(&path)
-            .with_context(|| format!("failed to read config at {}", path.display()))?;
-        let doc: toml::Value = toml::from_str(&raw)
-            .with_context(|| format!("failed to parse config at {}", path.display()))?;
-        (doc, Some(raw))
-    } else {
-        (toml::Value::Table(toml::value::Table::new()), None)
-    };
-
-    let table = doc
-        .as_table_mut()
-        .context("config.toml root must be a table")?;
-    table.insert(
-        "provider".to_string(),
-        toml::Value::String(provider_id.clone()),
-    );
-    let providers = table
-        .entry("providers".to_string())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
-        .as_table_mut()
-        .context("`providers` must be a table")?;
-    let entry = providers
-        .entry(provider_id.clone())
-        .or_insert_with(|| toml::Value::Table(toml::value::Table::new()))
-        .as_table_mut()
-        .with_context(|| format!("`providers.{provider_id}` must be a table"))?;
-    entry.insert(
-        "kind".to_string(),
-        toml::Value::String("openai-compatible".to_string()),
-    );
-    entry.insert("base_url".to_string(), toml::Value::String(base_url));
-    if let Some(model) = model {
-        entry.insert("model".to_string(), toml::Value::String(model));
-    } else {
-        entry.remove("model");
-    }
-    if let Some(api_key_env) = api_key_env {
-        entry.insert("api_key_env".to_string(), toml::Value::String(api_key_env));
-    } else {
-        entry.remove("api_key_env");
-    }
-
-    if let Some(raw) = original_raw {
-        save_toml_preserving_comments(&path, &doc, &raw)?;
-    } else {
-        let body = toml::to_string_pretty(&doc).context("failed to serialize config.toml")?;
-        fs::write(&path, body)
-            .with_context(|| format!("failed to write config at {}", path.display()))?;
-    }
+    mutate_config_document(&path, |doc| {
+        let entry = ["providers", provider_id.as_str()];
+        set_document_value(doc, &["provider"], provider_id.as_str())?;
+        set_document_value(doc, &[entry[0], entry[1], "kind"], "openai-compatible")?;
+        set_document_value(doc, &[entry[0], entry[1], "base_url"], base_url.as_str())?;
+        match model.as_deref() {
+            Some(model) => set_document_value(doc, &[entry[0], entry[1], "model"], model)?,
+            None => {
+                unset_document_value(doc, &[entry[0], entry[1], "model"])?;
+            }
+        }
+        match api_key_env.as_deref() {
+            Some(env) => set_document_value(doc, &[entry[0], entry[1], "api_key_env"], env)?,
+            None => {
+                unset_document_value(doc, &[entry[0], entry[1], "api_key_env"])?;
+            }
+        }
+        Ok(())
+    })?;
     Ok(path)
 }
 
@@ -515,104 +394,39 @@ pub(crate) fn persist_hotbar_bindings(
     config_path: Option<&Path>,
     bindings: &[codewhale_config::HotbarBindingToml],
 ) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-    use std::fs;
-
     let path = config_toml_path(config_path)?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create config directory {}", parent.display()))?;
-    }
-
-    let raw = if path.exists() {
-        Some(
-            fs::read_to_string(&path)
-                .with_context(|| format!("failed to read config at {}", path.display()))?,
-        )
-    } else {
-        None
-    };
-    let mut document = match raw.as_deref() {
-        Some(raw) if !raw.trim().is_empty() => raw
-            .parse::<toml_edit::DocumentMut>()
-            .with_context(|| format!("failed to edit config at {}", path.display()))?,
-        _ => toml_edit::DocumentMut::new(),
-    };
-
-    let table = document.as_table_mut();
-    table.remove("hotbar");
-    if bindings.is_empty() {
-        table.insert(
-            "hotbar",
-            toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new())),
-        );
-    } else {
-        let mut hotbar = toml_edit::ArrayOfTables::new();
-        for binding in bindings {
-            let mut table = toml_edit::Table::new();
-            table["slot"] = toml_edit::value(i64::from(binding.slot));
-            table["action"] = toml_edit::value(binding.action.clone());
-            if let Some(label) = binding.label.as_deref() {
-                table["label"] = toml_edit::value(label);
+    mutate_config_document(&path, |doc| {
+        let table = doc.as_table_mut();
+        table.remove("hotbar");
+        if bindings.is_empty() {
+            table.insert(
+                "hotbar",
+                toml_edit::Item::Value(toml_edit::Value::Array(toml_edit::Array::new())),
+            );
+        } else {
+            let mut hotbar = toml_edit::ArrayOfTables::new();
+            for binding in bindings {
+                let mut entry = toml_edit::Table::new();
+                entry["slot"] = toml_edit::value(i64::from(binding.slot));
+                entry["action"] = toml_edit::value(binding.action.clone());
+                if let Some(label) = binding.label.as_deref() {
+                    entry["label"] = toml_edit::value(label);
+                }
+                hotbar.push(entry);
             }
-            hotbar.push(table);
+            table.insert("hotbar", toml_edit::Item::ArrayOfTables(hotbar));
         }
-        table.insert("hotbar", toml_edit::Item::ArrayOfTables(hotbar));
-    }
-
-    fs::write(&path, document.to_string())
-        .with_context(|| format!("failed to write config at {}", path.display()))?;
+        Ok(())
+    })?;
     Ok(path)
 }
 
 pub(crate) fn config_toml_path(config_path: Option<&Path>) -> anyhow::Result<PathBuf> {
-    use anyhow::Context;
-
     if let Some(path) = config_path {
         return Ok(expand_path(path.to_string_lossy().as_ref()));
     }
-    if let Ok(env) = std::env::var("CODEWHALE_CONFIG_PATH") {
-        let trimmed = env.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-    if let Ok(env) = std::env::var("DEEPSEEK_CONFIG_PATH") {
-        let trimmed = env.trim();
-        if !trimmed.is_empty() {
-            return Ok(PathBuf::from(trimmed));
-        }
-    }
-    let home =
-        effective_home_dir().context("failed to resolve home directory for config.toml path")?;
-    let primary = home.join(".codewhale").join("config.toml");
-    if primary.exists() {
-        return Ok(primary);
-    }
-    let legacy = home.join(".deepseek").join("config.toml");
-    if legacy.exists() {
-        return Ok(legacy);
-    }
-    Ok(primary)
-}
-
-/// Write `doc` to `path`, merging comments from `original_raw` so user
-/// annotations survive the rewrite.
-fn save_toml_preserving_comments(
-    path: &Path,
-    doc: &toml::Value,
-    original_raw: &str,
-) -> anyhow::Result<()> {
-    use anyhow::Context;
-    let serialized = toml::to_string_pretty(doc).context("failed to serialize config.toml")?;
-    let body = codewhale_config::merge_and_preserve_comments(&serialized, original_raw)
-        .unwrap_or_else(|e| {
-            tracing::warn!("failed to merge config comments, saving without them: {e:#}");
-            serialized
-        });
-    std::fs::write(path, body)
-        .with_context(|| format!("failed to write config at {}", path.display()))?;
-    Ok(())
+    crate::config::resolve_load_config_path(None)
+        .context("failed to resolve the active config.toml path")
 }
 
 #[cfg(test)]
@@ -627,9 +441,10 @@ mod tests {
     struct EnvGuard {
         home: Option<OsString>,
         userprofile: Option<OsString>,
+        codewhale_home: Option<OsString>,
         codewhale_config_path: Option<OsString>,
         deepseek_config_path: Option<OsString>,
-        _lock: std::sync::MutexGuard<'static, ()>,
+        _lock: crate::test_support::TestEnvLock,
     }
 
     impl EnvGuard {
@@ -640,6 +455,7 @@ mod tests {
             let config_str = OsString::from(config_path.as_os_str());
             let home_prev = env::var_os("HOME");
             let userprofile_prev = env::var_os("USERPROFILE");
+            let codewhale_home_prev = env::var_os("CODEWHALE_HOME");
             let codewhale_config_prev = env::var_os("CODEWHALE_CONFIG_PATH");
             let deepseek_config_prev = env::var_os("DEEPSEEK_CONFIG_PATH");
 
@@ -647,6 +463,7 @@ mod tests {
             unsafe {
                 env::set_var("HOME", &home_str);
                 env::set_var("USERPROFILE", &home_str);
+                env::remove_var("CODEWHALE_HOME");
                 env::remove_var("CODEWHALE_CONFIG_PATH");
                 env::set_var("DEEPSEEK_CONFIG_PATH", &config_str);
             }
@@ -654,6 +471,7 @@ mod tests {
             Self {
                 home: home_prev,
                 userprofile: userprofile_prev,
+                codewhale_home: codewhale_home_prev,
                 codewhale_config_path: codewhale_config_prev,
                 deepseek_config_path: deepseek_config_prev,
                 _lock: lock,
@@ -684,6 +502,18 @@ mod tests {
                 // Safety: test-only environment mutation guarded by a global mutex.
                 unsafe {
                     env::remove_var("USERPROFILE");
+                }
+            }
+
+            if let Some(value) = self.codewhale_home.take() {
+                // Safety: test-only environment mutation guarded by a global mutex.
+                unsafe {
+                    env::set_var("CODEWHALE_HOME", value);
+                }
+            } else {
+                // Safety: test-only environment mutation guarded by a global mutex.
+                unsafe {
+                    env::remove_var("CODEWHALE_HOME");
                 }
             }
 
@@ -776,6 +606,26 @@ mod tests {
     }
 
     #[test]
+    fn config_toml_path_ignores_legacy_config_when_codewhale_home_is_explicit() {
+        let temp_root = temp_root("codewhale-config-path-explicit-home");
+        let explicit_home = temp_root.join("isolated-codewhale");
+        let legacy_config = temp_root.join(".deepseek").join("config.toml");
+        fs::create_dir_all(legacy_config.parent().unwrap()).unwrap();
+        fs::write(&legacy_config, "").unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+
+        unsafe {
+            env::remove_var("DEEPSEEK_CONFIG_PATH");
+            env::set_var("CODEWHALE_HOME", &explicit_home);
+        }
+
+        assert_eq!(
+            config_toml_path(None).unwrap(),
+            explicit_home.join("config.toml")
+        );
+    }
+
+    #[test]
     fn config_toml_path_prefers_codewhale_env_over_legacy_env() {
         let temp_root = temp_root("codewhale-config-path-env");
         fs::create_dir_all(&temp_root).unwrap();
@@ -789,6 +639,23 @@ mod tests {
         }
 
         assert_eq!(config_toml_path(None).unwrap(), preferred);
+    }
+
+    #[test]
+    fn config_toml_path_uses_existing_home_fallback_when_env_target_is_missing() {
+        let temp_root = temp_root("codewhale-config-path-missing-env-fallback");
+        let home_config = temp_root.join(".codewhale").join("config.toml");
+        fs::create_dir_all(home_config.parent().unwrap()).unwrap();
+        fs::write(&home_config, "# existing fallback\n").unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let missing_env = temp_root.join("override").join("missing.toml");
+
+        unsafe {
+            env::set_var("DEEPSEEK_CONFIG_PATH", &missing_env);
+        }
+
+        assert_eq!(config_toml_path(None).unwrap(), home_config);
+        assert!(!missing_env.exists());
     }
 
     #[test]
@@ -1100,5 +967,295 @@ enabled = true
         let parsed: codewhale_config::ConfigToml =
             toml::from_str(&body).expect("written hotbar config should parse");
         assert_eq!(parsed.hotbar, Some(Vec::new()));
+    }
+
+    // ------------------------------------------------------------------
+    // Golden-file coverage for the shared toml_edit mutation path
+    // (findings #18/#19/#20): unrelated comments, ordering, and quoted
+    // provider tables must survive every supported mutation.
+    // ------------------------------------------------------------------
+
+    const GOLDEN_CONFIG: &str = r#"# CodeWhale golden config fixture, top note.
+# api_key = "sk-placeholder" (uncomment to set the key by hand)
+model = "deepseek-v4-pro" # pinned for release QA
+
+# workspace trust note
+[projects."/Users/example/work"]
+trust_level = "trusted" # granted manually
+
+# providers note
+[providers.openrouter]
+base_url = "https://openrouter.ai/api/v1" # keep in sync with docs
+
+[providers."quoted.provider"]
+base_url = "https://quoted.example/v1"
+
+[[hotbar]]
+slot = 1
+action = "mode.plan"
+"#;
+
+    fn write_golden_config(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, GOLDEN_CONFIG).unwrap();
+    }
+
+    #[test]
+    fn golden_replacing_existing_root_value_only_touches_that_value() {
+        let temp_root = temp_root("codewhale-golden-root-value");
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let path = temp_root.join(".deepseek").join("config.toml");
+        write_golden_config(&path);
+
+        persist_root_string_key(Some(&path), "model", "deepseek-v4-flash")
+            .expect("persist should succeed");
+
+        let body = fs::read_to_string(&path).unwrap();
+        let expected = GOLDEN_CONFIG.replace(
+            "model = \"deepseek-v4-pro\" # pinned for release QA",
+            "model = \"deepseek-v4-flash\" # pinned for release QA",
+        );
+        assert_eq!(body, expected, "only the model value may change");
+    }
+
+    #[test]
+    fn golden_mutations_preserve_unrelated_comments_order_and_quoted_tables() {
+        let temp_root = temp_root("codewhale-golden-mutations");
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let path = temp_root.join(".deepseek").join("config.toml");
+        write_golden_config(&path);
+
+        persist_root_bool_key(Some(&path), "allow_shell", true).unwrap();
+        persist_tui_integer_key(Some(&path), "scrollback_lines", 4000).unwrap();
+        persist_table_string_key(Some(&path), "memory", "backend", "sqlite").unwrap();
+        persist_subagents_bool_key(Some(&path), "enabled", true).unwrap();
+        persist_provider_base_url_key(
+            Some(&path),
+            crate::config::ApiProvider::Openrouter,
+            "https://openrouter.example/v2",
+        )
+        .unwrap();
+        persist_status_items(&[crate::config::StatusItem::Mode]).unwrap();
+        persist_hotbar_bindings(
+            Some(&path),
+            &[codewhale_config::HotbarBindingToml {
+                slot: 2,
+                action: "session.compact".to_string(),
+                label: None,
+            }],
+        )
+        .unwrap();
+
+        let body = fs::read_to_string(&path).unwrap();
+        for comment in [
+            "# CodeWhale golden config fixture, top note.",
+            "# api_key = \"sk-placeholder\" (uncomment to set the key by hand)",
+            "# pinned for release QA",
+            "# workspace trust note",
+            "# granted manually",
+            "# providers note",
+            "# keep in sync with docs",
+        ] {
+            assert!(body.contains(comment), "comment lost: {comment}\n{body}");
+        }
+        // Updated in place, keeping the trailing comment on the same line.
+        assert!(
+            body.contains("base_url = \"https://openrouter.example/v2\" # keep in sync with docs"),
+            "{body}"
+        );
+        assert!(body.contains("[providers.\"quoted.provider\"]"), "{body}");
+        assert!(
+            !body.contains("mode.plan"),
+            "old hotbar entry must be replaced: {body}"
+        );
+
+        // Original section order is intact.
+        let model_at = body.find("model = ").unwrap();
+        let projects_at = body.find("[projects.").unwrap();
+        let providers_at = body.find("[providers.openrouter]").unwrap();
+        assert!(
+            model_at < projects_at && projects_at < providers_at,
+            "{body}"
+        );
+
+        let parsed: toml::Value = toml::from_str(&body).unwrap();
+        assert_eq!(
+            parsed.get("allow_shell").and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            parsed
+                .get("tui")
+                .and_then(|t| t.get("scrollback_lines"))
+                .and_then(toml::Value::as_integer),
+            Some(4000)
+        );
+        assert_eq!(
+            parsed
+                .get("memory")
+                .and_then(|t| t.get("backend"))
+                .and_then(toml::Value::as_str),
+            Some("sqlite")
+        );
+        assert_eq!(
+            parsed
+                .get("subagents")
+                .and_then(|t| t.get("enabled"))
+                .and_then(toml::Value::as_bool),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn set_document_value_inserts_api_key_even_when_a_comment_mentions_it() {
+        // Finding #20 at the primitive level: the old string scan treated a
+        // comment mentioning api_key as an existing assignment and skipped
+        // the insert entirely.
+        let temp_root = temp_root("codewhale-golden-api-key-comment");
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let path = temp_root.join(".deepseek").join("config.toml");
+        write_golden_config(&path);
+
+        mutate_config_document(&path, |doc| {
+            set_document_value(doc, &["api_key"], "sk-fresh")
+        })
+        .expect("mutation should succeed");
+
+        let body = fs::read_to_string(&path).unwrap();
+        assert!(
+            body.contains("# api_key = \"sk-placeholder\""),
+            "comment lost: {body}"
+        );
+        let parsed: toml::Value = toml::from_str(&body).unwrap();
+        assert_eq!(
+            parsed.get("api_key").and_then(toml::Value::as_str),
+            Some("sk-fresh"),
+            "real key must be inserted despite the comment: {body}"
+        );
+    }
+
+    #[test]
+    fn unset_document_value_reports_removal_and_tolerates_missing_parents() {
+        let mut doc = "model = \"deepseek-v4-pro\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        assert!(!unset_document_value(&mut doc, &["providers", "openrouter", "api_key"]).unwrap());
+        assert!(!unset_document_value(&mut doc, &["model", "nested"]).unwrap());
+        assert!(unset_document_value(&mut doc, &["model"]).unwrap());
+        assert!(!unset_document_value(&mut doc, &["model"]).unwrap());
+    }
+
+    #[test]
+    fn unset_last_root_value_preserves_its_leading_comment() {
+        let mut doc = "# keep this explanation\napproval_policy = \"on-request\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+
+        assert!(unset_document_value(&mut doc, &["approval_policy"]).unwrap());
+
+        let saved = doc.to_string();
+        assert!(saved.contains("# keep this explanation"), "{saved:?}");
+        assert!(!saved.contains("approval_policy"), "{saved:?}");
+    }
+
+    #[test]
+    fn set_document_value_rejects_non_table_parents() {
+        let mut doc = "model = \"deepseek-v4-pro\"\n"
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+        let err = set_document_value(&mut doc, &["model", "nested"], "x")
+            .expect_err("scalar parent must be rejected");
+        assert!(err.to_string().contains("must be a table"), "{err}");
+    }
+
+    #[test]
+    fn remove_document_key_recursive_strips_nested_and_quoted_tables() {
+        let mut doc = r#"# root note
+api_key = "root"
+api_key_env = "KEEP_ENV"
+
+[providers.openrouter]
+api_key = "or"
+base_url = "https://openrouter.ai/api/v1"
+
+[providers."quoted.provider"]
+api_key = "quoted"
+
+[[hotbar]]
+slot = 1
+"#
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+
+        remove_document_key_recursive(doc.as_table_mut(), "api_key");
+
+        let body = doc.to_string();
+        assert!(!body.contains("api_key = "), "{body}");
+        assert!(body.contains("# root note"), "{body}");
+        assert!(body.contains("api_key_env = \"KEEP_ENV\""), "{body}");
+        assert!(body.contains("base_url"), "{body}");
+        assert!(body.contains("[[hotbar]]"), "{body}");
+    }
+
+    #[test]
+    fn persist_custom_provider_unsets_removed_optional_fields() {
+        let temp_root = temp_root("codewhale-custom-provider-unset");
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let path = temp_root.join(".codewhale").join("config.toml");
+
+        persist_custom_provider(
+            Some(&path),
+            "acme_ai",
+            "https://api.acme.example/v1",
+            Some("acme/code-1"),
+            Some("ACME_API_KEY"),
+        )
+        .expect("first persist should succeed");
+        persist_custom_provider(
+            Some(&path),
+            "acme_ai",
+            "https://api.acme.example/v2",
+            None,
+            None,
+        )
+        .expect("second persist should succeed");
+
+        let body = fs::read_to_string(&path).unwrap();
+        let parsed: toml::Value = toml::from_str(&body).unwrap();
+        let entry = parsed
+            .get("providers")
+            .and_then(|providers| providers.get("acme_ai"))
+            .expect("provider entry");
+        assert_eq!(
+            entry.get("base_url").and_then(toml::Value::as_str),
+            Some("https://api.acme.example/v2")
+        );
+        assert!(entry.get("model").is_none(), "model must be unset: {body}");
+        assert!(
+            entry.get("api_key_env").is_none(),
+            "api_key_env must be unset: {body}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_writes_land_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_root = temp_root("codewhale-persist-perms");
+        fs::create_dir_all(&temp_root).unwrap();
+        let _guard = EnvGuard::new(&temp_root);
+        let path = temp_root.join(".deepseek").join("config.toml");
+        write_golden_config(&path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        persist_root_bool_key(Some(&path), "allow_shell", true).expect("persist should succeed");
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "config.toml can hold api keys");
     }
 }

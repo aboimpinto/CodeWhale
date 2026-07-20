@@ -18,6 +18,7 @@ fn none_request(kind: ProviderKind) -> RouteRequest {
         model_selector: None,
         saved_provider_model: None,
         base_url_override: None,
+        limit_overrides: Vec::new(),
     }
 }
 
@@ -72,20 +73,21 @@ fn every_provider_kind_resolves_its_default_route() {
         });
 
         assert_eq!(
-            candidate.provider_kind, kind,
+            candidate.provider_kind(),
+            kind,
             "{kind:?}: resolved to a different provider"
         );
         assert_eq!(
-            candidate.provider_id,
-            ProviderId::from_kind(kind),
+            candidate.provider_id(),
+            &ProviderId::from_kind(kind),
             "{kind:?}: resolved provider id mismatch"
         );
 
         // The resolver prefers this provider's bundled *default offering* wire id
         // when one exists, and otherwise falls back to the descriptor default
-        // wire model. Assert that exact contract so a future drift between
-        // OFFERING_SEEDS and `Provider::default_model()` fails with an honest
-        // message instead of coincidentally passing.
+        // wire model. Assert that exact contract so a future drift between the
+        // catalog-backed default and `Provider::default_model()` fails with an
+        // honest message instead of coincidentally passing.
         let expected_wire = bundled
             .iter()
             .find(|offering| {
@@ -96,7 +98,7 @@ fn every_provider_kind_resolves_its_default_route() {
                 |offering| offering.wire_model_id.as_str().to_string(),
             );
         assert_eq!(
-            candidate.wire_model_id.as_str(),
+            candidate.wire_model_id().as_str(),
             expected_wire,
             "{kind:?}: None selector must resolve to the bundled default offering (or descriptor default)"
         );
@@ -112,23 +114,25 @@ fn every_provider_kind_resolves_the_auto_selector() {
             model_selector: Some(LogicalModelRef::from("auto")),
             saved_provider_model: None,
             base_url_override: None,
+            limit_overrides: Vec::new(),
         };
         let candidate = resolver
             .resolve(&request)
             .unwrap_or_else(|err| panic!("{kind:?}: `auto` must resolve, got {err:?}"));
 
         assert_eq!(
-            candidate.provider_kind, kind,
+            candidate.provider_kind(),
+            kind,
             "{kind:?}: auto resolved to a different provider"
         );
         assert!(
-            candidate.logical_model.is_auto(),
+            candidate.logical_model().is_auto(),
             "{kind:?}: `auto` must stay the auto sentinel, never a literal model"
         );
         // `auto` with no catalog default falls back to the descriptor default,
         // which conformance #2 already pins; here we only assert it resolves.
         assert!(
-            !candidate.wire_model_id.as_str().trim().is_empty(),
+            !candidate.wire_model_id().as_str().trim().is_empty(),
             "{kind:?}: auto resolved to an empty wire model"
         );
     }

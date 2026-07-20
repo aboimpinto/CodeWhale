@@ -15,9 +15,10 @@ use crate::tui::app::App;
 pub struct ConfigCommands;
 
 impl CommandGroup for ConfigCommands {
-    fn commands(&self) -> Vec<Box<dyn Command>> {
-        vec![
+    fn commands(&self) -> &'static [Box<dyn Command>] {
+        cached_command_list!(vec![
             Box::new(FunctionCommand::new(&CONFIG_INFO, run_config)),
+            Box::new(FunctionCommand::new(&AUTH_INFO, run_auth)),
             Box::new(FunctionCommand::new(&SIDEBAR_INFO, run_sidebar)),
             Box::new(FunctionCommand::new(&SETTINGS_INFO, run_settings)),
             Box::new(FunctionCommand::new(&STATUS_INFO, run_status)),
@@ -28,22 +29,28 @@ impl CommandGroup for ConfigCommands {
             Box::new(FunctionCommand::new(&TRUST_INFO, run_trust)),
             Box::new(FunctionCommand::new(&LOGOUT_INFO, run_logout)),
             Box::new(FunctionCommand::new(&DEBT_INFO, run_debt)),
-        ]
+        ])
     }
 }
 
 static CONFIG_INFO: CommandInfo = CommandInfo {
     name: "config",
     // /experiments is a discoverable entry to the same view: the Experimental
-    // section exposes the WhaleFlow, goal, and sub-agent opt-ins (#3182).
+    // section exposes the Workflow, goal, and sub-agent opt-ins (#3182).
     aliases: &["experiments", "experimental"],
     usage: "/config [ask-rules|status|<key> [value]]",
     description_id: MessageId::CmdConfigDescription,
 };
+static AUTH_INFO: CommandInfo = CommandInfo {
+    name: "auth",
+    aliases: &[],
+    usage: "/auth xai-device",
+    description_id: MessageId::CmdAuthDescription,
+};
 static SIDEBAR_INFO: CommandInfo = CommandInfo {
     name: "sidebar",
     aliases: &[],
-    usage: "/sidebar [on|off|auto|work|tasks|agents|context] [--save]",
+    usage: "/sidebar [on|off|auto|work|activity|tasks|agents|context] [--save]",
     description_id: MessageId::CmdSidebarDescription,
 };
 static SETTINGS_INFO: CommandInfo = CommandInfo {
@@ -67,7 +74,7 @@ static STATUSLINE_INFO: CommandInfo = CommandInfo {
 static MODE_INFO: CommandInfo = CommandInfo {
     name: "mode",
     aliases: &["jihua", "zidong"],
-    usage: "/mode [agent|plan|yolo|1|2|4]",
+    usage: "/mode [act|plan|operate|1|2|3]",
     description_id: MessageId::CmdModeDescription,
 };
 static THEME_INFO: CommandInfo = CommandInfo {
@@ -108,6 +115,9 @@ fn run_registered(app: &mut App, name: &str, arg: Option<&str>) -> CommandResult
 fn run_config(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "config", arg)
 }
+fn run_auth(app: &mut App, arg: Option<&str>) -> CommandResult {
+    run_registered(app, "auth", arg)
+}
 fn run_sidebar(app: &mut App, arg: Option<&str>) -> CommandResult {
     run_registered(app, "sidebar", arg)
 }
@@ -146,6 +156,12 @@ pub(in crate::commands) fn dispatch(
 ) -> Option<CommandResult> {
     let result = match command {
         "config" | "experiments" | "experimental" => config::config_command(app, arg),
+        "auth" => match arg.map(str::trim) {
+            Some("xai-device") | Some("xai_device") => {
+                CommandResult::action(crate::tui::app::AppAction::StartXaiDeviceLogin)
+            }
+            _ => CommandResult::error("Usage: /auth xai-device"),
+        },
         "sidebar" => config::sidebar(app, arg),
         "settings" => config::show_settings(app),
         "status" => status::status(app),

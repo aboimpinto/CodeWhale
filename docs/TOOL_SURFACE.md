@@ -15,7 +15,7 @@ chosen over the available shell equivalent. Companion to `crates/tui/src/prompts
   for the same backing operation are a model trap — the LLM will alternate
   between them and the cache hit rate suffers.
 
-## Current surface (v0.8.49)
+## Current surface (v0.9.1)
 
 ### File operations
 
@@ -78,16 +78,21 @@ stale rather than presented as live processes.
 
 Shell permission policy is evaluated by `crates/execpolicy`. Deny prefixes are
 checked before trusted prefixes and block matching commands regardless of layer.
-Trusted prefixes only skip approval in modes that permit trust shortcuts. Typed
-ask records are an ask-only layer: when one matches under
-`AskForApproval::Never`, the invocation is rejected because the runtime cannot
-ask the user; YOLO / auto approval keeps complete freedom and is not limited by
-ask rules. Existing allow/deny behavior is otherwise unchanged.
+Trusted prefixes only skip approval in modes that permit trust shortcuts.
+Manually authored `permissions.toml` records support
+`action = "deny" | "ask" | "allow"`: `deny` blocks matching invocations before
+mode-based approval handling, `allow` skips approval for matching invocations,
+and `ask` forces approval only in modes that can prompt. Outside the TUI
+auto-approve path, a matching `ask` rule under `AskForApproval::Never` is
+rejected because the runtime cannot ask the user. In YOLO / auto-approval
+sessions, `ask` rules do not downgrade the session into prompting or blocking;
+explicit `deny` rules still block according to the current execution-policy
+logic.
 
-The TUI runtime loads ask-only records from the sibling `permissions.toml` file
-and applies matching `exec_shell` command ask-rules and explicit file-path
-ask-rules in modes that can ask. In supported approval cards, `S` approves once
-and appends persistent ask rules:
+The TUI runtime loads typed records from the sibling `permissions.toml` file and
+applies matching `exec_shell` command rules and explicit file-path rules. In
+supported approval cards, `S` approves once and appends persistent
+`action = "ask"` rules:
 
 - `exec_shell`: the exact approved command string (matched by the existing
   arity-aware command matcher).
@@ -96,10 +101,10 @@ and appends persistent ask rules:
 - `apply_patch`: one exact workspace-relative path rule per validated touched
   file reported by apply-patch preflight.
 
-`read_file` path ask rules can be authored in `permissions.toml` and matched at
+`read_file` path rules can be authored in `permissions.toml` and matched at
 runtime, but the approval UI does not save `read_file` rules. This is still not
-a policy editor: no typed allow/deny records, glob expansion, broad directory
-rules, or UI edit/delete flow exist for saved ask rules.
+a policy editor: the UI does not save `allow`/`deny`, edit or delete rules,
+expand globs, or create broad directory rules.
 
 ### MCP manager and palette discovery
 
@@ -129,20 +134,19 @@ to the model, such as `mcp_<server>_<tool>`.
 
 | Tool | Niche |
 |---|---|
-| `update_plan` | Optional high-level strategy metadata for complex multi-phase work; keep `checklist_write` as the primary progress surface. |
+| `update_plan` | Optional high-level Strategy metadata/context/route for complex multi-phase work — not a second checklist. |
 | `task_create` | Create/enqueue a durable background task through `TaskManager`. This is the real executable work object for long-running agent work. |
 | `task_list` | List durable tasks with status and linked runtime ids. |
 | `task_read` | Read durable task detail: thread/turn linkage, timeline, checklist, gates, artifacts, PR attempts, GitHub events. |
 | `task_cancel` | Cancel a queued or running durable task. Approval-required. |
-| `checklist_write` | Granular progress under the active thread/task. Checklist state is subordinate to the durable task. |
-| `checklist_add` / `checklist_update` / `checklist_list` | Single-item checklist operations. |
+| `work_update` | Canonical To-do / Work progress under the active thread/task. Ordinary in-flight progress flows through this tool. |
 | `note` | One-off important fact for later. |
 
-The legacy `todo_write`, `todo_add`, `todo_update`, and `todo_list` names are
-hidden compatibility aliases for saved transcript replay. They remain callable
-by exact name, but they are not part of the model-visible catalog; compatibility
-results include `_deprecation.use_instead = checklist_*` and
-`_deprecation.removed_in = 0.9.0`.
+The legacy `checklist_write` / `checklist_add` / `checklist_update` /
+`checklist_list` and older `todo_write` / `todo_add` / `todo_update` /
+`todo_list` names are hidden compatibility aliases for saved transcript
+replay. They remain callable by exact name, but they are not part of the
+model-visible catalog (#4132).
 
 `update_plan` accepts both the legacy shape (`explanation` plus `plan` steps)
 and a richer PlanArtifact shape for Plan mode review. The richer fields are
@@ -312,14 +316,16 @@ guidance.
 The old one-shot `rlm` model-facing tool is also replaced by persistent
 `rlm_open` / `rlm_eval` / `rlm_configure` / `rlm_close` sessions.
 
-v0.9.0 adds the following hidden-compat aliases (#2682, #2683):
+v0.9.0 ships the following hidden-compat aliases (#2682, #2683, #4132) —
+they are deliberately retained for transcript replay, not scheduled for
+removal (the earlier plan to drop `todo_*` at the next major was
+superseded by #4132):
 
 | Hidden alias | Canonical replacement | Status |
 |---|---|---|
-| `todo_write` | `checklist_write` | Hidden, returns `_deprecation` metadata |
-| `todo_add` | `checklist_add` | Hidden, returns `_deprecation` metadata |
-| `todo_update` | `checklist_update` | Hidden, returns `_deprecation` metadata |
-| `todo_list` | `checklist_list` | Hidden, returns `_deprecation` metadata |
+| `checklist_write` | `work_update` | Hidden, callable for replay (#4132) |
+| `checklist_add` / `checklist_update` / `checklist_list` | `work_update` | Hidden, callable for replay |
+| `todo_write` / `todo_add` / `todo_update` / `todo_list` | `work_update` | Hidden, callable for replay |
 | `exec_wait` | `exec_shell_wait` | Hidden, callable for replay |
 | `exec_interact` | `exec_shell_interact` | Hidden, callable for replay |
 

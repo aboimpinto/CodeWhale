@@ -2,15 +2,40 @@ use super::{
     ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, PlanUpdateCell,
     REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, TOOL_RUNNING_SYMBOLS,
     TOOL_STATUS_SYMBOL_MS, ToolCell, ToolStatus, TranscriptRenderOptions, USER_GLYPH,
-    assistant_label_style_for, extract_reasoning_summary, render_thinking,
+    WebSearchCell, assistant_label_style_for, extract_reasoning_summary, render_thinking,
     running_status_label_with_elapsed,
 };
 use crate::deepseek_theme::Theme;
 use crate::models::{ContentBlock, Message};
 use crate::palette;
 use crate::tools::plan::{PlanSnapshot, StepStatus};
+use crate::tui::ui_text::{line_to_plain, slice_text, text_display_width};
 use ratatui::style::Modifier;
 use std::time::{Duration, Instant};
+
+#[test]
+fn web_search_cell_renders_receipt_source_degradation_and_citations() {
+    let cell = WebSearchCell {
+        query: "current release".to_string(),
+        status: ToolStatus::Success,
+        summary: Some("Found 2 results".to_string()),
+        source: Some("provider-native/xai/grok-4.5".to_string()),
+        degraded: Some("provider_native -> duckduckgo".to_string()),
+        ref_count: 2,
+    };
+    let rendered = cell
+        .lines_with_motion(120, true)
+        .iter()
+        .map(line_to_plain)
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    assert!(rendered.contains("source"));
+    assert!(rendered.contains("provider-native/xai/grok-4.5"));
+    assert!(rendered.contains("degraded"));
+    assert!(rendered.contains("provider_native -> duckduckgo"));
+    assert!(rendered.contains("citations"));
+}
 
 // ---- elapsed-seconds badge for long-running tools ----
 //
@@ -78,6 +103,197 @@ fn render_spillover_annotation_omitted_in_transcript_mode() {
     assert!(
         !joined.contains("full output:"),
         "annotation should be omitted in transcript mode: {joined:?}"
+    );
+}
+
+#[test]
+fn workflow_tool_renders_run_card_instead_of_generic_oneliner() {
+    let output = serde_json::json!({
+        "run_id": "workflow_2400c600",
+        "status": "completed",
+        "workflow_goal": "audit the FLEET and WORKFLOW docs",
+        "child_ids": ["a1", "a2", "a3"],
+        "progress": ["phase: Scan", "log: 3 findings"],
+        "events": [
+            {
+                "type": "task_started",
+                "task_id": "a1",
+                "label": "scan-docs",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_phase_id": "Scan",
+                "workflow_task_label": "scan-docs",
+                "workflow_child_index": 0,
+            },
+            {
+                "type": "task_started",
+                "task_id": "a2",
+                "workflow_task_label": "check-fleet",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_child_index": 1,
+            },
+            {
+                "type": "task_started",
+                "task_id": "a3",
+                "label": "summarize",
+                "workflow_run_id": "workflow_2400c600",
+                "workflow_child_index": 2,
+            },
+        ],
+        "schema_errors": [],
+    })
+    .to_string();
+    let cell = GenericToolCell {
+        name: "workflow".to_string(),
+        status: ToolStatus::Success,
+        input_summary: Some("action: run".to_string()),
+        output: Some(output),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    let joined: String = cell
+        .lines_with_mode(120, true, super::RenderMode::Live)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect();
+    // Compact (#4122): lifecycle, children, phases, failures, elapsed.
+    assert!(
+        joined.contains("3 children") || joined.contains("children"),
+        "child count: {joined:?}"
+    );
+    assert!(
+        joined.contains("success") || joined.contains("done"),
+        "header lifecycle: {joined:?}"
+    );
+    assert!(joined.contains("phase"), "phase count: {joined:?}");
+    assert!(joined.contains("fail"), "failure count present: {joined:?}");
+    assert!(
+        joined.contains('s') || joined.contains('m'),
+        "elapsed: {joined:?}"
+    );
+    assert!(
+        !joined.contains("status:"),
+        "body must not repeat the header lifecycle: {joined:?}"
+    );
+}
+
+#[test]
+fn workflow_tool_expanded_card_shows_phase_child_result_and_failures() {
+    let output = serde_json::json!({
+        "run_id": "workflow_exp",
+        "status": "failed",
+        "workflow_goal": "ship v0.8.68",
+        "started_at_ms": 1000,
+        "completed_at_ms": 5000,
+        "source_path": "workflows/demo.workflow.js",
+        "error": "phase Verify failed",
+        "result": {"summary": "2 of 3 children ok"},
+        "events": [
+            {
+                "type": "run_started",
+                "at_ms": 1000,
+                "run_id": "workflow_exp",
+                "workflow_goal": "ship v0.8.68"
+            },
+            {"type": "phase_started", "at_ms": 1100, "title": "Verify"},
+            {
+                "type": "task_started",
+                "at_ms": 1200,
+                "task_id": "t1",
+                "label": "run tests",
+                "workflow_task_label": "run tests",
+                "profile": "implementer"
+            },
+            {
+                "type": "task_completed",
+                "at_ms": 4000,
+                "task_id": "t1",
+                "status": "failed"
+            },
+            {
+                "type": "run_completed",
+                "at_ms": 5000,
+                "status": "failed",
+                "error": "phase Verify failed"
+            }
+        ]
+    })
+    .to_string();
+    let cell = GenericToolCell {
+        name: "workflow".to_string(),
+        status: ToolStatus::Failed,
+        input_summary: Some("action: run".to_string()),
+        output: Some(output),
+        prompts: None,
+        spillover_path: Some(std::path::PathBuf::from("/tmp/wf-artifact.json")),
+        output_summary: None,
+        is_diff: false,
+    };
+    let joined: String = cell
+        .lines_with_mode(140, true, super::RenderMode::Transcript)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(joined.contains("ship v0.8.68"), "goal: {joined}");
+    assert!(
+        joined.contains("phases:") || joined.contains("Verify"),
+        "phase: {joined}"
+    );
+    assert!(
+        joined.contains("children:") || joined.contains("child"),
+        "child: {joined}"
+    );
+    assert!(joined.contains("run tests"), "child label: {joined}");
+    assert!(
+        joined.contains("result:") || joined.contains("2 of 3"),
+        "final result: {joined}"
+    );
+    assert!(
+        joined.contains("artifact:")
+            || joined.contains("source:")
+            || joined.contains("transcript:"),
+        "links: {joined}"
+    );
+    assert!(
+        joined.contains("error:") || joined.contains("phase Verify failed"),
+        "failure details: {joined}"
+    );
+}
+
+#[test]
+fn workflow_tool_renders_status_list_card() {
+    let output = serde_json::json!({
+        "action": "status",
+        "count": 2,
+        "runs": [
+            {"run_id": "workflow_aaa", "status": "running", "child_count": 4},
+            {"run_id": "workflow_bbb", "status": "completed", "child_count": 1},
+        ],
+    })
+    .to_string();
+    let cell = GenericToolCell {
+        name: "workflow".to_string(),
+        status: ToolStatus::Success,
+        input_summary: Some("action: status".to_string()),
+        output: Some(output),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    let joined: String = cell
+        .lines_with_mode(120, true, super::RenderMode::Live)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+        .collect();
+    assert!(joined.contains("2 run(s)"), "count header: {joined:?}");
+    assert!(joined.contains("workflow_aaa"), "first run row: {joined:?}");
+    assert!(joined.contains("running"), "run status: {joined:?}");
+    assert!(
+        joined.contains("workflow_bbb"),
+        "second run row: {joined:?}"
     );
 }
 
@@ -270,7 +486,8 @@ fn extract_agent_id_returns_none_for_empty_id() {
 }
 
 #[test]
-fn agent_renders_single_compact_line_in_live_mode() {
+fn agent_spawn_suppresses_generic_card_in_live_mode() {
+    // #4133: spawn cards yield entirely to DelegateCard — no generic tool row.
     let cell = GenericToolCell {
         name: "agent".to_string(),
         status: ToolStatus::Running,
@@ -285,19 +502,38 @@ fn agent_renders_single_compact_line_in_live_mode() {
         is_diff: false,
     };
     let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
-    // One header line, no details/args/output expansion.
+    assert!(
+        lines.is_empty(),
+        "spawn generic tool card must be suppressed: {lines:?}"
+    );
+}
+
+#[test]
+fn agent_inspection_renders_single_compact_line_in_live_mode() {
+    let cell = GenericToolCell {
+        name: "agent".to_string(),
+        status: ToolStatus::Running,
+        input_summary: Some("action: peek agent_id: agent-abc12".to_string()),
+        output: Some(
+            r#"{"agent_id": "agent-abc12", "nickname": "Beluga", "model": "deepseek-v4-flash"}"#
+                .to_string(),
+        ),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
     assert_eq!(lines.len(), 1, "expected exactly 1 line, got {lines:?}");
     let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-    // Header carries the agent id and the running status.
     assert!(
         rendered.contains("agent-abc12"),
         "expected agent id in header: {rendered:?}"
     );
     assert!(
-        rendered.contains("running"),
-        "expected status in header: {rendered:?}"
+        rendered.contains("checking"),
+        "expected inspection status in header: {rendered:?}"
     );
-    // No verbose `args:` / `name:` rows.
     assert!(
         !rendered.contains("args"),
         "args should be hidden: {rendered:?}"
@@ -305,14 +541,12 @@ fn agent_renders_single_compact_line_in_live_mode() {
 }
 
 #[test]
-fn agent_pending_render_uses_placeholder_id() {
-    // No output yet → use the … placeholder so the user still sees a
-    // header line during the brief gap between tool-call-started and
-    // the spawn returning the agent_id.
+fn agent_pending_inspection_uses_fallback_token() {
+    // Pending inspection (no agent_id yet) still renders a compact check line.
     let cell = GenericToolCell {
         name: "agent".to_string(),
         status: ToolStatus::Running,
-        input_summary: Some("prompt: do thing".to_string()),
+        input_summary: Some("action: peek prompt: do thing".to_string()),
         output: None,
         prompts: None,
         spillover_path: None,
@@ -320,15 +554,19 @@ fn agent_pending_render_uses_placeholder_id() {
         is_diff: false,
     };
     let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
-    assert_eq!(lines.len(), 1);
+    assert_eq!(lines.len(), 1, "inspection must stay compact: {lines:?}");
     let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
-    assert!(rendered.contains('\u{2026}'), "{rendered:?}"); // …
+    assert!(
+        rendered.contains("checking") || rendered.contains("subagent"),
+        "{rendered:?}"
+    );
+    assert!(!rendered.contains('\u{2026}'), "{rendered:?}");
 }
 
 #[test]
-fn agent_transcript_mode_keeps_full_block() {
-    // Transcript mode is for replay/debug — preserve the full block
-    // so session export still carries the args/output verbatim.
+fn agent_spawn_suppresses_generic_card_in_transcript_mode() {
+    // #4133: spawn cards are suppressed in both Live and Transcript; DelegateCard
+    // is the sole visible spawn artifact.
     let cell = GenericToolCell {
         name: "agent".to_string(),
         status: ToolStatus::Success,
@@ -340,9 +578,10 @@ fn agent_transcript_mode_keeps_full_block() {
         is_diff: false,
     };
     let lines = cell.lines_with_mode(80, true, super::RenderMode::Transcript);
-    // Transcript mode emits header + name kv + (no args, output present)
-    // + output rows. At minimum more than the live one-liner.
-    assert!(lines.len() > 1, "expected verbose transcript render");
+    assert!(
+        lines.is_empty(),
+        "spawn generic tool card must be suppressed in transcript: {lines:?}"
+    );
 }
 
 #[test]
@@ -361,6 +600,61 @@ fn other_tools_are_unaffected_by_agent_compact_path() {
     };
     let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
     assert_eq!(lines.len(), 1, "live tools should use compact rows");
+}
+
+#[test]
+fn agent_compact_header_omits_unknown_child_fallback() {
+    // #4148: an inspection whose identity can't be resolved must not leak the
+    // raw internal "unknown child" token into the default transcript.
+    let cell = GenericToolCell {
+        name: "agent".to_string(),
+        status: ToolStatus::Running,
+        input_summary: Some("action: peek agent_type: delegate".to_string()),
+        output: None,
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+    assert_eq!(lines.len(), 1, "inspection must stay compact: {lines:?}");
+    let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        !rendered.contains("unknown child"),
+        "raw fallback token must not leak: {rendered:?}"
+    );
+    assert!(
+        rendered.contains("subagent"),
+        "friendly fallback label should be shown: {rendered:?}"
+    );
+}
+
+#[test]
+fn agent_compact_header_does_not_duplicate_delegate_verb() {
+    // #4148: when the resolved identity collapses to the "delegate" verb, the
+    // compact inspection header must not render a redundant "delegate · delegate".
+    let cell = GenericToolCell {
+        name: "agent".to_string(),
+        status: ToolStatus::Running,
+        input_summary: Some("action: peek role: delegate".to_string()),
+        output: None,
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+    assert_eq!(lines.len(), 1, "inspection must stay compact: {lines:?}");
+    let rendered: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+    assert!(
+        !rendered.contains("delegate delegate"),
+        "no adjacent duplicate: {rendered:?}"
+    );
+    assert_eq!(
+        rendered.matches("delegate").count(),
+        1,
+        "verb must not be echoed by the summary: {rendered:?}"
+    );
 }
 
 // ---- #403 concise todo / checklist update rendering ----
@@ -575,6 +869,24 @@ fn archived_context_metadata_preserves_spaces_in_attributes() {
 }
 
 #[test]
+fn tool_history_repair_receipt_renders_as_system_history() {
+    let msg = Message {
+        role: "assistant".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "[tool_history_repair] Repaired 1 crashed tool call(s); quarantined 0 duplicate and 0 orphan terminal result(s).".to_string(),
+            cache_control: None,
+        }],
+    };
+
+    let cells = super::history_cells_from_message(&msg);
+
+    assert!(matches!(
+        cells.as_slice(),
+        [HistoryCell::System { content }] if content.starts_with("[tool_history_repair]")
+    ));
+}
+
+#[test]
 fn history_replays_update_plan_tool_use_as_plan_card() {
     let msg = Message {
         role: "assistant".to_string(),
@@ -760,7 +1072,12 @@ fn tool_lines_with_options_respects_low_motion_in_default_path() {
     // platforms with coarse timer resolution (Windows ≈ 15.6 ms) and
     // gives several frame intervals of headroom before the index could
     // wrap back to 0.
-    let started_at = Some(Instant::now() - Duration::from_millis(TOOL_STATUS_SYMBOL_MS * 2));
+    let started_at = Some(
+        Instant::now()
+            - Duration::from_millis(
+                crate::tui::spinner::LIVE_MARKER_DELAY_MS + TOOL_STATUS_SYMBOL_MS * 2,
+            ),
+    );
     let cell = HistoryCell::Tool(ToolCell::Exec(ExecCell {
         command: "echo hi".to_string(),
         status: ToolStatus::Running,
@@ -789,8 +1106,9 @@ fn tool_lines_with_options_respects_low_motion_in_default_path() {
     let animated_symbol = animated[0].spans[1].content.trim();
     let low_motion_symbol = low_motion[0].spans[1].content.trim();
 
-    // low_motion always pins to the first (static) frame.
-    assert_eq!(low_motion_symbol, TOOL_RUNNING_SYMBOLS[0]);
+    // Reduced motion freezes at a filled, legible bubble rather than an
+    // invisible blank braille cell.
+    assert_eq!(low_motion_symbol, "⣤");
     // The animated path should be on a different frame (index 2).
     assert_ne!(animated_symbol, TOOL_RUNNING_SYMBOLS[0]);
 }
@@ -907,6 +1225,134 @@ fn assistant_cell_renders_with_bullet_glyph_not_literal_label() {
     );
     assert!(visible.contains("ready"));
     assert_ne!(head.style.bg, Some(palette::SURFACE_ELEVATED));
+}
+
+#[test]
+fn copy_metadata_strips_tool_receipt_chrome_but_keeps_text() {
+    let cell = HistoryCell::Tool(ToolCell::Exec(ExecCell {
+        command: "printf 'receipt'".to_string(),
+        status: ToolStatus::Success,
+        output: Some("receipt".to_string()),
+        live_output: None,
+        shell_task_id: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        started_at: None,
+        duration_ms: None,
+        source: ExecSource::Assistant,
+        interaction: None,
+        output_summary: None,
+    }));
+    let rendered = cell.lines_with_copy_metadata(80, TranscriptRenderOptions::default());
+    let header = rendered.first().expect("tool receipt header");
+    assert!(
+        header.copy_prefix_width >= 4,
+        "missing status/family chrome width"
+    );
+    assert!(
+        header
+            .line
+            .spans
+            .iter()
+            .any(|span| span.content.contains("receipt")),
+        "receipt text must remain in the rendered copy source"
+    );
+    let header_text = line_to_plain(&ratatui::text::Line::from(
+        header
+            .line
+            .spans
+            .iter()
+            .skip(1)
+            .cloned()
+            .collect::<Vec<_>>(),
+    ));
+    let copied = slice_text(
+        &header_text,
+        header.copy_prefix_width,
+        text_display_width(&header_text),
+    );
+    assert!(
+        !copied.contains('✓'),
+        "status chrome leaked into copy: {copied:?}"
+    );
+    assert!(
+        !copied.contains('●'),
+        "family chrome leaked into copy: {copied:?}"
+    );
+    assert!(
+        copied.contains("run done"),
+        "receipt text was clipped: {copied:?}"
+    );
+}
+
+#[test]
+fn copy_metadata_tracks_wrapped_assistant_code_prefix_in_display_columns() {
+    let cell = HistoryCell::Assistant {
+        content: "```text\n  中文 = 1\n```".to_string(),
+        streaming: false,
+    };
+    let rendered = cell.lines_with_copy_metadata(24, TranscriptRenderOptions::default());
+    let code_line = rendered
+        .iter()
+        .find(|line| {
+            line.line
+                .spans
+                .iter()
+                .any(|span| span.content.contains("中文"))
+        })
+        .expect("wrapped fenced code line");
+    assert_eq!(
+        code_line.copy_prefix_width, 2,
+        "code continuation prefix uses the role marker's two display columns"
+    );
+    let code = line_to_plain(&code_line.line);
+    let copied = slice_text(
+        &code,
+        code_line.copy_prefix_width,
+        text_display_width(&code),
+    );
+    assert!(
+        copied.contains("中文 = 1"),
+        "code text was clipped: {copied:?}"
+    );
+    assert!(
+        copied.starts_with("    中文"),
+        "code indentation or visual prefix was wrong: {copied:?}"
+    );
+}
+
+#[test]
+fn copy_metadata_keeps_fenced_code_indentation_after_prefix_removal() {
+    let cell = HistoryCell::Assistant {
+        content: "```rust\n    let answer = 42;\n```".to_string(),
+        streaming: false,
+    };
+    let rendered = cell.lines_with_copy_metadata(40, TranscriptRenderOptions::default());
+    let code_line = rendered
+        .iter()
+        .find(|line| {
+            line.line
+                .spans
+                .iter()
+                .any(|span| span.content.contains("answer"))
+        })
+        .expect("fenced code body");
+    let text = line_to_plain(&code_line.line);
+    let content = slice_text(
+        &text,
+        code_line.copy_prefix_width,
+        text_display_width(&text),
+    );
+    assert!(
+        content.contains("    let answer = 42;"),
+        "code indentation was not preserved: {content:?}"
+    );
+    for glyph in ['╎', '▎', '●', '│', '┃'] {
+        assert!(
+            !content.contains(glyph),
+            "decorative glyph leaked: {content:?}"
+        );
+    }
 }
 
 #[test]
@@ -1069,8 +1515,8 @@ fn assistant_glyph_holds_full_brightness_when_idle() {
     // source sky — pulse only fires when actively streaming.
     let idle = assistant_label_style_for(false, false);
     let low_motion = assistant_label_style_for(true, true);
-    assert_eq!(idle.fg, Some(palette::DEEPSEEK_SKY));
-    assert_eq!(low_motion.fg, Some(palette::DEEPSEEK_SKY));
+    assert_eq!(idle.fg, Some(palette::WHALE_INFO));
+    assert_eq!(low_motion.fg, Some(palette::WHALE_INFO));
 }
 
 #[test]
@@ -1084,8 +1530,8 @@ fn assistant_glyph_pulses_when_streaming_and_motion_allowed() {
     let mut saw_dimmed = false;
     for _ in 0..50 {
         if let Some(Color::Rgb(_, _, b)) = assistant_label_style_for(true, false).fg {
-            let Color::Rgb(_, _, src_b) = palette::DEEPSEEK_SKY else {
-                panic!("DEEPSEEK_SKY must be RGB");
+            let Color::Rgb(_, _, src_b) = palette::WHALE_INFO else {
+                panic!("WHALE_INFO must be RGB");
             };
             if b < src_b {
                 saw_dimmed = true;
@@ -1161,17 +1607,51 @@ fn exec_cell_header_includes_compact_command_summary() {
         .collect::<String>();
     assert!(visible.contains("run running"));
     assert!(
-        visible.contains("cargo test --workspace --all-features"),
-        "header should expose command target: {visible:?}"
+        visible.contains("Ctrl+B"),
+        "foreground wait header should expose Ctrl+B hint, not command: {visible:?}"
+    );
+    assert!(
+        !visible.contains("cargo test"),
+        "foreground wait live header must not repeat command target: {visible:?}"
+    );
+
+    let transcript_visible: String = HistoryCell::Tool(ToolCell::Exec(ExecCell {
+        command: "cargo test --workspace --all-features".to_string(),
+        status: ToolStatus::Running,
+        output: None,
+        live_output: None,
+        shell_task_id: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        started_at: None,
+        duration_ms: None,
+        source: ExecSource::Assistant,
+        interaction: None,
+        output_summary: None,
+    }))
+    .transcript_lines(80)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        transcript_visible.contains("Ctrl+B"),
+        "transcript compact wait should expose Ctrl+B hint: {transcript_visible:?}"
+    );
+    assert!(
+        !transcript_visible.contains("cargo test --workspace --all-features"),
+        "transcript compact wait must not repeat command target: {transcript_visible:?}"
     );
 }
 
 #[test]
 fn generic_tool_cell_picks_family_from_tool_name() {
+    // Use an inspection call so the compact Delegate header still renders;
+    // spawn cards are suppressed entirely (#4133).
     let cell = GenericToolCell {
         name: "agent".to_string(),
         status: ToolStatus::Running,
-        input_summary: Some("foo".to_string()),
+        input_summary: Some("action: peek foo".to_string()),
         output: None,
         prompts: None,
         spillover_path: None,
@@ -1179,6 +1659,7 @@ fn generic_tool_cell_picks_family_from_tool_name() {
         is_diff: false,
     };
     let lines = cell.lines_with_mode(80, true, super::RenderMode::Live);
+    assert_eq!(lines.len(), 1, "inspection must stay compact: {lines:?}");
     let header_visible: String = lines[0]
         .spans
         .iter()
@@ -1221,6 +1702,56 @@ fn generic_tool_cell_renders_rlm_with_rlm_label_not_swarm() {
     assert!(
         !header_visible.contains("swarm"),
         "RLM card must not use removed swarm wording: {header_visible:?}"
+    );
+}
+
+#[test]
+fn exploring_card_search_reads_as_find_not_read() {
+    // #4145: a completed grep grouped under the exploration card must not
+    // render `read done · Searching …`; the header verb has to agree with the
+    // `Searching for …` label.
+    let cell = super::ExploringCell {
+        entries: vec![super::ExploringEntry {
+            label: "Searching for `TranscriptScroll`".to_string(),
+            status: ToolStatus::Success,
+        }],
+    };
+    let header: String = cell.lines_with_motion(80, true)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        header.contains("find done"),
+        "search card header should read `find done`: {header:?}"
+    );
+    assert!(
+        !header.contains("read done"),
+        "search card must not pair `read done` with a search label: {header:?}"
+    );
+    assert!(
+        header.contains("Searching for `TranscriptScroll`"),
+        "search label should remain intact: {header:?}"
+    );
+}
+
+#[test]
+fn exploring_card_read_keeps_read_verb() {
+    // The fix only re-verbs search-only cards — a plain read stays `read`.
+    let cell = super::ExploringCell {
+        entries: vec![super::ExploringEntry {
+            label: "Reading src/foo.rs".to_string(),
+            status: ToolStatus::Success,
+        }],
+    };
+    let header: String = cell.lines_with_motion(80, true)[0]
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect::<String>();
+    assert!(
+        header.contains("read done"),
+        "read card header should read `read done`: {header:?}"
     );
 }
 
@@ -1417,7 +1948,7 @@ fn plan_update_cell_renders_rich_artifact_metadata() {
             context_summary: Some("Grounded in issue #2691".to_string()),
             sources_used: vec!["gh issue view 2691".to_string()],
             critical_files: vec!["crates/tui/src/tools/plan.rs".to_string()],
-            constraints: vec!["Keep checklist primary".to_string()],
+            constraints: vec!["Keep To-do primary".to_string()],
             recommended_approach: Some(
                 "Enrich update_plan without breaking legacy calls".to_string(),
             ),
@@ -1538,12 +2069,26 @@ fn exec_cell_renders_live_shell_output_before_final_output() {
         output_summary: None,
     };
 
-    let text = lines_text(&cell.lines_with_motion(80, true));
+    let live_text = lines_text(&cell.lines_with_motion(80, true));
+    assert!(
+        !live_text.contains("running line 1"),
+        "foreground shell live output belongs in sidebar/jobs, not main transcript: {live_text}"
+    );
+    assert!(
+        live_text.contains("Ctrl+B"),
+        "compact foreground wait must keep Ctrl+B hint: {live_text}"
+    );
+    assert!(!live_text.contains("command:"));
+    assert!(!live_text.contains("Ctrl+B backgrounds this command"));
+    assert!(!live_text.contains("Ctrl+B moves this shell wait to /jobs"));
 
-    assert!(text.contains("running line 1"));
-    assert!(text.contains("running line 2"));
-    assert!(!text.contains("Ctrl+B backgrounds this command"));
-    assert!(!text.contains("Ctrl+B moves this shell wait to /jobs"));
+    let transcript_text = lines_text(&HistoryCell::Tool(ToolCell::Exec(cell)).transcript_lines(80));
+    assert!(
+        !transcript_text.contains("running line 1"),
+        "foreground shell live output belongs in sidebar/jobs, not transcript: {transcript_text}"
+    );
+    assert!(!transcript_text.contains("command:"));
+    assert!(transcript_text.contains("Ctrl+B"));
 }
 
 #[test]
@@ -1668,6 +2213,62 @@ fn completed_short_thinking_without_summary_stays_visible_in_live_view() {
     assert!(
         !live_text.contains("Full reasoning in Ctrl+O"),
         "complete short reasoning should not need the detail affordance: {live_text}"
+    );
+}
+
+#[test]
+fn completed_reasoning_receipt_hides_internal_function_names_until_expanded() {
+    // #4146/#4148: a completed-reasoning receipt in the default (collapsed)
+    // transcript must not expose internal function names; the full body —
+    // identifiers intact — stays reachable on expand and in the transcript.
+    let cell = HistoryCell::Thinking {
+        content: "I will call refresh_catalog_cache to refresh the model list.".to_string(),
+        streaming: false,
+        duration_secs: Some(1.0),
+    };
+
+    // Default collapsed view: identifier scrubbed, prose preserved, and the
+    // expand affordance offered.
+    let collapsed = cell.lines_with_options(
+        80,
+        TranscriptRenderOptions {
+            low_motion: true,
+            ..TranscriptRenderOptions::default()
+        },
+    );
+    let collapsed_text = lines_text(&collapsed);
+    assert!(
+        !collapsed_text.contains("refresh_catalog_cache"),
+        "internal function name must not leak by default: {collapsed_text}"
+    );
+    assert!(
+        collapsed_text.contains("refresh the model list"),
+        "surrounding prose must still read: {collapsed_text}"
+    );
+    assert!(
+        collapsed_text.contains("Full reasoning in Ctrl+O"),
+        "collapsed receipt must offer the expand affordance: {collapsed_text}"
+    );
+
+    // Expanded view (Space toggles the fold relative to the default): the full
+    // identifier is restored.
+    let expanded = cell.lines_with_options_folded(
+        80,
+        TranscriptRenderOptions {
+            low_motion: true,
+            ..TranscriptRenderOptions::default()
+        },
+        true,
+    );
+    assert!(
+        lines_text(&expanded).contains("refresh_catalog_cache"),
+        "expanded reasoning must restore the full identifier"
+    );
+
+    // Transcript / pager / clipboard keeps the full, un-redacted body.
+    assert!(
+        lines_text(&cell.transcript_lines(80)).contains("refresh_catalog_cache"),
+        "transcript must keep the full identifier"
     );
 }
 
@@ -2456,4 +3057,128 @@ fn tool_run_summary_uses_metadata_fallback_for_unknown_groups() {
     };
 
     assert_eq!(super::tool_run_summary(&run), "Updated metadata");
+}
+
+// ---- #4112 / dogfood A5: transcript noise ----
+
+fn agent_cell(
+    action_summary: Option<&str>,
+    status: ToolStatus,
+    output: Option<&str>,
+) -> GenericToolCell {
+    GenericToolCell {
+        name: "agent".to_string(),
+        status,
+        input_summary: action_summary.map(str::to_string),
+        output: output.map(str::to_string),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    }
+}
+
+fn joined_lines(cell: &GenericToolCell, mode: super::RenderMode) -> String {
+    cell.lines_with_mode(120, true, mode)
+        .iter()
+        .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+        .collect()
+}
+
+#[test]
+fn unknown_tool_failure_collapses_to_one_line() {
+    let cell = GenericToolCell {
+        name: "item".to_string(),
+        status: ToolStatus::Failed,
+        input_summary: Some("status: pending".to_string()),
+        output: Some(
+            "Tool 'item' is not available in the current tool catalog. \
+             Checklist entries are not separate tool calls."
+                .to_string(),
+        ),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    };
+    for mode in [super::RenderMode::Live, super::RenderMode::Transcript] {
+        let lines = cell.lines_with_mode(120, true, mode);
+        assert_eq!(
+            lines.len(),
+            1,
+            "unknown-tool failure should be a single header line in {mode:?}: {lines:?}"
+        );
+        let joined = joined_lines(&cell, mode);
+        assert!(
+            joined.contains("Tool 'item' is not available"),
+            "the catalog error is the useful part: {joined:?}"
+        );
+        assert!(
+            !joined.contains("name: item"),
+            "no name:/args:/result: block for unknown tools: {joined:?}"
+        );
+    }
+}
+
+#[test]
+fn agent_peek_renders_checked_not_done() {
+    let cell = agent_cell(
+        Some("action: peek agent_id: agent_scout_1"),
+        ToolStatus::Success,
+        Some(r#"{"agent_id":"agent_scout_1","status":"running"}"#),
+    );
+    let joined = joined_lines(&cell, super::RenderMode::Live);
+    assert!(
+        joined.contains("checked") && joined.contains("agent_scout_1"),
+        "peek should read as a check, not a completed delegate: {joined:?}"
+    );
+    assert!(
+        !joined.contains("delegate done"),
+        "peek must not draw the spawn-completion line: {joined:?}"
+    );
+}
+
+#[test]
+fn agent_wait_renders_waited_label() {
+    let cell = agent_cell(
+        Some("action: wait"),
+        ToolStatus::Success,
+        Some(r#"{"action":"wait","settled":[{"agent_id":"agent_scout_1"}]}"#),
+    );
+    let joined = joined_lines(&cell, super::RenderMode::Live);
+    assert!(
+        joined.contains("waited"),
+        "wait cells should read as a join: {joined:?}"
+    );
+}
+
+#[test]
+fn agent_inspection_stays_compact_in_transcript_mode() {
+    let cell = agent_cell(
+        Some("action: status agent_id: agent_scout_1"),
+        ToolStatus::Success,
+        Some(r#"{"agent_id":"agent_scout_1","status":"running","terminal":false}"#),
+    );
+    let lines = cell.lines_with_mode(120, true, super::RenderMode::Transcript);
+    assert_eq!(
+        lines.len(),
+        1,
+        "status checks should not dump full projections in the pager: {lines:?}"
+    );
+}
+
+#[test]
+fn agent_spawn_suppresses_generic_card_in_favor_of_delegate_card() {
+    let cell = agent_cell(
+        Some("prompt: map the repo"),
+        ToolStatus::Success,
+        Some(r#"{"agent_id":"agent_scout_1","status":"running"}"#),
+    );
+    for mode in [super::RenderMode::Live, super::RenderMode::Transcript] {
+        let lines = cell.lines_with_mode(120, true, mode);
+        assert!(
+            lines.is_empty(),
+            "spawn generic tool card must yield to DelegateCard (#4133): {mode:?} {lines:?}"
+        );
+    }
 }

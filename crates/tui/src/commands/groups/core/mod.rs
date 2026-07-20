@@ -31,9 +31,11 @@ mod rlm;
 mod setup;
 mod stash;
 mod subagents;
+mod transcript;
 mod translate;
 pub mod util;
 pub mod voice;
+mod workflow;
 mod workspace;
 
 pub(in crate::commands) use self::core::reset_conversation_state;
@@ -44,8 +46,8 @@ use crate::commands::traits::{Command, CommandGroup, FunctionCommand, RegisterCo
 pub struct CoreCommands;
 
 impl CommandGroup for CoreCommands {
-    fn commands(&self) -> Vec<Box<dyn Command>> {
-        vec![
+    fn commands(&self) -> &'static [Box<dyn Command>] {
+        cached_command_list!(vec![
             Box::new(FunctionCommand::new(
                 anchor::AnchorCmd::info(),
                 anchor::AnchorCmd::execute,
@@ -99,6 +101,10 @@ impl CommandGroup for CoreCommands {
                 fleet::FleetCmd::execute,
             )),
             Box::new(FunctionCommand::new(
+                workflow::WorkflowCmd::info(),
+                workflow::WorkflowCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
                 hotbar::HotbarCmd::info(),
                 hotbar::HotbarCmd::execute,
             )),
@@ -117,6 +123,10 @@ impl CommandGroup for CoreCommands {
             Box::new(FunctionCommand::new(
                 links::LinksCmd::info(),
                 links::LinksCmd::execute,
+            )),
+            Box::new(FunctionCommand::new(
+                transcript::TranscriptCmd::info(),
+                transcript::TranscriptCmd::execute,
             )),
             Box::new(FunctionCommand::new(
                 feedback::FeedbackCmd::info(),
@@ -155,6 +165,6 @@ impl CommandGroup for CoreCommands {
                 voice::VoiceControlCmd::info(),
                 voice::VoiceControlCmd::execute,
             )),
-        ]
+        ])
     }
 }

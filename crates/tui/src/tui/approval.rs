@@ -7,8 +7,8 @@
 //!
 //! ## v0.6.7: Codex-style takeover with stakes-based variants (#129)
 //!
-//! The modal now renders as a full-screen takeover (calm centered card
-//! against the transcript area) and routes each request to one of two
+//! The modal renders as a compact bottom-anchored approval card that preserves
+//! transcript context and routes each request to one of two
 //! stakes-based variants:
 //!
 //! - **Benign** (`RiskLevel::Benign`) — read-only ops, MCP discovery,
@@ -17,7 +17,7 @@
 //! - **Destructive** (`RiskLevel::Destructive`) — file writes, shell
 //!   commands that are not proven read-only, patches, MCP actions,
 //!   unclassified tools, and any "fetch arbitrary content" surface.
-//!   The takeover keeps the destructive badge and
+//!   The approval card keeps the destructive badge and
 //!   impact summary visible, then lets `Enter` commit the highlighted
 //!   option or `y` / `a` / `d` commit directly.
 //!
@@ -27,16 +27,25 @@
 //! happen *before* the view is constructed (see `tui/ui.rs`); this
 //! module always assumes the user is being asked.
 
-use crate::command_safety::is_parallel_readonly_command;
-use crate::localization::Locale;
+use crate::localization::{Locale, MessageId, tr};
 use crate::sandbox::SandboxPolicy;
+use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 use crate::tui::widgets::{ApprovalWidget, ElevationWidget, Renderable};
 use codewhale_config::ToolAskRule;
-use crossterm::event::{KeyCode, KeyEvent};
+use crossterm::event::{KeyCode, KeyEvent, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 use serde_json::Value;
+use std::borrow::Cow;
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+pub mod policy;
+
+pub use policy::{
+    ApprovalStakes, RiskLevel, ToolCategory, classify_risk, classify_stakes, get_tool_category,
+};
 
 /// Determines when tool executions require user approval
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -53,6 +62,9 @@ pub enum ApprovalMode {
 }
 
 impl ApprovalMode {
+    /// Shift+Tab permission cycle order (#0.8.68 M2).
+    pub const PERMISSION_CYCLE: [Self; 3] = [Self::Suggest, Self::Auto, Self::Bypass];
+
     pub fn label(self) -> &'static str {
         match self {
             ApprovalMode::Auto => "AUTO",
@@ -64,12 +76,32 @@ impl ApprovalMode {
 
     pub fn from_config_value(value: &str) -> Option<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "auto" => Some(ApprovalMode::Auto),
+            "auto" | "auto-review" | "auto_review" => Some(ApprovalMode::Auto),
             "bypass" | "yolo" | "dontask" | "dont_ask" | "bypass-permissions"
-            | "bypasspermissions" => Some(ApprovalMode::Bypass),
-            "suggest" | "suggested" | "on-request" | "untrusted" => Some(ApprovalMode::Suggest),
+            | "bypasspermissions" | "full-access" | "full" => Some(ApprovalMode::Bypass),
+            "suggest" | "suggested" | "on-request" | "untrusted" | "ask" => {
+                Some(ApprovalMode::Suggest)
+            }
             "never" | "deny" | "denied" => Some(ApprovalMode::Never),
             _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn cycle_permission_next(self) -> Self {
+        let Some(index) = Self::PERMISSION_CYCLE.iter().position(|mode| *mode == self) else {
+            return Self::Suggest;
+        };
+        Self::PERMISSION_CYCLE[(index + 1) % Self::PERMISSION_CYCLE.len()]
+    }
+
+    #[must_use]
+    pub fn permission_chip_label(self) -> &'static str {
+        match self {
+            Self::Suggest => "Ask",
+            Self::Auto => "Auto-Review",
+            Self::Bypass => "Full Access",
+            Self::Never => "Never",
         }
     }
 }
@@ -87,42 +119,6 @@ pub enum ReviewDecision {
     Abort,
 }
 
-/// Categorizes tools by cost/risk level
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolCategory {
-    /// Free, read-only operations (`list_dir`, `read_file`, todo_*)
-    Safe,
-    /// File modifications (`write_file`, `edit_file`)
-    FileWrite,
-    /// Shell execution (`exec_shell`)
-    Shell,
-    /// Network-oriented built-in tools
-    Network,
-    /// Read-only MCP discovery and resource access
-    McpRead,
-    /// MCP actions that may change remote state
-    McpAction,
-    /// Sub-agent lifecycle (`agent` start/status/peek/cancel); the child's
-    /// own tool gates govern what it may actually do
-    Agent,
-    /// Unknown or unclassified tool surface
-    Unknown,
-}
-
-/// Stakes-based variant for the takeover modal.
-///
-/// `RiskLevel::Benign` lets a single keystroke commit the approval.
-/// `RiskLevel::Destructive` keeps stronger warning copy and styling
-/// around approvals that can touch files, shell, or remote state.
-///
-/// Routing rules live in [`classify_risk`] — when in doubt, route to
-/// `Destructive`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RiskLevel {
-    Benign,
-    Destructive,
-}
-
 /// Request for user approval of a tool execution
 #[derive(Debug, Clone)]
 pub struct ApprovalRequest {
@@ -134,7 +130,7 @@ pub struct ApprovalRequest {
     pub description: String,
     /// Tool category
     pub category: ToolCategory,
-    /// Stakes-based routing for the takeover modal
+    /// Stakes-based routing for the compact approval card
     pub risk: RiskLevel,
     /// Derived impact summary for the approval prompt
     pub impacts: Vec<String>,
@@ -188,6 +184,15 @@ impl AskRuleSavePreview {
 const ASK_RULE_SAVE_PREVIEW_MAX_ENTRIES: usize = 4;
 
 impl ApprovalRequest {
+    /// Mechanical repo-law asks are a distinct authority boundary, not an
+    /// ordinary risk prompt. The engine stamps this stable prefix when a
+    /// `.codewhale/constitution.json` ask rule forces review.
+    #[must_use]
+    pub fn is_repo_law_prompt(&self) -> bool {
+        self.description.starts_with("Repo law holds this write:")
+            && self.description.contains(".codewhale/constitution.json")
+    }
+
     /// Presentation stakes for this request (see [`ApprovalStakes`]).
     #[must_use]
     pub fn stakes(&self) -> ApprovalStakes {
@@ -307,14 +312,12 @@ impl ApprovalRequest {
             .map(|mut detail| {
                 let is_preview = detail.label == "Preview";
                 detail.label = localize_detail_label(&detail.label, locale).to_string();
-                if is_preview {
-                    if let Some(lines) = detail.shell_lines.as_mut() {
-                        for line in lines.iter_mut() {
-                            *line = localize_preview_shell_line(&self.tool_name, line, locale)
-                                .to_string();
-                        }
-                        detail.value = lines.join("\n");
+                if is_preview && let Some(lines) = detail.shell_lines.as_mut() {
+                    for line in lines.iter_mut() {
+                        *line =
+                            localize_preview_shell_line(&self.tool_name, line, locale).to_string();
                     }
+                    detail.value = lines.join("\n");
                 }
                 detail
             })
@@ -453,156 +456,6 @@ fn build_apply_patch_ask_rules(params: &Value, workspace: &Path) -> Vec<ToolAskR
     rules
 }
 
-/// Get the category for a tool by name
-pub fn get_tool_category(name: &str) -> ToolCategory {
-    if name == "agent" {
-        ToolCategory::Agent
-    } else if matches!(name, "write_file" | "edit_file" | "apply_patch") {
-        ToolCategory::FileWrite
-    } else if matches!(
-        name,
-        "web_run" | "web_search" | "fetch_url" | "wait_for_dev_server"
-    ) {
-        ToolCategory::Network
-    } else if matches!(
-        name,
-        "exec_shell"
-            | "task_shell_start"
-            | "task_shell_wait"
-            | "exec_shell_wait"
-            | "exec_shell_interact"
-            | "exec_wait"
-            | "exec_interact"
-    ) {
-        ToolCategory::Shell
-    } else if name.starts_with("list_mcp_")
-        || name.starts_with("read_mcp_")
-        || name.starts_with("get_mcp_")
-    {
-        ToolCategory::McpRead
-    } else if name.starts_with("mcp_") {
-        ToolCategory::McpAction
-    } else if matches!(
-        name,
-        "read_file"
-            | "list_dir"
-            | "todo_write"
-            | "todo_read"
-            | "note"
-            | "update_plan"
-            | "search"
-            | "file_search"
-            | "project"
-            | "diagnostics"
-    ) || name.starts_with("read_")
-        || name.starts_with("list_")
-        || name.starts_with("get_")
-    {
-        ToolCategory::Safe
-    } else {
-        ToolCategory::Unknown
-    }
-}
-
-/// Presentation-level stakes for the approval prompt (#3883 follow-up).
-///
-/// `RiskLevel` drives keymaps and stays conservative ("not provably
-/// read-only" is `Destructive`), but rendering everything in that bucket
-/// as a red DESTRUCTIVE takeover made routine file edits and build
-/// commands read like emergencies. Stakes split presentation three ways:
-///
-/// - `Routine` — provably read-only; minimal chrome.
-/// - `Elevated` — ordinary state-touching work (edits, builds, MCP
-///   actions); a calm approval, not a warning.
-/// - `Critical` — genuinely destructive, publish-like, or
-///   secret-touching per `ToolActionKind`; keeps the strong styling and
-///   the policy semantics lines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ApprovalStakes {
-    Routine,
-    Elevated,
-    Critical,
-}
-
-#[must_use]
-pub fn classify_stakes(
-    tool_name: &str,
-    category: ToolCategory,
-    risk: RiskLevel,
-    params: &Value,
-) -> ApprovalStakes {
-    if matches!(risk, RiskLevel::Benign) {
-        return ApprovalStakes::Routine;
-    }
-    match crate::tui::auto_review::ToolActionKind::from_tool_call(tool_name, params, category) {
-        crate::tui::auto_review::ToolActionKind::Publish
-        | crate::tui::auto_review::ToolActionKind::Destructive
-        | crate::tui::auto_review::ToolActionKind::Secret => ApprovalStakes::Critical,
-        _ => ApprovalStakes::Elevated,
-    }
-}
-
-/// Decide the stakes variant for an approval request.
-///
-/// The bias is conservative: a category we don't recognise routes to
-/// `Destructive`, and any shell command that `command_safety` flags as
-/// `Dangerous` is forced to `Destructive` even when the rest of the
-/// request looks calm. The split lets the modal render stronger warning
-/// copy on anything that can touch state outside this turn.
-#[must_use]
-pub fn classify_risk(tool_name: &str, category: ToolCategory, params: &Value) -> RiskLevel {
-    match category {
-        // Read paths and discovery.
-        ToolCategory::Safe | ToolCategory::McpRead => RiskLevel::Benign,
-        // Query-only network is benign; opening a URL pulls arbitrary
-        // remote content, so it stays destructive.
-        ToolCategory::Network => match tool_name {
-            "web_search" | "wait_for_dev_server" => RiskLevel::Benign,
-            // web_run is benign for search/query, but its `open`/`click`
-            // actions fetch model-supplied URLs (arbitrary remote content) —
-            // destructive, consistent with fetch_url.
-            "web_run" => {
-                let fetches_url = params
-                    .get("open")
-                    .and_then(Value::as_array)
-                    .is_some_and(|a| !a.is_empty())
-                    || params
-                        .get("click")
-                        .and_then(Value::as_array)
-                        .is_some_and(|a| !a.is_empty());
-                if fetches_url {
-                    RiskLevel::Destructive
-                } else {
-                    RiskLevel::Benign
-                }
-            }
-            _ => RiskLevel::Destructive,
-        },
-        // Shell stays destructive unless the existing command-safety analyzer
-        // can prove the concrete command is read-only.
-        ToolCategory::Shell => {
-            if let Some(cmd) = params.get("command").and_then(Value::as_str) {
-                if is_parallel_readonly_command(cmd) {
-                    return RiskLevel::Benign;
-                }
-            }
-            RiskLevel::Destructive
-        }
-        // Sub-agent lifecycle: status/peek are inspection-only. Starts and
-        // other actions keep the explicit-options keymap (the child's own
-        // gates govern what it may do once running).
-        ToolCategory::Agent => match params.get("action").and_then(Value::as_str) {
-            Some("status" | "peek" | "list") => RiskLevel::Benign,
-            _ => RiskLevel::Destructive,
-        },
-        // File writes, MCP actions, unclassified surfaces — all
-        // require explicit confirmation.
-        ToolCategory::FileWrite | ToolCategory::McpAction | ToolCategory::Unknown => {
-            RiskLevel::Destructive
-        }
-    }
-}
-
 fn param_preview(params: &Value, keys: &[&str], max_len: usize) -> Option<String> {
     let Value::Object(map) = params else {
         return None;
@@ -689,6 +542,11 @@ fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value)
             }
             impacts
         }
+        ToolCategory::Agent if tool_name == "workflow" => {
+            // #4126: elevated Workflow plan card — goal, children, capability flags, budget.
+            crate::tools::workflow_plan_approval::analyze_workflow_plan_approval(params)
+                .approval_impacts()
+        }
         ToolCategory::Agent => {
             let mut impacts = vec![
                 "Starts or inspects a child agent task; the child's own tool gates still apply."
@@ -716,17 +574,16 @@ fn build_impact_summary(tool_name: &str, category: ToolCategory, params: &Value)
 }
 
 fn localized_description_zh_hans(category: ToolCategory) -> String {
+    let locale = Locale::ZhHans;
     match category {
-        ToolCategory::Safe => "请求执行只读操作。".to_string(),
-        ToolCategory::FileWrite => "请求修改文件。请确认路径和内容符合预期。".to_string(),
-        ToolCategory::Shell => "请求执行 shell 命令。请先检查命令和工作目录。".to_string(),
-        ToolCategory::Network => "请求访问网络或远程内容。请确认目标可信。".to_string(),
-        ToolCategory::McpRead => "请求从 MCP 服务器读取信息。".to_string(),
-        ToolCategory::McpAction => "请求调用 MCP 服务器操作，可能产生副作用。".to_string(),
-        ToolCategory::Agent => {
-            "请求启动或查看子代理任务；子代理仍受其自身工具门控约束。".to_string()
-        }
-        ToolCategory::Unknown => "请求运行未分类工具。批准前请仔细检查参数。".to_string(),
+        ToolCategory::Safe => tr(locale, MessageId::ApprovalDescSafe).to_string(),
+        ToolCategory::FileWrite => tr(locale, MessageId::ApprovalDescFileWrite).to_string(),
+        ToolCategory::Shell => tr(locale, MessageId::ApprovalDescShell).to_string(),
+        ToolCategory::Network => tr(locale, MessageId::ApprovalDescNetwork).to_string(),
+        ToolCategory::McpRead => tr(locale, MessageId::ApprovalDescMcpRead).to_string(),
+        ToolCategory::McpAction => tr(locale, MessageId::ApprovalDescMcpAction).to_string(),
+        ToolCategory::Agent => tr(locale, MessageId::ApprovalDescAgent).to_string(),
+        ToolCategory::Unknown => tr(locale, MessageId::ApprovalDescUnknown).to_string(),
     }
 }
 
@@ -735,26 +592,27 @@ fn build_impact_summary_zh_hans(
     category: ToolCategory,
     params: &Value,
 ) -> Vec<String> {
+    let locale = Locale::ZhHans;
     match category {
         ToolCategory::Safe => {
-            let mut impacts = vec!["只读操作。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactSafe).to_string()];
             if let Some(path) = param_preview(params, &["path", "ref_id", "uri"], 72) {
                 impacts.push(format!("读取：{path}"));
             }
             impacts
         }
         ToolCategory::FileWrite => {
-            let mut impacts = vec!["会写入工作区或已批准写入范围内的文件。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactFileWrite).to_string()];
             if let Some(path) = param_preview(params, &["path", "target", "destination"], 72) {
                 impacts.push(format!("写入：{path}"));
             }
             impacts
         }
         ToolCategory::Shell => {
-            vec!["在工作区执行 Bash 命令。".to_string()]
+            vec![tr(locale, MessageId::ApprovalImpactShell).to_string()]
         }
         ToolCategory::Network => {
-            let mut impacts = vec!["可能访问网络服务或远程内容。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactNetwork).to_string()];
             if let Some(target) =
                 param_preview(params, &["url", "q", "query", "location", "repo"], 96)
             {
@@ -763,29 +621,28 @@ fn build_impact_summary_zh_hans(
             impacts
         }
         ToolCategory::McpRead => {
-            let mut impacts = vec!["从 MCP 服务器读取信息，不应产生本地写入。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactMcpRead).to_string()];
             if let Some(target) = mcp_target_hint(tool_name) {
                 impacts.push(format!("MCP 目标：{target}"));
             }
             impacts
         }
         ToolCategory::McpAction => {
-            let mut impacts = vec!["调用可能产生副作用的 MCP 服务器操作。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactMcpAction).to_string()];
             if let Some(target) = mcp_target_hint(tool_name) {
                 impacts.push(format!("MCP 目标：{target}"));
             }
             impacts
         }
         ToolCategory::Agent => {
-            let mut impacts =
-                vec!["启动或查看子代理任务；子代理仍受其自身工具门控约束。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactAgent).to_string()];
             if let Some(kind) = param_preview(params, &["type"], 40) {
                 impacts.push(format!("子代理类型：{kind}"));
             }
             impacts
         }
         ToolCategory::Unknown => {
-            let mut impacts = vec!["工具未分类。批准前请仔细检查参数。".to_string()];
+            let mut impacts = vec![tr(locale, MessageId::ApprovalImpactUnknown).to_string()];
             if let Some(target) = param_preview(
                 params,
                 &["path", "cmd", "command", "url", "q", "query", "ref_id"],
@@ -857,6 +714,18 @@ fn build_prominent_details(
                 });
             }
         }
+        ToolCategory::Agent if tool_name == "workflow" => {
+            // #4126: elevated Workflow plan card fields.
+            let summary =
+                crate::tools::workflow_plan_approval::analyze_workflow_plan_approval(params);
+            for (label, value) in summary.card_fields() {
+                details.push(ApprovalDetail {
+                    label: label.to_string(),
+                    value,
+                    shell_lines: None,
+                });
+            }
+        }
         ToolCategory::Agent => {
             if let Some(action) = param_preview(params, &["action"], 40) {
                 details.push(ApprovalDetail {
@@ -916,16 +785,13 @@ fn file_write_preview_lines(tool_name: &str, params: &Value) -> Option<Vec<Strin
             lines.extend(prefixed_preview_lines("with this", "+ ", &replace, 3));
             Some(lines)
         }
-        "apply_patch" => params
-            .get("patch")
-            .and_then(Value::as_str)
-            .and_then(apply_patch_preview_lines)
-            .or_else(|| {
-                params
-                    .get("changes")
-                    .and_then(Value::as_array)
-                    .and_then(|changes| changes_preview_lines(changes))
-            }),
+        "apply_patch" => match normalize_apply_patch_input(params) {
+            Ok(NormalizedApplyPatchInput::Patch(patch)) => apply_patch_preview_lines(patch),
+            Ok(NormalizedApplyPatchInput::Replacement { entries, .. }) => {
+                changes_preview_lines(entries)
+            }
+            Err(_) => None,
+        },
         _ => None,
     }
     .filter(|lines| !lines.is_empty())
@@ -1024,10 +890,8 @@ fn changes_preview_lines(changes: &[Value]) -> Option<Vec<String>> {
             .and_then(Value::as_str)
             .unwrap_or("<file>");
         let content = change.get("content").and_then(Value::as_str).unwrap_or("");
-        if idx > 0 {
-            if !push_preview_line(&mut lines, String::new(), PREVIEW_LIMIT) {
-                break;
-            }
+        if idx > 0 && !push_preview_line(&mut lines, String::new(), PREVIEW_LIMIT) {
+            break;
         }
         if !push_preview_line(&mut lines, format!("file: {path}"), PREVIEW_LIMIT) {
             break;
@@ -1076,36 +940,42 @@ fn param_text(params: &Value, keys: &[&str]) -> Option<String> {
     None
 }
 
-fn localize_detail_label(label: &str, locale: Locale) -> &str {
+fn localize_detail_label(label: &str, locale: Locale) -> Cow<'static, str> {
     match locale {
         Locale::ZhHans => match label {
-            "Command" => "命令",
-            "Dir" => "目录",
-            "File" => "文件",
-            "Preview" => "预览",
-            "proposed content" => "拟写入内容",
-            "replace this" => "替换此内容",
-            "with this" => "替换为",
-            "replacement content" => "替换内容",
-            "Path" => "路径",
-            "Target" => "目标",
-            "Input" => "输入",
-            "Action" => "操作",
-            "Type" => "类型",
-            "Prompt" => "提示",
-            _ => label,
+            "Command" => tr(locale, MessageId::ApprovalLabelCommand),
+            "Dir" => tr(locale, MessageId::ApprovalLabelDir),
+            "File" => tr(locale, MessageId::ApprovalLabelFile),
+            "Preview" => tr(locale, MessageId::ApprovalLabelPreview),
+            "proposed content" => tr(locale, MessageId::ApprovalLabelProposedContent),
+            "replace this" => tr(locale, MessageId::ApprovalLabelReplaceThis),
+            "with this" => tr(locale, MessageId::ApprovalLabelWithThis),
+            "replacement content" => tr(locale, MessageId::ApprovalLabelReplacementContent),
+            "Path" => tr(locale, MessageId::ApprovalLabelPath),
+            "Target" => tr(locale, MessageId::ApprovalLabelTarget),
+            "Input" => tr(locale, MessageId::ApprovalLabelInput),
+            "Action" => tr(locale, MessageId::ApprovalLabelAction),
+            "Type" => tr(locale, MessageId::ApprovalLabelType),
+            "Prompt" => tr(locale, MessageId::ApprovalLabelPrompt),
+            "Goal" => "目标".into(),
+            "Children" => "子任务".into(),
+            "Writes" => "写入".into(),
+            "Shell" => "Shell".into(),
+            "Network" => "网络".into(),
+            "Budget" => "预算".into(),
+            _ => label.to_string().into(),
         },
-        _ => label,
+        _ => label.to_string().into(),
     }
 }
 
-fn localize_preview_shell_line<'a>(tool_name: &str, line: &'a str, locale: Locale) -> &'a str {
+fn localize_preview_shell_line(tool_name: &str, line: &str, locale: Locale) -> Cow<'static, str> {
     match tool_name {
         "write_file" if line == "proposed content" => localize_detail_label(line, locale),
         "edit_file" if matches!(line, "replace this" | "with this") => {
             localize_detail_label(line, locale)
         }
-        _ => line,
+        _ => line.to_string().into(),
     }
 }
 
@@ -1307,21 +1177,40 @@ impl ApprovalOption {
         ApprovalOption::Abort,
     ];
 
-    fn from_index(idx: usize) -> ApprovalOption {
-        Self::ORDER.get(idx).copied().unwrap_or(Self::Abort)
+    /// Workflow elevated-plan card (#4126): Approve / Edit plan / Cancel.
+    const WORKFLOW_ORDER: [ApprovalOption; 3] = [
+        ApprovalOption::ApproveOnce,
+        ApprovalOption::Deny,
+        ApprovalOption::Abort,
+    ];
+
+    fn order_for(tool_name: &str) -> &'static [ApprovalOption] {
+        if tool_name == "workflow" {
+            &Self::WORKFLOW_ORDER
+        } else {
+            &Self::ORDER
+        }
     }
 
-    fn index(self) -> usize {
-        Self::ORDER
+    fn from_index_for(tool_name: &str, idx: usize) -> ApprovalOption {
+        Self::order_for(tool_name)
+            .get(idx)
+            .copied()
+            .unwrap_or(Self::Abort)
+    }
+
+    fn index_for(self, tool_name: &str) -> usize {
+        Self::order_for(tool_name)
             .iter()
             .position(|o| *o == self)
-            .unwrap_or(Self::ORDER.len() - 1)
+            .unwrap_or(Self::order_for(tool_name).len().saturating_sub(1))
     }
 
     fn decision(self) -> ReviewDecision {
         match self {
             ApprovalOption::ApproveOnce => ReviewDecision::Approved,
             ApprovalOption::ApproveAlways => ReviewDecision::ApprovedForSession,
+            // Workflow maps Deny → "Edit plan" (model revises plan).
             ApprovalOption::Deny => ReviewDecision::Denied,
             ApprovalOption::Abort => ReviewDecision::Abort,
         }
@@ -1333,6 +1222,7 @@ impl ApprovalOption {
 pub struct ApprovalView {
     request: ApprovalRequest,
     selected: usize,
+    row_hitboxes: RefCell<Vec<Rect>>,
     locale: Locale,
     timeout: Option<Duration>,
     requested_at: Instant,
@@ -1350,6 +1240,7 @@ impl ApprovalView {
         Self {
             request,
             selected: 0,
+            row_hitboxes: RefCell::new(Vec::new()),
             locale,
             timeout: None,
             requested_at: Instant::now(),
@@ -1362,11 +1253,20 @@ impl ApprovalView {
     }
 
     fn select_next(&mut self) {
-        self.selected = (self.selected + 1).min(ApprovalOption::ORDER.len() - 1);
+        let max = ApprovalOption::order_for(&self.request.tool_name)
+            .len()
+            .saturating_sub(1);
+        self.selected = (self.selected + 1).min(max);
     }
 
     fn current_option(&self) -> ApprovalOption {
-        ApprovalOption::from_index(self.selected)
+        ApprovalOption::from_index_for(&self.request.tool_name, self.selected)
+    }
+
+    /// Whether this approval is the elevated Workflow plan card (#4126).
+    #[must_use]
+    pub fn is_workflow_plan_approval(&self) -> bool {
+        self.request.tool_name == "workflow"
     }
 
     /// Test-only accessor for the selected option's decision.
@@ -1378,6 +1278,10 @@ impl ApprovalView {
     /// Selected option for the renderer (used by the widget tests too).
     pub fn selected(&self) -> usize {
         self.selected
+    }
+
+    pub(crate) fn set_mouse_hitboxes(&self, hitboxes: Vec<Rect>) {
+        *self.row_hitboxes.borrow_mut() = hitboxes;
     }
 
     /// Risk level for the renderer's accent picking.
@@ -1392,7 +1296,7 @@ impl ApprovalView {
 
     /// Commit the given option and close the approval modal.
     fn commit_option(&mut self, option: ApprovalOption) -> ViewAction {
-        self.selected = option.index();
+        self.selected = option.index_for(&self.request.tool_name);
         self.emit_decision(option.decision(), false)
     }
 
@@ -1421,16 +1325,14 @@ impl ApprovalView {
         // The compact prompt keeps the about/impact dossier out of the
         // default band; the pager is where that context now lives.
         let locale = self.locale();
-        let (about_label, impact_label) = match locale {
-            Locale::ZhHans => ("说明：", "影响："),
-            _ => ("About: ", "Impact: "),
-        };
+        let about_label = tr(locale, MessageId::ApprovalLabelAbout);
+        let impact_label = tr(locale, MessageId::ApprovalLabelImpact);
         let mut content = String::new();
-        content.push_str(about_label);
+        content.push_str(&about_label);
         content.push_str(&self.request.description_for_locale(locale));
         content.push('\n');
         for impact in self.request.impacts_for_locale(locale) {
-            content.push_str(impact_label);
+            content.push_str(&impact_label);
             content.push_str(&impact);
             content.push('\n');
         }
@@ -1482,8 +1384,16 @@ impl ModalView for ApprovalView {
             KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Char('1') => {
                 self.commit_option(ApprovalOption::ApproveOnce)
             }
-            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('2') => {
+            KeyCode::Char('a') | KeyCode::Char('A') | KeyCode::Char('2')
+                if !self.is_workflow_plan_approval() =>
+            {
                 self.commit_option(ApprovalOption::ApproveAlways)
+            }
+            // Workflow plan card (#4126): [2/e] Edit plan, [3/n/d] Cancel.
+            KeyCode::Char('e') | KeyCode::Char('E') | KeyCode::Char('2')
+                if self.is_workflow_plan_approval() =>
+            {
+                self.commit_option(ApprovalOption::Deny)
             }
             KeyCode::Char('s') | KeyCode::Char('S') if self.request.can_save_ask_rule() => self
                 .emit_decision_with_rules(
@@ -1495,9 +1405,45 @@ impl ModalView for ApprovalView {
             | KeyCode::Char('N')
             | KeyCode::Char('d')
             | KeyCode::Char('D')
-            | KeyCode::Char('3') => self.commit_option(ApprovalOption::Deny),
-            KeyCode::Char('v') | KeyCode::Char('V') => self.emit_params_pager(),
+            | KeyCode::Char('3') => {
+                if self.is_workflow_plan_approval() {
+                    // Cancel (abort turn) rather than session-deny.
+                    self.commit_option(ApprovalOption::Abort)
+                } else {
+                    self.commit_option(ApprovalOption::Deny)
+                }
+            }
+            // Details is Alt+V / Option+V only; bare `v` is never a shortcut.
+            _ if crate::tui::shell_key_routing::is_tool_details_shortcut(&key) => {
+                self.emit_params_pager()
+            }
             KeyCode::Esc => self.emit_decision(ReviewDecision::Abort, false),
+            _ => ViewAction::None,
+        }
+    }
+
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.select_prev();
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.select_next();
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().position(|rect| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                });
+                if let Some(index) = clicked {
+                    return self.commit_option(ApprovalOption::from_index_for(
+                        &self.request.tool_name,
+                        index,
+                    ));
+                }
+                ViewAction::None
+            }
             _ => ViewAction::None,
         }
     }
@@ -1686,6 +1632,7 @@ pub struct ElevationView {
     request: ElevationRequest,
     selected: usize,
     locale: Locale,
+    row_hitboxes: RefCell<Vec<Rect>>,
 }
 
 impl ElevationView {
@@ -1694,6 +1641,7 @@ impl ElevationView {
             request,
             selected: 0,
             locale,
+            row_hitboxes: RefCell::new(Vec::new()),
         }
     }
 
@@ -1767,8 +1715,36 @@ impl ModalView for ElevationView {
         }
     }
 
+    fn handle_mouse(&mut self, mouse: MouseEvent) -> ViewAction {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                self.select_prev();
+                ViewAction::None
+            }
+            MouseEventKind::ScrollDown => {
+                self.select_next();
+                ViewAction::None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().position(|rect| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                });
+                if let Some(index) = clicked {
+                    return self.emit_decision(self.request.options[index].clone());
+                }
+                ViewAction::None
+            }
+            _ => ViewAction::None,
+        }
+    }
+
     fn render(&self, area: ratatui::layout::Rect, buf: &mut ratatui::buffer::Buffer) {
-        let elevation_widget = ElevationWidget::new(&self.request, self.selected, self.locale);
+        let elevation_widget = ElevationWidget::new_with_hitboxes(
+            &self.request,
+            self.selected,
+            self.locale,
+            &self.row_hitboxes,
+        );
         elevation_widget.render(area, buf);
     }
 }
@@ -1780,7 +1756,8 @@ impl ModalView for ElevationView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crossterm::event::{KeyCode, KeyModifiers};
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use ratatui::{Terminal, backend::TestBackend};
     use serde_json::json;
 
     fn create_key_event(code: KeyCode) -> KeyEvent {
@@ -1841,6 +1818,8 @@ mod tests {
         assert_eq!(get_tool_category("read_file"), ToolCategory::Safe);
         assert_eq!(get_tool_category("list_dir"), ToolCategory::Safe);
         assert_eq!(get_tool_category("todo_write"), ToolCategory::Safe);
+        assert_eq!(get_tool_category("work_update"), ToolCategory::Safe);
+        assert_eq!(get_tool_category("checklist_write"), ToolCategory::Safe);
         assert_eq!(get_tool_category("todo_read"), ToolCategory::Safe);
         assert_eq!(get_tool_category("note"), ToolCategory::Safe);
         assert_eq!(get_tool_category("update_plan"), ToolCategory::Safe);
@@ -2183,7 +2162,7 @@ mod tests {
             "apply_patch",
             "Apply a patch",
             &json!({
-                "changes": [
+                "replace": [
                     {
                         "path": "src/lib.rs",
                         "content": "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"
@@ -2220,13 +2199,39 @@ mod tests {
     }
 
     #[test]
+    fn prominent_details_apply_patch_legacy_changes_includes_preview() {
+        let request = ApprovalRequest::new(
+            "test-id",
+            "apply_patch",
+            "Apply a patch",
+            &json!({
+                "changes": [{
+                    "path": "src/lib.rs",
+                    "content": "fn legacy() {}\n"
+                }]
+            }),
+            "tool:apply_patch",
+        );
+
+        let details = request.prominent_detail_items(Locale::En);
+        let preview = details
+            .iter()
+            .find(|detail| detail.label == "Preview")
+            .and_then(|detail| detail.shell_lines.as_ref())
+            .expect("legacy changes preview");
+
+        assert!(preview.iter().any(|line| line == "file: src/lib.rs"));
+        assert!(preview.iter().any(|line| line == "+ fn legacy() {}"));
+    }
+
+    #[test]
     fn apply_patch_changes_array_preview_reports_second_file_when_first_fills_buffer() {
         let request = ApprovalRequest::new(
             "test-id",
             "apply_patch",
             "Apply a patch",
             &json!({
-                "changes": [
+                "replace": [
                     {
                         "path": "src/lib.rs",
                         "content": "one\ntwo\nthree\nfour\nfive\nsix\nseven\neight"
@@ -2560,7 +2565,7 @@ diff --git a/src/b.rs b/src/b.rs
             "apply_patch",
             "Apply a patch",
             &json!({
-                "changes": [
+                "replace": [
                     { "path": "src/a.rs", "content": "one" },
                     { "path": "/workspace/src/a.rs", "content": "two" }
                 ]
@@ -2629,7 +2634,7 @@ diff --git a/src/b.rs b/src/b.rs
             "apply_patch",
             "Apply a patch",
             &json!({
-                "changes": [
+                "replace": [
                     { "path": "src/a.rs", "content": "safe" },
                     { "path": "../escape.rs", "content": "unsafe" }
                 ]
@@ -2681,11 +2686,10 @@ diff --git a/src/b.rs b/src/b.rs
 
     #[test]
     fn tab_toggles_collapsed_card_so_transcript_stays_visible() {
-        // Regression for PR #1455 / @tiger-dog: the approval modal
-        // rendered as a full-screen takeover that hid the transcript
-        // behind it, so users had to dismiss the prompt to remember
-        // what they were approving. Tab now flips between the full
-        // takeover card and a single-line bottom banner.
+        // Regression for PR #1455 / @tiger-dog: the approval modal once hid
+        // the transcript, so users had to dismiss the prompt to remember what
+        // they were approving. Tab flips between the expanded compact card
+        // and a single-line bottom banner.
         let mut view = ApprovalView::new(benign_request());
         assert!(
             !view.collapsed,
@@ -2698,7 +2702,7 @@ diff --git a/src/b.rs b/src/b.rs
 
         let action = view.handle_key(create_key_event(KeyCode::Tab));
         assert!(matches!(action, ViewAction::None));
-        assert!(!view.collapsed, "second Tab restores the takeover card");
+        assert!(!view.collapsed, "second Tab restores the expanded card");
     }
 
     #[test]
@@ -2819,6 +2823,84 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
+    fn mouse_click_renders_and_approves_inline_option() {
+        let mut view = ApprovalView::new(benign_request());
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).expect("test terminal");
+        terminal
+            .draw(|frame| view.render(frame.area(), frame.buffer_mut()))
+            .expect("render approval prompt");
+        let rect = view.row_hitboxes.borrow()[0];
+        let action = view.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            action,
+            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision {
+                decision: ReviewDecision::Approved,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn tiny_localized_approval_keeps_every_action_and_hitbox() {
+        const WIDTH: u16 = 40;
+        const HEIGHT: u16 = 12;
+        let expected = [
+            ReviewDecision::Approved,
+            ReviewDecision::ApprovedForSession,
+            ReviewDecision::Denied,
+            ReviewDecision::Abort,
+        ];
+
+        for &locale in Locale::shipped() {
+            let rendered_view = ApprovalView::new_for_locale(destructive_request(), locale);
+            let rendered = render_lines(&rendered_view, WIDTH, HEIGHT).join("\n");
+            assert_approval_key_badges_visible(&rendered);
+            assert!(
+                rendered.contains(crate::tui::shell_key_routing::tool_details_chord().as_ref()),
+                "missing details chord for {locale:?}:\n{rendered}"
+            );
+
+            for (index, expected_decision) in expected.iter().enumerate() {
+                let mut view = ApprovalView::new_for_locale(destructive_request(), locale);
+                let mut terminal =
+                    Terminal::new(TestBackend::new(WIDTH, HEIGHT)).expect("test terminal");
+                terminal
+                    .draw(|frame| view.render(frame.area(), frame.buffer_mut()))
+                    .expect("render localized approval prompt");
+
+                let hitboxes = view.row_hitboxes.borrow().clone();
+                assert_eq!(hitboxes.len(), expected.len(), "{locale:?}: {hitboxes:?}");
+                for hitbox in &hitboxes {
+                    assert!(hitbox.height > 0, "{locale:?}: {hitboxes:?}");
+                    assert!(hitbox.right() <= WIDTH, "{locale:?}: {hitboxes:?}");
+                    assert!(hitbox.bottom() <= HEIGHT, "{locale:?}: {hitboxes:?}");
+                }
+                for pair in hitboxes.windows(2) {
+                    assert!(pair[0].bottom() <= pair[1].y, "{locale:?}: {hitboxes:?}");
+                }
+
+                let rect = hitboxes[index];
+                let action = view.handle_mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Left),
+                    column: rect.x,
+                    row: rect.y,
+                    modifiers: KeyModifiers::NONE,
+                });
+                let ViewAction::EmitAndClose(ViewEvent::ApprovalDecision { decision, .. }) = action
+                else {
+                    panic!("click {index} did not decide for {locale:?}");
+                };
+                assert_eq!(decision, *expected_decision, "{locale:?} option {index}");
+            }
+        }
+    }
+
+    #[test]
     fn benign_a_two_approves_for_session() {
         for code in [KeyCode::Char('a'), KeyCode::Char('A'), KeyCode::Char('2')] {
             let mut view = ApprovalView::new(benign_request());
@@ -2911,15 +2993,18 @@ diff --git a/src/b.rs b/src/b.rs
 
     #[test]
     fn test_approval_view_view_params() {
+        // Bare `v` must not open details (TUI-DOG-002).
         let mut view = ApprovalView::new(benign_request());
         let action = view.handle_key(create_key_event(KeyCode::Char('v')));
-        assert!(matches!(
-            action,
-            ViewAction::Emit(ViewEvent::OpenTextPager { .. })
-        ));
+        assert!(matches!(action, ViewAction::None));
 
         let mut view = ApprovalView::new(benign_request());
         let action = view.handle_key(create_key_event(KeyCode::Char('V')));
+        assert!(matches!(action, ViewAction::None));
+
+        // Alt+V / Option+V opens the params pager.
+        let mut view = ApprovalView::new(benign_request());
+        let action = view.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
         assert!(matches!(
             action,
             ViewAction::Emit(ViewEvent::OpenTextPager { .. })
@@ -3064,8 +3149,7 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     // ========================================================================
-    // Render takeover smoke tests — keep the visual contract honest so a
-    // future widget refactor cannot silently shrink back to a popup.
+    // Render approval-card smoke tests — keep the visual contract honest.
     // ========================================================================
 
     fn render_lines(view: &ApprovalView, w: u16, h: u16) -> Vec<String> {
@@ -3188,19 +3272,52 @@ diff --git a/src/b.rs b/src/b.rs
         let joined = lines.join("\n");
         assert!(joined.contains("REVIEW"), "missing REVIEW badge:\n{joined}");
         assert_approval_key_badges_visible(&joined);
-        assert!(joined.contains("Choose"), "benign hint missing:\n{joined}");
+        // The selection prose moved into the per-option key badges; the footer
+        // keeps only the escape-hatch hints.
         assert!(
-            joined.contains("Enter selected option"),
-            "benign selection hint missing:\n{joined}"
+            joined.contains("Pg↑/↓ review"),
+            "footer controls hint missing:\n{joined}"
         );
         assert!(joined.contains("read_file"));
+    }
+
+    #[test]
+    fn approval_footer_hints_use_muted_contrast_tier() {
+        // #3380: the footer key hints ("Pg↑/↓ review · Alt+V/⌥V details · Esc abort")
+        // must render one contrast tier above TEXT_HINT — TEXT_MUTED, the same
+        // color the app-wide ActionHint modal footers use for labels.
+        use crate::palette;
+        use ratatui::buffer::Buffer;
+        use ratatui::layout::Rect;
+
+        let view = ApprovalView::new(benign_request());
+        let (w, h) = (100u16, 40u16);
+        let mut buf = Buffer::empty(Rect::new(0, 0, w, h));
+        ModalView::render(&view, Rect::new(0, 0, w, h), &mut buf);
+
+        let target: Vec<String> = "Pg↑/↓ review".chars().map(|c| c.to_string()).collect();
+        let mut found = None;
+        for y in 0..h {
+            let symbols: Vec<String> = (0..w).map(|x| buf[(x, y)].symbol().to_string()).collect();
+            for x in 0..=(w as usize - target.len()) {
+                if symbols[x..x + target.len()] == target[..] {
+                    found = Some((u16::try_from(x).expect("column fits"), y));
+                }
+            }
+        }
+        let (x, y) = found.expect("footer key hints must be rendered");
+        assert_eq!(
+            buf[(x, y)].fg,
+            palette::TEXT_MUTED,
+            "footer key hints must use the muted (not hint) contrast tier"
+        );
     }
 
     #[test]
     fn render_elevated_write_is_calm_and_compact() {
         // Ordinary state-touching work (a file write) renders as a calm
         // APPROVAL ask: no DESTRUCTIVE badge, no policy dossier, no
-        // impact/category taxonomy — that detail stays one `v` away.
+        // impact/category taxonomy — that detail stays one details chord away.
         let view = ApprovalView::new(destructive_request());
         let lines = render_lines(&view, 100, 40);
         let joined = lines.join("\n");
@@ -3211,8 +3328,8 @@ diff --git a/src/b.rs b/src/b.rs
         );
         assert_approval_key_badges_visible(&joined);
         assert!(
-            joined.contains("Enter selected option"),
-            "selection hint missing:\n{joined}"
+            joined.contains("Pg↑/↓ review"),
+            "footer controls hint missing:\n{joined}"
         );
         assert!(
             !joined.contains("active approval policy"),
@@ -3266,12 +3383,8 @@ diff --git a/src/b.rs b/src/b.rs
             "routine write must not use the destructive zh badge:\n{joined}"
         );
         assert!(
-            joined.contains("选择："),
-            "missing zh selection prefix:\n{joined}"
-        );
-        assert!(
-            joined.contains("Enter执行选中项，或直接按y/a/d"),
-            "missing zh one-step hint:\n{joined}"
+            joined.contains("Pg↑/↓回看"),
+            "missing zh footer controls hint:\n{joined}"
         );
         assert!(
             !joined.contains("影响："),
@@ -3281,6 +3394,31 @@ diff --git a/src/b.rs b/src/b.rs
             joined.contains("仅本次批准"),
             "missing zh approve option:\n{joined}"
         );
+    }
+
+    #[test]
+    fn approval_review_and_save_hints_stay_on_one_row_at_80_columns() {
+        for &locale in Locale::shipped() {
+            let view = ApprovalView::new_for_locale(destructive_request(), locale);
+            let lines = render_lines(&view, 80, 40);
+            let review_rows = lines
+                .iter()
+                .filter(|line| line.contains("Pg↑/↓"))
+                .collect::<Vec<_>>();
+
+            assert_eq!(
+                review_rows.len(),
+                1,
+                "expected one approval review-hint row for {locale:?}:\n{}",
+                lines.join("\n")
+            );
+            let controls = review_rows[0];
+            assert!(
+                controls.contains("Esc") && controls.contains(" s "),
+                "review, abort, and save-rule hints wrapped for {locale:?}:\n{}",
+                lines.join("\n")
+            );
+        }
     }
 
     #[test]
@@ -3692,6 +3830,121 @@ diff --git a/src/b.rs b/src/b.rs
                 .iter()
                 .any(|o| matches!(o, ElevationOption::Abort))
         );
+    }
+
+    // ========================================================================
+    // Workflow elevated plan approval card (#4126)
+    // ========================================================================
+
+    #[test]
+    fn workflow_tool_is_agent_category_and_shows_plan_card_fields() {
+        assert_eq!(get_tool_category("workflow"), ToolCategory::Agent);
+        let request = ApprovalRequest::new(
+            "wf-1",
+            "workflow",
+            "Launch workflow",
+            &json!({
+                "action": "start",
+                "plan": {
+                    "goal": "ship the fix",
+                    "risk": "writes",
+                    "token_budget": 80_000,
+                    "children": [
+                        {
+                            "id": "impl",
+                            "label": "builder",
+                            "prompt": "edit files",
+                            "type": "implementer",
+                            "mode": "read_write"
+                        }
+                    ]
+                }
+            }),
+            "tool:workflow",
+        );
+        assert_eq!(request.category, ToolCategory::Agent);
+        let details = request.prominent_detail_items(Locale::En);
+        let labels: Vec<_> = details.iter().map(|d| d.label.as_str()).collect();
+        assert!(labels.contains(&"Goal"), "{labels:?}");
+        assert!(labels.contains(&"Children"), "{labels:?}");
+        assert!(labels.contains(&"Writes"), "{labels:?}");
+        assert!(labels.contains(&"Shell"), "{labels:?}");
+        assert!(labels.contains(&"Network"), "{labels:?}");
+        assert!(labels.contains(&"Budget"), "{labels:?}");
+        assert!(
+            details
+                .iter()
+                .any(|d| d.label == "Goal" && d.value.contains("ship the fix")),
+            "{details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .any(|d| d.label == "Writes" && d.value == "yes"),
+            "{details:?}"
+        );
+        assert!(
+            request
+                .impacts
+                .iter()
+                .any(|i| i.contains("Approve to launch")),
+            "{:?}",
+            request.impacts
+        );
+
+        let view = ApprovalView::new(request);
+        assert!(view.is_workflow_plan_approval());
+        assert_eq!(view.current_decision(), ReviewDecision::Approved);
+    }
+
+    #[test]
+    fn workflow_plan_card_edit_plan_and_cancel_keys() {
+        let request = ApprovalRequest::new(
+            "wf-2",
+            "workflow",
+            "Launch workflow",
+            &json!({
+                "action": "start",
+                "plan": {
+                    "goal": "risky",
+                    "risk": "elevated",
+                    "children": [{ "prompt": "go", "type": "implementer" }]
+                }
+            }),
+            "tool:workflow",
+        );
+        let mut view = ApprovalView::new(request);
+        // [2 / e] → Edit plan → Denied
+        let action = view.handle_key(create_key_event(KeyCode::Char('e')));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision { decision, .. }) => {
+                assert_eq!(decision, ReviewDecision::Denied);
+            }
+            other => panic!("expected edit-plan denial, got {other:?}"),
+        }
+
+        let request = ApprovalRequest::new(
+            "wf-3",
+            "workflow",
+            "Launch workflow",
+            &json!({
+                "action": "start",
+                "plan": {
+                    "goal": "risky",
+                    "risk": "elevated",
+                    "children": [{ "prompt": "go", "type": "implementer" }]
+                }
+            }),
+            "tool:workflow",
+        );
+        let mut view = ApprovalView::new(request);
+        let action = view.handle_key(create_key_event(KeyCode::Char('3')));
+        match action {
+            ViewAction::EmitAndClose(ViewEvent::ApprovalDecision { decision, .. }) => {
+                assert_eq!(decision, ReviewDecision::Abort);
+            }
+            other => panic!("expected cancel abort, got {other:?}"),
+        }
     }
 
     // ========================================================================

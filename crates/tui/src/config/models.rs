@@ -40,6 +40,7 @@ pub const OPENROUTER_QWEN_3_6_35B_A3B_MODEL: &str = "qwen/qwen3.6-35b-a3b";
 pub const OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL: &str = "qwen/qwen3.6-max-preview";
 pub const OPENROUTER_QWEN_3_6_27B_MODEL: &str = "qwen/qwen3.6-27b";
 pub const OPENROUTER_QWEN_3_6_PLUS_MODEL: &str = "qwen/qwen3.6-plus";
+pub const OPENROUTER_QWEN_3_7_PLUS_MODEL: &str = "qwen/qwen3.7-plus";
 pub const OPENROUTER_QWEN_3_7_MAX_MODEL: &str = "qwen/qwen3.7-max";
 pub const OPENROUTER_MINIMAX_M2_7_MODEL: &str = "minimax/minimax-m2.7";
 pub const OPENROUTER_NEMOTRON_3_ULTRA_MODEL: &str = "nvidia/nemotron-3-ultra-550b-a55b";
@@ -56,6 +57,7 @@ pub const RECENT_OPENROUTER_LARGE_MODELS: &[&str] = &[
     OPENROUTER_QWEN_3_6_MAX_PREVIEW_MODEL,
     OPENROUTER_QWEN_3_6_27B_MODEL,
     OPENROUTER_QWEN_3_6_PLUS_MODEL,
+    OPENROUTER_QWEN_3_7_PLUS_MODEL,
     OPENROUTER_QWEN_3_7_MAX_MODEL,
     OPENROUTER_MINIMAX_M2_7_MODEL,
     OPENROUTER_NEMOTRON_3_ULTRA_MODEL,
@@ -96,17 +98,31 @@ pub const ARCEE_TRINITY_LARGE_PREVIEW_MODEL: &str = "trinity-large-preview";
 pub const ARCEE_TRINITY_MINI_MODEL: &str = "trinity-mini";
 pub const DEFAULT_ARCEE_BASE_URL: &str = "https://api.arcee.ai/api/v1";
 pub const DEFAULT_MOONSHOT_MODEL: &str = "kimi-k2.7-code";
+/// Moonshot's direct pay-as-you-go K3 wire model id.
+pub const MOONSHOT_KIMI_K3_MODEL: &str = "kimi-k3";
 pub const MOONSHOT_KIMI_K2_6_MODEL: &str = "kimi-k2.6";
 pub const DEFAULT_MOONSHOT_BASE_URL: &str = "https://api.moonshot.ai/v1";
 pub const DEFAULT_KIMI_CODE_MODEL: &str = "kimi-for-coding";
 pub const DEFAULT_KIMI_CODE_BASE_URL: &str = "https://api.kimi.com/coding/v1";
+pub const KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL: &str =
+    codewhale_config::provider::KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL;
+/// Official Kimi Code route model id. It is deliberately distinct from
+/// Moonshot's pay-as-you-go `kimi-k3` catalog id.
+pub const KIMI_CODE_K3_MODEL: &str = "k3";
+// The K3 contract constants (`KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS`,
+// `KIMI_K3_CONTEXT_WINDOW_TOKENS`, and the distinct default/direct output
+// limits) live in `crate::models` — the model-facts table, which also compiles
+// standalone in integration tests — so the facts have exactly one home.
+// Re-export only the route-owned floor, which existing `crate::config` call
+// sites import.
+pub use crate::models::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS;
 pub const DEFAULT_SGLANG_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_SGLANG_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_SGLANG_BASE_URL: &str = "http://localhost:30000/v1";
 pub const DEFAULT_VLLM_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_VLLM_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_VLLM_BASE_URL: &str = "http://localhost:8000/v1";
-pub const DEFAULT_OLLAMA_MODEL: &str = "deepseek-coder:1.3b";
+pub const DEFAULT_OLLAMA_MODEL: &str = "deepseek-v4-flash";
 pub const DEFAULT_OLLAMA_BASE_URL: &str = "http://localhost:11434/v1";
 pub const DEFAULT_HUGGINGFACE_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_HUGGINGFACE_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
@@ -116,12 +132,15 @@ pub const DEFAULT_DEEPINFRA_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
 pub const DEFAULT_DEEPINFRA_BASE_URL: &str = "https://api.deepinfra.com/v1/openai";
 pub const DEFAULT_TOGETHER_MODEL: &str = "deepseek-ai/DeepSeek-V4-Pro";
 pub const DEFAULT_TOGETHER_FLASH_MODEL: &str = "deepseek-ai/DeepSeek-V4-Flash";
+pub const TOGETHER_INKLING_MODEL: &str = "thinkingmachines/inkling";
 pub const DEFAULT_TOGETHER_BASE_URL: &str = "https://api.together.xyz/v1";
 pub const DEFAULT_QIANFAN_MODEL: &str = "ernie-4.0-turbo-8k";
 pub const DEFAULT_QIANFAN_BASE_URL: &str = "https://api.baiduqianfan.ai/v1";
 pub const DEFAULT_OPENAI_CODEX_MODEL: &str = "gpt-5.5";
 pub const DEFAULT_OPENAI_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
-pub const OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS: u32 = 400_000;
+/// Conservative offline floor for an OAuth model absent from a fresh Codex
+/// roster. Fresh account-scoped cache metadata overrides this in route_runtime.
+pub const OPENAI_CODEX_EFFECTIVE_CONTEXT_WINDOW_TOKENS: u32 = 128_000;
 /// Legacy `deepseek-cn` provider alias.
 ///
 /// DeepSeek's official API host is the same worldwide. Keep this alias for
@@ -160,6 +179,21 @@ pub const MINIMAX_M2_1_MODEL: &str = "MiniMax-M2.1";
 pub const MINIMAX_M2_1_HIGHSPEED_MODEL: &str = "MiniMax-M2.1-highspeed";
 pub const MINIMAX_M2_MODEL: &str = "MiniMax-M2";
 pub const DEFAULT_MINIMAX_BASE_URL: &str = "https://api.minimax.io/v1";
+pub const DEFAULT_MINIMAX_ANTHROPIC_BASE_URL: &str = "https://api.minimax.io/anthropic";
 pub const DEFAULT_SAKANA_MODEL: &str = "fugu";
 pub const SAKANA_FUGU_ULTRA_MODEL: &str = "fugu-ultra-20260615";
 pub const DEFAULT_SAKANA_BASE_URL: &str = "https://api.sakana.ai/v1";
+pub const DEFAULT_LONGCAT_MODEL: &str = "LongCat-2.0";
+pub const DEFAULT_LONGCAT_BASE_URL: &str = "https://api.longcat.chat/openai/v1";
+pub const DEFAULT_OPENCODE_GO_MODEL: &str = "deepseek-v4-pro";
+pub const DEFAULT_OPENCODE_GO_BASE_URL: &str = "https://opencode.ai/zen/go/v1";
+pub use codewhale_config::OPENCODE_GO_CHAT_MODELS;
+pub const DEFAULT_META_MODEL: &str = "muse-spark-1.1";
+pub const DEFAULT_META_BASE_URL: &str = "https://api.meta.ai/v1";
+pub const DEFAULT_XAI_MODEL: &str = "grok-4.5";
+pub const XAI_GROK_4_3_MODEL: &str = "grok-4.3";
+pub const XAI_GROK_BUILD_MODEL: &str = "grok-build";
+pub const XAI_GROK_COMPOSER_2_5_FAST_MODEL: &str = "grok-composer-2.5-fast";
+pub const XAI_GROK_4_20_0309_REASONING_MODEL: &str = "grok-4.20-0309-reasoning";
+pub const XAI_GROK_4_20_0309_NON_REASONING_MODEL: &str = "grok-4.20-0309-non-reasoning";
+pub const DEFAULT_XAI_BASE_URL: &str = "https://api.x.ai/v1";

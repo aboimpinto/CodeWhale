@@ -52,7 +52,7 @@ pub enum ModelProvider {
     DeepSeek,
     /// Anthropic Claude models.
     Anthropic,
-    /// OpenAI public API models (gpt-5.5 family).
+    /// OpenAI public API models (GPT-5.5 / GPT-5.6 families).
     OpenAi,
     /// OpenAI Codex route models (gpt-5*-codex).
     OpenAiCodex,
@@ -66,8 +66,14 @@ pub enum ModelProvider {
     Qwen,
     /// Arcee Trinity models.
     Arcee,
+    /// Together-hosted models with provider-owned wire identities.
+    Together,
     /// Xiaomi MiMo models.
     XiaomiMimo,
+    /// Meta Muse models.
+    Meta,
+    /// xAI / Grok models.
+    Xai,
     /// Anything not otherwise classified (still gets real metadata via the
     /// `models.rs` heuristics where possible).
     Other,
@@ -130,12 +136,18 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     // --- Anthropic (config DEFAULT_ANTHROPIC_MODEL + models.rs rows) ---
     ("claude-opus-4-8", ModelProvider::Anthropic),
     ("claude-sonnet-4-6", ModelProvider::Anthropic),
+    ("claude-sonnet-5", ModelProvider::Anthropic),
+    ("claude-fable-5", ModelProvider::Anthropic),
     ("claude-haiku-4-5", ModelProvider::Anthropic),
     // --- OpenAI public API + Codex (config DEFAULT_OPENAI_CODEX_MODEL) ---
     ("gpt-5.5", ModelProvider::OpenAi),
     ("gpt-5.5-pro", ModelProvider::OpenAi),
+    ("gpt-5.6", ModelProvider::OpenAi),
+    ("gpt-5.6-sol", ModelProvider::OpenAi),
+    ("gpt-5.6-terra", ModelProvider::OpenAi),
+    ("gpt-5.6-luna", ModelProvider::OpenAi),
     ("gpt-5-codex", ModelProvider::OpenAiCodex),
-    ("gpt-5.3-codex", ModelProvider::OpenAiCodex),
+    ("gpt-5.3-codex", ModelProvider::OpenAi),
     // --- Moonshot / Kimi (config DEFAULT_MOONSHOT_MODEL / KIMI_CODE) ---
     ("kimi-k2.7-code", ModelProvider::Moonshot),
     ("kimi-k2.6", ModelProvider::Moonshot),
@@ -155,15 +167,32 @@ const SEED_MODEL_IDS: &[(&str, ModelProvider)] = &[
     // --- Qwen (OpenRouter routing defaults) ---
     ("qwen/qwen3.6-flash", ModelProvider::Qwen),
     ("qwen/qwen3.6-plus", ModelProvider::Qwen),
+    ("qwen/qwen3.7-plus", ModelProvider::Qwen),
     ("qwen/qwen3.6-35b-a3b", ModelProvider::Qwen),
     // --- Arcee Trinity (config DEFAULT_ARCEE_MODEL) ---
     ("trinity-large-thinking", ModelProvider::Arcee),
     ("arcee-ai/trinity-large-thinking", ModelProvider::Arcee),
     ("trinity-mini", ModelProvider::Arcee),
+    // --- Together / Thinking Machines ---
+    ("thinkingmachines/inkling", ModelProvider::Together),
+    // --- Sakana / Fugu (config DEFAULT_SAKANA_MODEL) ---
+    ("fugu-ultra-20260615", ModelProvider::Other),
+    ("fugu-ultra", ModelProvider::Other),
+    // --- StepFun (config DEFAULT_STEPFUN_MODEL) ---
+    ("step-3.7-flash", ModelProvider::Other),
     // --- Xiaomi MiMo (config DEFAULT_XIAOMI_MIMO_MODEL) ---
     ("mimo-v2.5-pro", ModelProvider::XiaomiMimo),
     ("mimo-v2.5-pro-ultraspeed", ModelProvider::XiaomiMimo),
     ("mimo-v2.5", ModelProvider::XiaomiMimo),
+    // --- Meta Model API (config DEFAULT_META_MODEL) ---
+    ("muse-spark-1.1", ModelProvider::Meta),
+    // --- xAI / Grok (config DEFAULT_XAI_MODEL) ---
+    ("grok-4.5", ModelProvider::Xai),
+    ("grok-4.3", ModelProvider::Xai),
+    ("grok-build", ModelProvider::Xai),
+    ("grok-composer-2.5-fast", ModelProvider::Xai),
+    ("grok-4.20-0309-reasoning", ModelProvider::Xai),
+    ("grok-4.20-0309-non-reasoning", ModelProvider::Xai),
 ];
 
 fn registry() -> &'static BTreeMap<&'static str, ModelMetadata> {
@@ -242,8 +271,12 @@ mod tests {
             ("deepseek-coder:1.3b", Some(128_000)),
             ("claude-opus-4-8", Some(1_000_000)),
             ("claude-sonnet-4-6", Some(1_000_000)),
+            ("claude-sonnet-5", Some(1_000_000)),
+            ("claude-fable-5", Some(1_000_000)),
             ("claude-haiku-4-5", Some(200_000)),
             ("gpt-5.5", Some(1_050_000)),
+            ("gpt-5.6", Some(1_050_000)),
+            ("gpt-5.6-terra", Some(1_050_000)),
             ("gpt-5-codex", Some(400_000)),
             ("kimi-k2.7-code", Some(262_144)),
             ("kimi-k2.6", Some(262_144)),
@@ -258,6 +291,10 @@ mod tests {
             ("mimo-v2.5-pro", Some(1_000_000)),
             ("mimo-v2.5-pro-ultraspeed", Some(1_000_000)),
             ("mimo-v2.5", Some(1_000_000)),
+            ("muse-spark-1.1", Some(1_000_000)),
+            ("grok-4.5", Some(500_000)),
+            ("grok-4.3", Some(1_000_000)),
+            ("grok-4.20-0309-reasoning", Some(2_000_000)),
         ];
         for (model, expected) in sample {
             let meta = lookup(model)
@@ -307,6 +344,52 @@ mod tests {
             assert_eq!(meta.provider, ModelProvider::DeepSeek);
             assert_eq!(meta.context_window, Some(1_000_000));
         }
+    }
+
+    #[test]
+    fn xai_models_are_classified_as_xai() {
+        let meta = lookup("grok-4.5").expect("xAI default should be seeded");
+        assert_eq!(meta.provider, ModelProvider::Xai);
+        assert_eq!(meta.context_window, Some(500_000));
+        assert!(meta.supports_reasoning);
+
+        let fast = lookup("grok-4.20-0309-non-reasoning").expect("xAI fast model should be seeded");
+        assert_eq!(fast.provider, ModelProvider::Xai);
+        assert_eq!(fast.context_window, Some(2_000_000));
+        assert!(!fast.supports_reasoning);
+    }
+
+    #[test]
+    fn meta_muse_spark_is_classified_as_meta() {
+        let meta = lookup("muse-spark-1.1").expect("Muse Spark default should be seeded");
+        assert_eq!(meta.provider, ModelProvider::Meta);
+        assert_eq!(meta.context_window, Some(1_000_000));
+        assert_eq!(meta.max_output, Some(32_000));
+        assert!(meta.supports_reasoning);
+    }
+
+    #[test]
+    fn v090_model_metadata_is_provider_correct_and_conservative() {
+        let gpt = lookup("gpt-5.3-codex").expect("GPT-5.3 Codex seed");
+        assert_eq!(gpt.provider, ModelProvider::OpenAi);
+
+        let qwen = lookup("qwen/qwen3.7-plus").expect("Qwen 3.7 Plus seed");
+        assert_eq!(qwen.provider, ModelProvider::Qwen);
+        assert_eq!(qwen.context_window, None);
+        assert_eq!(qwen.max_output, None);
+        assert!(qwen.supports_reasoning);
+
+        let trinity = lookup("trinity-mini").expect("Trinity Mini seed");
+        assert_eq!(trinity.provider, ModelProvider::Arcee);
+        assert_eq!(trinity.context_window, Some(128_000));
+        assert_eq!(trinity.max_output, None);
+        assert!(trinity.supports_reasoning);
+
+        let inkling = lookup("thinkingmachines/inkling").expect("Inkling seed");
+        assert_eq!(inkling.provider, ModelProvider::Together);
+        assert_eq!(inkling.context_window, None);
+        assert_eq!(inkling.max_output, None);
+        assert!(inkling.supports_reasoning);
     }
 
     #[test]

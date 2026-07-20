@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
+use crate::config::ApiProvider;
 use crate::models::Usage;
 
 use super::SubAgentType;
@@ -63,6 +64,9 @@ pub enum MailboxMessage {
     /// Published after each turn so the parent's cost counter updates live.
     TokenUsage {
         agent_id: String,
+        /// Effective provider that produced this usage. Pricing and billing
+        /// policy are route-scoped, so model identity alone is insufficient.
+        provider: ApiProvider,
         /// Model that produced this usage, used for pricing.
         model: String,
         /// Provider usage payload, including cache-hit/cache-miss fields.
@@ -105,11 +109,13 @@ impl MailboxMessage {
 
     pub(crate) fn token_usage(
         agent_id: impl Into<String>,
+        provider: ApiProvider,
         model: impl Into<String>,
         usage: Usage,
     ) -> Self {
         Self::TokenUsage {
             agent_id: agent_id.into(),
+            provider,
             model: model.into(),
             usage,
         }
@@ -476,6 +482,7 @@ mod tests {
             (
                 MailboxMessage::TokenUsage {
                     agent_id: "a9".into(),
+                    provider: ApiProvider::Deepseek,
                     model: "deepseek-v4-flash".into(),
                     usage: Usage {
                         input_tokens: 100,

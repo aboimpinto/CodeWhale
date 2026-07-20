@@ -212,10 +212,11 @@ impl ModelReferenceDatabase {
         Self::from_offerings(&snapshot.offerings)
     }
 
-    /// Build from CodeWhale's bundled, network-free catalog snapshot.
+    /// Build from CodeWhale's offline/stale bundled catalog snapshot (#4188).
     ///
-    /// This is the curated reference set every install carries; it needs no
-    /// credentials or network and is always available.
+    /// Prefer a live/compiled [`CatalogSnapshot`] when available. The bundled
+    /// set needs no credentials or network and remains the offline fallback
+    /// every install carries.
     #[must_use]
     pub fn bundled() -> Self {
         Self::from_offerings(&bundled_catalog_offerings())
@@ -492,7 +493,7 @@ mod tests {
         assert!(!db.is_empty());
         assert!(
             db.len() >= 20,
-            "bundled snapshot should carry the curated offerings, got {}",
+            "bundled offline snapshot should carry seed offerings, got {}",
             db.len()
         );
 
@@ -518,9 +519,16 @@ mod tests {
 
         // A priced row surfaces its stated per-token rate.
         let minimax = db
-            .find("minimax", "MiniMax-M3")
+            .find("minimax", "MiniMax-M2.7")
             .expect("bundled minimax row");
         assert_eq!(minimax.price_label(), "$0.30 / $1.20 per Mtok");
+
+        // MiniMax-M3 ships without verified per-token pricing, so its price
+        // stays honestly unknown rather than inheriting a sibling's rate.
+        let minimax_m3 = db
+            .find("minimax", "MiniMax-M3")
+            .expect("bundled minimax m3 row");
+        assert_eq!(minimax_m3.price_label(), "unknown");
     }
 
     #[test]

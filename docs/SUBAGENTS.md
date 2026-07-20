@@ -16,10 +16,10 @@ The current `agent` implementation delegates to the durable sub-agent runtime
 while that cutover completes. It can still be useful for short in-session
 delegation. Transient provider header/stream/time-out failures are retried with
 backoff inside the child runtime before the worker is marked interrupted; if the
-retry budget is exhausted, CodeWhale preserves a checkpoint and returns a
+retry budget is exhausted, Codewhale preserves a checkpoint and returns a
 continuation handle instead of leaving the parent to infer what happened. For
 work that must survive process restarts, sleep, or remote execution, prefer
-Fleet or a WhaleFlow-backed fleet run.
+Fleet or a Workflow-backed fleet run.
 
 Sub-agents inherit the parent's tool registry by default, but child agents are
 leaf workers: they do not receive `agent` or nested lifecycle tools. `agent`
@@ -39,7 +39,7 @@ stance toward the work — not just a different label.
 
 ## Maintainer posture
 
-Sub-agents help CodeWhale move faster, but the parent agent still owns the
+Sub-agents help Codewhale move faster, but the parent agent still owns the
 maintainer decision. Use children to gather evidence, review patches, and run
 verification while keeping the community posture in
 [`AGENT_ETHOS.md`](AGENT_ETHOS.md): issues are open intake, PR gates are
@@ -88,7 +88,7 @@ approach.
 
 ## Worktree isolation
 
-For parallel edit lanes, launch the child with `worktree: true`. CodeWhale
+For parallel edit lanes, launch the child with `worktree: true`. Codewhale
 creates a fresh git worktree and branch for that child, runs the child from the
 isolated checkout, and reports the resulting workspace/branch in the returned
 session projection and worker record. By default the branch is
@@ -207,9 +207,9 @@ the next turn.
 
 ## Concurrency cap
 
-Up to **20** sub-agents can run concurrently by default (configurable via
-`[subagents].max_concurrent` in `~/.codewhale/config.toml`; the default equals
-the hard instantaneous-concurrency ceiling of 20). The session admits a bounded
+Up to **64** sub-agents run concurrently by default (`DEFAULT_MAX_SUBAGENTS`),
+configurable via `[subagents].max_concurrent` in `~/.codewhale/config.toml` up to
+the hard ceiling of **128** (`MAX_SUBAGENTS`). The session admits a bounded
 queue of up to **200** running plus queued sub-agents by default, so a turn can
 request broad fan-out and let the manager drain it without creating an
 unbounded population.
@@ -331,6 +331,49 @@ OpenRouter, Novita, SiliconFlow, SGLang, vLLM) route between that pair;
 providers without a known cheap tier (e.g. Ollama, Moonshot) skip the
 network router and keep children on the session model.
 
+## Per-profile provider routes (#3965)
+
+`[subagents.models]` changes the child model within the active provider. To pin
+a child to a different provider, use a Fleet/AgentProfile and pass it to the
+model-facing `agent` tool with `profile`. The profile's explicit `provider` +
+`model` fields win over the parent session route; omitting `provider` preserves
+the existing inherit behavior.
+
+Example: keep the parent session on DeepSeek, but run a formatter child on a
+local LM Studio OpenAI-compatible endpoint:
+
+```toml
+# ~/.codewhale/config.toml or workspace config
+provider = "deepseek"
+
+[providers.deepseek]
+api_key = "YOUR_DEEPSEEK_KEY"
+
+[providers.lm-studio]
+kind = "openai-compatible"
+base_url = "http://127.0.0.1:1234/v1"
+api_key = "lm-studio"
+model = "qwen-2.5-7b"
+```
+
+```toml
+# .codewhale/agents/local-formatter.toml
+id = "local-formatter"
+role_hint = "formatter"
+provider = "lm-studio"
+model = "qwen-2.5-7b"
+reasoning_effort = "off"
+
+[instructions]
+text = "Use small, local edits. Keep formatting changes mechanical."
+```
+
+Then call `agent(profile: "local-formatter", prompt: "...")`. In-process
+children build a client for `lm-studio`; Fleet workers forward
+`--provider lm-studio` to `codewhale exec`, which resolves the same
+`[providers.lm-studio]` table. Unknown or unconfigured provider ids fail the
+spawn rather than silently falling back to the parent provider.
+
 ## Per-step API timeout (#1806, #1808)
 
 Each sub-agent step wraps its DeepSeek `create_message` call in a
@@ -451,6 +494,11 @@ don't go through the standard write-approval flow.
 - Persisted state: `<workspace>/.codewhale/state/subagents.v1.json`. Schema
   version `1` (forward-compatible — new optional fields use
   `#[serde(default)]`).
+- Worker records are pruned by time: completed / failed / cancelled /
+  interrupted records are evicted after the same retention window used for
+  finished agents (default 1h, `COMPLETED_AGENT_RETENTION`). Running /
+  starting / waiting records are preserved. The hard cap of 256 records
+  remains as a safety bound (#4217).
 - `SubAgentRuntime::background_runtime()` starts from `child_runtime()` but
   replaces the turn-scoped child token with a fresh cancellation token, so
   parent turn cancellation does not stop detached background sessions.

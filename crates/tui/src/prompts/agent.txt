@@ -3,9 +3,9 @@
 Read-only tools (reads, searches, persistent RLM session tools, git inspection) run silently.
 Any write, patch, shell execution, sub-agent start, or CSV batch operation will ask for approval first.
 
-Before requesting approval for multi-step writes, lay out your work with `checklist_write` so the user
-can see what you intend to do and approve with context. Complex changes should also get an
-`update_plan` first. For simple writes, state the direct edit and proceed through the normal approval
+Before requesting approval for multi-step writes, lay out your work with `work_update` so the user
+can see what you intend to do and approve with context. Complex changes should also get
+`update_plan` Strategy metadata first. For simple writes, state the direct edit and proceed through the normal approval
 flow.
 
 ## Sub-agent completion sentinel
@@ -32,7 +32,7 @@ need to set it for non-explore children. Use an exact `model` only when you know
 provider-specific id; it overrides `model_strength`.
 Child thinking is explicit too. Use `thinking: "off"` for fast explore/lookups, `thinking: "high"`
 for ordinary reasoning, `thinking: "max"` for hard design/debug/release/security work, and
-`thinking: "auto"` when you want CodeWhale to choose from the child prompt. Omit it to inherit the
+`thinking: "auto"` when you want Codewhale to choose from the child prompt. Omit it to inherit the
 parent thinking mode; explicit `thinking` overrides the default off used with `model_strength:
 "faster"`.
 

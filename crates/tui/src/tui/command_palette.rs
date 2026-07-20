@@ -1,19 +1,23 @@
 //! Command palette modal for quick command/skill insertion.
+//!
+//! Product job (#4276): **find and run one action** — not a dense manual.
+//! Help owns concepts; Config owns settings; Fleet owns worker readiness.
 
+use std::cell::RefCell;
 use std::path::Path;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind};
+use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Padding, Paragraph, Widget, Wrap},
+    widgets::{Block, Borders, Padding, Paragraph, Widget},
 };
 use unicode_width::UnicodeWidthStr;
 
 use crate::commands;
-use crate::localization::Locale;
+use crate::localization::{Locale, MessageId, tr};
 use crate::palette;
 use crate::skills;
 use crate::tools::spec::ApprovalRequirement;
@@ -52,10 +56,14 @@ impl CommandPaletteEntry {
 }
 
 pub struct CommandPaletteView {
+    locale: Locale,
     entries: Vec<CommandPaletteEntry>,
     filtered: Vec<usize>,
     query: String,
     selected: usize,
+    /// Entry rows from the most recent render. Keeping the absolute filtered
+    /// index here makes mouse activation use the exact same action as Enter.
+    row_hitboxes: RefCell<Vec<(Rect, usize)>>,
 }
 
 pub fn build_entries(
@@ -65,6 +73,26 @@ pub fn build_entries(
     workspace: &Path,
     mcp_config_path: &Path,
     mcp_snapshot: Option<&crate::mcp::McpManagerSnapshot>,
+) -> Vec<CommandPaletteEntry> {
+    build_entries_with_plugins(
+        locale,
+        skills_dir,
+        skills_scan_codewhale_only,
+        workspace,
+        mcp_config_path,
+        mcp_snapshot,
+        &crate::plugins::PluginRegistry::empty(workspace),
+    )
+}
+
+pub fn build_entries_with_plugins(
+    locale: Locale,
+    skills_dir: &Path,
+    skills_scan_codewhale_only: bool,
+    workspace: &Path,
+    mcp_config_path: &Path,
+    mcp_snapshot: Option<&crate::mcp::McpManagerSnapshot>,
+    plugins: &crate::plugins::PluginRegistry,
 ) -> Vec<CommandPaletteEntry> {
     let mut entries = Vec::new();
     commands::user_registry::with_registry_for_workspace(Some(workspace), |user_registry| {
@@ -129,11 +157,13 @@ pub fn build_entries(
         }
     });
 
-    let skills = skills::discover_for_workspace_and_dir_with_mode(
+    let skills = skills::discover_for_workspace_and_dir_with_mode_and_plugins(
         workspace,
         skills_dir,
         skills::SkillDiscoveryMode::from_codewhale_only(skills_scan_codewhale_only),
-    );
+        Some(plugins),
+    )
+    .into_enabled();
     for skill in skills.list() {
         entries.push(CommandPaletteEntry {
             section: PaletteSection::Skill,
@@ -218,7 +248,12 @@ pub fn build_entries(
     tool_entries.sort_by(|a, b| a.label.cmp(&b.label));
     entries.extend(tool_entries);
 
-    entries.extend(build_mcp_entries(workspace, mcp_config_path, mcp_snapshot));
+    entries.extend(build_mcp_entries(
+        workspace,
+        mcp_config_path,
+        mcp_snapshot,
+        plugins,
+    ));
 
     entries.sort_by(|a, b| a.label.cmp(&b.label));
     entries.sort_by_key(|entry| entry.section);
@@ -251,10 +286,16 @@ fn build_mcp_entries(
     workspace: &Path,
     mcp_config_path: &Path,
     mcp_snapshot: Option<&crate::mcp::McpManagerSnapshot>,
+    plugins: &crate::plugins::PluginRegistry,
 ) -> Vec<CommandPaletteEntry> {
     let owned_snapshot = if mcp_snapshot.is_none() {
-        crate::mcp::manager_snapshot_from_config_with_workspace(mcp_config_path, workspace, false)
-            .ok()
+        crate::mcp::manager_snapshot_from_config_with_workspace_and_plugins(
+            mcp_config_path,
+            workspace,
+            false,
+            plugins,
+        )
+        .ok()
     } else {
         None
     };
@@ -438,7 +479,7 @@ fn modal_block() -> Block<'static> {
     Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
-        .style(Style::default().bg(palette::DEEPSEEK_INK))
+        .style(Style::default().bg(palette::WHALE_BG))
         .padding(Padding::uniform(1))
 }
 
@@ -682,12 +723,19 @@ fn visible_entry_window(
 }
 
 impl CommandPaletteView {
+    #[cfg(test)]
     pub fn new(entries: Vec<CommandPaletteEntry>) -> Self {
+        Self::new_for_locale(Locale::En, entries)
+    }
+
+    pub fn new_for_locale(locale: Locale, entries: Vec<CommandPaletteEntry>) -> Self {
         let mut view = Self {
+            locale,
             entries,
             filtered: Vec::new(),
             query: String::new(),
             selected: 0,
+            row_hitboxes: RefCell::new(Vec::new()),
         };
         view.refilter();
         view
@@ -743,7 +791,7 @@ impl CommandPaletteView {
         Line::from(vec![Span::styled(
             format!("  {title} ({count})  "),
             Style::default()
-                .fg(palette::DEEPSEEK_SKY)
+                .fg(palette::WHALE_INFO)
                 .add_modifier(Modifier::BOLD),
         )])
     }
@@ -800,6 +848,23 @@ impl ModalView for CommandPaletteView {
         match mouse.kind {
             MouseEventKind::ScrollUp => self.move_selection(-1),
             MouseEventKind::ScrollDown => self.move_selection(1),
+            MouseEventKind::Down(MouseButton::Left) => {
+                let clicked = self.row_hitboxes.borrow().iter().find_map(|(rect, index)| {
+                    rect.contains(ratatui::layout::Position::new(mouse.column, mouse.row))
+                        .then_some(*index)
+                });
+                if let Some(index) = clicked {
+                    if self.selected == index {
+                        if let Some(entry) = self.selected_entry() {
+                            return ViewAction::EmitAndClose(ViewEvent::CommandPaletteSelected {
+                                action: entry.action.clone(),
+                            });
+                        }
+                    } else {
+                        self.selected = index;
+                    }
+                }
+            }
             _ => {}
         }
         ViewAction::None
@@ -867,12 +932,23 @@ impl ModalView for CommandPaletteView {
     }
 
     fn render(&self, area: Rect, buf: &mut Buffer) {
+        self.row_hitboxes.borrow_mut().clear();
         let popup_area = centered_modal_area(area, 90, 22, 44, 8);
         let popup_width = popup_area.width;
 
         render_modal_surface(area, popup_area, buf);
 
-        let block = modal_block().title(" Command Palette ");
+        let title = format!(
+            " {} — {} ",
+            tr(self.locale, MessageId::CommandPaletteTitle),
+            tr(self.locale, MessageId::CommandPaletteSubtitle)
+        );
+        let block = modal_block().title(Line::from(Span::styled(
+            title,
+            Style::default()
+                .fg(palette::WHALE_INFO)
+                .add_modifier(Modifier::BOLD),
+        )));
         let inner = block.inner(popup_area);
         block.render(popup_area, buf);
 
@@ -881,14 +957,15 @@ impl ModalView for CommandPaletteView {
             buf,
             &[
                 ActionHint::new("↑/↓/j/k", "move"),
-                ActionHint::new("Enter", "run/open"),
+                ActionHint::new("Enter", "run"),
                 ActionHint::new("Esc", "close"),
             ],
         );
 
         let mut lines = Vec::new();
+        let mut entry_line_indices = Vec::new();
         let query_label = if self.query.is_empty() {
-            "Type to filter".to_string()
+            "Type to find and run one action".to_string()
         } else {
             format!("Filter: {}", self.query)
         };
@@ -994,13 +1071,23 @@ impl ModalView for CommandPaletteView {
                 }
                 line.push_str("  ");
                 line.push_str(&desc);
+                entry_line_indices.push((lines.len(), absolute));
                 lines.push(Line::from(Span::styled(line, style)));
             }
         }
 
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .render(content, buf);
+        // The palette's row-budget logic intentionally treats each logical
+        // line as one terminal row. Do not wrap here: wrapping a long query or
+        // label would both hide later entries and make mouse hitboxes lie.
+        Paragraph::new(lines).render(content, buf);
+        *self.row_hitboxes.borrow_mut() = entry_line_indices
+            .into_iter()
+            .filter_map(|(line, index)| {
+                let row = content.y.saturating_add(line as u16);
+                (row < content.bottom())
+                    .then_some((Rect::new(content.x, row, content.width, 1), index))
+            })
+            .collect();
     }
 }
 
@@ -1273,6 +1360,69 @@ mod tests {
 
         assert!(skill_labels.contains(&"$codewhale-skill"));
         assert!(!skill_labels.contains(&"$claude-skill"));
+    }
+
+    #[test]
+    fn command_palette_includes_only_active_reviewed_plugin_skills() {
+        let _env = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let _home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("home"));
+        let workspace = tmp.path().join("workspace");
+        let plugin_root = tmp.path().join("plugins/demo");
+        std::fs::create_dir_all(plugin_root.join("skills/review")).expect("plugin Skill dir");
+        std::fs::write(
+            plugin_root.join("plugin.toml"),
+            "schema_version = 1\n[plugin]\nname = \"demo\"\nversion = \"1.0.0\"\n[skills]\npath = \"skills\"\n",
+        )
+        .expect("plugin manifest");
+        std::fs::write(
+            plugin_root.join("skills/review/SKILL.md"),
+            "---\nname: review\ndescription: reviewed plugin Skill\n---\nbody\n",
+        )
+        .expect("plugin Skill");
+        let config = crate::plugins::discovery::DiscoveryConfig {
+            workspace: workspace.clone(),
+            user_plugins_dir: tmp.path().join("plugins"),
+            workspace_plugins_dir: workspace.join(".codewhale/plugins"),
+            builtin_plugin_dirs: Vec::new(),
+            state_path: tmp.path().join("plugin-state/state.json"),
+        };
+        let mut plugins = crate::plugins::discovery::discover_with_config(&config);
+        let entries_before = build_entries_with_plugins(
+            Locale::En,
+            tmp.path().join("skills").as_path(),
+            false,
+            &workspace,
+            Path::new("mcp.json"),
+            None,
+            &plugins,
+        );
+        assert!(
+            !entries_before
+                .iter()
+                .any(|entry| entry.label == "$demo:review")
+        );
+
+        plugins.trust("demo").expect("trust plugin");
+        plugins.enable("demo").expect("enable plugin");
+        let entries_after = build_entries_with_plugins(
+            Locale::En,
+            tmp.path().join("skills").as_path(),
+            false,
+            &workspace,
+            Path::new("mcp.json"),
+            None,
+            &plugins,
+        );
+        let skill = entries_after
+            .iter()
+            .find(|entry| entry.label == "$demo:review")
+            .expect("active reviewed plugin Skill should reach the palette");
+        assert!(matches!(
+            &skill.action,
+            CommandPaletteAction::ExecuteCommand { command } if command == "$demo:review"
+        ));
     }
 
     #[test]
@@ -1553,7 +1703,7 @@ mod tests {
         let snapshot = crate::mcp::McpManagerSnapshot {
             config_path: Path::new("mcp.json").to_path_buf(),
             config_exists: true,
-            restart_required: false,
+            reload_required: false,
             servers: vec![
                 crate::mcp::McpServerSnapshot {
                     name: "fs".to_string(),
@@ -1629,7 +1779,7 @@ mod tests {
         let snapshot = crate::mcp::McpManagerSnapshot {
             config_path: Path::new("mcp.json").to_path_buf(),
             config_exists: true,
-            restart_required: false,
+            reload_required: false,
             servers: vec![crate::mcp::McpServerSnapshot {
                 name: "muted".to_string(),
                 enabled: false,
@@ -1689,6 +1839,56 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn command_palette_mouse_runs_the_same_skill_action_as_enter() {
+        let entries = vec![
+            palette_entry(PaletteSection::Command, "/config", "open config", "/config"),
+            CommandPaletteEntry {
+                section: PaletteSection::Skill,
+                label: "$plugin:review".to_string(),
+                description: "review from an enabled plugin".to_string(),
+                command: "$plugin:review".to_string(),
+                action: CommandPaletteAction::ExecuteCommand {
+                    command: "$plugin:review".to_string(),
+                },
+                show_on_empty_query: true,
+            },
+        ];
+        let mut keyboard = CommandPaletteView::new(entries.clone());
+        keyboard.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::empty()));
+        let keyboard_action =
+            keyboard.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+
+        let mut mouse = CommandPaletteView::new(entries);
+        let area = Rect::new(0, 0, 100, 30);
+        let mut buf = Buffer::empty(area);
+        mouse.render(area, &mut buf);
+        let (rect, _) = mouse
+            .row_hitboxes
+            .borrow()
+            .iter()
+            .find(|(_, index)| *index == 1)
+            .copied()
+            .expect("plugin Skill row should have a mouse hitbox");
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(matches!(mouse.handle_mouse(click), ViewAction::None));
+        let mouse_action = mouse.handle_mouse(click);
+
+        for action in [keyboard_action, mouse_action] {
+            assert!(matches!(
+                action,
+                ViewAction::EmitAndClose(ViewEvent::CommandPaletteSelected {
+                    action: CommandPaletteAction::ExecuteCommand { command }
+                }) if command == "$plugin:review"
+            ));
+        }
+    }
+
     /// The four terminal sizes the v0.8.66 modal blocker (#3732) requires every
     /// overlay to remain readable and fully operable at.
     const BLOCKER_SIZES: [(u16, u16); 4] = [(80, 24), (100, 30), (120, 32), (160, 40)];
@@ -1726,17 +1926,14 @@ mod tests {
 
             // Footer keeps every action.
             assert!(text.contains("move"), "{w}x{h}: missing 'move' hint");
-            assert!(
-                text.contains("run/open"),
-                "{w}x{h}: missing 'run/open' hint"
-            );
+            assert!(text.contains("run"), "{w}x{h}: missing 'run' hint");
             assert!(text.contains("close"), "{w}x{h}: missing 'close' hint");
 
             // Composited frame is fully opaque.
             assert!(!text.contains('X'), "{w}x{h}: background bleed-through");
             assert_eq!(
                 buf[(w / 2, h / 2)].bg,
-                palette::DEEPSEEK_INK,
+                palette::WHALE_BG,
                 "{w}x{h}: modal interior must be opaque"
             );
 

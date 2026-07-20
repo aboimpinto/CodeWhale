@@ -7,13 +7,15 @@
 //! and executes them.
 
 use regex::Regex;
-use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
 use tokio::sync::mpsc::Sender;
 
+use crate::config::ApiProvider;
 use crate::core::events::Event;
+use crate::fast_hash::{FastHashMap, FastHashSet};
 use crate::llm_client::LlmClient;
 use crate::models::{ContentBlock, Message, MessageRequest, Tool};
+use crate::regex_cache::compile_user_regex;
 
 // ── Prompt‑building constants ──────────────────────────────────────────────
 
@@ -315,7 +317,7 @@ pub fn parse_purge_operations(
                     .unwrap_or("")
                     .to_string();
 
-                let pattern = Regex::new(pattern_str)
+                let pattern = compile_user_regex(pattern_str)
                     .map_err(|e| format!("operation[{i}]: invalid regex pattern: {e}"))?;
 
                 parsed.push(PurgeOp::Replace {
@@ -346,7 +348,7 @@ pub fn parse_purge_operations(
 /// prevent orphaned blocks.
 pub fn execute_purge_operations(messages: &[Message], ops: &[PurgeOp]) -> PurgeResult {
     let mut msgs = messages.to_vec();
-    let mut msg_indices_to_remove: HashSet<usize> = HashSet::new();
+    let mut msg_indices_to_remove: FastHashSet<usize> = FastHashSet::default();
     let mut replaced_count = 0usize;
 
     // Phase 1: collect removes and apply replaces.
@@ -400,14 +402,15 @@ pub fn execute_purge_operations(messages: &[Message], ops: &[PurgeOp]) -> PurgeR
 /// When a message containing a ToolUse or ToolResult is marked for removal,
 /// cascade that removal to its counterpart so the API never sees orphaned
 /// blocks. Runs a fixpoint loop until the remove set is closed under pairing.
-fn cascade_tool_pair_removals(messages: &[Message], remove_set: &mut HashSet<usize>) {
+fn cascade_tool_pair_removals(messages: &[Message], remove_set: &mut FastHashSet<usize>) {
     if remove_set.is_empty() {
         return;
     }
 
-    // Build lookup maps: tool_use id → message index, tool_result id → message index.
-    let mut call_id_to_idx: HashMap<String, usize> = HashMap::new();
-    let mut result_id_to_idx: HashMap<String, usize> = HashMap::new();
+    // Internal transcript IDs and message indices are assigned by the engine,
+    // so this per-purge pairing pass can use the faster non-cryptographic hasher.
+    let mut call_id_to_idx: FastHashMap<String, usize> = FastHashMap::default();
+    let mut result_id_to_idx: FastHashMap<String, usize> = FastHashMap::default();
 
     for (idx, msg) in messages.iter().enumerate() {
         for block in &msg.content {
@@ -530,6 +533,7 @@ pub fn build_purge_tool() -> Tool {
 /// and for replacing the session message list with `PurgeResult.messages`.
 pub async fn run_purge(
     client: &impl LlmClient,
+    provider: ApiProvider,
     messages: &[Message],
     model: &str,
     reasoning_effort: Option<String>,
@@ -571,7 +575,7 @@ pub async fn run_purge(
         .await
         .map_err(|e| format!("Purge API error: {e}"))?;
 
-    crate::cost_status::report(&response.model, &response.usage);
+    crate::cost_status::report(provider, &response.model, &response.usage);
 
     // 5. Find the `purge_context` tool call in the response.
     let tool_input = response.content.iter().find_map(|block| {
@@ -847,7 +851,7 @@ mod tests {
             msg_text("user", "bye"),
         ];
 
-        let result = run_purge(&mock, &messages, "mock", None, 4096)
+        let result = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
             .await
             .unwrap();
         assert_eq!(result.removed_count, 1);
@@ -859,7 +863,7 @@ mod tests {
         } else {
             panic!(
                 "expected text block, got {:?}",
-                &result.messages[0].content[0]
+                result.messages[0].content[0]
             );
         }
         if let ContentBlock::Text { text, .. } = &result.messages[1].content[0] {
@@ -867,7 +871,7 @@ mod tests {
         } else {
             panic!(
                 "expected text block, got {:?}",
-                &result.messages[1].content[0]
+                result.messages[1].content[0]
             );
         }
     }
@@ -881,7 +885,7 @@ mod tests {
 
         let messages = vec![msg_text("assistant", "this is very long and verbose text")];
 
-        let result = run_purge(&mock, &messages, "mock", None, 4096)
+        let result = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
             .await
             .unwrap();
         assert_eq!(result.removed_count, 0);
@@ -892,7 +896,7 @@ mod tests {
         } else {
             panic!(
                 "expected text block, got {:?}",
-                &result.messages[0].content[0]
+                result.messages[0].content[0]
             );
         }
     }
@@ -903,7 +907,7 @@ mod tests {
         mock.push_message_response(msg_response_without_tool_call("nothing to clean up"));
 
         let messages = vec![msg_text("user", "hi")];
-        let err = run_purge(&mock, &messages, "mock", None, 4096)
+        let err = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
             .await
             .unwrap_err();
         assert!(err.contains("did not call purge_context"));
@@ -914,7 +918,7 @@ mod tests {
         // No canned response — MockLlmClient returns an error.
         let mock = MockLlmClient::new(vec![]);
         let messages = vec![msg_text("user", "hi")];
-        let err = run_purge(&mock, &messages, "mock", None, 4096)
+        let err = run_purge(&mock, ApiProvider::Deepseek, &messages, "mock", None, 4096)
             .await
             .unwrap_err();
         assert!(err.contains("Purge API error"));

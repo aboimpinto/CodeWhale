@@ -10,6 +10,7 @@ use super::spec::{
 };
 use async_trait::async_trait;
 use serde_json::{Value, json};
+#[cfg(feature = "pdf")]
 use std::fmt::Display;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -18,6 +19,71 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 // === ReadFileTool ===
+
+fn canonical_path_for_credential_guard(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(path)
+        }
+    })
+}
+
+fn config_backup_path_for_credential_guard(config_path: &Path) -> PathBuf {
+    let mut file_name = config_path
+        .file_name()
+        .map(std::ffi::OsString::from)
+        .unwrap_or_else(|| std::ffi::OsString::from(codewhale_config::CONFIG_FILE_NAME));
+    file_name.push(".bak");
+    config_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(file_name)
+}
+
+fn is_config_or_backup(candidate: &Path, config_path: &Path) -> bool {
+    let config_path = canonical_path_for_credential_guard(config_path);
+    let backup_path =
+        canonical_path_for_credential_guard(&config_backup_path_for_credential_guard(&config_path));
+    candidate == config_path || candidate == backup_path
+}
+
+/// Return whether `read_file` must refuse a CodeWhale-owned credential file.
+///
+/// This is deliberately scoped to the active config, the two conventional
+/// config locations (including one-time backups), and CodeWhale's file-backed
+/// secret-store directories. Other dotfiles remain readable. Model-bound
+/// redaction is still required because shell tools can read these files and
+/// arbitrary commands can print credentials without reading a file at all.
+fn is_codewhale_credential_path(path: &Path) -> bool {
+    let candidate = canonical_path_for_credential_guard(path);
+
+    if let Ok(active_config) = codewhale_config::resolve_config_path(None)
+        && is_config_or_backup(&candidate, &active_config)
+    {
+        return true;
+    }
+
+    let roots = [
+        codewhale_config::codewhale_home(),
+        codewhale_config::legacy_deepseek_home(),
+    ];
+    for root in roots.into_iter().flatten() {
+        if is_config_or_backup(&candidate, &root.join(codewhale_config::CONFIG_FILE_NAME)) {
+            return true;
+        }
+
+        let secrets_dir = canonical_path_for_credential_guard(&root.join("secrets"));
+        if candidate.starts_with(secrets_dir) {
+            return true;
+        }
+    }
+
+    false
+}
 
 /// Tool for reading UTF-8 files from the workspace.
 pub struct ReadFileTool;
@@ -29,7 +95,7 @@ impl ToolSpec for ReadFileTool {
     }
 
     fn description(&self) -> &'static str {
-        "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `exec_shell` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is and records the file snapshot required before `edit_file` will make a narrow in-place edit. PDFs are auto-extracted via the bundled pure-Rust extractor (no Poppler install required). Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns at most 200 lines (~16KB). If `truncated=\"true\"` in the response, use `next_start_line` to continue reading. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
+        "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `exec_shell` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is and records the file snapshot required before `edit_file` will make a narrow in-place edit. CodeWhale config files and file-backed credential stores cannot be read with this tool; use `codewhale config list` or `codewhale auth status` for safe inspection. PDFs are auto-extracted via the bundled pure-Rust extractor (no Poppler install required). Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns at most 200 lines (~16KB). If `truncated=\"true\"` in the response, use `next_start_line` to continue reading. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
     }
 
     fn input_schema(&self) -> Value {
@@ -66,22 +132,13 @@ impl ToolSpec for ReadFileTool {
     }
 
     async fn execute(&self, input: Value, context: &ToolContext) -> Result<ToolResult, ToolError> {
-        // Bounded output for large files. The small-file fast path keeps the
-        // historical "return contents unchanged" behavior so existing flows
-        // (small configs, single source files, etc.) don't suddenly start
-        // seeing wrapped output. Once a file is large or the caller asks
-        // for an explicit range, we switch to a numbered, line-tagged
-        // window with continuation hints so the model can page through
-        // without re-loading the entire file on every turn. Harvested
-        // from PR #1451 by @Oliver-ZPLiu, closes part of #1450.
-        const DEFAULT_READ_LINES: usize = 200;
-        const HARD_MAX_READ_LINES: usize = 500;
-        const MAX_VISIBLE_BYTES: usize = 16 * 1024;
-        const SMALL_FILE_LINES: usize = 200;
-        const SMALL_FILE_BYTES: usize = 16 * 1024;
-
         let path_str = required_str(&input, "path")?;
         let file_path = context.resolve_path(path_str)?;
+        if is_codewhale_credential_path(&file_path) {
+            return Err(ToolError::permission_denied(
+                "read_file cannot expose CodeWhale configuration or credential-store files; use `codewhale config list` or `codewhale auth status` for safe inspection",
+            ));
+        }
         let pages = optional_str(&input, "pages");
 
         if is_pdf(&file_path)? {
@@ -91,13 +148,14 @@ impl ToolSpec for ReadFileTool {
             return read_image_via_ocr(&file_path, path_str);
         }
 
-        let contents = fs::read_to_string(&file_path).map_err(|e| {
+        // Open before parameter parsing so a missing file keeps the
+        // historical "Failed to read …" error shape regardless of the other
+        // arguments.
+        let file = fs::File::open(&file_path).map_err(|e| {
             ToolError::execution_failed(format!("Failed to read {}: {}", file_path.display(), e))
         })?;
-        context.note_file_read(&file_path);
+        let file_bytes = file.metadata().map(|meta| meta.len()).unwrap_or(u64::MAX);
 
-        let total_lines = contents.lines().count();
-        let total_bytes = contents.len();
         let explicit_range = input
             .get("start_line")
             .or_else(|| input.get("max_lines"))
@@ -106,8 +164,36 @@ impl ToolSpec for ReadFileTool {
         // Small-file fast path. Only applies when the caller didn't pass an
         // explicit range — otherwise an explicit `start_line = 5` on a
         // tiny file would silently ignore the request.
-        if !explicit_range && total_lines <= SMALL_FILE_LINES && total_bytes <= SMALL_FILE_BYTES {
-            return Ok(ToolResult::success(contents));
+        if !explicit_range && file_bytes <= SMALL_FILE_BYTES as u64 {
+            drop(file);
+            let contents = fs::read_to_string(&file_path).map_err(|e| {
+                ToolError::execution_failed(format!(
+                    "Failed to read {}: {}",
+                    file_path.display(),
+                    e
+                ))
+            })?;
+            context.note_file_read(&file_path);
+
+            let total_lines = contents.lines().count();
+            if total_lines <= SMALL_FILE_LINES {
+                return Ok(ToolResult::success(contents));
+            }
+
+            // Small in bytes but too many lines: render the default window
+            // straight from the in-memory contents.
+            let window: Vec<String> = contents
+                .lines()
+                .take(DEFAULT_READ_LINES)
+                .map(str::to_string)
+                .collect();
+            return Ok(render_line_window(
+                path_str,
+                &window,
+                total_lines,
+                1,
+                DEFAULT_READ_LINES,
+            ));
         }
 
         let start_line = match input.get("start_line").and_then(Value::as_u64) {
@@ -141,6 +227,20 @@ impl ToolSpec for ReadFileTool {
             None => DEFAULT_READ_LINES,
         };
 
+        // Bounded read for ranged/large files: skip and take lines through a
+        // BufReader instead of materializing the whole file. The stream still
+        // runs to EOF so the total line count and whole-file UTF-8 validation
+        // match the historical read_to_string behavior.
+        let (window, total_lines) =
+            read_window_streaming(file, start_line, max_lines).map_err(|e| {
+                ToolError::execution_failed(format!(
+                    "Failed to read {}: {}",
+                    file_path.display(),
+                    e
+                ))
+            })?;
+        context.note_file_read(&file_path);
+
         // `start_line > total_lines` is not an error — it lets the model
         // page past the end without raising. Returns an empty-content
         // sentinel so subsequent reads can stop.
@@ -154,56 +254,137 @@ impl ToolSpec for ReadFileTool {
             return Ok(ToolResult::success(output));
         }
 
-        let lines: Vec<&str> = contents.lines().collect();
-        let zero_based_start = start_line - 1;
-        let zero_based_end = std::cmp::min(zero_based_start + max_lines, total_lines);
-        let shown_first = start_line;
-        let shown_last = zero_based_end; // 1-based inclusive line number of the last shown line
+        Ok(render_line_window(
+            path_str,
+            &window,
+            total_lines,
+            start_line,
+            max_lines,
+        ))
+    }
+}
 
-        let mut numbered = String::new();
-        for (offset, line) in lines[zero_based_start..zero_based_end].iter().enumerate() {
-            let line_no = start_line + offset;
-            numbered.push_str(&format!("{line_no:>6}│ {line}\n"));
+// Bounded output for large files. The small-file fast path keeps the
+// historical "return contents unchanged" behavior so existing flows
+// (small configs, single source files, etc.) don't suddenly start
+// seeing wrapped output. Once a file is large or the caller asks
+// for an explicit range, we switch to a numbered, line-tagged
+// window with continuation hints so the model can page through
+// without re-loading the entire file on every turn. Harvested
+// from PR #1451 by @Oliver-ZPLiu, closes part of #1450.
+const DEFAULT_READ_LINES: usize = 200;
+const HARD_MAX_READ_LINES: usize = 500;
+const MAX_VISIBLE_BYTES: usize = 16 * 1024;
+const SMALL_FILE_LINES: usize = 200;
+const SMALL_FILE_BYTES: usize = 16 * 1024;
+
+/// Stream a line window out of `file`: skip `start_line - 1` lines, collect
+/// up to `max_lines`, then keep counting (and validating UTF-8) to EOF.
+/// Returns the collected window plus the total line count. Only the window
+/// is ever held in memory.
+fn read_window_streaming(
+    file: fs::File,
+    start_line: usize,
+    max_lines: usize,
+) -> std::io::Result<(Vec<String>, usize)> {
+    use std::io::BufRead;
+
+    let mut reader = std::io::BufReader::new(file);
+    let mut raw: Vec<u8> = Vec::new();
+    let mut window: Vec<String> = Vec::new();
+    let mut total_lines = 0usize;
+    let start_idx = start_line - 1;
+
+    loop {
+        raw.clear();
+        let n = reader.read_until(b'\n', &mut raw)?;
+        if n == 0 {
+            break;
         }
-
-        // UTF-8-safe byte truncation of the rendered range.
-        let truncated_by_bytes = numbered.len() > MAX_VISIBLE_BYTES;
-        let shown_content = if truncated_by_bytes {
-            let mut end = MAX_VISIBLE_BYTES;
-            while end > 0 && !numbered.is_char_boundary(end) {
+        // Mirror `str::lines`: strip the trailing '\n', and a '\r' only when
+        // it directly precedes that '\n'.
+        let mut end = raw.len();
+        if raw[..end].ends_with(b"\n") {
+            end -= 1;
+            if raw[..end].ends_with(b"\r") {
                 end -= 1;
             }
-            &numbered[..end]
-        } else {
-            &numbered
-        };
-
-        let truncated_by_lines = zero_based_end < total_lines;
-        let truncated = truncated_by_lines || truncated_by_bytes;
-        let next_start = zero_based_end + 1;
-
-        let mut attrs = format!(
-            "path=\"{path_str}\" total_lines=\"{total_lines}\" shown_lines=\"{shown_first}-{shown_last}\" truncated=\"{truncated}\""
-        );
-        if truncated_by_lines {
-            attrs.push_str(&format!(" next_start_line=\"{next_start}\""));
         }
-
-        let mut output = format!("<file {attrs}>\n{shown_content}");
-        if truncated_by_lines {
-            output.push_str(&format!(
-                "\n[TRUNCATED] Showing lines {shown_first}-{shown_last} of {total_lines}. To continue, call read_file with path=\"{path_str}\" start_line={next_start} max_lines={max_lines}\n"
-            ));
+        // Validate every line so invalid UTF-8 anywhere in the file fails
+        // exactly like the previous whole-file read_to_string did.
+        let line = std::str::from_utf8(&raw[..end]).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "stream did not contain valid UTF-8",
+            )
+        })?;
+        if total_lines >= start_idx && window.len() < max_lines {
+            window.push(line.to_string());
         }
-        if truncated_by_bytes {
-            output.push_str(
-                "\n[TRUNCATED] The selected range exceeded 16KB. Continue with a smaller max_lines value.\n",
-            );
-        }
-        output.push_str("</file>");
-
-        Ok(ToolResult::success(output))
+        total_lines += 1;
     }
+
+    Ok((window, total_lines))
+}
+
+/// Render a collected line window into the `<file …>` wrapper used for
+/// ranged/large reads. `window` must hold the lines for
+/// `start_line..start_line + max_lines` (clamped to EOF).
+fn render_line_window(
+    path_str: &str,
+    window: &[String],
+    total_lines: usize,
+    start_line: usize,
+    max_lines: usize,
+) -> ToolResult {
+    let zero_based_start = start_line - 1;
+    let zero_based_end = std::cmp::min(zero_based_start + max_lines, total_lines);
+    let shown_first = start_line;
+    let shown_last = zero_based_end; // 1-based inclusive line number of the last shown line
+
+    let mut numbered = String::new();
+    for (offset, line) in window.iter().enumerate() {
+        let line_no = start_line + offset;
+        numbered.push_str(&format!("{line_no:>6}│ {line}\n"));
+    }
+
+    // UTF-8-safe byte truncation of the rendered range.
+    let truncated_by_bytes = numbered.len() > MAX_VISIBLE_BYTES;
+    let shown_content = if truncated_by_bytes {
+        let mut end = MAX_VISIBLE_BYTES;
+        while end > 0 && !numbered.is_char_boundary(end) {
+            end -= 1;
+        }
+        &numbered[..end]
+    } else {
+        &numbered
+    };
+
+    let truncated_by_lines = zero_based_end < total_lines;
+    let truncated = truncated_by_lines || truncated_by_bytes;
+    let next_start = zero_based_end + 1;
+
+    let mut attrs = format!(
+        "path=\"{path_str}\" total_lines=\"{total_lines}\" shown_lines=\"{shown_first}-{shown_last}\" truncated=\"{truncated}\""
+    );
+    if truncated_by_lines {
+        attrs.push_str(&format!(" next_start_line=\"{next_start}\""));
+    }
+
+    let mut output = format!("<file {attrs}>\n{shown_content}");
+    if truncated_by_lines {
+        output.push_str(&format!(
+            "\n[TRUNCATED] Showing lines {shown_first}-{shown_last} of {total_lines}. To continue, call read_file with path=\"{path_str}\" start_line={next_start} max_lines={max_lines}\n"
+        ));
+    }
+    if truncated_by_bytes {
+        output.push_str(
+            "\n[TRUNCATED] The selected range exceeded 16KB. Continue with a smaller max_lines value.\n",
+        );
+    }
+    output.push_str("</file>");
+
+    ToolResult::success(output)
 }
 
 fn read_image_via_ocr(path: &Path, requested_path: &str) -> Result<ToolResult, ToolError> {
@@ -344,10 +525,18 @@ fn read_pdf(path: &Path, pages: Option<&str>) -> Result<ToolResult, ToolError> {
     if prefer_external {
         read_pdf_via_pdftotext(path, page_range)
     } else {
-        read_pdf_via_pdf_extract(path, page_range)
+        #[cfg(feature = "pdf")]
+        {
+            read_pdf_via_pdf_extract(path, page_range)
+        }
+        #[cfg(not(feature = "pdf"))]
+        {
+            read_pdf_via_pdftotext(path, page_range)
+        }
     }
 }
 
+#[cfg(feature = "pdf")]
 fn read_pdf_via_pdf_extract(
     path: &Path,
     page_range: Option<(u32, u32)>,
@@ -545,7 +734,7 @@ impl ToolSpec for WriteFileTool {
             })?;
         }
 
-        crate::utils::write_atomic(&file_path, file_content.as_bytes()).map_err(|e| {
+        crate::utils::write_atomic_workspace(&file_path, file_content.as_bytes()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
         })?;
         context.note_file_read(&file_path);
@@ -702,7 +891,7 @@ impl ToolSpec for EditFileTool {
             (contents.replace(search, replace), count, None)
         };
 
-        crate::utils::write_atomic(&file_path, updated.as_bytes()).map_err(|e| {
+        crate::utils::write_atomic_workspace(&file_path, updated.as_bytes()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
         })?;
         context.note_file_read(&file_path);
@@ -759,6 +948,18 @@ fn line_start_before(input: &str, idx: usize) -> usize {
         .map_or(0, |newline| newline.saturating_add(1))
 }
 
+fn next_char_boundary(input: &str, idx: usize) -> usize {
+    if idx >= input.len() {
+        return input.len();
+    }
+
+    let mut next = idx.saturating_add(1);
+    while next < input.len() && !input.is_char_boundary(next) {
+        next = next.saturating_add(1);
+    }
+    next
+}
+
 fn leading_whitespace_fuzzy_matches(contents: &str, search: &str) -> Vec<(usize, usize)> {
     let (normalized_contents, byte_map) = strip_line_leading_whitespace_with_map(contents);
     let (normalized_search, _) = strip_line_leading_whitespace_with_map(search);
@@ -788,7 +989,7 @@ fn leading_whitespace_fuzzy_matches(contents: &str, search: &str) -> Vec<(usize,
             };
         let original_end = byte_map.get(norm_end).copied().unwrap_or(contents.len());
         matches.push((original_start, original_end));
-        cursor = norm_start.saturating_add(1);
+        cursor = next_char_boundary(&normalized_contents, norm_start);
     }
     matches
 }
@@ -850,7 +1051,7 @@ fn punctuation_normalized_matches(contents: &str, search: &str) -> Vec<(usize, u
         };
         let original_end = byte_map.get(norm_end).copied().unwrap_or(contents.len());
         matches.push((original_start, original_end));
-        cursor = norm_start.saturating_add(1);
+        cursor = next_char_boundary(&norm_contents, norm_start);
     }
     matches
 }
@@ -861,6 +1062,13 @@ fn punctuation_normalized_matches(contents: &str, search: &str) -> Vec<(usize, u
 pub struct ListDirTool;
 
 const LIST_DIR_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Cap on entries returned by a single `list_dir` call so a huge directory
+/// (node_modules, build output, photo dumps) can't balloon the tool result.
+/// Mirrors the bounded-output idiom of `read_file`'s `HARD_MAX_READ_LINES`.
+/// Directories at or under the cap keep the historical plain-array response;
+/// larger ones return an object with truncation metadata.
+const LIST_DIR_MAX_ENTRIES: usize = 500;
 
 #[async_trait]
 impl ToolSpec for ListDirTool {
@@ -909,7 +1117,7 @@ async fn list_dir_entries_async(
     dir_path: PathBuf,
     cancel_token: Option<CancellationToken>,
     timeout: Duration,
-) -> Result<Vec<Value>, ToolError> {
+) -> Result<Value, ToolError> {
     let worker_cancel_token = cancel_token.clone();
     run_blocking_list_dir(timeout, cancel_token, move || {
         list_dir_entries(&dir_path, worker_cancel_token.as_ref())
@@ -921,9 +1129,9 @@ async fn run_blocking_list_dir<F>(
     timeout: Duration,
     cancel_token: Option<CancellationToken>,
     list_dir: F,
-) -> Result<Vec<Value>, ToolError>
+) -> Result<Value, ToolError>
 where
-    F: FnOnce() -> Result<Vec<Value>, ToolError> + Send + 'static,
+    F: FnOnce() -> Result<Value, ToolError> + Send + 'static,
 {
     if cancel_token
         .as_ref()
@@ -953,10 +1161,11 @@ where
 fn list_dir_entries(
     dir_path: &Path,
     cancel_token: Option<&CancellationToken>,
-) -> Result<Vec<Value>, ToolError> {
+) -> Result<Value, ToolError> {
     check_list_dir_cancelled(cancel_token)?;
 
     let mut entries = Vec::new();
+    let mut total_entries = 0usize;
 
     for entry in fs::read_dir(dir_path).map_err(|e| {
         ToolError::execution_failed(format!(
@@ -968,6 +1177,12 @@ fn list_dir_entries(
         check_list_dir_cancelled(cancel_token)?;
 
         let entry = entry.map_err(|e| ToolError::execution_failed(e.to_string()))?;
+        total_entries += 1;
+        // Past the cap, keep counting for the truncation metadata but stop
+        // materializing entries.
+        if entries.len() >= LIST_DIR_MAX_ENTRIES {
+            continue;
+        }
         let file_type = entry
             .file_type()
             .map_err(|e| ToolError::execution_failed(e.to_string()))?;
@@ -978,7 +1193,16 @@ fn list_dir_entries(
         }));
     }
 
-    Ok(entries)
+    if total_entries > entries.len() {
+        Ok(json!({
+            "entries": entries,
+            "listed_entries": LIST_DIR_MAX_ENTRIES,
+            "total_entries": total_entries,
+            "truncated": true,
+        }))
+    } else {
+        Ok(Value::Array(entries))
+    }
 }
 
 fn check_list_dir_cancelled(cancel_token: Option<&CancellationToken>) -> Result<(), ToolError> {
@@ -989,7 +1213,7 @@ fn check_list_dir_cancelled(cancel_token: Option<&CancellationToken>) -> Result<
 }
 
 fn list_dir_cancelled() -> ToolError {
-    ToolError::execution_failed("list_dir cancelled before completion")
+    ToolError::cancelled("list_dir cancelled before completion")
 }
 
 fn list_dir_timeout(timeout: Duration) -> ToolError {
@@ -1029,6 +1253,50 @@ mod tests {
 
         assert!(result.success);
         assert_eq!(result.content, "hello world");
+    }
+
+    // This test deliberately serializes process-global environment changes
+    // while awaiting the tool path.
+    #[allow(clippy::await_holding_lock)]
+    #[tokio::test]
+    async fn read_file_denies_codewhale_config_backups_and_secret_store() {
+        let _env_lock = crate::test_support::lock_test_env();
+        let tmp = tempdir().expect("tempdir");
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path());
+        let _config_path = crate::test_support::EnvVarGuard::remove("CODEWHALE_CONFIG_PATH");
+        let _legacy_config_path = crate::test_support::EnvVarGuard::remove("DEEPSEEK_CONFIG_PATH");
+
+        fs::write(tmp.path().join("config.toml"), "api_key = \"secret\"\n").expect("write config");
+        fs::write(
+            tmp.path().join("config.toml.bak"),
+            "api_key = \"old-secret\"\n",
+        )
+        .expect("write config backup");
+        fs::create_dir_all(tmp.path().join("secrets")).expect("create secrets dir");
+        fs::write(
+            tmp.path().join("secrets").join("secrets.json"),
+            r#"{"provider":"secret"}"#,
+        )
+        .expect("write file keyring");
+        fs::write(tmp.path().join("notes.txt"), "ordinary workspace data")
+            .expect("write ordinary file");
+
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        for path in ["config.toml", "config.toml.bak", "secrets/secrets.json"] {
+            let err = ReadFileTool
+                .execute(json!({"path": path}), &ctx)
+                .await
+                .expect_err("credential-bearing CodeWhale file must be denied");
+            let message = err.to_string();
+            assert!(message.contains("cannot expose CodeWhale"), "{message}");
+            assert!(message.contains("codewhale config list"), "{message}");
+        }
+
+        let ordinary = ReadFileTool
+            .execute(json!({"path": "notes.txt"}), &ctx)
+            .await
+            .expect("ordinary workspace file should remain readable");
+        assert_eq!(ordinary.content, "ordinary workspace data");
     }
 
     #[tokio::test]
@@ -1275,6 +1543,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_file_streamed_range_on_large_file_matches_windowed_contract() {
+        // Over 16KB forces the streamed BufRead path even without an
+        // explicit range; assert the ranged output stays byte-compatible
+        // with the historical full-read implementation.
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let file = tmp.path().join("large.txt");
+        let body: String = (1..=2000)
+            .map(|n| format!("line {n} {}\n", "x".repeat(20)))
+            .collect();
+        assert!(body.len() > 16 * 1024, "fixture must exceed 16KB");
+        fs::write(&file, &body).expect("write");
+
+        let tool = ReadFileTool;
+        let result = tool
+            .execute(
+                json!({ "path": "large.txt", "start_line": 1500, "max_lines": 10 }),
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        assert!(result.success);
+        assert!(result.content.contains("total_lines=\"2000\""));
+        assert!(result.content.contains("shown_lines=\"1500-1509\""));
+        assert!(result.content.contains("next_start_line=\"1510\""));
+        assert!(result.content.contains("  1500│ line 1500"));
+        assert!(result.content.contains("  1509│ line 1509"));
+        assert!(!result.content.contains("  1510│"));
+        assert!(result.content.contains(
+            "[TRUNCATED] Showing lines 1500-1509 of 2000. To continue, call read_file with path=\"large.txt\" start_line=1510 max_lines=10"
+        ));
+
+        // Default window (no range) on the same large file starts at line 1.
+        let default_window = tool
+            .execute(json!({ "path": "large.txt" }), &ctx)
+            .await
+            .expect("execute");
+        assert!(default_window.content.contains("shown_lines=\"1-200\""));
+        assert!(default_window.content.contains("next_start_line=\"201\""));
+        assert!(default_window.content.contains("     1│ line 1"));
+
+        // Paging past EOF returns the no-content sentinel, not an error.
+        let past_end = tool
+            .execute(json!({ "path": "large.txt", "start_line": 5000 }), &ctx)
+            .await
+            .expect("execute");
+        assert!(past_end.content.contains("[NO CONTENT]"));
+        assert!(past_end.content.contains("shown_lines=\"none\""));
+    }
+
+    #[tokio::test]
+    async fn read_file_streamed_range_rejects_invalid_utf8_like_full_read() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let file = tmp.path().join("mixed.bin");
+        // Valid first lines, invalid bytes later: the streamed path must
+        // still fail the whole read like read_to_string did.
+        let mut bytes = b"good line\n".repeat(5);
+        bytes.extend_from_slice(&[0xFF, 0xFE, b'\n']);
+        fs::write(&file, &bytes).expect("write");
+
+        let err = ReadFileTool
+            .execute(
+                json!({ "path": "mixed.bin", "start_line": 1, "max_lines": 2 }),
+                &ctx,
+            )
+            .await
+            .expect_err("invalid UTF-8 must error");
+        let message = err.to_string();
+        assert!(message.contains("Failed to read"), "{message}");
+        assert!(message.contains("valid UTF-8"), "{message}");
+    }
+
+    #[tokio::test]
     async fn test_read_file_missing_path() {
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
@@ -1387,7 +1730,7 @@ mod tests {
         assert!(
             result.content.contains("Recursive Language Models"),
             "pdf-extract should recover the document title; got prefix {:?}",
-            &result.content.chars().take(200).collect::<String>()
+            result.content.chars().take(200).collect::<String>()
         );
     }
 
@@ -1585,6 +1928,93 @@ mod tests {
         // Verify nested file was created
         let written = fs::read_to_string(tmp.path().join("subdir/nested/file.txt")).expect("read");
         assert_eq!(written, "nested content");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_tool_new_file_matches_standard_creation_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let control = tmp.path().join("control.txt");
+        fs::write(&control, b"control").expect("write control");
+
+        WriteFileTool
+            .execute(
+                json!({"path": "created.txt", "content": "from write_file"}),
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        let control_mode = fs::metadata(&control)
+            .expect("control metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let created_mode = fs::metadata(tmp.path().join("created.txt"))
+            .expect("created metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(created_mode, control_mode);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn write_file_tool_preserves_existing_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let path = tmp.path().join("shared.txt");
+        fs::write(&path, b"before").expect("initial write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o664))
+            .expect("set shared permissions");
+
+        WriteFileTool
+            .execute(json!({"path": "shared.txt", "content": "after"}), &ctx)
+            .await
+            .expect("execute");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o664);
+        assert_eq!(fs::read_to_string(&path).expect("read"), "after");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_file_tool_preserves_executable_bits() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let path = tmp.path().join("script.sh");
+        fs::write(&path, b"#!/bin/sh\nexit 0\n").expect("initial write");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755))
+            .expect("set executable permissions");
+        read_before_edit(&ctx, "script.sh").await;
+
+        EditFileTool
+            .execute(
+                json!({
+                    "path": "script.sh",
+                    "search": "exit 0",
+                    "replace": "exit 1"
+                }),
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        let mode = fs::metadata(&path).expect("metadata").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        assert_eq!(
+            fs::read_to_string(&path).expect("read"),
+            "#!/bin/sh\nexit 1\n"
+        );
     }
 
     #[tokio::test]
@@ -1792,6 +2222,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_edit_file_fuzz_tolerates_leading_whitespace_after_multibyte_start() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let test_file = tmp.path().join("fuzzy_cjk.txt");
+        fs::write(&test_file, "数据\n").expect("write");
+        read_before_edit(&ctx, "fuzzy_cjk.txt").await;
+
+        let tool = EditFileTool;
+        let result = tool
+            .execute(
+                json!({
+                    "path": "fuzzy_cjk.txt",
+                    "search": "    数据",
+                    "replace": "记录",
+                    "fuzz": true
+                }),
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        assert!(result.success, "{}", result.content);
+        assert!(result.content.contains("fuzzy indentation match"));
+        let edited = fs::read_to_string(&test_file).expect("read");
+        assert_eq!(edited, "记录\n");
+    }
+
+    #[tokio::test]
     async fn test_edit_file_fuzz_tolerates_smart_quote_substitution() {
         // The file on disk has ASCII quotes. The search comes from a
         // browser paste with curly quotes. Exact match fails; the
@@ -1826,6 +2285,35 @@ mod tests {
         );
         let edited = fs::read_to_string(&test_file).expect("read");
         assert_eq!(edited, "let s = \"hello universe\";\n");
+    }
+
+    #[tokio::test]
+    async fn test_edit_file_fuzz_tolerates_smart_quote_after_multibyte_start() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+
+        let test_file = tmp.path().join("smart_cjk.md");
+        fs::write(&test_file, "数据 \"x\"\n").expect("write");
+        read_before_edit(&ctx, "smart_cjk.md").await;
+
+        let tool = EditFileTool;
+        let result = tool
+            .execute(
+                json!({
+                    "path": "smart_cjk.md",
+                    "search": "数据 \u{201C}x\u{201D}",
+                    "replace": "数据 y",
+                    "fuzz": true
+                }),
+                &ctx,
+            )
+            .await
+            .expect("execute");
+
+        assert!(result.success, "{}", result.content);
+        assert!(result.content.contains("fuzzy punctuation match"));
+        let edited = fs::read_to_string(&test_file).expect("read");
+        assert_eq!(edited, "数据 y\n");
     }
 
     #[tokio::test]
@@ -1963,7 +2451,11 @@ mod tests {
         assert!(result.content.contains("file1.txt"));
         assert!(result.content.contains("file2.txt"));
         assert!(result.content.contains("subdir"));
-        assert!(result.content.contains("\"is_dir\": true"));
+        let entries: Value = serde_json::from_str(&result.content).expect("list_dir json");
+        assert!(entries.as_array().expect("entries").iter().any(|entry| {
+            entry.get("name").and_then(Value::as_str) == Some("subdir")
+                && entry.get("is_dir").and_then(Value::as_bool) == Some(true)
+        }));
     }
 
     #[tokio::test]
@@ -1984,6 +2476,52 @@ mod tests {
 
         assert!(result.success);
         assert!(result.content.contains("nested.txt"));
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_small_dir_keeps_plain_array_response() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        fs::write(tmp.path().join("only.txt"), "").expect("write");
+
+        let tool = ListDirTool;
+        let result = tool.execute(json!({}), &ctx).await.expect("execute");
+
+        let parsed: Value = serde_json::from_str(&result.content).expect("json");
+        assert!(
+            parsed.is_array(),
+            "small dirs must keep the historical array shape: {parsed}"
+        );
+        assert_eq!(parsed.as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_list_dir_caps_entries_with_truncation_metadata() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let extra = 7;
+        for i in 0..LIST_DIR_MAX_ENTRIES + extra {
+            fs::write(tmp.path().join(format!("f{i:04}.txt")), "").expect("write");
+        }
+
+        let tool = ListDirTool;
+        let result = tool.execute(json!({}), &ctx).await.expect("execute");
+
+        let parsed: Value = serde_json::from_str(&result.content).expect("json");
+        assert!(parsed.is_object(), "oversized dirs return an object");
+        assert_eq!(parsed["truncated"], json!(true));
+        assert_eq!(
+            parsed["listed_entries"].as_u64().unwrap() as usize,
+            LIST_DIR_MAX_ENTRIES
+        );
+        assert_eq!(
+            parsed["total_entries"].as_u64().unwrap() as usize,
+            LIST_DIR_MAX_ENTRIES + extra
+        );
+        assert_eq!(
+            parsed["entries"].as_array().unwrap().len(),
+            LIST_DIR_MAX_ENTRIES
+        );
     }
 
     #[tokio::test]
@@ -2010,7 +2548,7 @@ mod tests {
     async fn test_list_dir_blocking_wrapper_reports_timeout() {
         let err = run_blocking_list_dir(Duration::from_millis(1), None, || {
             std::thread::sleep(Duration::from_millis(50));
-            Ok(Vec::new())
+            Ok(Value::Array(Vec::new()))
         })
         .await
         .expect_err("slow list_dir worker should time out");

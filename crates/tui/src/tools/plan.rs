@@ -47,7 +47,7 @@ impl StepStatus {
 }
 
 /// Input representation for a plan item.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanItemArg {
     pub step: String,
     pub status: StepStatus,
@@ -136,7 +136,7 @@ impl PlanStep {
 }
 
 /// Serializable snapshot for display
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PlanSnapshot {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
@@ -348,6 +348,28 @@ impl PlanState {
         }
     }
 
+    /// Restore persisted plan data through the same normalization path used by
+    /// `update_plan`. Timing is intentionally session-local and starts fresh.
+    #[must_use]
+    pub fn from_snapshot(snapshot: &PlanSnapshot) -> Self {
+        let mut state = Self::default();
+        state.update(UpdatePlanArgs {
+            title: snapshot.title.clone(),
+            objective: snapshot.objective.clone(),
+            context_summary: snapshot.context_summary.clone(),
+            explanation: snapshot.explanation.clone(),
+            sources_used: snapshot.sources_used.clone(),
+            critical_files: snapshot.critical_files.clone(),
+            constraints: snapshot.constraints.clone(),
+            recommended_approach: snapshot.recommended_approach.clone(),
+            verification_plan: snapshot.verification_plan.clone(),
+            risks_and_unknowns: snapshot.risks_and_unknowns.clone(),
+            handoff_packet: snapshot.handoff_packet.clone(),
+            plan: snapshot.items.clone(),
+        });
+        state
+    }
+
     pub fn explanation(&self) -> Option<&str> {
         self.explanation.as_deref()
     }
@@ -470,7 +492,7 @@ impl ToolSpec for UpdatePlanTool {
     }
 
     fn description(&self) -> &'static str {
-        "Update optional high-level strategy metadata for complex initiatives. Use checklist_write for primary Work progress; update_plan should capture phase-level approach changes, not duplicate checklist items. Include sources, critical files, constraints, verification, risks, and handoff context when they help the user review or continue the plan. Each strategy step has a description and status (pending, in_progress, completed)."
+        "Update optional high-level Strategy metadata for complex initiatives. Use work_update for primary To-do / Work progress; update_plan should capture approach, context, and route — not a second checklist. Include sources, critical files, constraints, verification, risks, and handoff context when they help the user review or continue the plan. Each strategy step has a description and status (pending, in_progress, completed). Reserve Phase for Workflow stages."
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -558,7 +580,7 @@ impl ToolSpec for UpdatePlanTool {
     async fn execute(
         &self,
         input: serde_json::Value,
-        _context: &ToolContext,
+        context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
         let empty_plan = Vec::new();
         let plan_items = match input.get("plan") {
@@ -603,18 +625,57 @@ impl ToolSpec for UpdatePlanTool {
             plan: plan_args,
         };
 
-        let mut state = self.plan_state.lock().await;
-
-        state.update(args);
-
-        let snapshot = state.snapshot();
+        let mut next_state = PlanState::default();
+        next_state.update(args);
+        let desired = next_state.snapshot();
+        let proposed_for_review = context.review_plan_changes;
+        let snapshot = if let Some(work) = context.runtime.work.as_ref()
+            && work.matches_plan(&self.plan_state)
+        {
+            if proposed_for_review {
+                work.propose_plan_update(&context.state_namespace, self.name(), &desired)
+                    .await
+                    .map_err(ToolError::execution_failed)?
+            } else {
+                work.apply_plan_update(&context.state_namespace, self.name(), &desired)
+                    .await
+                    .map_err(ToolError::execution_failed)?
+            }
+        } else if proposed_for_review {
+            return Err(ToolError::execution_failed(
+                "Plan review requires the active Work Graph runtime".to_string(),
+            ));
+        } else {
+            let mut state = self.plan_state.lock().await;
+            state.update(UpdatePlanArgs {
+                title: desired.title.clone(),
+                objective: desired.objective.clone(),
+                context_summary: desired.context_summary.clone(),
+                explanation: desired.explanation.clone(),
+                sources_used: desired.sources_used.clone(),
+                critical_files: desired.critical_files.clone(),
+                constraints: desired.constraints.clone(),
+                recommended_approach: desired.recommended_approach.clone(),
+                verification_plan: desired.verification_plan.clone(),
+                risks_and_unknowns: desired.risks_and_unknowns.clone(),
+                handoff_packet: desired.handoff_packet.clone(),
+                plan: desired.items.clone(),
+            });
+            state.snapshot()
+        };
+        let state = PlanState::from_snapshot(&snapshot);
         let (pending, in_progress, completed) = state.counts();
         let progress = state.progress_percent();
 
         let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
 
+        let outcome = if proposed_for_review {
+            "Plan proposed for review"
+        } else {
+            "Plan updated"
+        };
         Ok(ToolResult::success(format!(
-            "Plan updated: {pending} pending, {in_progress} in progress, {completed} completed ({progress}% done)\n{result}"
+            "{outcome}: {pending} pending, {in_progress} in progress, {completed} completed ({progress}% done)\n{result}"
         )))
     }
 }
@@ -646,13 +707,88 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn update_plan_description_keeps_checklist_as_primary_work_progress() {
+    fn update_plan_description_keeps_work_update_as_primary_progress() {
         let tool = UpdatePlanTool::new(new_shared_plan_state());
         let description = tool.description();
 
-        assert!(description.contains("Use checklist_write for primary Work progress"));
-        assert!(description.contains("not duplicate checklist items"));
-        assert!(description.contains("high-level strategy metadata"));
+        assert!(description.contains("Use work_update for primary To-do / Work progress"));
+        assert!(description.contains("not a second checklist"));
+        assert!(description.contains("Strategy metadata"));
+        assert!(description.contains("approach, context, and route"));
+        assert!(description.contains("Reserve Phase for Workflow stages"));
+        assert!(
+            !description.contains("phase-level"),
+            "Strategy must not reuse Workflow Phase vocabulary: {description}"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_plan_routes_through_attached_work_graph() {
+        let plan = new_shared_plan_state();
+        let todos = crate::tools::todo::new_shared_todo_list();
+        let work = crate::work_graph::new_shared_work_runtime(todos, plan.clone());
+        let tool = UpdatePlanTool::new(plan);
+        let mut context = ToolContext::new(std::env::temp_dir());
+        context.runtime.work = Some(work.clone());
+
+        tool.execute(
+            json!({
+                "objective": "Prove the real tool path",
+                "plan": [{"step": "Update graph", "status": "in_progress"}]
+            }),
+            &context,
+        )
+        .await
+        .expect("update_plan succeeds");
+
+        let state = work
+            .capture(Some(&context.state_namespace))
+            .expect("capture")
+            .expect("graph state");
+        assert_eq!(
+            state.plan.objective.as_deref(),
+            Some("Prove the real tool path")
+        );
+        assert_eq!(state.graph.compat.plan_order.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn plan_mode_update_returns_reviewable_proposal_without_publishing_it() {
+        let plan = new_shared_plan_state();
+        let todos = crate::tools::todo::new_shared_todo_list();
+        let work = crate::work_graph::new_shared_work_runtime(todos, plan.clone());
+        let tool = UpdatePlanTool::new(plan.clone());
+        let mut context = ToolContext::new(std::env::temp_dir());
+        context.runtime.work = Some(work.clone());
+        context.review_plan_changes = true;
+
+        let result = tool
+            .execute(
+                json!({
+                    "objective": "Review before mutation",
+                    "plan": [{"step": "Inspect the diff", "status": "in_progress"}]
+                }),
+                &context,
+            )
+            .await
+            .expect("Plan-mode proposal succeeds");
+
+        assert!(result.content.starts_with("Plan proposed for review:"));
+        assert!(plan.lock().await.snapshot().is_empty());
+        let captured = work
+            .capture(Some(&context.state_namespace))
+            .expect("capture proposal")
+            .expect("proposal graph");
+        assert!(captured.plan.is_empty());
+        assert_eq!(captured.graph.proposals.len(), 1);
+        assert_eq!(
+            work.plan_for_review(Some(&context.state_namespace))
+                .expect("review preview")
+                .expect("pending plan")
+                .objective
+                .as_deref(),
+            Some("Review before mutation")
+        );
     }
 
     #[test]
@@ -746,6 +882,27 @@ mod tests {
         assert_eq!(snapshot.items.len(), 1);
         assert_eq!(snapshot.items[0].step, "render sections");
         assert_eq!(snapshot.items[0].status, StepStatus::InProgress);
+    }
+
+    #[test]
+    fn plan_state_restores_from_persisted_snapshot() {
+        let snapshot = PlanSnapshot {
+            objective: Some("Restore Work state".to_string()),
+            items: vec![
+                PlanItemArg {
+                    step: "inspect".to_string(),
+                    status: StepStatus::Completed,
+                },
+                PlanItemArg {
+                    step: "verify".to_string(),
+                    status: StepStatus::InProgress,
+                },
+            ],
+            ..PlanSnapshot::default()
+        };
+
+        let restored = PlanState::from_snapshot(&snapshot);
+        assert_eq!(restored.snapshot(), snapshot);
     }
 
     #[test]

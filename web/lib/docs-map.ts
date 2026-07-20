@@ -24,6 +24,8 @@ export interface DocTopic {
   repoSource: string | string[];
   /** Whether this topic has a dedicated website page (vs. linking out). */
   hasPage: boolean;
+  /** Locale-relative website path when the page lives outside `/docs/<slug>`. */
+  sitePath?: string;
   /** Category for grouping in the sidebar. */
   category: "getting-started" | "core-concepts" | "reference" | "extending" | "operations";
 }
@@ -38,7 +40,8 @@ export const DOC_TOPICS: DocTopic[] = [
       zh: "npm、Cargo、Homebrew、Docker、Nix、Scoop、CNB 镜像及平台说明。",
     },
     repoSource: "docs/INSTALL.md",
-    hasPage: false,
+    hasPage: true,
+    sitePath: "install",
     category: "getting-started",
   },
   {
@@ -74,7 +77,8 @@ export const DOC_TOPICS: DocTopic[] = [
       zh: "支持的提供商、模型切换、本地运行时（vLLM、Ollama、SGLang）和模型实验室。",
     },
     repoSource: ["docs/PROVIDERS.md", "docs/MODEL_LAB.md"],
-    hasPage: false,
+    hasPage: true,
+    sitePath: "models",
     category: "reference",
   },
   {
@@ -94,8 +98,8 @@ export const DOC_TOPICS: DocTopic[] = [
     slug: "modes",
     label: { en: "Modes", zh: "模式" },
     description: {
-      en: "Plan, Agent, YOLO modes and orthogonal approval policies.",
-      zh: "Plan、Agent、YOLO 三种模式与正交审批策略。",
+      en: "Plan, Act, Operate modes and orthogonal approval posture.",
+      zh: "Plan、Act、Operate 三种模式与正交审批姿态。",
     },
     repoSource: "docs/MODES.md",
     hasPage: true,
@@ -138,18 +142,6 @@ export const DOC_TOPICS: DocTopic[] = [
     category: "extending",
   },
   {
-    id: "skills",
-    slug: "skills",
-    label: { en: "Skills", zh: "技能" },
-    description: {
-      en: "Skill loading, invocation design, and the community skill ecosystem.",
-      zh: "技能加载、调用设计和社区技能生态。",
-    },
-    repoSource: ["docs/SKILL_INVOCATION_DESIGN.md"],
-    hasPage: false,
-    category: "extending",
-  },
-  {
     id: "hooks",
     slug: "hooks",
     label: { en: "Hooks", zh: "钩子" },
@@ -186,14 +178,26 @@ export const DOC_TOPICS: DocTopic[] = [
     category: "extending",
   },
   {
+    id: "web",
+    slug: "web",
+    label: { en: "Browser Client", zh: "浏览器客户端" },
+    description: {
+      en: "Run the embedded browser client on loopback, with its one-time bootstrap and session boundaries.",
+      zh: "仅在本机回环地址运行内置浏览器客户端，了解一次性引导与会话边界。",
+    },
+    repoSource: "docs/WEB.md",
+    hasPage: false,
+    category: "extending",
+  },
+  {
     id: "fleet",
     slug: "fleet",
-    label: { en: "Fleet / WhaleFlow", zh: "Fleet / WhaleFlow" },
+    label: { en: "Fleet / Workflow", zh: "Fleet / Workflow" },
     description: {
-      en: "Durable task execution, fleet management, and WhaleFlow authoring.",
-      zh: "持久任务执行、Fleet 管理和 WhaleFlow 编写。",
+      en: "Durable task execution, fleet management, and Workflow authoring.",
+      zh: "持久任务执行、Fleet 管理和 Workflow 编写。",
     },
-    repoSource: ["docs/FLEET.md", "docs/WHALEFLOW_AUTHORING.md"],
+    repoSource: ["docs/FLEET.md", "docs/WORKFLOW_AUTHORING.md"],
     hasPage: false,
     category: "operations",
   },
@@ -242,6 +246,19 @@ export function getTopicsByCategory(): Map<string, DocTopic[]> {
     map.set(t.category, group);
   }
   return map;
+}
+
+/** Resolve a topic to its on-site route or canonical repository document. */
+export function docTopicHref(topic: DocTopic, locale: string): string {
+  if (topic.sitePath) return `/${locale}/${topic.sitePath}`;
+  if (topic.hasPage) return `/${locale}/docs/${topic.slug}`;
+  const source = Array.isArray(topic.repoSource) ? topic.repoSource[0] : topic.repoSource;
+  return `${REPO_DOCS_BASE}/${source}`;
+}
+
+/** Whether following a topic leaves codewhale.net for the source document. */
+export function docTopicIsExternal(topic: DocTopic): boolean {
+  return !topic.hasPage;
 }
 
 /** Repo source base URL for generating direct links. */

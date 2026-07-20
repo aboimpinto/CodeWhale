@@ -47,28 +47,36 @@ pub enum SetupStep {
     ProviderModel,
     /// Trust, approvals, sandbox, network — runtime posture (#3406).
     TrustSandbox,
-    /// Tools / MCP / skills / plugins (later lanes; tracked for completeness).
-    ToolsMcp,
-    /// Hotbar opt-in (v0.8.68 lane; tracked for completeness).
-    Hotbar,
-    /// Remote / mobile runtime (v0.8.69+ lane; tracked for completeness).
-    RemoteRuntime,
     /// User-global constitution choice / checkpoint.
     Constitution,
+    /// Operate/Fleet readiness: provider auth, worker runtime, roster, and
+    /// concurrency review. Plan-limit detection remains a separate product
+    /// decision; this step only records reviewed current facts.
+    OperateFleet,
+    /// Hotbar shortcuts are optional, but now have a first-class setup card.
+    Hotbar,
+    /// Tools / MCP / skills / plugins (later lanes; tracked for completeness).
+    ToolsMcp,
+    /// Remote / mobile runtime (later lane; tracked for completeness).
+    RemoteRuntime,
+    /// Persistence paths for setup state, config, constitution, memory, and notes.
+    Persistence,
     /// Final verification / doctor / ready summary.
     Verification,
 }
 
 impl SetupStep {
     /// All steps in canonical first-run order.
-    pub const ALL: [SetupStep; 8] = [
+    pub const ALL: [SetupStep; 10] = [
         SetupStep::Language,
         SetupStep::ProviderModel,
         SetupStep::TrustSandbox,
-        SetupStep::ToolsMcp,
-        SetupStep::Hotbar,
-        SetupStep::RemoteRuntime,
         SetupStep::Constitution,
+        SetupStep::OperateFleet,
+        SetupStep::Hotbar,
+        SetupStep::ToolsMcp,
+        SetupStep::RemoteRuntime,
+        SetupStep::Persistence,
         SetupStep::Verification,
     ];
 }
@@ -299,6 +307,12 @@ pub struct SetupState {
     #[serde(default)]
     pub runtime_posture_source: RuntimePostureSource,
 
+    /// Host-enforced Workflow dispatch and terminal receipts have been proven
+    /// for this installation. Older records did not carry this proof and must
+    /// deserialize false even if their Operate/Fleet card was marked Verified.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub operate_receipts_verified: bool,
+
     /// True when this record was *derived* from existing config rather than
     /// persisted by an explicit setup run. Lets `/setup` and `doctor` explain
     /// why an updating user is not treated as a broken fresh install.
@@ -325,6 +339,7 @@ impl Default for SetupState {
             constitution_preview_hash: None,
             constitution_preview_version: 0,
             runtime_posture_source: RuntimePostureSource::default(),
+            operate_receipts_verified: false,
             inherited: false,
         }
     }
@@ -393,6 +408,19 @@ impl SetupState {
             && self.provider_model_ready_or_needs_action()
             && self.runtime_posture_source.is_reviewed()
             && self.constitution_choice.is_explicit()
+    }
+
+    /// Operate/Fleet "ready": provider credentials are verified, runtime
+    /// posture has been reviewed, and the user has explicitly reviewed the
+    /// Fleet/Operate on-ramp. This is intentionally separate from
+    /// [`first_run_ready`](Self::first_run_ready): a local-first user can be
+    /// ready for ordinary first use before enabling durable multi-worker work.
+    #[must_use]
+    pub fn operate_ready(&self) -> bool {
+        self.first_run_ready()
+            && self.step_verified(SetupStep::ProviderModel)
+            && self.step_verified(SetupStep::OperateFleet)
+            && self.operate_receipts_verified
     }
 
     /// Update "ready" for `version`: the constitution checkpoint for that lane is
@@ -551,6 +579,34 @@ mod tests {
     }
 
     #[test]
+    fn persistence_is_optional_before_verification() {
+        let persistence_index = SetupStep::ALL
+            .iter()
+            .position(|step| *step == SetupStep::Persistence)
+            .expect("persistence step");
+        let verification_index = SetupStep::ALL
+            .iter()
+            .position(|step| *step == SetupStep::Verification)
+            .expect("verification step");
+
+        assert!(persistence_index < verification_index);
+
+        let mut state = SetupState::default();
+        state.set_step(SetupStep::Language, verified("0.8.67"));
+        state.set_step(SetupStep::ProviderModel, verified("0.8.67"));
+        state.runtime_posture_source = RuntimePostureSource::Confirmed;
+        state.constitution_choice = ConstitutionChoice::Bundled;
+        assert!(state.first_run_ready());
+
+        state.set_step(
+            SetupStep::Persistence,
+            StepEntry::new(StepStatus::NeedsAction, false, "0.8.67"),
+        );
+        assert!(state.first_run_ready());
+        assert!(!state.operate_ready());
+    }
+
+    #[test]
     fn first_run_ready_requires_all_pillars() {
         let mut state = SetupState::default();
         state.set_step(SetupStep::Language, verified("0.8.67"));
@@ -560,6 +616,56 @@ mod tests {
         assert!(!state.first_run_ready());
         state.constitution_choice = ConstitutionChoice::Bundled;
         assert!(state.first_run_ready());
+    }
+
+    #[test]
+    fn operate_ready_is_separate_from_first_run_ready() {
+        let mut state = SetupState::default();
+        state.set_step(SetupStep::Language, verified("0.8.67"));
+        state.set_step(SetupStep::ProviderModel, verified("0.8.67"));
+        state.runtime_posture_source = RuntimePostureSource::Confirmed;
+        state.constitution_choice = ConstitutionChoice::Bundled;
+        assert!(state.first_run_ready());
+        assert!(!state.operate_ready());
+
+        state.set_step(SetupStep::OperateFleet, verified("0.8.67"));
+        assert!(
+            !state.operate_ready(),
+            "a legacy Verified card is not receipt proof"
+        );
+        state.operate_receipts_verified = true;
+        assert!(state.operate_ready());
+    }
+
+    #[test]
+    fn legacy_verified_operate_card_without_receipt_proof_fails_closed() {
+        let mut legacy = SetupState::default();
+        legacy.set_step(SetupStep::Language, verified("0.8.67"));
+        legacy.set_step(SetupStep::ProviderModel, verified("0.8.67"));
+        legacy.set_step(SetupStep::OperateFleet, verified("0.8.67"));
+        legacy.runtime_posture_source = RuntimePostureSource::Confirmed;
+        legacy.constitution_choice = ConstitutionChoice::Bundled;
+        let raw = serde_json::to_string(&legacy).expect("serialize legacy-style state");
+        assert!(!raw.contains("operate_receipts_verified"), "{raw}");
+
+        let loaded: SetupState = serde_json::from_str(&raw).expect("load legacy-style state");
+
+        assert_eq!(loaded.status(SetupStep::OperateFleet), StepStatus::Verified);
+        assert!(!loaded.operate_receipts_verified);
+        assert!(!loaded.operate_ready());
+    }
+
+    #[test]
+    fn operate_ready_requires_verified_provider_not_needs_action() {
+        let mut state = SetupState::default();
+        state.set_step(
+            SetupStep::ProviderModel,
+            StepEntry::new(StepStatus::NeedsAction, true, "0.8.67"),
+        );
+        state.runtime_posture_source = RuntimePostureSource::Confirmed;
+        state.set_step(SetupStep::OperateFleet, verified("0.8.67"));
+
+        assert!(!state.operate_ready());
     }
 
     #[test]
@@ -668,9 +774,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join(SETUP_STATE_FILE_NAME);
 
-        let mut state = SetupState::default();
-        state.constitution_choice = ConstitutionChoice::GuidedCustom;
-        state.constitution_authoring = Some(ConstitutionAuthoring::ModelDrafted);
+        let state = SetupState {
+            constitution_choice: ConstitutionChoice::GuidedCustom,
+            constitution_authoring: Some(ConstitutionAuthoring::ModelDrafted),
+            ..Default::default()
+        };
         state.save_to(&path).unwrap();
 
         let loaded = SetupState::load_from(&path).expect("record should load");

@@ -35,12 +35,38 @@ if [[ -z "$BIN" ]]; then
     BIN="target/release/codewhale-tui"
   fi
 fi
+if [[ "$BIN" != /* ]]; then
+  BIN="$REPO_ROOT/$BIN"
+fi
 echo "Using binary: $BIN" >&2
 
 PASS=0
 FAIL=0
 pass() { echo "  PASS: $1"; PASS=$((PASS + 1)); }
 fail() { echo "  FAIL: $1" >&2; FAIL=$((FAIL + 1)); }
+expect_jq_value() {
+  local label="$1"
+  local json="$2"
+  local filter="$3"
+  local expected="$4"
+  local observed
+  observed="$(echo "$json" | jq -r "$filter")"
+  if [[ "$observed" == "$expected" ]]; then
+    pass "$label"
+  else
+    fail "$label wrong: $observed"
+  fi
+}
+expect_jq_select() {
+  local label="$1"
+  local json="$2"
+  local filter="$3"
+  if echo "$json" | jq -e "$filter" >/dev/null; then
+    pass "$label"
+  else
+    fail "$label missing"
+  fi
+}
 
 # Run the binary in a fully isolated home so no real install is read or
 # mutated. Echoes the doctor --json blob on stdout.
@@ -72,18 +98,32 @@ if [[ -n "$SETUP" && "$SETUP" != "null" ]]; then
 else
   fail "doctor --json .setup missing on a clean home"
 fi
-for field in constitution runtime_posture_source steps next_actions; do
+for field in constitution provider_model runtime_posture_source steps next_actions; do
   if echo "$SETUP" | jq -e "has(\"$field\")" >/dev/null; then
     pass ".setup.$field present"
   else
     fail ".setup.$field missing"
   fi
 done
-if [[ "$(echo "$SETUP" | jq -r '.next_actions.constitution')" == "/constitution" ]]; then
-  pass ".setup.next_actions.constitution == /constitution"
-else
-  fail ".setup.next_actions.constitution wrong: $(echo "$SETUP" | jq -r '.next_actions.constitution')"
-fi
+expect_jq_value ".setup.first_run_ready == false" "$SETUP" '.first_run_ready' "false"
+expect_jq_value ".setup.update_ready == false" "$SETUP" '.update_ready' "false"
+expect_jq_value ".setup.operate_ready == false" "$SETUP" '.operate_ready' "false"
+expect_jq_value ".setup.next_actions.constitution == /constitution" "$SETUP" '.next_actions.constitution' "/constitution"
+expect_jq_value ".setup.next_actions.provider_model advertises guided provider setup" "$SETUP" '.next_actions.provider_model' "/setup provider, /provider setup <name>, or /model"
+expect_jq_value ".setup.next_actions.hotbar == /setup hotbar" "$SETUP" '.next_actions.hotbar' "/setup hotbar"
+expect_jq_value ".setup.next_actions.tools_mcp == /setup tools" "$SETUP" '.next_actions.tools_mcp' "/setup tools"
+expect_jq_value ".setup.next_actions.remote_runtime == /setup remote" "$SETUP" '.next_actions.remote_runtime' "/setup remote"
+expect_jq_value ".setup.next_actions.persistence == /setup persistence" "$SETUP" '.next_actions.persistence' "/setup persistence"
+expect_jq_value ".setup.provider_model.provider.id == deepseek" "$SETUP" '.provider_model.provider.id' "deepseek"
+expect_jq_value ".setup.provider_model.model.resolved == deepseek-v4-pro" "$SETUP" '.provider_model.model.resolved' "deepseek-v4-pro"
+expect_jq_value ".setup.provider_model.auth.credential_url is DeepSeek" "$SETUP" '.provider_model.auth.credential_url' "https://platform.deepseek.com/api_keys"
+expect_jq_value ".setup.provider_model.auth.env_vars[0] == DEEPSEEK_API_KEY" "$SETUP" '.provider_model.auth.env_vars[0]' "DEEPSEEK_API_KEY"
+expect_jq_value ".setup.provider_model.health.live_validation == false" "$SETUP" '.provider_model.health.live_validation' "false"
+expect_jq_value ".setup.operate_fleet.concurrency.plan_limit_probed == false" "$SETUP" '.operate_fleet.concurrency.plan_limit_probed' "false"
+expect_jq_value ".setup.operate_fleet.roster.readiness_rule is documented" "$SETUP" '.operate_fleet.roster.readiness_rule' "built-in starter roster or custom roster"
+for step in provider_model trust_sandbox operate_fleet hotbar tools_mcp remote_runtime persistence verification; do
+  expect_jq_select ".setup.steps includes $step" "$SETUP" ".steps[] | select(.step == \"$step\")"
+done
 rm -rf "$H"
 
 # --- Scenario: secret safety — a configured key must never appear in doctor --json ---
@@ -118,7 +158,7 @@ cat > "$WS/.codewhale/constitution.json" <<'EOF'
 EOF
 CTX="$(cd "$WS" && CODEWHALE_HOME="$H/codewhale-home" HOME="$H/home" USERPROFILE="$H/home" \
   "$BIN" doctor --context-json 2>/dev/null || true)"
-if echo "$CTX" | jq -e '.entries[] | select(.source_kind == "constitution")' >/dev/null 2>&1; then
+if echo "$CTX" | jq -e '.entries[] | select(.source_kind == "repo_constitution")' >/dev/null 2>&1; then
   pass "repo constitution surfaces in --context-json"
 else
   fail "repo constitution not found in --context-json"

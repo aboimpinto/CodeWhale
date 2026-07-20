@@ -350,8 +350,8 @@ impl ToolRegistry {
         let names: Vec<&str> = self.tools.keys().map(String::as_str).collect();
         let lower = requested.to_lowercase();
 
-        // 1. lowercase exact
-        if let Some(n) = names.iter().find(|n| n.to_lowercase() == lower) {
+        // 1. ASCII case-insensitive exact
+        if let Some(n) = names.iter().find(|n| n.eq_ignore_ascii_case(requested)) {
             return Some(n);
         }
         // 2. hyphen/space → underscore
@@ -573,6 +573,31 @@ impl ToolRegistryBuilder {
             .with_tool(Arc::new(ShellCancelTool))
             .with_tool(Arc::new(ShellWaitTool::new("exec_wait")))
             .with_tool(Arc::new(ShellInteractTool::new("exec_interact")))
+            .with_terminal_tools()
+    }
+
+    /// Include the stateful PTY terminal tools. Like `exec_shell`, these are
+    /// only exposed when the active shell policy allows shell access.
+    #[cfg(not(target_env = "ohos"))]
+    #[must_use]
+    pub fn with_terminal_tools(self) -> Self {
+        use super::terminal_session::{
+            TerminalCancelTool, TerminalResetTool, TerminalRunTool, TerminalSendTool,
+            TerminalWaitTool,
+        };
+        self.with_tool(Arc::new(TerminalRunTool))
+            .with_tool(Arc::new(TerminalSendTool))
+            .with_tool(Arc::new(TerminalWaitTool))
+            .with_tool(Arc::new(TerminalCancelTool))
+            .with_tool(Arc::new(TerminalResetTool))
+    }
+
+    /// OpenHarmony does not include the `portable-pty` dependency, so keep the
+    /// ordinary shell tools without advertising unavailable persistent PTYs.
+    #[cfg(target_env = "ohos")]
+    #[must_use]
+    pub fn with_terminal_tools(self) -> Self {
+        self
     }
 
     /// Include search tools (`grep_files`).
@@ -954,6 +979,21 @@ impl ToolRegistryBuilder {
         self
     }
 
+    /// Register the `start_mcp_server` tool for dynamically adding MCP servers
+    /// from conversation context. Does not register MCP tool adapters — those
+    /// are returned by `pool.to_api_tools()` in `engine.mcp_tools()`.
+    #[must_use]
+    pub fn with_runtime_mcp_tool(
+        mut self,
+        mcp_pool: std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>,
+    ) -> Self {
+        self.tools
+            .push(Arc::new(super::runtime_mcp::StartRuntimeMcpServer::new(
+                mcp_pool,
+            )));
+        self
+    }
+
     /// Include all agent tools (file tools + shell + note + search).
     ///
     /// Web and patch tools are NOT registered here — callers must add them
@@ -1117,18 +1157,23 @@ impl ToolRegistryBuilder {
         )
     }
 
-    /// Include the todo tool with a shared `TodoList`.
+    /// Include the todo / work-progress tools with a shared `TodoList`.
+    ///
+    /// `work_update` is the sole model-visible progress surface (#4132).
+    /// `checklist_*` and `todo_*` remain registered as hidden compat aliases
+    /// so saved transcripts and older prompts still replay.
     #[must_use]
     pub fn with_todo_tool(self, todo_list: super::todo::SharedTodoList) -> Self {
         use super::todo::{TodoAddTool, TodoListTool, TodoUpdateTool, TodoWriteTool};
-        self.with_tool(Arc::new(TodoWriteTool::checklist(todo_list.clone())))
+        self.with_tool(Arc::new(TodoWriteTool::work_update(todo_list.clone())))
+            .with_tool(Arc::new(TodoWriteTool::checklist(todo_list.clone())))
+            .with_tool(Arc::new(TodoWriteTool::todo(todo_list.clone())))
             .with_tool(Arc::new(TodoAddTool::checklist(todo_list.clone())))
+            .with_tool(Arc::new(TodoAddTool::todo(todo_list.clone())))
             .with_tool(Arc::new(TodoUpdateTool::checklist(todo_list.clone())))
+            .with_tool(Arc::new(TodoUpdateTool::todo(todo_list.clone())))
             .with_tool(Arc::new(TodoListTool::checklist(todo_list.clone())))
-            .with_tool(Arc::new(TodoWriteTool::new(todo_list.clone())))
-            .with_tool(Arc::new(TodoAddTool::new(todo_list.clone())))
-            .with_tool(Arc::new(TodoUpdateTool::new(todo_list.clone())))
-            .with_tool(Arc::new(TodoListTool::new(todo_list)))
+            .with_tool(Arc::new(TodoListTool::todo(todo_list.clone())))
     }
 
     /// Include the plan tool with a shared `PlanState`.
@@ -1155,8 +1200,26 @@ impl ToolRegistryBuilder {
         runtime: super::subagent::SubAgentRuntime,
     ) -> Self {
         use super::subagent::AgentTool;
+        use super::subagent::register_coordination_tools;
+        use super::workflow::WorkflowTool;
+        use super::workflow_trigger::soft_auto_policy_is_linked;
 
-        self.with_tool(Arc::new(AgentTool::new(manager, runtime)))
+        // Keep soft-auto trigger policy linked in release builds (#4127).
+        debug_assert!(
+            soft_auto_policy_is_linked(),
+            "workflow soft-auto policy must stay linked"
+        );
+
+        let builder = self
+            .with_tool(Arc::new(WorkflowTool::new(
+                Arc::clone(&manager),
+                runtime.clone(),
+            )))
+            .with_tool(Arc::new(AgentTool::new(
+                Arc::clone(&manager),
+                runtime.clone(),
+            )));
+        register_coordination_tools(builder, manager, runtime)
     }
 
     /// Build the registry with the given context.
@@ -1199,6 +1262,17 @@ struct McpToolAdapter {
     pool: std::sync::Arc<tokio::sync::Mutex<crate::mcp::McpPool>>,
 }
 
+fn is_mcp_read_helper(name: &str) -> bool {
+    matches!(
+        name,
+        "list_mcp_resources"
+            | "list_mcp_resource_templates"
+            | "mcp_read_resource"
+            | "read_mcp_resource"
+            | "mcp_get_prompt"
+    )
+}
+
 #[async_trait::async_trait]
 impl ToolSpec for McpToolAdapter {
     fn name(&self) -> &str {
@@ -1218,29 +1292,24 @@ impl ToolSpec for McpToolAdapter {
     fn capabilities(&self) -> Vec<ToolCapability> {
         // Conservatively treat MCP tools as requiring approval and
         // network access unless they're known discovery helpers.
-        let name_lower = self.name.to_lowercase();
-        if name_lower.contains("list_mcp")
-            || name_lower.contains("read_mcp")
-            || name_lower.contains("mcp_read")
-            || name_lower.contains("mcp_get_prompt")
-        {
+        if is_mcp_read_helper(&self.name) {
             vec![ToolCapability::ReadOnly]
         } else {
             vec![ToolCapability::Network, ToolCapability::RequiresApproval]
         }
     }
 
+    fn approval_requirement(&self) -> ApprovalRequirement {
+        if is_mcp_read_helper(&self.name) {
+            ApprovalRequirement::Auto
+        } else {
+            ApprovalRequirement::Required
+        }
+    }
+
     fn defer_loading(&self) -> bool {
         // Discovery helpers stay loaded; everything else is deferred.
-        let keep_loaded = matches!(
-            self.name.as_str(),
-            "list_mcp_resources"
-                | "list_mcp_resource_templates"
-                | "mcp_read_resource"
-                | "read_mcp_resource"
-                | "mcp_get_prompt"
-        );
-        !keep_loaded
+        !is_mcp_read_helper(&self.name)
     }
 
     async fn execute(&self, input: Value, _context: &ToolContext) -> Result<ToolResult, ToolError> {
@@ -1249,9 +1318,24 @@ impl ToolSpec for McpToolAdapter {
             .call_tool(&self.name, input)
             .await
             .map_err(|e| ToolError::execution_failed(format!("MCP tool failed: {e}")))?;
-        let content = serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string());
+        let content = serde_json::to_string(&result).unwrap_or_else(|_| result.to_string());
         Ok(ToolResult::success(content))
     }
+}
+
+#[cfg(test)]
+pub(super) fn mcp_tool_adapter_for_test(name: &str) -> Arc<dyn ToolSpec> {
+    Arc::new(McpToolAdapter {
+        name: name.to_string(),
+        tool: crate::mcp::McpTool {
+            name: name.to_string(),
+            description: None,
+            input_schema: serde_json::json!({"type": "object"}),
+        },
+        pool: Arc::new(tokio::sync::Mutex::new(crate::mcp::McpPool::new(
+            crate::mcp::McpConfig::default(),
+        ))),
+    })
 }
 
 // === Unit Tests ===
@@ -1267,10 +1351,11 @@ mod tests {
     use crate::config::ToolOverride;
     use crate::tools::ToolRegistryBuilder;
     use crate::tools::spec::{
-        ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec, required_str,
+        ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
+        required_str,
     };
 
-    use super::ToolRegistry;
+    use super::{ToolRegistry, mcp_tool_adapter_for_test};
 
     /// A simple test tool for unit testing
     struct TestTool {
@@ -1320,6 +1405,49 @@ mod tests {
     }
 
     #[test]
+    fn mcp_read_helpers_remain_auto_and_eagerly_loaded() {
+        for name in [
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "mcp_read_resource",
+            "read_mcp_resource",
+            "mcp_get_prompt",
+        ] {
+            let adapter = mcp_tool_adapter_for_test(name);
+            assert_eq!(
+                adapter.approval_requirement(),
+                ApprovalRequirement::Auto,
+                "{name} should remain an automatic read helper"
+            );
+            assert!(adapter.is_read_only(), "{name} should remain read-only");
+            assert!(!adapter.defer_loading(), "{name} should remain loaded");
+        }
+    }
+
+    #[test]
+    fn mcp_actions_require_approval_with_exact_helper_matching() {
+        for name in [
+            "mcp_github_create_pull_request",
+            "mcp_github_list_mcp_resources_export",
+            "read_mcp_resource_and_delete",
+        ] {
+            let adapter = mcp_tool_adapter_for_test(name);
+            assert_eq!(
+                adapter.approval_requirement(),
+                ApprovalRequirement::Required,
+                "{name} must not inherit read-helper approval"
+            );
+            assert!(
+                adapter
+                    .capabilities()
+                    .contains(&ToolCapability::RequiresApproval),
+                "{name} should advertise approval gating"
+            );
+            assert!(adapter.defer_loading(), "{name} should remain deferred");
+        }
+    }
+
+    #[test]
     fn test_registry_register_and_get() {
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
@@ -1334,6 +1462,17 @@ mod tests {
     }
 
     #[test]
+    fn resolve_exact_match_is_ascii_case_insensitive() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let mut registry = ToolRegistry::new(ctx);
+
+        registry.register(make_test_tool("read_file"));
+
+        assert_eq!(registry.resolve("READ_FILE"), Some("read_file"));
+    }
+
+    #[test]
     fn todo_aliases_stay_callable_but_hidden_from_model_catalog() {
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
@@ -1341,8 +1480,19 @@ mod tests {
             .with_todo_tool(crate::tools::todo::new_shared_todo_list())
             .build(ctx);
 
-        for alias in ["todo_write", "todo_add", "todo_update", "todo_list"] {
-            assert!(registry.contains(alias), "{alias} should remain callable");
+        // Canonical + legacy spellings stay callable for replay.
+        for name in [
+            "work_update",
+            "checklist_write",
+            "checklist_add",
+            "checklist_update",
+            "checklist_list",
+            "todo_write",
+            "todo_add",
+            "todo_update",
+            "todo_list",
+        ] {
+            assert!(registry.contains(name), "{name} should remain callable");
         }
 
         let api_names = registry
@@ -1351,21 +1501,23 @@ mod tests {
             .map(|tool| tool.name)
             .collect::<Vec<_>>();
 
-        for canonical in [
+        assert!(
+            api_names.iter().any(|name| name == "work_update"),
+            "work_update should be the sole model-visible progress surface"
+        );
+        for hidden in [
             "checklist_write",
             "checklist_add",
             "checklist_update",
             "checklist_list",
+            "todo_write",
+            "todo_add",
+            "todo_update",
+            "todo_list",
         ] {
             assert!(
-                api_names.iter().any(|name| name == canonical),
-                "{canonical} should stay model-visible"
-            );
-        }
-        for alias in ["todo_write", "todo_add", "todo_update", "todo_list"] {
-            assert!(
-                api_names.iter().all(|name| name != alias),
-                "{alias} should be hidden from the model catalog"
+                api_names.iter().all(|name| name != hidden),
+                "{hidden} should be hidden from the model catalog"
             );
         }
     }

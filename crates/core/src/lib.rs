@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use std::time::Duration;
+
 use anyhow::Result;
 use codewhale_agent::ModelRegistry;
 use codewhale_config::{CliRuntimeOverrides, ConfigToml, ProviderKind};
@@ -15,10 +17,10 @@ use codewhale_mcp::{
 };
 use codewhale_protocol::{
     AppResponse, EventFrame, ExecApprovalRequestEvent, PromptRequest, PromptResponse,
-    ResponseChannel, ReviewDecision, Thread, ThreadForkParams, ThreadGoal, ThreadGoalClearParams,
-    ThreadGoalGetParams, ThreadGoalProgressParams, ThreadGoalSetParams, ThreadGoalStatus,
-    ThreadListParams, ThreadReadParams, ThreadRequest, ThreadResponse, ThreadResumeParams,
-    ThreadSetNameParams, ThreadStatus, ToolPayload, UserInputRequestEvent,
+    ResponseChannel, ReviewDecision, Status, Thread, ThreadForkParams, ThreadGoal,
+    ThreadGoalClearParams, ThreadGoalGetParams, ThreadGoalProgressParams, ThreadGoalSetParams,
+    ThreadGoalStatus, ThreadListParams, ThreadReadParams, ThreadRequest, ThreadResponse,
+    ThreadResumeParams, ThreadSetNameParams, ThreadStatus, ToolPayload, UserInputRequestEvent,
 };
 use codewhale_state::{
     JobStateRecord, JobStateStatus, SessionSource, StateStore, ThreadGoalRecord,
@@ -27,7 +29,18 @@ use codewhale_state::{
 };
 use codewhale_tools::{ToolCall, ToolRegistry};
 use serde_json::{Value, json};
+use tokio::time;
 use uuid::Uuid;
+
+/// Per-tool dispatch budget for the headless runtime. Matches the generous
+/// subagent default so long-running tools are not cut off prematurely.
+fn tool_dispatch_timeout() -> Duration {
+    if cfg!(test) {
+        Duration::from_millis(50)
+    } else {
+        Duration::from_secs(300)
+    }
+}
 
 /// How a new thread's conversation history is initialized.
 #[derive(Debug, Clone)]
@@ -76,6 +89,18 @@ pub enum JobStatus {
     Failed,
     /// Cancelled by the user.
     Cancelled,
+}
+
+impl Status for JobStatus {
+    fn is_terminal(&self) -> bool {
+        matches!(self, Self::Completed | Self::Failed | Self::Cancelled)
+    }
+    fn is_active(&self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+    fn is_paused(&self) -> bool {
+        matches!(self, Self::Paused)
+    }
 }
 
 const JOB_DETAIL_SCHEMA_VERSION: u8 = 1;
@@ -156,6 +181,53 @@ pub struct JobRecord {
     pub created_at: i64,
     /// Timestamp of the last state change.
     pub updated_at: i64,
+}
+
+/// Map a durable [`JobRecord`] to the dependency-neutral run read model.
+///
+/// Pure projection of the record as persisted: unknown budgets stay unset and
+/// nothing is fabricated. `updated_at` (epoch seconds) provides the terminal
+/// timestamp because the job manager records no separate end time. The
+/// free-form job detail is intentionally omitted because this owner does not
+/// classify it as safe for a cross-surface read model.
+#[must_use]
+pub fn job_record_to_agent_run(
+    record: &JobRecord,
+) -> codewhale_protocol::agent_run::AgentRunSnapshot {
+    use codewhale_protocol::agent_run::{
+        AgentRunSnapshot, BudgetSummary, RunSource, RunState, TerminalOutcome, TerminalSummary,
+    };
+
+    let (state, terminal) = match record.status {
+        JobStatus::Queued => (RunState::Queued, None),
+        JobStatus::Running => (RunState::Running, None),
+        JobStatus::Paused => (RunState::Paused, None),
+        JobStatus::Completed | JobStatus::Failed | JobStatus::Cancelled => {
+            let outcome = match record.status {
+                JobStatus::Completed => TerminalOutcome::Completed,
+                JobStatus::Failed => TerminalOutcome::Failed,
+                _ => TerminalOutcome::Cancelled,
+            };
+            (
+                RunState::Terminal,
+                Some(TerminalSummary {
+                    outcome,
+                    ended_at_ms: record.updated_at.checked_mul(1000),
+                    detail: None,
+                }),
+            )
+        }
+    };
+
+    AgentRunSnapshot {
+        run_id: record.id.clone(),
+        parent: None,
+        source: RunSource::CoreJob,
+        state,
+        budget: BudgetSummary::default(),
+        terminal,
+        refs: Vec::new(),
+    }
 }
 
 /// Manages background jobs with retry logic and persistence.
@@ -723,6 +795,12 @@ impl ThreadManager {
     /// Restores an archived thread to active status.
     pub fn unarchive_thread(&mut self, thread_id: &str) -> Result<()> {
         self.store.mark_unarchived(thread_id)?;
+        if let Some(metadata) = self.store.get_thread(thread_id)? {
+            let thread = to_protocol_thread(metadata);
+            if let Some(cached) = self.running_threads.get_mut(thread_id) {
+                *cached = thread;
+            }
+        }
         Ok(())
     }
 
@@ -861,8 +939,8 @@ impl Runtime {
     /// **Not** refreshed by this call:
     /// * `mcp_manager` — MCP server connections are loaded once at
     ///   startup from `mcp_config_path`. Changing `mcp_config_path` or the
-    ///   referenced `mcp.json` still requires a restart, exactly as the
-    ///   TUI flags via `mcp_restart_required`.
+    ///   referenced `mcp.json` still requires a headless-runtime restart;
+    ///   the TUI owns a separate explicit `/mcp reload` operation.
     /// * `tool_registry` — built once at startup.
     /// * `model_registry` — static catalog.
     pub fn reload_config_and_policy(&mut self, config: ConfigToml, exec_policy: ExecPolicyEngine) {
@@ -1486,8 +1564,13 @@ impl Runtime {
             })
             .await;
 
-        match self.tool_registry.dispatch(call.clone(), true).await {
-            Ok(tool_output) => {
+        match time::timeout(
+            tool_dispatch_timeout(),
+            self.tool_registry.dispatch(call.clone(), true),
+        )
+        .await
+        {
+            Ok(Ok(tool_output)) => {
                 let result_frame = EventFrame::ToolCallResult {
                     response_id: response_id.clone(),
                     tool_name: call.name.clone(),
@@ -1519,7 +1602,7 @@ impl Runtime {
                     ]
                 }))
             }
-            Err(err) => {
+            Ok(Err(err)) => {
                 let message = format!("{err:?}");
                 let error_frame = EventFrame::Error {
                     response_id: response_id.clone(),
@@ -1541,6 +1624,39 @@ impl Runtime {
                 Ok(json!({
                     "ok": false,
                     "status": "failed",
+                    "execution_kind": execution_kind,
+                    "response_id": response_id,
+                    "precheck": precheck,
+                    "error": message,
+                    "events": [
+                        event_frame_payload(&start_frame),
+                        event_frame_payload(&error_frame)
+                    ]
+                }))
+            }
+            Err(_elapsed) => {
+                let seconds = tool_dispatch_timeout().as_secs().max(1);
+                let message = format!("Tool '{}' timed out after {seconds}s", call.name);
+                let error_frame = EventFrame::Error {
+                    response_id: response_id.clone(),
+                    message: message.clone(),
+                };
+                self.hooks
+                    .emit(HookEvent::GenericEventFrame {
+                        frame: Box::new(error_frame.clone()),
+                    })
+                    .await;
+                self.hooks
+                    .emit(HookEvent::ToolLifecycle {
+                        response_id: response_id.clone(),
+                        tool_name: call.name,
+                        phase: "failed".to_string(),
+                        payload: json!({ "error": message.clone(), "timeout": true }),
+                    })
+                    .await;
+                Ok(json!({
+                    "ok": false,
+                    "status": "timeout",
                     "execution_kind": execution_kind,
                     "response_id": response_id,
                     "precheck": precheck,
@@ -2144,7 +2260,7 @@ fn runtime_status_to_job_state(status: JobStatus) -> JobStateStatus {
     match status {
         JobStatus::Queued => JobStateStatus::Queued,
         JobStatus::Running => JobStateStatus::Running,
-        JobStatus::Paused => JobStateStatus::Running,
+        JobStatus::Paused => JobStateStatus::Paused,
         JobStatus::Completed => JobStateStatus::Completed,
         JobStatus::Failed => JobStateStatus::Failed,
         JobStatus::Cancelled => JobStateStatus::Cancelled,
@@ -2155,6 +2271,7 @@ fn job_state_status_to_runtime(status: JobStateStatus) -> JobStatus {
     match status {
         JobStateStatus::Queued => JobStatus::Queued,
         JobStateStatus::Running => JobStatus::Running,
+        JobStateStatus::Paused => JobStatus::Paused,
         JobStateStatus::Completed => JobStatus::Completed,
         JobStateStatus::Failed => JobStatus::Failed,
         JobStateStatus::Cancelled => JobStatus::Cancelled,
@@ -2164,6 +2281,7 @@ fn job_state_status_to_runtime(status: JobStateStatus) -> JobStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codewhale_protocol::ThreadResumeParams;
     use codewhale_tools::ToolCallSource;
 
     fn temp_core_state(name: &str) -> StateStore {
@@ -2676,7 +2794,7 @@ mod tests {
         );
         assert_eq!(
             runtime_status_to_job_state(JobStatus::Paused),
-            JobStateStatus::Running
+            JobStateStatus::Paused
         );
         assert_eq!(
             runtime_status_to_job_state(JobStatus::Completed),
@@ -2701,6 +2819,10 @@ mod tests {
         assert_eq!(
             job_state_status_to_runtime(JobStateStatus::Running),
             JobStatus::Running
+        );
+        assert_eq!(
+            job_state_status_to_runtime(JobStateStatus::Paused),
+            JobStatus::Paused
         );
         assert_eq!(
             job_state_status_to_runtime(JobStateStatus::Completed),
@@ -2803,5 +2925,254 @@ mod tests {
         assert_eq!(entry.status, JobStatus::Running);
         assert_eq!(entry.progress, Some(50));
         assert_eq!(entry.detail.as_deref(), Some("working"));
+    }
+
+    #[test]
+    fn paused_job_persists_as_paused_not_running() {
+        let store = temp_core_state("paused-persist");
+        let mut jm = JobManager::default();
+        let job = jm.enqueue("task");
+        let id = job.id.clone();
+        jm.set_running(&id);
+        jm.pause(&id, Some("waiting".to_string()));
+        jm.persist_job(&store, &id).expect("persist paused job");
+
+        let persisted = store.list_jobs(Some(10)).expect("list jobs");
+        let record = persisted.iter().find(|job| job.id == id).unwrap();
+        assert_eq!(record.status, JobStateStatus::Paused);
+
+        let mut reloaded = JobManager::default();
+        reloaded.load_from_store(&store).expect("reload jobs");
+        let jobs = reloaded.list();
+        let reloaded_job = jobs.iter().find(|job| job.id == id).unwrap();
+        assert_eq!(reloaded_job.status, JobStatus::Paused);
+    }
+
+    // ── O1: JobRecord → AgentRunSnapshot adapter ────────────────────────
+
+    fn sample_job_record(status: JobStatus, detail: Option<&str>) -> JobRecord {
+        JobRecord {
+            id: "job-o1-1".to_string(),
+            name: "sample".to_string(),
+            status,
+            progress: None,
+            detail: detail.map(str::to_string),
+            retry: JobRetryMetadata {
+                attempt: 0,
+                max_attempts: DEFAULT_JOB_MAX_ATTEMPTS,
+                backoff_base_ms: DEFAULT_JOB_BACKOFF_BASE_MS,
+                next_backoff_ms: 0,
+                next_retry_at: None,
+            },
+            history: Vec::new(),
+            created_at: 1_700_000_000,
+            updated_at: 1_700_000_042,
+        }
+    }
+
+    #[test]
+    fn job_record_to_agent_run_maps_non_terminal_states() {
+        use codewhale_protocol::agent_run::RunState;
+
+        for (status, expected) in [
+            (JobStatus::Queued, RunState::Queued),
+            (JobStatus::Running, RunState::Running),
+            (JobStatus::Paused, RunState::Paused),
+        ] {
+            let snapshot = job_record_to_agent_run(&sample_job_record(status, None));
+            assert!(snapshot.is_coherent());
+            assert_eq!(snapshot.run_id, "job-o1-1");
+            assert_eq!(snapshot.parent, None);
+            assert_eq!(
+                snapshot.source,
+                codewhale_protocol::agent_run::RunSource::CoreJob
+            );
+            assert_eq!(snapshot.state, expected);
+            assert!(snapshot.terminal.is_none());
+            assert!(snapshot.refs.is_empty());
+            assert_eq!(
+                snapshot.budget,
+                codewhale_protocol::agent_run::BudgetSummary::default()
+            );
+        }
+    }
+
+    #[test]
+    fn job_record_to_agent_run_maps_terminal_states_without_fabricating_fields() {
+        use codewhale_protocol::agent_run::{RunState, TerminalOutcome};
+
+        let cases = [
+            (
+                JobStatus::Completed,
+                TerminalOutcome::Completed,
+                Some("done"),
+            ),
+            (JobStatus::Failed, TerminalOutcome::Failed, Some("boom")),
+            (JobStatus::Cancelled, TerminalOutcome::Cancelled, None),
+        ];
+
+        for (status, outcome, detail) in cases {
+            let snapshot = job_record_to_agent_run(&sample_job_record(status, detail));
+            assert!(snapshot.is_coherent());
+            assert_eq!(snapshot.state, RunState::Terminal);
+            let terminal = snapshot.terminal.expect("terminal summary");
+            assert_eq!(terminal.outcome, outcome);
+            assert_eq!(terminal.ended_at_ms, Some(1_700_000_042_000));
+            assert_eq!(terminal.detail, None);
+            assert_eq!(
+                snapshot.budget,
+                codewhale_protocol::agent_run::BudgetSummary::default()
+            );
+            assert!(snapshot.refs.is_empty());
+            assert_eq!(snapshot.parent, None);
+        }
+    }
+
+    #[test]
+    fn job_record_to_agent_run_does_not_export_unclassified_detail() {
+        let record = sample_job_record(JobStatus::Failed, Some("owner-private diagnostic"));
+        let snapshot = job_record_to_agent_run(&record);
+        let terminal = snapshot.terminal.as_ref().expect("terminal summary");
+        assert_eq!(terminal.detail, None);
+        let serialized = serde_json::to_string(&snapshot).expect("serialize snapshot");
+        assert!(!serialized.contains("owner-private diagnostic"));
+    }
+
+    #[test]
+    fn job_record_to_agent_run_omits_ended_at_on_updated_at_overflow() {
+        let mut record = sample_job_record(JobStatus::Completed, Some("ok"));
+        record.updated_at = i64::MAX;
+        let snapshot = job_record_to_agent_run(&record);
+        assert!(snapshot.is_coherent());
+        let terminal = snapshot.terminal.expect("terminal summary");
+        assert_eq!(terminal.ended_at_ms, None);
+    }
+
+    #[test]
+    fn unarchive_thread_updates_running_threads_cache() {
+        let store = temp_core_state("unarchive-cache");
+        let mut manager = ThreadManager::new(store);
+        let spawned = manager
+            .spawn_thread_with_history(
+                "deepseek".to_string(),
+                PathBuf::from("/tmp/codewhale"),
+                InitialHistory::New,
+                true,
+            )
+            .expect("spawn thread");
+        let thread_id = spawned.thread.id.clone();
+        let resume_params = ThreadResumeParams {
+            thread_id: thread_id.clone(),
+            history: None,
+            path: None,
+            model: None,
+            model_provider: None,
+            cwd: None,
+            approval_policy: None,
+            sandbox: None,
+            config: None,
+            base_instructions: None,
+            developer_instructions: None,
+            personality: None,
+            persist_extended_history: false,
+        };
+
+        manager.archive_thread(&thread_id).expect("archive thread");
+        let archived = manager
+            .resume_thread_with_history(
+                &resume_params,
+                Path::new("/tmp/codewhale"),
+                "deepseek".to_string(),
+            )
+            .expect("resume archived thread")
+            .expect("thread in cache");
+        assert_eq!(archived.thread.status, ThreadStatus::Archived);
+
+        manager
+            .unarchive_thread(&thread_id)
+            .expect("unarchive thread");
+        let restored = manager
+            .resume_thread_with_history(
+                &resume_params,
+                Path::new("/tmp/codewhale"),
+                "deepseek".to_string(),
+            )
+            .expect("resume unarchived thread")
+            .expect("thread in cache");
+        assert_eq!(restored.thread.status, ThreadStatus::Idle);
+    }
+
+    #[tokio::test]
+    async fn invoke_tool_returns_timeout_status_for_slow_tools() {
+        use async_trait::async_trait;
+        use codewhale_agent::ModelRegistry;
+        use codewhale_config::ConfigToml;
+        use codewhale_execpolicy::{AskForApproval, ExecPolicyEngine};
+        use codewhale_hooks::HookDispatcher;
+        use codewhale_mcp::McpManager;
+        use codewhale_protocol::{ToolKind, ToolOutput, ToolPayload};
+        use codewhale_tools::{FunctionCallError, ToolDescriptor, ToolHandler, ToolInvocation};
+
+        struct SlowTool;
+        #[async_trait]
+        impl ToolHandler for SlowTool {
+            fn kind(&self) -> ToolKind {
+                ToolKind::Function
+            }
+
+            async fn handle(
+                &self,
+                _invocation: ToolInvocation,
+            ) -> std::result::Result<ToolOutput, FunctionCallError> {
+                time::sleep(Duration::from_millis(200)).await;
+                Ok(ToolOutput::Function {
+                    body: Some(json!("late")),
+                    success: true,
+                })
+            }
+        }
+
+        let mut registry = ToolRegistry::default();
+        registry
+            .register(
+                ToolDescriptor {
+                    name: "slow_tool".to_string(),
+                    input_schema: json!({"type":"object"}),
+                    output_schema: json!({"type":"object"}),
+                    supports_parallel_tool_calls: true,
+                    timeout_ms: None,
+                },
+                Arc::new(SlowTool),
+            )
+            .expect("register slow tool");
+
+        let runtime = Runtime::new(
+            ConfigToml::default(),
+            ModelRegistry::default(),
+            temp_core_state("invoke-tool-timeout"),
+            Arc::new(registry),
+            Arc::new(McpManager::default()),
+            ExecPolicyEngine::new(vec![], vec![]),
+            HookDispatcher::default(),
+        );
+
+        let result = runtime
+            .invoke_tool(
+                ToolCall {
+                    name: "slow_tool".to_string(),
+                    payload: ToolPayload::Function {
+                        arguments: "{}".to_string(),
+                    },
+                    source: ToolCallSource::Direct,
+                    raw_tool_call_id: None,
+                },
+                AskForApproval::Never,
+                Path::new("/tmp/codewhale"),
+            )
+            .await
+            .expect("invoke tool");
+
+        assert_eq!(result["status"], "timeout");
+        assert_eq!(result["ok"], false);
     }
 }

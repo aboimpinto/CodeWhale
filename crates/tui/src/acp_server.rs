@@ -219,12 +219,11 @@ where
                     // Stream exhausted without an explicit stop: turn is done.
                     None => return Ok(PromptOutcome::Completed(accumulated)),
                     Some(Ok(event)) => {
-                        if let Some(text) = stream_text_chunk(&event) {
-                            if !text.is_empty() {
+                        if let Some(text) = stream_text_chunk(&event)
+                            && !text.is_empty() {
                                 accumulated.push_str(text);
                                 write_session_update(writer, session_id, text.to_string()).await?;
                             }
-                        }
                         match event {
                             StreamEvent::MessageStop => {
                                 return Ok(PromptOutcome::Completed(accumulated));
@@ -543,7 +542,13 @@ impl AcpServer {
         let client = DeepSeekClient::new(&execution_config)?;
         let reasoning_effort = route
             .reasoning_effort
-            .and_then(|effort| effort.api_value_for_provider(execution_config.api_provider()))
+            .and_then(|effort| {
+                effort.api_value_for_route(
+                    execution_config.api_provider(),
+                    &execution_config.deepseek_base_url(),
+                    &route.model,
+                )
+            })
             .map(str::to_string);
 
         let request = MessageRequest {
@@ -638,8 +643,8 @@ fn acp_auth_methods(config: &Config) -> Value {
     json!([
         {
             "id": "codewhale-terminal-auth",
-            "name": "Set CodeWhale API key",
-            "description": format!("Run CodeWhale's terminal credential setup for the {provider} provider."),
+            "name": "Set Codewhale API key",
+            "description": format!("Run Codewhale's terminal credential setup for the {provider} provider."),
             "type": "terminal",
             "args": ["auth", "set", "--provider", provider],
             "env": {}

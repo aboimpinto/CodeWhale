@@ -12,6 +12,7 @@ use super::{ASSISTANT_GLYPH, USER_GLYPH};
 
 pub(crate) struct RenderedTranscriptLine {
     pub line: Line<'static>,
+    pub links: Vec<crate::tui::osc8::LineLink>,
     pub copy_prefix_width: usize,
     pub copy_separator_after: CopyLineSeparator,
 }
@@ -52,6 +53,16 @@ pub(super) fn render_message_with_copy_metadata(
     let rendered =
         markdown_render::render_markdown_tagged(content, content_width as u16, body_style);
     for (idx, rendered_line) in rendered.into_iter().enumerate() {
+        let display_prefix_width = if prefix.is_empty() {
+            0
+        } else {
+            prefix_width + 1
+        };
+        let links = rendered_line
+            .links
+            .iter()
+            .map(|link| link.shifted(display_prefix_width))
+            .collect();
         let line = if idx == 0 {
             let mut spans = Vec::new();
             if !prefix.is_empty() {
@@ -81,6 +92,7 @@ pub(super) fn render_message_with_copy_metadata(
         };
         lines.push(RenderedTranscriptLine {
             line,
+            links,
             copy_prefix_width: rendered_line.copy_prefix_width
                 + history_copy_prefix_width(prefix, prefix_width, rendered_line.is_code, idx),
             copy_separator_after: rendered_line.copy_separator_after,
@@ -89,6 +101,7 @@ pub(super) fn render_message_with_copy_metadata(
     if lines.is_empty() {
         lines.push(RenderedTranscriptLine {
             line: Line::from(""),
+            links: Vec::new(),
             copy_prefix_width: 0,
             copy_separator_after: CopyLineSeparator::Newline,
         });
@@ -114,6 +127,7 @@ pub(super) fn hard_break_copy_lines(lines: Vec<Line<'static>>) -> Vec<RenderedTr
         .into_iter()
         .map(|line| RenderedTranscriptLine {
             line,
+            links: Vec::new(),
             copy_prefix_width: 0,
             copy_separator_after: CopyLineSeparator::Newline,
         })
@@ -218,9 +232,9 @@ pub(super) fn assistant_label_style_for(streaming: bool, low_motion: bool) -> St
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        palette::pulse_brightness(palette::DEEPSEEK_SKY, now_ms)
+        palette::pulse_brightness(palette::WHALE_INFO, now_ms)
     } else {
-        palette::DEEPSEEK_SKY
+        palette::WHALE_INFO
     };
     Style::default().fg(color)
 }

@@ -15,11 +15,11 @@ fn modal_block(title: &str) -> Block<'static> {
     Block::default()
         .title(Line::from(vec![Span::styled(
             title.to_string(),
-            Style::default().fg(palette::WHALE_ACCENT_PRIMARY).bold(),
+            Style::default().fg(palette::WHALE_HUMAN).bold(),
         )]))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(palette::BORDER_COLOR))
-        .style(Style::default().bg(palette::DEEPSEEK_INK))
+        .style(Style::default().bg(palette::WHALE_BG))
         .padding(Padding::uniform(1))
 }
 
@@ -127,7 +127,12 @@ impl UserInputView {
 
     /// True when the multi-select "Confirm selection" row is highlighted.
     fn is_confirm_selected(&self) -> bool {
-        self.is_multi_select() && self.selected + 1 == self.option_count()
+        self.confirm_index() == Some(self.selected)
+    }
+
+    fn confirm_index(&self) -> Option<usize> {
+        self.is_multi_select()
+            .then(|| self.option_count().saturating_sub(1))
     }
 
     fn is_multi_select(&self) -> bool {
@@ -333,7 +338,7 @@ impl ModalView for UserInputView {
         let mut lines: Vec<Line> = Vec::new();
         lines.push(Line::from(vec![Span::styled(
             "Action required",
-            Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+            Style::default().fg(palette::WHALE_INFO).bold(),
         )]));
         lines.push(Line::from(vec![
             Span::styled(
@@ -382,8 +387,7 @@ impl ModalView for UserInputView {
         // Multi-select gets a dedicated "Confirm selection" row after the
         // options (and after "Other" when present). Selecting and pressing
         // Enter on it flushes the pending set as the question's answers.
-        if self.is_multi_select() {
-            let confirm_index = self.option_count();
+        if let Some(confirm_index) = self.confirm_index() {
             let confirm_number = confirm_index + 1;
             push_option_lines(
                 &mut lines,
@@ -409,7 +413,7 @@ impl ModalView for UserInputView {
                     } else {
                         self.other_input.clone()
                     },
-                    Style::default().fg(palette::WHALE_ACCENT_PRIMARY),
+                    Style::default().fg(palette::WHALE_HUMAN),
                 ),
             ]));
         }
@@ -417,10 +421,10 @@ impl ModalView for UserInputView {
         lines.push(Line::from(""));
         if self.mode == InputMode::OtherInput {
             lines.push(Line::from(vec![
-                Span::styled("Enter", Style::default().fg(palette::DEEPSEEK_SKY).bold()),
+                Span::styled("Enter", Style::default().fg(palette::WHALE_INFO).bold()),
                 Span::styled(" submit", Style::default().fg(palette::TEXT_MUTED)),
                 Span::raw("  "),
-                Span::styled("Esc", Style::default().fg(palette::DEEPSEEK_SKY).bold()),
+                Span::styled("Esc", Style::default().fg(palette::WHALE_INFO).bold()),
                 Span::styled(" back", Style::default().fg(palette::TEXT_MUTED)),
             ]));
         } else {
@@ -434,34 +438,34 @@ impl ModalView for UserInputView {
                 lines.push(Line::from(vec![
                     Span::styled(
                         quick_pick_label,
-                        Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+                        Style::default().fg(palette::WHALE_INFO).bold(),
                     ),
                     Span::styled(" move", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw("  "),
-                    Span::styled("Space", Style::default().fg(palette::DEEPSEEK_SKY).bold()),
+                    Span::styled("Space", Style::default().fg(palette::WHALE_INFO).bold()),
                     Span::styled(" toggle", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw("  "),
-                    Span::styled("Enter", Style::default().fg(palette::DEEPSEEK_SKY).bold()),
+                    Span::styled("Enter", Style::default().fg(palette::WHALE_INFO).bold()),
                     Span::styled(" toggle/confirm", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw("  "),
-                    Span::styled("Esc", Style::default().fg(palette::DEEPSEEK_SKY).bold()),
+                    Span::styled("Esc", Style::default().fg(palette::WHALE_INFO).bold()),
                     Span::styled(" cancel", Style::default().fg(palette::TEXT_MUTED)),
                 ]));
             } else {
                 lines.push(Line::from(vec![
                     Span::styled(
                         quick_pick_label,
-                        Style::default().fg(palette::DEEPSEEK_SKY).bold(),
+                        Style::default().fg(palette::WHALE_INFO).bold(),
                     ),
                     Span::styled(" quick pick", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw("  "),
-                    Span::styled("Up/Down", Style::default().fg(palette::DEEPSEEK_SKY).bold()),
+                    Span::styled("Up/Down", Style::default().fg(palette::WHALE_INFO).bold()),
                     Span::styled(" move", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw("  "),
-                    Span::styled("Enter", Style::default().fg(palette::DEEPSEEK_SKY).bold()),
+                    Span::styled("Enter", Style::default().fg(palette::WHALE_INFO).bold()),
                     Span::styled(" confirm", Style::default().fg(palette::TEXT_MUTED)),
                     Span::raw("  "),
-                    Span::styled("Esc", Style::default().fg(palette::DEEPSEEK_SKY).bold()),
+                    Span::styled("Esc", Style::default().fg(palette::WHALE_INFO).bold()),
                     Span::styled(" cancel", Style::default().fg(palette::TEXT_MUTED)),
                 ]));
             }
@@ -603,5 +607,29 @@ mod tests {
         );
         assert!(rendered.contains("Submit 1 selected"));
         assert!(rendered.contains("toggle"));
+        assert!(
+            rendered.contains(">  3) Confirm selection"),
+            "confirm row should display selected focus at its real quick-pick index"
+        );
+        assert!(
+            !rendered.contains("4) Confirm selection"),
+            "confirm row must not advertise an unreachable quick-pick number"
+        );
+    }
+
+    #[test]
+    fn user_input_modal_numbers_confirm_after_other_row() {
+        let mut view = sample_view();
+        view.request.questions[0].multi_select = true;
+        view.request.questions[0].allow_free_text = true;
+        view.selected = view.option_count() - 1;
+
+        let rendered = render_view(&view, 120, 40);
+        assert!(rendered.contains("3) Other"));
+        assert!(
+            rendered.contains(">  4) Confirm selection"),
+            "confirm should follow the optional Other row with selected focus"
+        );
+        assert!(!rendered.contains("5) Confirm selection"));
     }
 }
