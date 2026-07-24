@@ -62,15 +62,15 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
 
     // Animate the spacer between the left status line and the right-hand
     // chips whenever a turn is live: model loading/streaming, compacting, or
-    // sub-agents in flight. The spout strip and dot-pulse fallback are gated
-    // on `fancy_animations` (the "do I want animated chrome" knob);
-    // `low_motion` governs streaming pacing and redraw cadence.
+    // sub-agents in flight. The shared Full-motion policy owns the spout strip
+    // and dot pulse; Reduced and Still keep the truthful label without cycling.
     if footer_working_strip_active(app) {
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        let dot_frame = footer_working_label_frame(now_ms, app.fancy_animations);
+        let status_motion = app.motion_policy().allows_status_spin();
+        let dot_frame = footer_working_label_frame(now_ms, status_motion);
         // Header ● Live owns coarse turn state; footer shows action detail only.
         let elapsed_secs = app
             .turn_started_at
@@ -121,9 +121,9 @@ pub(crate) fn render_footer(f: &mut Frame, area: Rect, app: &mut App) {
         // math in `footer_working_strip_glyph_at` was tuned for this cadence
         // (`t = frame / 1000.0`, primary term × 8.0 ≈ 1.3 Hz at 1 ms ticks),
         // so frame must advance at ~1000 units/sec to produce the intended
-        // animation feel. `fancy_animations = false` hides the strip and pins
-        // the textual fallback to `working`.
-        if app.fancy_animations {
+        // animation feel. Non-Full modes hide the strip and pin the textual
+        // fallback to `working`.
+        if status_motion {
             props.working_strip_frame = Some(now_ms);
         }
     } else if matches!(props.state_label.as_str(), "idle" | "ready")
@@ -215,14 +215,21 @@ fn provider_wait_reason(app: &App) -> String {
 
     let near_timeout = budget > 0 && idle >= budget.saturating_mul(3) / 4; // ≥ 75%
     if near_timeout {
-        format!("waiting for model · {idle}s/{budget}s idle timeout")
+        format!(
+            "waiting for model · {}/{} idle timeout",
+            crate::elapsed::format_elapsed_secs(idle),
+            crate::elapsed::format_elapsed_secs(budget)
+        )
     } else if idle < PROVIDER_WAIT_IDLE_SHOW_SECS {
         // Normal wait — no countdown noise.
         "waiting for model".to_string()
     } else {
-        // Significant idle — surface the elapsed seconds so the user can judge
+        // Significant idle — surface the elapsed time so the user can judge
         // whether the stream is making progress.
-        format!("waiting for model · {idle}s")
+        format!(
+            "waiting for model · {}",
+            crate::elapsed::format_elapsed_secs(idle)
+        )
     }
 }
 
@@ -286,8 +293,8 @@ pub(crate) fn footer_working_strip_active(app: &App) -> bool {
         || turn_in_progress
 }
 
-pub(crate) fn footer_working_label_frame(now_ms: u64, fancy_animations: bool) -> u64 {
-    if fancy_animations { now_ms / 400 } else { 0 }
+pub(crate) fn footer_working_label_frame(now_ms: u64, animate: bool) -> u64 {
+    if animate { now_ms / 400 } else { 0 }
 }
 
 #[cfg(test)]
@@ -435,9 +442,9 @@ mod tests {
         app.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(60));
         let reason = super::provider_wait_reason(&app);
         assert!(reason.contains("waiting for model"));
-        assert!(reason.contains("60s"));
+        assert!(reason.contains("1m 00s"));
         // Should NOT show the full timeout budget yet (<75% of 300s = 225s)
-        assert!(!reason.contains("/300s"));
+        assert!(!reason.contains("/5m 00s"));
     }
 
     #[test]
@@ -448,8 +455,8 @@ mod tests {
         app.turn_started_at = Some(std::time::Instant::now() - std::time::Duration::from_secs(240));
         let reason = super::provider_wait_reason(&app);
         assert!(reason.contains("waiting for model"));
-        assert!(reason.contains("/300s idle timeout"));
-        assert!(reason.contains("240s"));
+        assert!(reason.contains("/5m 00s idle timeout"));
+        assert!(reason.contains("4m 00s"));
     }
 
     #[test]
@@ -596,7 +603,7 @@ pub(crate) fn active_tool_status_label(app: &App, include_counts: bool) -> Optio
     let elapsed = snapshot
         .started_at
         .or(app.turn_started_at)
-        .map(|started| format!("{}s", started.elapsed().as_secs()));
+        .map(|started| crate::elapsed::format_elapsed_secs(started.elapsed().as_secs()));
 
     let mut parts = vec![primary];
     if include_counts {
@@ -637,7 +644,7 @@ fn collect_active_tool_status(
             }
         }
         ToolCell::PlanUpdate(plan) => {
-            snapshot.record("update Strategy".to_string(), plan.status, None);
+            snapshot.record("legacy plan update".to_string(), plan.status, None);
         }
         ToolCell::PatchSummary(patch) => {
             snapshot.record(format!("patch {}", patch.path), patch.status, None);

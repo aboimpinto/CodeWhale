@@ -22,8 +22,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::localization::{MessageId, tr};
 use crate::tui::{
     app::App,
-    history::{HistoryCell, ToolCell, ToolStatus},
-    underwater::{ShellPhase, ShellTier, phase_marker},
+    underwater::{LiveActivity, ShellPhase, ShellTier, phase_marker_with_activity},
 };
 
 /// Where the phase band sits relative to the composer.
@@ -91,23 +90,19 @@ fn truncate_to_width(text: &str, width: usize) -> String {
     result
 }
 
-/// Compact working detail for the phase band: `run ×N · 12s`.
+/// Compact working detail for the phase band: `×N` for tools or `1m 15s`
+/// while the model is thinking.
 /// Kept quieter than the classic footer's verbose tool-status line so the
 /// transcript owns the ledger and the strip only names the live pulse.
-fn working_detail(app: &App) -> Option<String> {
-    let mut running = 0usize;
-    if let Some(active) = app.active_cell.as_ref() {
-        for cell in active.entries() {
-            running = running.saturating_add(count_running_tools(cell));
-        }
-    }
+fn working_detail(app: &App, activity: LiveActivity) -> Option<String> {
+    let running = activity.running_tool_count();
     let secs = app
         .turn_started_at
         .map(|started| started.elapsed().as_secs());
     match (running, secs) {
-        (0, Some(secs)) if secs > 0 => Some(format!("{secs}s")),
-        (n, Some(secs)) if n > 0 => Some(format!("run ×{n} · {secs}s")),
-        (n, None) if n > 0 => Some(format!("run ×{n}")),
+        (0, Some(secs)) if secs > 0 => Some(crate::elapsed::format_elapsed_secs(secs)),
+        (n, Some(_)) if n > 0 => Some(format!("×{n}")),
+        (n, None) if n > 0 => Some(format!("×{n}")),
         _ => None,
     }
 }
@@ -125,36 +120,26 @@ fn session_cache_hit_percentage(app: &App) -> Option<u8> {
     Some(((hit * 100 + total / 2) / total) as u8)
 }
 
-fn count_running_tools(cell: &HistoryCell) -> usize {
-    let HistoryCell::Tool(tool) = cell else {
-        return 0;
-    };
-    match tool {
-        ToolCell::Exploring(explore) => explore
-            .entries
-            .iter()
-            .filter(|entry| matches!(entry.status, ToolStatus::Running))
-            .count(),
-        other => usize::from(other.status() == Some(ToolStatus::Running)),
-    }
-}
-
-/// Paint the one-line phase band. Owns phase, optional working detail, cost,
-/// configured session cache rate, and detail-key hints — never route/context
-/// (header) or Tasks/To-do (work surface).
+/// Paint the one-line phase rail. Compact left marker (icon + verb + duration)
+/// instead of a full-width routine phase band. Amber only for approval/waiting;
+/// cyan/teal for routine work.
 pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
     if area.width == 0 || area.height == 0 {
         return;
     }
     let status_toast = app.active_status_toast();
-    let phase = ShellPhase::from_app(app);
+    let activity = LiveActivity::from_app(app);
+    let phase = ShellPhase::from_app_with_activity(app, activity);
     let tier = ShellTier::for_chrome_width(area.width);
+    // Quiet chrome background — never paint the full row in phase accent.
     Block::default()
         .style(Style::default().bg(app.ui_theme.footer_bg))
         .render(area, buf);
 
-    let (marker, phase_label) = phase_marker(app, phase);
-    let phase_style = Style::default().fg(phase.color(app)).add_modifier(
+    // Compact left rail: one accent cell + marker + verb (not a full-width band).
+    let rail_color = phase.color(app);
+    let (marker, phase_label) = phase_marker_with_activity(app, phase, activity);
+    let phase_style = Style::default().fg(rail_color).add_modifier(
         if matches!(phase, ShellPhase::Waiting | ShellPhase::Approval) {
             Modifier::BOLD
         } else {
@@ -162,6 +147,7 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
         },
     );
     let mut left = vec![
+        Span::styled("▌", phase_style),
         Span::styled(marker, phase_style),
         Span::raw(" "),
         Span::styled(phase_label.clone(), phase_style),
@@ -169,7 +155,7 @@ pub fn render(area: Rect, buf: &mut Buffer, app: &mut App) {
 
     if tier != ShellTier::Compact
         && matches!(phase, ShellPhase::Working | ShellPhase::Verifying)
-        && let Some(detail) = working_detail(app)
+        && let Some(detail) = working_detail(app, activity)
     {
         left.push(Span::styled(
             " · ",
@@ -289,7 +275,7 @@ mod tests {
         config::Config,
         tui::active_cell::ActiveCell,
         tui::app::TuiOptions,
-        tui::history::{ExecCell, ExecSource, ToolCell, ToolStatus},
+        tui::history::{ExecCell, ExecSource, HistoryCell, ToolCell, ToolStatus},
     };
     use ratatui::{Terminal, backend::TestBackend};
     use std::{
@@ -364,7 +350,7 @@ mod tests {
     }
 
     #[test]
-    fn working_band_names_run_count_without_key_chorus() {
+    fn working_band_names_tool_use_and_bounded_count_without_key_chorus() {
         let mut app = test_app();
         app.ui_locale = crate::localization::Locale::En;
         app.is_loading = true;
@@ -403,11 +389,79 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(text.contains("working"), "{text}");
-        assert!(text.contains("run ×1"), "{text}");
+        assert!(text.contains("using tool"), "{text}");
+        assert!(text.contains("×1"), "{text}");
+        assert!(
+            !text.contains("12s"),
+            "tool elapsed time belongs to the live tool row: {text}"
+        );
+        assert!(
+            !text.contains("run ×1"),
+            "detail repeated the tool verb: {text}"
+        );
         assert!(
             !text.contains("Alt+?") && !text.contains("F1:"),
             "live phase strip stays quiet: {text}"
+        );
+    }
+
+    #[test]
+    fn compact_activity_band_keeps_only_the_semantic_label() {
+        let mut app = test_app();
+        app.ui_locale = crate::localization::Locale::En;
+        app.turn_started_at = Some(Instant::now() - Duration::from_secs(12));
+        let mut active = ActiveCell::new();
+        active.push_tool(
+            "exec-compact",
+            HistoryCell::Tool(ToolCell::Exec(ExecCell {
+                command: "cargo build -p tui".to_string(),
+                status: ToolStatus::Running,
+                output: None,
+                live_output: None,
+                shell_task_id: None,
+                owner_agent_id: None,
+                owner_agent_name: None,
+                started_at: app.turn_started_at,
+                duration_ms: None,
+                source: ExecSource::Assistant,
+                interaction: None,
+                output_summary: None,
+            })),
+        );
+        app.active_cell = Some(active);
+
+        let backend = TestBackend::new(50, 1);
+        let mut terminal = Terminal::new(backend).expect("terminal");
+        terminal
+            .draw(|frame| render(frame.area(), frame.buffer_mut(), &mut app))
+            .expect("draw");
+        let text = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+
+        assert!(text.contains("using tool"), "{text}");
+        assert!(
+            !text.contains('×'),
+            "compact strip leaked count detail: {text}"
+        );
+        assert!(
+            !text.contains("12s"),
+            "compact strip leaked timing detail: {text}"
+        );
+    }
+
+    #[test]
+    fn working_band_keeps_elapsed_time_when_model_is_thinking() {
+        let mut app = test_app();
+        app.turn_started_at = Some(Instant::now() - Duration::from_secs(12));
+
+        assert_eq!(
+            working_detail(&app, LiveActivity::from_app(&app)).as_deref(),
+            Some("12s")
         );
     }
 

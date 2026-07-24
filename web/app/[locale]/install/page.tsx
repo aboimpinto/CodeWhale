@@ -5,6 +5,8 @@ import { InstallBinary } from "@/components/install-binary";
 import { getFacts } from "@/lib/facts";
 import { buildPageMetadata } from "@/lib/page-meta";
 
+export const revalidate = 300;
+
 export async function generateMetadata({ params }: { params: Promise<{ locale: string }> }) {
   const { locale } = await params;
   const isZh = locale === "zh";
@@ -57,27 +59,27 @@ const FROM_SOURCE = `git clone https://github.com/Hmbown/CodeWhale
 cd CodeWhale
 cargo build --release --locked
 
-# Install both binaries from the local checkout
-cargo install --path crates/cli --locked   # codewhale
+# Install two Cargo packages; together they provide three commands
+cargo install --path crates/cli --locked   # codewhale + codew
 cargo install --path crates/tui --locked   # codewhale-tui`;
 
-const CONFIG_TREE = `~/.codewhale/
+const CONFIG_TREE = `$CODEWHALE_HOME/ (default: ~/.codewhale/)
 ├── config.toml      api keys, model, hooks, profiles
 ├── mcp.json         MCP server definitions
 ├── skills/          user skills (each with SKILL.md)
 ├── sessions/        checkpoints + offline queue
 ├── tasks/           background task store
-└── audit.log        credential / approval / elevation audit trail
+└── audit.log        best-effort credential / approval / elevation events
 
 ./.codewhale/        project-scoped config (optional, per-repo)`;
 
-const CONFIG_TREE_ZH = `~/.codewhale/
+const CONFIG_TREE_ZH = `$CODEWHALE_HOME/（默认：~/.codewhale/）
 ├── config.toml      API 密钥、模型、钩子、配置集
 ├── mcp.json         MCP 服务器定义
 ├── skills/          用户技能（每个含 SKILL.md）
 ├── sessions/        检查点 + 离线队列
 ├── tasks/           后台任务存储
-└── audit.log        凭证 / 审批 / 提权审计日志
+└── audit.log        尽力写入的凭证 / 审批 / 提权事件
 
 ./.codewhale/        项目级配置（可选，每个仓库）`;
 
@@ -85,8 +87,11 @@ export default async function InstallPage({ params }: { params: Promise<{ locale
   const { locale } = await params;
   const isZh = locale === "zh";
   const facts = await getFacts();
-  const tag = facts.version ? `v${facts.version}` : "v0.8.x";
-  const verify = `codewhale --version   # ${facts.version ?? "prints the installed version"}
+  const publishedRelease = facts.latestPublishedRelease;
+  const sourceIsPublished = publishedRelease?.version === facts.version;
+  const verify = `codewhale --version${
+    publishedRelease ? `   # latest published: ${publishedRelease.version}` : ""
+  }
 codewhale doctor`;
 
   const copyLabel = isZh ? "复制" : "Copy";
@@ -184,8 +189,10 @@ codewhale doctor`;
               <code className="inline">curl</code> 命令覆盖更新。
               通过包管理器安装的话，用包管理器升级更稳：npm 安装的运行{" "}
               <code className="inline">npm update -g codewhale</code>；
-              Cargo 安装的重跑两个 <code className="inline">cargo install</code> 命令并加{" "}
-              <code className="inline">--force</code>；
+              Cargo 安装的重跑两个 package 的 <code className="inline">cargo install</code> 命令并加{" "}
+              <code className="inline">--force</code>（<code className="inline">codewhale-cli</code> 提供
+              <code className="inline">codewhale</code> 与 <code className="inline">codew</code>，
+              <code className="inline">codewhale-tui</code> 提供同名命令）；
               旧版 Homebrew tap 用 <code className="inline">brew upgrade deepseek-tui</code>。
             </>
           ) : (
@@ -194,9 +201,12 @@ codewhale doctor`;
               installed with <code className="inline">install.sh</code>, re-run the same{" "}
               <code className="inline">curl</code> command to overwrite the binaries.
               If you installed via a package manager, prefer it instead: npm users run{" "}
-              <code className="inline">npm update -g codewhale</code>; cargo users re-run both{" "}
-              <code className="inline">cargo install</code> commands with{" "}
-              <code className="inline">--force</code>; the legacy Homebrew tap updates with{" "}
+              <code className="inline">npm update -g codewhale</code>; cargo users re-run the two
+              package <code className="inline">cargo install</code> commands with{" "}
+              <code className="inline">--force</code> (<code className="inline">codewhale-cli</code>
+              provides <code className="inline">codewhale</code> and <code className="inline">codew</code>;
+              <code className="inline">codewhale-tui</code> provides the command of the same name);
+              the legacy Homebrew tap updates with{" "}
               <code className="inline">brew upgrade deepseek-tui</code>.
             </>
           )}
@@ -291,10 +301,20 @@ codewhale doctor`;
           <h2 className="font-display text-3xl mb-2">
             {isZh ? "其他安装方式" : "Other ways to install"}
           </h2>
-          <p className="text-sm text-ink-soft max-w-2xl mb-10">
+          <p className="text-sm text-ink-soft max-w-2xl mb-4">
             {isZh
               ? "如果上面的脚本路径不适合你，请从下面选择匹配你环境的方式。各渠道的命令和打包形式有所不同，说明会明确列出安装内容。"
               : "If the script above doesn't fit your setup, choose the channel that matches your environment. Command availability and packaging differ by channel, and each description states exactly what it installs."}
+          </p>
+
+          <p className="text-sm text-ink-soft max-w-2xl mb-10">
+            {publishedRelease
+              ? isZh
+                ? `下方的发布命令以 ${publishedRelease.tag} 为准；它是 GitHub 上最新的已发布版本。${sourceIsPublished ? "当前源码与该发布版一致。" : `当前源码候选版为 v${facts.version}，发布前不会被安装命令当作正式版本。`}`
+                : `Release-backed commands below use ${publishedRelease.tag}, the latest version published on GitHub. ${sourceIsPublished ? "The current source matches that release." : `The current source candidate is v${facts.version}; install commands do not advertise it before publication.`}`
+              : isZh
+                ? "暂时无法验证最新的 GitHub 发布标签；请先查看 Releases，再运行需要固定标签的命令。"
+                : "The latest GitHub release tag could not be verified. Check Releases before running a command that requires a pinned tag."}
           </p>
 
           <div className="space-y-10">
@@ -334,16 +354,19 @@ codewhale doctor`;
               <p className="mt-3 text-sm text-ink-soft leading-relaxed max-w-2xl">
                 {isZh ? (
                   <>
-                    编译并安装 <code className="inline">codewhale</code> 和 <code className="inline">codewhale-tui</code> 到 <code className="inline">~/.cargo/bin</code>。
+                    两个 Cargo package 会把 <code className="inline">codewhale</code>、
+                    <code className="inline">codew</code> 和 <code className="inline">codewhale-tui</code>
+                    三个命令安装到 <code className="inline">~/.cargo/bin</code>。
                     需要 Rust 1.88+；Linux 用户先安装 <code className="inline">pkg-config</code> 和{" "}
                     <code className="inline">libdbus-1-dev</code> 等构建依赖。如未安装 Rust，可访问{" "}
                     <a href="https://rustup.rs" className="body-link">rustup.rs</a>。
                   </>
                 ) : (
                   <>
-                    Compiles and installs <code className="inline">codewhale</code> and{" "}
-                    <code className="inline">codewhale-tui</code> to{" "}
-                    <code className="inline">~/.cargo/bin</code>. Requires Rust 1.88+; install via{" "}
+                    The two Cargo packages install three commands—
+                    <code className="inline">codewhale</code>, <code className="inline">codew</code>, and{" "}
+                    <code className="inline">codewhale-tui</code>—to <code className="inline">~/.cargo/bin</code>.
+                    Requires Rust 1.88+; install via{" "}
                     <a href="https://rustup.rs" className="body-link">rustup.rs</a> if you don&apos;t have it.
                     On Linux, install build dependencies such as{" "}
                     <code className="inline">pkg-config</code> and{" "}
@@ -362,7 +385,20 @@ codewhale doctor`;
             {/* CNB */}
             <div className="rounded-lg border border-ink/12 bg-white/70 p-5">
               <div className="font-display text-lg mb-3">{isZh ? "CNB 镜像" : "CNB mirror"}</div>
-              <InstallCodeBlock cmd={cnbInstall(tag)} copyLabel={copyLabel} copiedLabel={copiedLabel} />
+              {publishedRelease ? (
+                <InstallCodeBlock
+                  cmd={cnbInstall(publishedRelease.tag)}
+                  copyLabel={copyLabel}
+                  copiedLabel={copiedLabel}
+                />
+              ) : (
+                <a
+                  href="https://github.com/Hmbown/CodeWhale/releases/latest"
+                  className="body-link"
+                >
+                  {isZh ? "查看最新 GitHub 发布" : "Check the latest GitHub release"}
+                </a>
+              )}
             </div>
 
             {/* Mainland China network */}

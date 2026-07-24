@@ -1,7 +1,7 @@
 //! Plan tool implementation with step tracking and validation
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 use tokio::sync::Mutex;
 
 use async_trait::async_trait;
@@ -103,34 +103,6 @@ impl PlanStep {
             status,
             started_at: None,
             completed_at: None,
-        }
-    }
-
-    /// Get the elapsed time if the step has timing info
-    #[must_use]
-    pub fn elapsed(&self) -> Option<Duration> {
-        match (self.started_at, self.completed_at) {
-            (Some(start), Some(end)) => Some(end.duration_since(start)),
-            (Some(start), None) if self.status == StepStatus::InProgress => Some(start.elapsed()),
-            _ => None,
-        }
-    }
-
-    /// Format elapsed time for display
-    #[must_use]
-    pub fn elapsed_str(&self) -> String {
-        match self.elapsed() {
-            Some(d) => {
-                let secs = d.as_secs();
-                if secs < 60 {
-                    format!("{secs}s")
-                } else if secs < 3600 {
-                    format!("{}m {}s", secs / 60, secs % 60)
-                } else {
-                    format!("{}h {}m", secs / 3600, (secs % 3600) / 60)
-                }
-            }
-            None => String::new(),
         }
     }
 }
@@ -244,23 +216,6 @@ pub struct PlanState {
 }
 
 impl PlanState {
-    /// Check whether the plan is empty.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.steps.is_empty()
-            && self.title.is_none()
-            && self.objective.is_none()
-            && self.context_summary.is_none()
-            && self.explanation.is_none()
-            && self.sources_used.is_empty()
-            && self.critical_files.is_empty()
-            && self.constraints.is_empty()
-            && self.recommended_approach.is_none()
-            && self.verification_plan.is_none()
-            && self.risks_and_unknowns.is_none()
-            && self.handoff_packet.is_none()
-    }
-
     pub fn update(&mut self, args: UpdatePlanArgs) {
         self.title = clean_optional(args.title);
         self.objective = clean_optional(args.objective);
@@ -368,10 +323,6 @@ impl PlanState {
             plan: snapshot.items.clone(),
         });
         state
-    }
-
-    pub fn explanation(&self) -> Option<&str> {
-        self.explanation.as_deref()
     }
 
     pub fn steps(&self) -> &[PlanStep] {
@@ -492,7 +443,14 @@ impl ToolSpec for UpdatePlanTool {
     }
 
     fn description(&self) -> &'static str {
-        "Update optional high-level Strategy metadata for complex initiatives. Use work_update for primary To-do / Work progress; update_plan should capture approach, context, and route — not a second checklist. Include sources, critical files, constraints, verification, risks, and handoff context when they help the user review or continue the plan. Each strategy step has a description and status (pending, in_progress, completed). Reserve Phase for Workflow stages."
+        "Legacy compatibility tool for loading older Plan artifacts. New work uses the canonical work_update list and a normal Plan-mode response."
+    }
+
+    fn model_visible(&self) -> bool {
+        // Older transcripts and sessions can still replay this tool, but new
+        // model turns get one progress model (`work_update`) instead of the
+        // retired Strategy/Plan surface.
+        false
     }
 
     fn input_schema(&self) -> serde_json::Value {
@@ -548,22 +506,9 @@ impl ToolSpec for UpdatePlanTool {
                 },
                 "plan": {
                     "type": "array",
-                    "description": "List of plan steps",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "step": {
-                                "type": "string",
-                                "description": "Description of the step"
-                            },
-                            "status": {
-                                "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
-                                "description": "Step status"
-                            }
-                        },
-                        "required": ["step", "status"]
-                    }
+                    "description": "Legacy replay field; new work must use work_update",
+                    "deprecated": true,
+                    "items": { "type": "object" }
                 }
             }
         })
@@ -628,23 +573,12 @@ impl ToolSpec for UpdatePlanTool {
         let mut next_state = PlanState::default();
         next_state.update(args);
         let desired = next_state.snapshot();
-        let proposed_for_review = context.review_plan_changes;
         let snapshot = if let Some(work) = context.runtime.work.as_ref()
             && work.matches_plan(&self.plan_state)
         {
-            if proposed_for_review {
-                work.propose_plan_update(&context.state_namespace, self.name(), &desired)
-                    .await
-                    .map_err(ToolError::execution_failed)?
-            } else {
-                work.apply_plan_update(&context.state_namespace, self.name(), &desired)
-                    .await
-                    .map_err(ToolError::execution_failed)?
-            }
-        } else if proposed_for_review {
-            return Err(ToolError::execution_failed(
-                "Plan review requires the active Work Graph runtime".to_string(),
-            ));
+            work.apply_plan_update(&context.state_namespace, self.name(), &desired)
+                .await
+                .map_err(ToolError::execution_failed)?
         } else {
             let mut state = self.plan_state.lock().await;
             state.update(UpdatePlanArgs {
@@ -669,13 +603,8 @@ impl ToolSpec for UpdatePlanTool {
 
         let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
 
-        let outcome = if proposed_for_review {
-            "Plan proposed for review"
-        } else {
-            "Plan updated"
-        };
         Ok(ToolResult::success(format!(
-            "{outcome}: {pending} pending, {in_progress} in progress, {completed} completed ({progress}% done)\n{result}"
+            "Plan updated: {pending} pending, {in_progress} in progress, {completed} completed ({progress}% done)\n{result}"
         )))
     }
 }
@@ -707,19 +636,13 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn update_plan_description_keeps_work_update_as_primary_progress() {
+    fn update_plan_is_hidden_replay_compatibility() {
         let tool = UpdatePlanTool::new(new_shared_plan_state());
         let description = tool.description();
 
-        assert!(description.contains("Use work_update for primary To-do / Work progress"));
-        assert!(description.contains("not a second checklist"));
-        assert!(description.contains("Strategy metadata"));
-        assert!(description.contains("approach, context, and route"));
-        assert!(description.contains("Reserve Phase for Workflow stages"));
-        assert!(
-            !description.contains("phase-level"),
-            "Strategy must not reuse Workflow Phase vocabulary: {description}"
-        );
+        assert!(!tool.model_visible());
+        assert!(description.contains("Legacy compatibility"));
+        assert!(description.contains("canonical work_update list"));
     }
 
     #[tokio::test]
@@ -750,45 +673,6 @@ mod tests {
             Some("Prove the real tool path")
         );
         assert_eq!(state.graph.compat.plan_order.len(), 1);
-    }
-
-    #[tokio::test]
-    async fn plan_mode_update_returns_reviewable_proposal_without_publishing_it() {
-        let plan = new_shared_plan_state();
-        let todos = crate::tools::todo::new_shared_todo_list();
-        let work = crate::work_graph::new_shared_work_runtime(todos, plan.clone());
-        let tool = UpdatePlanTool::new(plan.clone());
-        let mut context = ToolContext::new(std::env::temp_dir());
-        context.runtime.work = Some(work.clone());
-        context.review_plan_changes = true;
-
-        let result = tool
-            .execute(
-                json!({
-                    "objective": "Review before mutation",
-                    "plan": [{"step": "Inspect the diff", "status": "in_progress"}]
-                }),
-                &context,
-            )
-            .await
-            .expect("Plan-mode proposal succeeds");
-
-        assert!(result.content.starts_with("Plan proposed for review:"));
-        assert!(plan.lock().await.snapshot().is_empty());
-        let captured = work
-            .capture(Some(&context.state_namespace))
-            .expect("capture proposal")
-            .expect("proposal graph");
-        assert!(captured.plan.is_empty());
-        assert_eq!(captured.graph.proposals.len(), 1);
-        assert_eq!(
-            work.plan_for_review(Some(&context.state_namespace))
-                .expect("review preview")
-                .expect("pending plan")
-                .objective
-                .as_deref(),
-            Some("Review before mutation")
-        );
     }
 
     #[test]
@@ -844,7 +728,7 @@ mod tests {
             let mut state = PlanState::default();
             state.update(args);
             assert!(
-                !state.is_empty(),
+                !state.snapshot().is_empty(),
                 "artifact metadata must keep plan state visible"
             );
         }

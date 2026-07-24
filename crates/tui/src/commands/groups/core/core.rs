@@ -4,9 +4,8 @@ use std::fmt::Write;
 use std::path::PathBuf;
 
 use crate::config::{
-    ApiProvider, COMMON_DEEPSEEK_MODELS, DEFAULT_KIMI_CODE_BASE_URL,
-    KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL, normalize_custom_model_id,
-    normalize_model_name_for_provider,
+    ApiProvider, DEFAULT_KIMI_CODE_BASE_URL, KIMI_CODE_MEMBERSHIP_PLAN_CONSOLE_URL,
+    normalize_custom_model_id, normalize_model_name_for_provider,
 };
 use crate::localization::{Locale, MessageId, tr};
 use crate::tui::app::{App, AppAction, AppMode, ReasoningEffort};
@@ -17,6 +16,14 @@ use super::CommandResult;
 /// Show help information
 pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
     if let Some(topic) = topic {
+        let user_commands = crate::commands::user_registry::with_registry_for_workspace(
+            Some(&app.workspace),
+            Clone::clone,
+        );
+        if let Some(command) = user_commands.get(topic) {
+            return CommandResult::message(user_command_help(app.ui_locale, command));
+        }
+
         // Show help for specific command
         if let Some(cmd) = crate::commands::get_command_info(topic) {
             let mut help = format!(
@@ -26,12 +33,18 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
                 tr(app.ui_locale, MessageId::HelpUsageLabel),
                 cmd.usage
             );
-            if !cmd.aliases.is_empty() {
+            let visible_aliases = cmd
+                .aliases
+                .iter()
+                .filter(|alias| user_commands.get(alias).is_none())
+                .copied()
+                .collect::<Vec<_>>();
+            if !visible_aliases.is_empty() {
                 let _ = write!(
                     help,
                     "\n  {} {}",
                     tr(app.ui_locale, MessageId::HelpAliasesLabel),
-                    cmd.aliases.join(", ")
+                    visible_aliases.join(", ")
                 );
             }
             return CommandResult::message(help);
@@ -43,9 +56,44 @@ pub fn help(app: &mut App, topic: Option<&str>) -> CommandResult {
 
     // Show help overlay
     if app.view_stack.top_kind() != Some(ModalKind::Help) {
-        app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
+        let help = HelpView::new_for_workspace(app.ui_locale, &app.workspace);
+        app.view_stack.push(help);
     }
     CommandResult::ok()
+}
+
+fn user_command_help(
+    locale: Locale,
+    command: &crate::commands::user_registry::UserCommandMetadata,
+) -> String {
+    let mut help = command.name.clone();
+    if let Some(description) = command
+        .description
+        .as_deref()
+        .filter(|description| !description.trim().is_empty())
+    {
+        let _ = write!(help, "\n\n  {description}");
+    }
+
+    let usage = command
+        .display_usage()
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("/{}", command.name));
+    let _ = write!(
+        help,
+        "\n\n  {} {}",
+        tr(locale, MessageId::HelpUsageLabel),
+        usage
+    );
+    if !command.aliases.is_empty() {
+        let _ = write!(
+            help,
+            "\n  {} {}",
+            tr(locale, MessageId::HelpAliasesLabel),
+            command.aliases.join(", ")
+        );
+    }
+    help
 }
 
 /// Clear conversation history
@@ -156,10 +204,9 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
                 app.session.last_completion_tokens = None;
                 app.session.last_output_throughput = None;
             }
-            app.provider_models.insert(
-                app.provider_identity_for_persistence().to_string(),
-                "auto".to_string(),
-            );
+            let provider_identity = app.provider_identity_for_persistence().to_string();
+            app.provider_models
+                .insert(provider_identity, "auto".to_string());
             let persist_warning = provider_model_selection_persist_warning(app, "auto");
             let mut message = tr(app.ui_locale, MessageId::ModelChanged)
                 .replace("{old}", &old_model)
@@ -182,8 +229,8 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
         } else {
             let Some(model_id) = normalize_model_name_for_provider(app.api_provider, name) else {
                 return CommandResult::error(format!(
-                    "Invalid model '{name}'. Expected auto or a model for the active provider. Common DeepSeek models: {}",
-                    COMMON_DEEPSEEK_MODELS.join(", ")
+                    "Invalid model '{name}'. Expected auto or a model for the active provider ({}).",
+                    app.api_provider.as_str()
                 ));
             };
             model_id
@@ -247,10 +294,10 @@ pub fn model(app: &mut App, model_name: Option<&str>) -> CommandResult {
             app.session.last_completion_tokens = None;
             app.session.last_output_throughput = None;
         }
-        app.provider_models.insert(
-            app.provider_identity_for_persistence().to_string(),
-            model_id.clone(),
-        );
+        let provider_identity = app.provider_identity_for_persistence().to_string();
+        app.provider_models
+            .insert(provider_identity.clone(), model_id.clone());
+        app.enable_provider_model(&provider_identity, &model_id);
         let persist_warning = provider_model_selection_persist_warning(app, &model_id);
         let mut message = tr(app.ui_locale, MessageId::ModelChanged)
             .replace("{old}", &old_model)
@@ -993,13 +1040,19 @@ mod tests {
             Some(u64::from(crate::config::KIMI_CODE_K3_CONTEXT_WINDOW_TOKENS))
         );
 
-        // The same bare model ID on Moonshot's direct API must retain the
-        // generic route limits rather than inheriting Kimi Code entitlement.
+        // Switching to the direct platform endpoint requires the direct model
+        // id (`kimi-k3`); bare `k3` is fail-closed (#4687).
         app.active_route_base_url = crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string();
-        let direct = model(&mut app, Some(crate::config::KIMI_CODE_K3_MODEL));
+        let rejected = model(&mut app, Some(crate::config::KIMI_CODE_K3_MODEL));
+        assert!(
+            rejected.is_error,
+            "bare k3 on direct Moonshot must fail closed: {rejected:?}"
+        );
+
+        let direct = model(&mut app, Some(crate::config::MOONSHOT_KIMI_K3_MODEL));
         assert!(
             !direct.is_error,
-            "direct Moonshot route remains valid: {direct:?}"
+            "direct Moonshot kimi-k3 remains valid: {direct:?}"
         );
         assert_ne!(
             app.active_route_limits
@@ -1274,8 +1327,8 @@ mod tests {
         let msg = result.message.unwrap();
         assert!(msg.contains("Invalid model"));
         assert!(msg.contains("active provider"));
-        assert!(msg.contains("deepseek-v4-pro"));
-        assert!(msg.contains("deepseek-v4-flash"));
+        assert!(msg.contains("deepseek"));
+        assert!(!msg.contains("Common DeepSeek models"));
         assert!(result.action.is_none());
     }
 

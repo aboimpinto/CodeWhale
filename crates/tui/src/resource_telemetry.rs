@@ -160,7 +160,7 @@ impl ResourceTelemetry {
             out,
             "{} tok · {}",
             format_tokens(self.tokens_used),
-            format_duration(self.time_used_seconds),
+            crate::elapsed::format_elapsed_secs(self.time_used_seconds),
         );
         if let Some(percent) = self.budget_percent() {
             let _ = write!(out, " · {percent}% budget");
@@ -266,39 +266,6 @@ fn format_scaled(value: u64, divisor: u64, suffix: char) -> String {
     }
 }
 
-/// Format a duration in seconds as a compact `Hh Mm Ss` string.
-///
-/// Leading zero units are dropped, so 252s renders as `4m12s` and 90s as
-/// `1m30s`. Sub-minute durations render as bare seconds (`0s`, `45s`). Minutes
-/// and seconds are zero-padded only when a larger unit precedes them, matching
-/// conventional clock-style readouts (`1h05m`, `2h00m03s`).
-fn format_duration(total_seconds: u64) -> String {
-    let hours = total_seconds / 3_600;
-    let minutes = (total_seconds % 3_600) / 60;
-    let seconds = total_seconds % 60;
-
-    let mut out = String::new();
-    if hours > 0 {
-        let _ = write!(out, "{hours}h");
-    }
-    if hours > 0 || minutes > 0 {
-        if hours > 0 {
-            let _ = write!(out, "{minutes:02}m");
-        } else {
-            let _ = write!(out, "{minutes}m");
-        }
-    }
-    // Always include seconds unless we have hours+minutes and seconds is zero
-    // would still be informative; we keep seconds for precision, padding when a
-    // minute or hour precedes it.
-    if hours > 0 || minutes > 0 {
-        let _ = write!(out, "{seconds:02}s");
-    } else {
-        let _ = write!(out, "{seconds}s");
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,38 +308,6 @@ mod tests {
     #[test]
     fn format_tokens_handles_very_large_values() {
         assert_eq!(format_tokens(u64::MAX), "18446744073709.6M");
-    }
-
-    // ---- duration formatting ---------------------------------------------
-
-    #[test]
-    fn format_duration_zero_and_sub_minute() {
-        assert_eq!(format_duration(0), "0s");
-        assert_eq!(format_duration(1), "1s");
-        assert_eq!(format_duration(45), "45s");
-        assert_eq!(format_duration(59), "59s");
-    }
-
-    #[test]
-    fn format_duration_minutes_and_seconds() {
-        assert_eq!(format_duration(60), "1m00s");
-        assert_eq!(format_duration(90), "1m30s");
-        assert_eq!(format_duration(252), "4m12s");
-        assert_eq!(format_duration(599), "9m59s");
-    }
-
-    #[test]
-    fn format_duration_hours() {
-        assert_eq!(format_duration(3_600), "1h00m00s");
-        assert_eq!(format_duration(3_661), "1h01m01s");
-        // 2h00m03s exercises zero-padded minutes between hours and seconds.
-        assert_eq!(format_duration(7_203), "2h00m03s");
-    }
-
-    #[test]
-    fn format_duration_large() {
-        // 100 hours, 1 minute, 1 second.
-        assert_eq!(format_duration(360_061), "100h01m01s");
     }
 
     // ---- throughput -------------------------------------------------------
@@ -529,8 +464,8 @@ mod tests {
     #[test]
     fn human_summary_bounded_matches_example_shape() {
         let t = ResourceTelemetry::new(12_345, 252).with_token_budget(30_000);
-        // 12_345 -> "12.3k", 252s -> "4m12s", 12345/30000 = 41.15% -> 41%.
-        assert_eq!(t.human_summary(), "12.3k tok · 4m12s · 41% budget");
+        // 12_345 -> "12.3k", 252s -> "4m 12s", 12345/30000 = 41.15% -> 41%.
+        assert_eq!(t.human_summary(), "12.3k tok · 4m 12s · 41% budget");
     }
 
     #[test]
@@ -550,16 +485,16 @@ mod tests {
     #[test]
     fn human_summary_over_budget_can_exceed_one_hundred_percent() {
         let t = ResourceTelemetry::new(15_000, 7_320).with_token_budget(10_000);
-        // 15000/10000 = 150%, 2h02m00s.
-        assert_eq!(t.human_summary(), "15k tok · 2h02m00s · 150% budget");
+        // 15000/10000 = 150%, 7320s -> 122m 00s.
+        assert_eq!(t.human_summary(), "15k tok · 122m 00s · 150% budget");
         assert_eq!(t.pressure(), PressureLevel::High);
     }
 
     #[test]
     fn human_summary_with_only_time_budget() {
         let t = ResourceTelemetry::new(2_000_000, 300).with_time_budget_seconds(600);
-        // 2M tokens, 5m00s, 300/600 = 50% budget.
-        assert_eq!(t.human_summary(), "2M tok · 5m00s · 50% budget");
+        // 2M tokens, 5m 00s, 300/600 = 50% budget.
+        assert_eq!(t.human_summary(), "2M tok · 5m 00s · 50% budget");
         assert_eq!(t.pressure(), PressureLevel::Low);
     }
 }

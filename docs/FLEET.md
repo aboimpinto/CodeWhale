@@ -41,7 +41,7 @@ logs and adapter logs are stored under `.codewhale/fleet/` and
 
 ### Interactive and persistent status
 
-CodeWhale has two similarly named status surfaces with different scopes:
+Codewhale has two similarly named status surfaces with different scopes:
 
 - In the TUI, `/fleet status` (or `/subagents`) shows the sub-agents attached
   to the current interactive session. It does not read the persistent Fleet
@@ -112,6 +112,16 @@ independent, parallel, isolated, or long-running work, but does not require a
 worker for every executable step. Workflow is an optional orchestration overlay
 for work that needs ordering, gates, shared budgets, replay, or deterministic
 fan-in.
+
+The short public vocabulary is:
+
+- **Fleet** = who does the work: the configured workers, roles, models, hosts,
+  and trust boundaries.
+- **Workflow** = what order the work follows: phases, gates, budgets, replay,
+  and fan-in.
+- **Lane** = one running Workflow instance and its live progress.
+- **Runtime** = where and how a Lane executes: local or remote process,
+  provider route, sandbox, and API boundary.
 
 - **Workflow** is the repeatable plan and user-facing orchestration
   overlay: a script/IR that decides which phases and agents run next, keeps

@@ -176,14 +176,118 @@ pub enum ShellPhase {
     Failed,
 }
 
+/// The one truthful verb shown while a turn is live. This deliberately stays
+/// smaller than the tool taxonomy: the phase strip only needs to distinguish
+/// hidden reasoning, read-shaped exploration, other tool use, verification,
+/// and generic model work. It never exposes reasoning text or tool arguments.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveActivityKind {
+    Working,
+    Reasoning,
+    Reading,
+    UsingTool,
+    Verifying,
+}
+
+/// Bounded projection of live turn activity. Completed entries are ignored,
+/// so an `ActiveCell` retained until `TurnComplete` cannot keep the shell in a
+/// false working state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveActivity {
+    kind: LiveActivityKind,
+    running_tools: usize,
+}
+
+impl LiveActivity {
+    #[must_use]
+    pub(crate) fn from_app(app: &App) -> Self {
+        let tools = running_tool_facts(app);
+        let kind = if tools.verifying {
+            LiveActivityKind::Verifying
+        } else if tools.count > 0 && tools.all_reading {
+            LiveActivityKind::Reading
+        } else if tools.count > 0 {
+            LiveActivityKind::UsingTool
+        } else if app.streaming_thinking_active_entry.is_some() {
+            LiveActivityKind::Reasoning
+        } else {
+            LiveActivityKind::Working
+        };
+        Self {
+            kind,
+            running_tools: tools.count,
+        }
+    }
+
+    #[must_use]
+    pub(crate) fn kind(self) -> LiveActivityKind {
+        self.kind
+    }
+
+    #[must_use]
+    pub(crate) fn running_tool_count(self) -> usize {
+        self.running_tools
+    }
+
+    #[must_use]
+    fn is_explicit(self) -> bool {
+        !matches!(self.kind, LiveActivityKind::Working)
+    }
+
+    #[must_use]
+    fn label(self, locale: Locale) -> Cow<'static, str> {
+        match self.kind {
+            LiveActivityKind::Working => tr(locale, MessageId::PhaseWorking),
+            LiveActivityKind::Reasoning => tr(locale, MessageId::PhaseReasoning),
+            LiveActivityKind::Reading => tr(locale, MessageId::PhaseReading),
+            LiveActivityKind::UsingTool => tr(locale, MessageId::PhaseUsingTool),
+            LiveActivityKind::Verifying => tr(locale, MessageId::PhaseVerifying),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RunningToolFacts {
+    count: usize,
+    all_reading: bool,
+    verifying: bool,
+}
+
+impl Default for RunningToolFacts {
+    fn default() -> Self {
+        Self {
+            count: 0,
+            all_reading: true,
+            verifying: false,
+        }
+    }
+}
+
+impl RunningToolFacts {
+    fn observe(&mut self, reading: bool, verifying: bool) {
+        self.count = self.count.saturating_add(1);
+        self.all_reading &= reading;
+        self.verifying |= verifying;
+    }
+}
+
 const WORKING_BUBBLE_FRAMES: [&str; 8] = ["⠀", "⢀", "⣀", "⣄", "⣤", "⣦", "⣶", "⣿"];
 const COMPLETION_BREATH_MS: u128 = 800;
 const COMPLETION_RELEASE_MS: u128 = 560;
+const IDLE_WHALE_SPOUT_ROW: &str = "   ˚";
 const IDLE_WHALE_ROWS: [&str; 3] = [
-    " ▗▄▄▄▄▄▄▄▄▄▄▄▄▄▖    ▚▞",
-    "▐██·████████████▙▄▄▄▞",
-    " ▝▀▀▀▀▀▀▀▀▀▀▀▀▀▘",
+    "  ▗▄▄▄▄▄▄▄▄▄▄▄▖      ▚▞",
+    " ▐██·███████████▙━━━━▞",
+    "  ▝▀▀▀▀▀▀▀▀▀▀▀▀▘",
 ];
+
+const UWU_IDLE_WHALE_SPOUT_ROW: &str = "   ˚✦";
+const UWU_IDLE_WHALE_ROWS: [&str; 3] = [
+    " ▗▄▄▄▄▄▄▄▄▄▄▄▖    ▚▞",
+    "▐█░·░█████████▙▄▄▞",
+    " ▝▀▀▀▀▀▀▀▀▀▀▀▘",
+];
+
 const IDLE_SHIMMER_CYCLE_MS: u128 = 4_000;
 const IDLE_SHIMMER_SWEEP_FRACTION: f32 = 0.32;
 const IDLE_SHIMMER_BAND_HALF_WIDTH: f32 = 0.38;
@@ -192,14 +296,14 @@ const IDLE_SHIMMER_STRENGTH: f32 = 0.33;
 impl ShellPhase {
     #[must_use]
     pub fn from_app(app: &App) -> Self {
+        Self::from_app_with_activity(app, LiveActivity::from_app(app))
+    }
+
+    #[must_use]
+    pub(crate) fn from_app_with_activity(app: &App, activity: LiveActivity) -> Self {
         if matches!(
             app.view_stack.top_kind(),
-            Some(
-                ModalKind::Approval
-                    | ModalKind::Elevation
-                    | ModalKind::UserInput
-                    | ModalKind::PlanPrompt
-            )
+            Some(ModalKind::Approval | ModalKind::Elevation | ModalKind::UserInput)
         ) {
             return Self::Approval;
         }
@@ -209,7 +313,6 @@ impl ShellPhase {
             return Self::Failed;
         }
         if app.pending_user_input_prompt.is_some()
-            || app.plan_prompt_pending
             || app
                 .task_panel
                 .iter()
@@ -219,21 +322,18 @@ impl ShellPhase {
         }
         if app.is_loading
             || matches!(app.runtime_turn_status.as_deref(), Some("in_progress"))
-            || app
-                .active_cell
-                .as_ref()
-                .is_some_and(|active| !active.is_empty())
+            || activity.is_explicit()
         {
-            if verification_run_active(app) {
+            if activity.kind() == LiveActivityKind::Verifying {
                 return Self::Verifying;
             }
             return Self::Working;
         }
-        if matches!(app.runtime_turn_status.as_deref(), Some("completed")) {
-            return Self::Done;
-        }
         if !app.input.is_empty() {
             return Self::Typing;
+        }
+        if matches!(app.runtime_turn_status.as_deref(), Some("completed")) {
+            return Self::Done;
         }
         Self::Idle
     }
@@ -266,30 +366,50 @@ impl ShellPhase {
     }
 }
 
-/// True when the live active cell is running a verification-shaped tool:
-/// the verifier tool itself or an exec whose program is a known test/check
-/// runner. Conservative by design — misclassifying real work as `verifying`
-/// would lie; plain `working` never does.
-fn verification_run_active(app: &App) -> bool {
+/// Summarize only tools whose lifecycle is actually `Running`. A read label
+/// is earned only when every running entry is read/exploration-shaped; mixed
+/// work stays the neutral `using tool`. Verification wins because it is the
+/// existing stronger promise made by the phase strip.
+fn running_tool_facts(app: &App) -> RunningToolFacts {
     use crate::tui::history::{HistoryCell, ToolCell, ToolStatus};
+    use crate::tui::widgets::tool_card::{ToolFamily, tool_family_for_name};
+
+    let mut facts = RunningToolFacts::default();
     let Some(active) = app.active_cell.as_ref() else {
-        return false;
+        return facts;
     };
-    active.entries().iter().any(|cell| {
+    for cell in active.entries() {
         let HistoryCell::Tool(tool) = cell else {
-            return false;
+            continue;
         };
         match tool {
             ToolCell::Exec(exec) if exec.status == ToolStatus::Running => {
-                exec_is_verification(&exec.command)
+                facts.observe(false, exec_is_verification(&exec.command));
             }
             ToolCell::Generic(generic) if generic.status == ToolStatus::Running => {
-                let name = generic.name.to_ascii_lowercase();
-                name.contains("verif") || name == "read_lints"
+                let family = tool_family_for_name(&generic.name);
+                facts.observe(
+                    matches!(family, ToolFamily::Read | ToolFamily::Find),
+                    family == ToolFamily::Verify || generic.name == "read_lints",
+                );
             }
-            _ => false,
+            ToolCell::Exploring(exploring) => {
+                for entry in &exploring.entries {
+                    if entry.status == ToolStatus::Running {
+                        facts.observe(true, false);
+                    }
+                }
+            }
+            ToolCell::WebSearch(search) if search.status == ToolStatus::Running => {
+                facts.observe(true, false);
+            }
+            other if other.status() == Some(ToolStatus::Running) => {
+                facts.observe(false, false);
+            }
+            _ => {}
         }
-    })
+    }
+    facts
 }
 
 fn exec_is_verification(command: &str) -> bool {
@@ -310,7 +430,7 @@ fn exec_is_verification(command: &str) -> bool {
 }
 
 fn completion_elapsed_ms(app: &App) -> Option<u128> {
-    if app.low_motion || !app.fancy_animations {
+    if !app.motion_policy().allows_decorative() {
         return None;
     }
     app.ocean_completion_started_at
@@ -318,7 +438,60 @@ fn completion_elapsed_ms(app: &App) -> Option<u128> {
         .filter(|elapsed| *elapsed < COMPLETION_BREATH_MS)
 }
 
+#[cfg(test)]
 pub(crate) fn phase_marker(app: &App, phase: ShellPhase) -> (&'static str, Cow<'static, str>) {
+    phase_marker_with_activity(app, phase, LiveActivity::from_app(app))
+}
+
+/// Truthful window-title activity verb for the OSC-0 whale animation.
+///
+/// Uses short English fragments (with fixed-width ellipsis) so alt-tabbed
+/// sessions stay legible without depending on the full localized phase strip.
+#[must_use]
+pub(crate) fn title_activity_verb(app: &App) -> &'static str {
+    let activity = LiveActivity::from_app(app);
+    let phase = ShellPhase::from_app_with_activity(app, activity);
+    match phase {
+        ShellPhase::Waiting | ShellPhase::Approval => "waiting on you…",
+        ShellPhase::Verifying => "verifying…",
+        ShellPhase::Done => "done",
+        ShellPhase::Failed => "failed",
+        ShellPhase::Typing => "drafting…",
+        ShellPhase::Idle => "idle",
+        ShellPhase::Working => match activity.kind() {
+            LiveActivityKind::Reasoning => "reasoning…",
+            LiveActivityKind::Reading => "reading…",
+            LiveActivityKind::UsingTool => "using tool…",
+            LiveActivityKind::Verifying => "verifying…",
+            LiveActivityKind::Working => "working…",
+        },
+    }
+}
+
+/// Push the current shell phase into the terminal title whale animation.
+pub(crate) fn sync_title_activity(app: &App) {
+    crate::tui::notifications::set_title_motion_enabled(
+        app.motion_policy().allows_decorative() && app.status_indicator != "off",
+    );
+    if app.is_loading
+        || matches!(
+            ShellPhase::from_app(app),
+            ShellPhase::Working
+                | ShellPhase::Verifying
+                | ShellPhase::Waiting
+                | ShellPhase::Approval
+                | ShellPhase::Typing
+        )
+    {
+        crate::tui::notifications::set_title_activity_verb(title_activity_verb(app));
+    }
+}
+
+pub(crate) fn phase_marker_with_activity(
+    app: &App,
+    phase: ShellPhase,
+    activity: LiveActivity,
+) -> (&'static str, Cow<'static, str>) {
     let locale = app.ui_locale;
     match phase {
         ShellPhase::Idle => ("·", phase.label(locale)),
@@ -328,19 +501,25 @@ pub(crate) fn phase_marker(app: &App, phase: ShellPhase) -> (&'static str, Cow<'
             // so the two primary liveness marks never look like unrelated
             // spinners. The shared helper also preserves the 400ms
             // "motion is earned" delay and reduced/still fallback.
-            let frame = crate::tui::spinner::braille_spinner_frame(
-                app.turn_started_at,
-                app.low_motion || !app.fancy_animations,
-            );
-            (frame, phase.label(locale))
+            let policy = app.motion_policy();
+            let animated = crate::tui::spinner::braille_spinner_frame(app.turn_started_at, false);
+            let earned = app.turn_started_at.is_none_or(|started| {
+                started.elapsed().as_millis()
+                    >= u128::from(crate::tui::spinner::LIVE_MARKER_DELAY_MS)
+            });
+            let frame = policy.spinner_glyph(animated, earned);
+            (frame, activity.label(locale))
         }
         ShellPhase::Verifying => {
             // Metered braille tick on the shared live clock — checking, not
             // searching. Reduced motion holds the legible mid frame.
-            let frame = crate::tui::spinner::verification_tick_frame(
-                app.turn_started_at,
-                app.low_motion || !app.fancy_animations,
-            );
+            let policy = app.motion_policy();
+            let animated = crate::tui::spinner::verification_tick_frame(app.turn_started_at, false);
+            let earned = app.turn_started_at.is_none_or(|started| {
+                started.elapsed().as_millis()
+                    >= u128::from(crate::tui::spinner::LIVE_MARKER_DELAY_MS)
+            });
+            let frame = policy.spinner_glyph(animated, earned);
             (frame, phase.label(locale))
         }
         ShellPhase::Waiting | ShellPhase::Approval => ("◆", phase.label(locale)),
@@ -374,15 +553,42 @@ fn permission_label(app: &App) -> Cow<'static, str> {
     if app.mode == AppMode::Plan {
         return tr(locale, MessageId::ChipPermissionReadOnly);
     }
-    match app.approval_mode {
+    let approval = match app.approval_mode {
         ApprovalMode::Suggest => tr(locale, MessageId::ChipPermissionAsk),
         ApprovalMode::Auto => tr(locale, MessageId::ChipPermissionAuto),
         // Keep the effective permission explicit. `bypass` is an
         // implementation detail and, more importantly, can imply that
         // repository law no longer applies. Full Access never bypasses
-        // constitution rules.
+        // constitution rules. This is **tool-approval posture**, not
+        // filesystem scope — see filesystem_scope_label.
         ApprovalMode::Bypass => tr(locale, MessageId::ChipPermissionFullAccess),
         ApprovalMode::Never => tr(locale, MessageId::ChipPermissionNever),
+    };
+    // Append filesystem scope so "Full Access" (approval) is never confused
+    // with unrestricted disk writes.
+    let fs = filesystem_scope_label(app);
+    Cow::Owned(format!("{approval} · {fs}"))
+}
+
+/// Always-legible filesystem sandbox scope for the shell chrome.
+///
+/// Defaults to workspace-write (the safe product default). Callers that change
+/// sandbox mid-session should update the process env `CODEWHALE_SANDBOX_MODE`.
+#[must_use]
+fn filesystem_scope_label(_app: &App) -> Cow<'static, str> {
+    // Spelled out because the old `fs:` prefix read as an unexplained
+    // acronym (user report, 2026-07-23): this chip states which files the
+    // session may write.
+    let mode = std::env::var("CODEWHALE_SANDBOX_MODE").unwrap_or_default();
+    match mode.trim().to_ascii_lowercase().as_str() {
+        "read-only" | "readonly" | "read_only" => Cow::Borrowed("files: read-only"),
+        "danger-full-access" | "danger_full_access" | "full" => Cow::Borrowed("files: full disk"),
+        "external-sandbox" | "external_sandbox" | "opensandbox" => {
+            Cow::Borrowed("files: external sandbox")
+        }
+        "workspace-write" | "workspace_write" | "workspace" => Cow::Borrowed("files: workspace"),
+        // Empty / unknown: product default is workspace-only.
+        _ => Cow::Borrowed("files: workspace"),
     }
 }
 
@@ -654,6 +860,18 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
     let (effective_provider, effective_model) = app.effective_route_identity_display();
     let route_label = format!("{effective_provider} · {effective_model}");
     let effort_label = app.reasoning_effort_display_label();
+    let mode_color = match app.mode {
+        AppMode::Plan => app.ui_theme.mode_plan,
+        AppMode::Operate => app.ui_theme.mode_operate,
+        _ => app.ui_theme.mode_agent,
+    };
+    // Match the composer's warm top edge exactly: Ask amber, Auto-Review
+    // Signal Gold, and Full Access coral.
+    let permission_color = match app.approval_mode {
+        ApprovalMode::Suggest | ApprovalMode::Never => app.ui_theme.permission_ask,
+        ApprovalMode::Auto => app.ui_theme.permission_auto_review,
+        ApprovalMode::Bypass => app.ui_theme.permission_full_access,
+    };
     let status_indicator = crate::tui::widgets::header_status_indicator_frame(
         (!app.low_motion && app.fancy_animations)
             .then_some(app.turn_started_at)
@@ -673,11 +891,7 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
         Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
         Span::styled(
             mode_label(app.ui_locale, app.mode),
-            Style::default().fg(match app.mode {
-                AppMode::Plan => app.ui_theme.mode_plan,
-                AppMode::Operate => app.ui_theme.mode_operate,
-                _ => app.ui_theme.mode_agent,
-            }),
+            Style::default().fg(mode_color),
         ),
         Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
         Span::styled(effort_label.clone(), Style::default().fg(app.ui_theme.info)),
@@ -703,10 +917,21 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
     ));
     left.push(Span::styled(
         permission_label(app),
-        Style::default().fg(app.ui_theme.text_muted),
+        Style::default().fg(permission_color),
     ));
 
     let mut right = Vec::new();
+    // Cached git branch/status only — never probe from the render path.
+    // Background refresh is scheduled from the event loop / idle ticks.
+    if let Some(git_label) =
+        crate::tui::git_status::chrome_label(&crate::tui::git_status::cached_status())
+    {
+        right.push(Span::styled(
+            git_label,
+            Style::default().fg(app.ui_theme.text_muted),
+        ));
+        right.push(Span::raw("  "));
+    }
     if tier != ShellTier::Compact
         && let Some((used, max, percent)) = crate::tui::ui::context_usage_snapshot(app)
     {
@@ -746,11 +971,11 @@ pub fn render_header(area: Rect, buf: &mut Buffer, app: &App) {
         };
         let suffix = vec![
             Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
-            Span::styled(mode, Style::default().fg(app.ui_theme.accent_primary)),
+            Span::styled(mode, Style::default().fg(mode_color)),
             Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
             Span::styled(effort, Style::default().fg(app.ui_theme.info)),
             Span::styled(" · ", Style::default().fg(app.ui_theme.text_dim)),
-            Span::styled(permission, Style::default().fg(app.ui_theme.text_muted)),
+            Span::styled(permission, Style::default().fg(permission_color)),
         ];
         let indicator_width = status_indicator.map_or(0, |indicator| 1 + indicator.width());
         let fixed_width = 4usize
@@ -817,12 +1042,7 @@ pub(crate) fn empty_state_mark_visible(area: Rect) -> bool {
 
 #[must_use]
 pub(crate) fn decorative_shell_motion_enabled(app: &App) -> bool {
-    crate::tui::motion::MotionPolicy::from_settings(
-        app.low_motion,
-        app.fancy_animations,
-        app.constrained_frame_rate,
-    )
-    .allows_decorative()
+    app.motion_policy().allows_decorative()
         && app.ocean_treatment.supports_ambient_life()
         && !app.attention_hold_active()
         && app.onboarding == OnboardingState::None
@@ -866,6 +1086,26 @@ fn idle_mark_color(base: Color, highlight: Color, opacity: f32) -> Color {
     }
 }
 
+fn idle_whale_is_uwu(app: &App) -> bool {
+    app.ui_theme.name == "uwu"
+}
+
+fn idle_whale_spout_row(app: &App) -> &'static str {
+    if idle_whale_is_uwu(app) {
+        UWU_IDLE_WHALE_SPOUT_ROW
+    } else {
+        IDLE_WHALE_SPOUT_ROW
+    }
+}
+
+fn idle_whale_rows(app: &App) -> [&'static str; 3] {
+    if idle_whale_is_uwu(app) {
+        UWU_IDLE_WHALE_ROWS
+    } else {
+        IDLE_WHALE_ROWS
+    }
+}
+
 fn idle_whale_row_spans(
     text: &'static str,
     row: usize,
@@ -887,7 +1127,8 @@ fn idle_whale_row_spans(
 
     for (column, ch) in text.chars().enumerate() {
         let diagonal = (column as f32 + (rows - 1.0 - row as f32)) / (cols + rows);
-        let color = if ch == '·' {
+        let color = if matches!(ch, '·' | '░' | '✦') {
+            // Soft uwu blush/sparkle use the eye/sakura channel; classic only has ·.
             eye
         } else if animated {
             idle_mark_color(
@@ -915,6 +1156,21 @@ fn idle_whale_row_spans(
     spans
 }
 
+#[must_use]
+fn idle_whale_block_width() -> usize {
+    let classic = std::iter::once(IDLE_WHALE_SPOUT_ROW)
+        .chain(IDLE_WHALE_ROWS.iter().copied())
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0);
+    let uwu = std::iter::once(UWU_IDLE_WHALE_SPOUT_ROW)
+        .chain(UWU_IDLE_WHALE_ROWS.iter().copied())
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or(0);
+    classic.max(uwu)
+}
+
 pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     if area.width == 0 || area.height == 0 {
         return Vec::new();
@@ -925,11 +1181,19 @@ pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
     if empty_state_mark_visible(area) {
         let animated = idle_mark_animation_enabled(app);
         let elapsed_ms = app.ocean_started_at.elapsed().as_millis();
+        let spout = idle_whale_spout_row(app);
+        let rows = idle_whale_rows(app);
         let mut mark = vec![vec![Span::styled(
-            "   ˚",
+            spout,
             Style::default().fg(app.ui_theme.accent_secondary),
         )]];
-        mark.extend(IDLE_WHALE_ROWS.iter().enumerate().map(|(row, text)| {
+        // Soft uwu: sakura blush/sparkle glyphs; classic keeps body peach + text eye.
+        let highlight = if idle_whale_is_uwu(app) {
+            app.ui_theme.accent_primary
+        } else {
+            app.ui_theme.text_body
+        };
+        mark.extend(rows.iter().enumerate().map(|(row, text)| {
             idle_whale_row_spans(
                 text,
                 row,
@@ -937,13 +1201,15 @@ pub fn empty_state_lines(app: &App, area: Rect) -> Vec<Line<'static>> {
                 animated,
                 app.ui_theme.accent_action,
                 app.ui_theme.text_body,
-                app.ui_theme.text_body,
+                highlight,
             )
         }));
+        // The spout, head, belly, peduncle, and flukes are one drawing. Give
+        // every row the same outer inset so the authored offsets survive;
+        // centering each row independently shears the silhouette apart.
+        let block_inset = " ".repeat(width.saturating_sub(idle_whale_block_width()) / 2);
         for row in mark {
-            let row_width = span_width(&row);
-            let inset = " ".repeat(width.saturating_sub(row_width) / 2);
-            let mut spans = vec![Span::raw(inset)];
+            let mut spans = vec![Span::raw(block_inset.clone())];
             spans.extend(row);
             lines.push(Line::from(spans));
         }
@@ -1118,6 +1384,43 @@ mod tests {
     }
 
     #[test]
+    fn header_labels_follow_the_ask_amber_auto_gold_full_access_coral_ramp() {
+        for width in [40, 100] {
+            for (approval_mode, expected_label) in [
+                (ApprovalMode::Suggest, "ask"),
+                (ApprovalMode::Auto, "auto"),
+                (ApprovalMode::Bypass, "Full Access"),
+            ] {
+                let mut app = test_app();
+                app.approval_mode = approval_mode;
+                let expected_color = match approval_mode {
+                    ApprovalMode::Suggest | ApprovalMode::Never => app.ui_theme.permission_ask,
+                    ApprovalMode::Auto => app.ui_theme.permission_auto_review,
+                    ApprovalMode::Bypass => app.ui_theme.permission_full_access,
+                };
+                let label = permission_label(&app).into_owned();
+                assert!(
+                    label.starts_with(expected_label) && label.contains("files:"),
+                    "{approval_mode:?}: {label}"
+                );
+                let area = Rect::new(0, 0, width, 1);
+                let mut buf = Buffer::empty(area);
+
+                render_header(area, &mut buf, &app);
+
+                let rendered = (0..width).map(|x| buf[(x, 0)].symbol()).collect::<String>();
+                // `auto` can also appear earlier as a route/mode label. The
+                // permission posture owns the rightmost occurrence.
+                let label_byte = rendered
+                    .rfind(expected_label)
+                    .expect("permission label should render");
+                let label_x = rendered[..label_byte].width() as u16;
+                assert_eq!(buf[(label_x, 0)].fg, expected_color, "{approval_mode:?}");
+            }
+        }
+    }
+
+    #[test]
     fn normal_header_keeps_requested_effective_effort_before_route_detail() {
         let mut app = test_app();
         app.mode = AppMode::Operate;
@@ -1139,14 +1442,21 @@ mod tests {
     }
 
     #[test]
-    fn compact_header_keeps_the_selected_whale_indicator() {
+    fn compact_header_never_shows_a_whale_emoji_even_for_legacy_settings() {
+        // The whale emoji header chip is retired (2026-07-23): a persisted
+        // "whale" opt-in renders the typographic mark, and no header width
+        // squeeze may reintroduce the emoji beside the model/mode chips.
         let mut app = test_app();
         app.status_indicator = "whale".to_string();
         app.model = "provider/model-with-a-deliberately-long-route-name".to_string();
 
         let header = header_text(&app, 40);
 
-        assert!(header.contains('🐳'), "selected whale missing: {header:?}");
+        assert!(
+            !header.contains('🐳') && !header.contains('🐋'),
+            "whale emoji must stay out of the header: {header:?}"
+        );
+        assert!(header.contains("cw"), "cw mark missing: {header:?}");
     }
 
     #[test]
@@ -1193,7 +1503,7 @@ mod tests {
     }
 
     /// Errors are sticky: they outlive the informational TTL window and stay
-    /// until their own resolution window passes.
+    /// until their own resolution window passes, then expire on their own.
     #[test]
     fn footer_errors_outlive_informational_acknowledgements() {
         let mut app = test_app();
@@ -1203,6 +1513,10 @@ mod tests {
         assert!(fresh.contains("failed"), "error notice missing: {fresh}");
 
         if let Some(sticky) = app.sticky_status.as_mut() {
+            assert_eq!(
+                sticky.ttl_ms,
+                Some(crate::tui::app::App::STICKY_ERROR_TTL_MS)
+            );
             sticky.created_at = Instant::now() - Duration::from_secs(6);
         } else {
             panic!("an error must be promoted to the sticky slot");
@@ -1211,6 +1525,32 @@ mod tests {
         assert!(
             held.contains("failed"),
             "errors must hold past the informational window: {held}"
+        );
+
+        if let Some(sticky) = app.sticky_status.as_mut() {
+            sticky.created_at = Instant::now()
+                - Duration::from_millis(crate::tui::app::App::STICKY_ERROR_TTL_MS + 1);
+        }
+        let expired = footer_text(&mut app);
+        assert!(
+            !expired.contains("failed"),
+            "sticky errors must expire after their TTL: {expired}"
+        );
+    }
+
+    #[test]
+    fn sticky_error_clears_when_composer_gets_input() {
+        let mut app = test_app();
+        app.set_sticky_status(
+            "workflow failed: script error",
+            crate::tui::app::StatusToastLevel::Error,
+            None,
+        );
+        assert!(app.sticky_status.is_some());
+        app.insert_char('x');
+        assert!(
+            app.sticky_status.is_none(),
+            "composer activity must dismiss sticky error chrome"
         );
     }
 
@@ -1314,16 +1654,124 @@ mod tests {
         );
 
         app.runtime_turn_status = None;
-        app.plan_prompt_pending = true;
-        let (marker, label) = phase_marker(&app, ShellPhase::from_app(&app));
-        assert_eq!(marker, "◆");
-        assert_eq!(label, "waiting on you");
-
-        app.plan_prompt_pending = false;
         app.runtime_turn_status = Some("failed".to_string());
         let (marker, label) = phase_marker(&app, ShellPhase::from_app(&app));
         assert_eq!(marker, "✕");
         assert_eq!(label, "failed");
+    }
+
+    #[test]
+    fn live_activity_is_truthful_prioritized_and_ignores_stale_tools() {
+        use crate::tui::active_cell::ActiveCell;
+        use crate::tui::history::{
+            ExploringCell, ExploringEntry, GenericToolCell, HistoryCell, ToolCell, ToolStatus,
+        };
+
+        let generic = |name: &str, status: ToolStatus| {
+            HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+                name: name.to_string(),
+                status,
+                input_summary: None,
+                output: None,
+                prompts: None,
+                spillover_path: None,
+                output_summary: None,
+                is_diff: false,
+            }))
+        };
+        let reading = || {
+            HistoryCell::Tool(ToolCell::Exploring(ExploringCell {
+                entries: vec![ExploringEntry {
+                    label: "Reading src/lib.rs".to_string(),
+                    status: ToolStatus::Running,
+                }],
+            }))
+        };
+
+        let mut app = test_app();
+
+        // A completed tool may remain in the active group until TurnComplete,
+        // but it cannot manufacture liveness on its own.
+        let mut stale = ActiveCell::new();
+        stale.push_tool("done", generic("write_file", ToolStatus::Success));
+        app.active_cell = Some(stale);
+        assert_eq!(
+            LiveActivity::from_app(&app).kind(),
+            LiveActivityKind::Working
+        );
+        assert_eq!(ShellPhase::from_app(&app), ShellPhase::Idle);
+
+        // Only the explicit streaming pointer earns the reasoning label. No
+        // configured effort, elapsed clock, or generic loading inference is
+        // involved.
+        let mut active = ActiveCell::new();
+        let thinking = active.push_thinking(HistoryCell::Thinking {
+            content: "private reasoning must not reach the strip".to_string(),
+            streaming: true,
+            duration_secs: None,
+        });
+        app.active_cell = Some(active);
+        app.streaming_thinking_active_entry = Some(thinking);
+        assert_eq!(
+            LiveActivity::from_app(&app).kind(),
+            LiveActivityKind::Reasoning
+        );
+        let (_, label) = phase_marker(&app, ShellPhase::from_app(&app));
+        assert_eq!(label, "reasoning");
+        assert!(!label.contains("private"));
+
+        // A running read wins over a stale thinking pointer.
+        app.active_cell
+            .as_mut()
+            .expect("active cell")
+            .push_tool("read", reading());
+        let activity = LiveActivity::from_app(&app);
+        assert_eq!(activity.kind(), LiveActivityKind::Reading);
+        assert_eq!(activity.running_tool_count(), 1);
+        assert_eq!(phase_marker(&app, ShellPhase::Working).1, "reading");
+
+        // Mixed tool work is not mislabeled as a pure read pass.
+        app.active_cell
+            .as_mut()
+            .expect("active cell")
+            .push_tool("write", generic("write_file", ToolStatus::Running));
+        let activity = LiveActivity::from_app(&app);
+        assert_eq!(activity.kind(), LiveActivityKind::UsingTool);
+        assert_eq!(activity.running_tool_count(), 2);
+        assert_eq!(phase_marker(&app, ShellPhase::Working).1, "using tool");
+
+        // Verification remains the strongest live promise.
+        app.active_cell
+            .as_mut()
+            .expect("active cell")
+            .push_tool("verify", generic("run_verifiers", ToolStatus::Running));
+        assert_eq!(
+            LiveActivity::from_app(&app).kind(),
+            LiveActivityKind::Verifying
+        );
+        assert_eq!(ShellPhase::from_app(&app), ShellPhase::Verifying);
+    }
+
+    #[test]
+    fn live_activity_marker_freezes_for_reduced_or_still_and_has_ascii_fallback() {
+        let mut app = test_app();
+        app.runtime_turn_status = Some("in_progress".to_string());
+        app.turn_started_at = Some(Instant::now() - Duration::from_secs(5));
+
+        app.low_motion = true;
+        let reduced = phase_marker(&app, ShellPhase::Working).0;
+        assert_eq!(reduced, crate::tui::spinner::BRAILLE_SPINNER_STILL_FRAME);
+
+        app.low_motion = false;
+        app.fancy_animations = false;
+        let fancy_off = phase_marker(&app, ShellPhase::Working).0;
+        assert_eq!(fancy_off, crate::tui::spinner::LIVE_STATIC_MARKER);
+
+        let mut cell = ratatui::buffer::Cell::default();
+        cell.set_symbol(fancy_off);
+        crate::tui::color_compat::adapt_cell_symbol_for_ascii(&mut cell);
+        assert_eq!(cell.symbol(), ">");
+        assert!(cell.symbol().is_ascii());
     }
 
     #[test]
@@ -1368,6 +1816,96 @@ mod tests {
     }
 
     #[test]
+    fn idle_whale_rows_share_one_centered_block_without_losing_authored_offsets() {
+        let mut app = test_app();
+        app.ui_theme = crate::palette::ThemeId::Whale.ui_theme();
+        app.low_motion = true;
+        let width = 60usize;
+        let rendered = empty_state_lines(&app, Rect::new(0, 0, width as u16, 16))
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>();
+        let block_width = idle_whale_block_width();
+        let block_inset = (width - block_width) / 2;
+
+        assert_eq!(
+            block_width, 23,
+            "the final mark should stay quiet at 60 cols"
+        );
+        for row in std::iter::once(IDLE_WHALE_SPOUT_ROW).chain(IDLE_WHALE_ROWS) {
+            let line = rendered
+                .iter()
+                .find(|line| line.trim_start() == row.trim_start())
+                .unwrap_or_else(|| panic!("missing authored whale row {row:?}"));
+            let rendered_inset = line.chars().take_while(|ch| *ch == ' ').count();
+            let authored_inset = row.chars().take_while(|ch| *ch == ' ').count();
+
+            assert_eq!(
+                rendered_inset - authored_inset,
+                block_inset,
+                "row drifted out of the shared silhouette: {line:?}"
+            );
+            assert!(
+                line.width() <= block_inset + block_width,
+                "row escaped the centered mark block: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn idle_whale_has_a_recognizable_ascii_safe_silhouette() {
+        let ascii_row = |row: &str| {
+            let mut rendered = String::new();
+            for ch in row.chars() {
+                let mut cell = ratatui::buffer::Cell::default();
+                cell.set_symbol(&ch.to_string());
+                crate::tui::color_compat::adapt_cell_symbol_for_ascii(&mut cell);
+                rendered.push_str(cell.symbol());
+            }
+            rendered
+        };
+        let rows = std::iter::once(IDLE_WHALE_SPOUT_ROW)
+            .chain(IDLE_WHALE_ROWS)
+            .map(ascii_row)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            rows,
+            [
+                "   o",
+                r"  .###########.      \/",
+                " |##.############----/",
+                "  .############.",
+            ]
+        );
+        assert!(rows.iter().all(|row| row.is_ascii()));
+    }
+
+    #[test]
+    fn reduced_motion_keeps_the_whole_idle_mark_still_and_cursorless() {
+        let mut app = test_app();
+        app.low_motion = true;
+        app.fancy_animations = true;
+        app.cursor_position = 7;
+        app.ocean_started_at = Instant::now() - Duration::from_secs(2);
+        let first = empty_state_lines(&app, Rect::new(0, 0, 100, 30));
+
+        app.ocean_started_at = Instant::now() - Duration::from_secs(11);
+        let second = empty_state_lines(&app, Rect::new(0, 0, 100, 30));
+
+        assert_eq!(first, second, "reduced motion must freeze mark and shine");
+        assert_eq!(
+            app.cursor_position, 7,
+            "the empty-state decoration must leave cursor ownership to the composer"
+        );
+    }
+
+    #[test]
     fn idle_whale_uses_the_human_brand_role_not_focus_blue() {
         let mut app = test_app();
         app.low_motion = true;
@@ -1398,10 +1936,6 @@ mod tests {
         assert!(!idle_mark_animation_enabled(&app));
 
         app.fancy_animations = true;
-        app.plan_prompt_pending = true;
-        assert!(!idle_mark_animation_enabled(&app));
-
-        app.plan_prompt_pending = false;
         app.ocean_treatment = crate::tui::ocean::OceanTreatment::Classic;
         assert!(!idle_mark_animation_enabled(&app));
 
@@ -1441,14 +1975,15 @@ mod tests {
         app.runtime_turn_status = Some("in_progress".to_string());
         app.turn_started_at = Some(Instant::now() - Duration::from_secs(3));
 
-        // A live test run reads as `verifying` with the metered tick.
+        // A live test run reads as `verifying`. Reduced motion keeps the
+        // semantic label while sharing the calm, static live-work marker.
         let mut active = ActiveCell::new();
         active.push_tool("exec-1", running_exec("cargo test -p codewhale-tui"));
         app.active_cell = Some(active);
         assert_eq!(ShellPhase::from_app(&app), ShellPhase::Verifying);
         app.low_motion = true;
         let (marker, label) = phase_marker(&app, ShellPhase::Verifying);
-        assert_eq!(marker, crate::tui::spinner::VERIFY_TICK_FRAMES[4]);
+        assert_eq!(marker, crate::tui::spinner::BRAILLE_SPINNER_STILL_FRAME);
         assert_eq!(label, "verifying");
         app.low_motion = false;
 
@@ -1504,5 +2039,16 @@ mod tests {
         let (marker, label) = phase_marker(&app, ShellPhase::Done);
         assert_eq!(marker, "✓");
         assert_eq!(label, "done");
+    }
+
+    #[test]
+    fn draft_phase_beats_stale_completion_status() {
+        let mut app = test_app();
+        app.runtime_turn_status = Some("completed".to_string());
+
+        assert_eq!(ShellPhase::from_app(&app), ShellPhase::Done);
+
+        app.input = "next task".to_string();
+        assert_eq!(ShellPhase::from_app(&app), ShellPhase::Typing);
     }
 }

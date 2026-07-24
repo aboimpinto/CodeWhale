@@ -48,18 +48,23 @@ impl Frame {
 
     /// Single row of the screen, 0-indexed from the top, trimmed at the
     /// right edge. Returns the empty string for out-of-range rows.
+    ///
+    /// Use `Screen::rows` rather than concatenating `Cell::contents()`.
+    /// Untouched blank cells have no contents in `vt100`, but they still
+    /// occupy a real terminal column between painted cells. Concatenating
+    /// only cell contents therefore turns truthful PTY output such as
+    /// `read running` into the misleading debug string `readrunning`.
+    /// `Screen::rows` preserves those interior columns and skips the hidden
+    /// continuation cell of a wide glyph.
     pub fn row(&self, y: u16) -> String {
         if y >= self.rows() {
             return String::new();
         }
-        let cols = self.cols();
-        let mut out = String::with_capacity(cols as usize);
-        for x in 0..cols {
-            if let Some(cell) = self.parser.screen().cell(y, x) {
-                out.push_str(cell.contents());
-            }
-        }
-        out
+        self.parser
+            .screen()
+            .rows(0, self.cols())
+            .nth(usize::from(y))
+            .unwrap_or_default()
     }
 
     pub fn contains(&self, needle: &str) -> bool {
@@ -71,10 +76,49 @@ impl Frame {
     /// instead of hard-coding layout coordinates.
     pub fn find_text(&self, needle: &str) -> Option<(u16, u16)> {
         for row in 0..self.rows() {
-            let text = self.row(row);
-            if let Some(byte) = text.find(needle) {
-                let col = unicode_width::UnicodeWidthStr::width(&text[..byte]);
-                return Some((row, u16::try_from(col).ok()?));
+            if let Some(col) = self.find_text_in_row(row, needle) {
+                return Some((row, col));
+            }
+        }
+        None
+    }
+
+    /// Locate text on one parsed terminal row without collapsing blank cells.
+    /// `vt100::Cell::contents()` is empty for untouched spaces, which matters
+    /// for transparent themes whose styled gaps do not need to be emitted.
+    pub fn find_text_in_row(&self, row: u16, needle: &str) -> Option<u16> {
+        if row >= self.rows() || needle.is_empty() {
+            return None;
+        }
+        for start in 0..self.cols() {
+            let mut col = start;
+            let mut matched = true;
+            for ch in needle.chars() {
+                let Some(cell) = self.parser.screen().cell(row, col) else {
+                    matched = false;
+                    break;
+                };
+                let contents = cell.contents();
+                let mut encoded = [0_u8; 4];
+                let expected = ch.encode_utf8(&mut encoded);
+                if if ch == ' ' {
+                    !contents.is_empty() && contents != " "
+                } else {
+                    contents != expected
+                } {
+                    matched = false;
+                    break;
+                }
+                let width = unicode_width::UnicodeWidthChar::width(ch)
+                    .unwrap_or(0)
+                    .max(1);
+                let Ok(width) = u16::try_from(width) else {
+                    return None;
+                };
+                col = col.saturating_add(width);
+            }
+            if matched {
+                return Some(start);
             }
         }
         None
@@ -130,5 +174,26 @@ impl Frame {
             out.push_str(&format!("{y:>3} | {}\n", self.row(y).trim_end()));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Frame;
+
+    #[test]
+    fn row_preserves_unpainted_interior_terminal_columns() {
+        let mut frame = Frame::new(1, 12);
+        frame.feed(b"read\x1b[6Grunning");
+
+        assert_eq!(frame.row(0), "read running");
+    }
+
+    #[test]
+    fn row_does_not_expand_wide_glyph_continuation_cells() {
+        let mut frame = Frame::new(1, 12);
+        frame.feed("界 read".as_bytes());
+
+        assert_eq!(frame.row(0), "界 read");
     }
 }

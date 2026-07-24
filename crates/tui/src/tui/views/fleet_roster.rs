@@ -347,7 +347,9 @@ impl FleetRosterView {
         let lines = if self.operator_selected() {
             operator_detail_lines(&self.operator)
         } else if let Some(member) = self.selected_member() {
-            member_detail_lines(member)
+            // Session model is the operator route so "fast" loadouts resolve
+            // to the fast sibling the runtime will actually launch.
+            member_detail_lines_with_session(member, Some(self.operator.model.as_str()))
         } else {
             vec![Line::from(Span::styled(
                 "Roster is empty.",
@@ -444,7 +446,15 @@ fn member_posture(member: &AgentProfile) -> String {
 
 /// The routing truth for a member: explicit model pin, else route preset, else
 /// same-route inheritance. `[subagents]` overrides still win at dispatch.
+///
+/// When the loadout is `fast`, show that the runtime resolves the **fast
+/// sibling of the active session model** — not a stale on-disk profile name —
+/// so the roster matches what Fleet will actually launch.
 fn member_routing(member: &AgentProfile) -> String {
+    member_routing_with_session(member, None)
+}
+
+fn member_routing_with_session(member: &AgentProfile, session_model: Option<&str>) -> String {
     if let Some(model) = member
         .profile
         .model
@@ -456,11 +466,18 @@ fn member_routing(member: &AgentProfile) -> String {
     }
     match member.profile.loadout.as_str() {
         "inherit" => "inherit session route".to_string(),
+        "fast" => match session_model.map(str::trim).filter(|m| !m.is_empty()) {
+            Some(session) => format!("fast sibling of {session} (resolved)"),
+            None => "route preset fast (resolved at launch)".to_string(),
+        },
         loadout => format!("route preset {loadout}"),
     }
 }
 
-fn member_detail_lines(member: &AgentProfile) -> Vec<Line<'static>> {
+fn member_detail_lines_with_session(
+    member: &AgentProfile,
+    session_model: Option<&str>,
+) -> Vec<Line<'static>> {
     let mut lines: Vec<Line> = Vec::new();
 
     let name = match member.display_name.as_deref().map(str::trim) {
@@ -480,7 +497,11 @@ fn member_detail_lines(member: &AgentProfile) -> Vec<Line<'static>> {
     );
     detail_field(&mut lines, "Slot", member.profile.slot.as_str().to_string());
     detail_field(&mut lines, "Posture", member_posture(member));
-    detail_field(&mut lines, "Routing", member_routing(member));
+    detail_field(
+        &mut lines,
+        "Routing",
+        member_routing_with_session(member, session_model),
+    );
 
     let delegation = &member.profile.delegation;
     if delegation.max_spawn_depth.is_some() || delegation.max_concurrency.is_some() {
@@ -737,7 +758,7 @@ mod tests {
             .clone();
         assert_eq!(
             member_posture(&reviewer),
-            "review worker · read-only · shell read-only"
+            "reviewer worker · read-only · shell read-only"
         );
         assert_eq!(member_routing(&reviewer), "inherit session route");
 
@@ -746,7 +767,7 @@ mod tests {
         let scout = FleetRoster::built_ins_only().get("scout").unwrap().clone();
         assert_eq!(
             member_posture(&scout),
-            "explore worker · read-only · shell read-only"
+            "scout worker · read-only · shell read-only"
         );
         assert_eq!(member_routing(&scout), "inherit session route");
 
@@ -757,7 +778,7 @@ mod tests {
             .clone();
         assert_eq!(
             member_posture(&builder),
-            "implementer worker · write · shell full"
+            "builder worker · write · shell full"
         );
 
         // A pinned model beats the route preset label.
@@ -770,7 +791,7 @@ mod tests {
     fn detail_lines_carry_overlay_source_for_project_members() {
         let view = view_with_overrides();
         let reviewer = view.members.iter().find(|m| m.id == "reviewer").unwrap();
-        let text = member_detail_lines(reviewer)
+        let text = member_detail_lines_with_session(reviewer, None)
             .iter()
             .map(|line| {
                 line.spans
@@ -817,7 +838,10 @@ mod tests {
         let view = FleetRosterView::from_parts(operator(), FleetRoster::load(&config, tmp.path()));
         let extra = view.members.iter().find(|m| m.id == "docs-writer").unwrap();
         assert_eq!(extra.origin, ProfileOrigin::Config);
-        assert_eq!(member_routing(extra), "route preset fast");
+        assert_eq!(
+            member_routing(extra),
+            "route preset fast (resolved at launch)"
+        );
     }
 
     #[test]

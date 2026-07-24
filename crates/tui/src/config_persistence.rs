@@ -303,6 +303,7 @@ fn provider_base_url_table_key(provider: ApiProvider) -> anyhow::Result<&'static
         ApiProvider::OpencodeGo => Ok("opencode_go"),
         ApiProvider::Meta => Ok("meta"),
         ApiProvider::Xai => Ok("xai"),
+        ApiProvider::Telecomjs => Ok("telecomjs"),
         // Custom providers live under a user-chosen `[providers.<name>]` table,
         // not a fixed key. Persisting base_url through this static-key path is
         // out of scope for the #1519 constrained slice; users edit the named
@@ -816,6 +817,14 @@ mod tests {
         );
         assert_eq!(entry.model.as_deref(), Some("acme/code-1"));
         assert_eq!(entry.api_key_env.as_deref(), Some("ACME_API_KEY"));
+
+        let dispatcher = codewhale_config::ConfigStore::load(Some(written))
+            .expect("the dispatcher must parse the exact config written by the TUI");
+        assert_eq!(
+            dispatcher.config.provider,
+            codewhale_config::ProviderKind::Custom
+        );
+        assert_eq!(dispatcher.config.provider_id(), "acme_ai");
     }
 
     #[test]

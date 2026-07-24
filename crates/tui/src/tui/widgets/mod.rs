@@ -3,14 +3,10 @@ mod header;
 // Some helpers (`shift`, `ctrl_alt`, `is_press`, etc.) are part of the
 // public surface for issue #93's help overlay and future call sites; allow
 // dead code rather than scattering `#[allow]` across every constructor.
-#[allow(dead_code)]
-pub mod key_hint;
-// Phase 1 of #85: widget lands without a wire-up site so reviewers can
-// evaluate the rendering in isolation. The follow-up PR plumbs it through
-// the composer area in `ui.rs`. `pub mod` (vs the usual `pub use` pattern)
-// keeps the unused-imports lint quiet until then.
 pub mod agent_card;
 pub mod decision_card;
+#[allow(dead_code)]
+pub mod key_hint;
 pub mod pending_input_preview;
 mod renderable;
 pub mod tool_card;
@@ -36,7 +32,8 @@ use crate::palette;
 use crate::provider_lake::all_catalog_models_for_provider;
 use crate::tui::app::{App, AppMode, ComposerDensity, VimMode};
 use crate::tui::approval::{
-    ApprovalRequest, ApprovalView, ElevationOption, ElevationRequest, RiskLevel, ToolCategory,
+    ApprovalMode, ApprovalRequest, ApprovalView, ElevationOption, ElevationRequest, RiskLevel,
+    ToolCategory,
 };
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolRun, ToolStatus};
 use crate::tui::scrolling::TranscriptLineMeta;
@@ -227,6 +224,10 @@ impl ChatWidget {
                 collapsed_tool_indices.insert(run.start + offset);
             }
         }
+
+        // v0.9.1: do not collapse concurrent sub-agent cards into an Enter-
+        // expand shelf. Count lives in header chrome; full cards stay visible;
+        // sidebar / SubAgents modal are the drill-in surface.
         let has_collapsed = !app.collapsed_cells.is_empty() || !collapsed_run_starts.is_empty();
 
         // Fast path: no collapsed cells — use original slices directly.
@@ -439,21 +440,25 @@ impl ChatWidget {
             );
         }
 
-        // Brief flash highlight on the most recently sent user message.
-        if !app.low_motion
-            && let Some(send_at) = app.last_send_at
-        {
-            if send_at.elapsed() < SEND_FLASH_DURATION {
-                apply_send_flash(
-                    &mut lines,
-                    top,
-                    &app.history,
-                    line_meta,
-                    &app.collapsed_cell_map,
-                );
-            } else {
-                app.last_send_at = None;
+        // Brief flash highlight on the most recently sent user message. It is
+        // a one-shot transition, so Reduced/Still clear the timestamp instead
+        // of leaving a stale flash waiting for a later state-change redraw.
+        if app.motion_policy().allows_decorative() {
+            if let Some(send_at) = app.last_send_at {
+                if send_at.elapsed() < SEND_FLASH_DURATION {
+                    apply_send_flash(
+                        &mut lines,
+                        top,
+                        &app.history,
+                        line_meta,
+                        &app.collapsed_cell_map,
+                    );
+                } else {
+                    app.last_send_at = None;
+                }
             }
+        } else {
+            app.last_send_at = None;
         }
 
         if let Some(target_cell) = detail_target_cell {
@@ -663,6 +668,7 @@ impl Renderable for ChatWidget {
         );
 
         let area = _area;
+        crate::tui::hover_layer::begin_frame();
 
         // Repaint the full chat area with the codewhale-ink background each
         // frame. Ratatui's `Paragraph` only writes cells that contain text,
@@ -718,6 +724,32 @@ impl Renderable for ChatWidget {
                 self.jump_arrow,
             );
         }
+
+        // Hover: register OSC-8 link regions (copyable), then apply aura.
+        let link_area = Rect {
+            width: area
+                .width
+                .saturating_sub(u16::from(self.scrollbar.is_some())),
+            ..area
+        };
+        for region in crate::tui::osc8::link_regions_for_lines(link_area, &self.line_links) {
+            let width = region
+                .col_end
+                .saturating_sub(region.col_start)
+                .saturating_add(1);
+            let hit = Rect::new(region.col_start, region.row, width, 1);
+            crate::tui::hover_layer::register_rect(
+                crate::tui::hover_hit::HoverTargetKind::Link,
+                hit,
+                region.target,
+                true,
+            );
+        }
+        crate::tui::hover_layer::apply_resolved_effects(
+            buf,
+            !self.ocean_animated,
+            self.scroll_thumb,
+        );
     }
 
     fn desired_height(&self, _width: u16) -> u16 {
@@ -733,12 +765,26 @@ impl ChatWidget {
     /// ocean.
     fn render_underwater_field(&self, area: Rect, buf: &mut Buffer) {
         if let Some(column) = self.ocean_column {
+            // Cache per-row ocean colors; invalidate only on phase/size/breath.
+            let phase_tag = column.phase_tag();
+            let fingerprint = column.ramp_fingerprint();
+            let ramp = crate::tui::ambient_life::frame_ocean_ramp(
+                &column,
+                area.height,
+                area.y,
+                self.ocean_elapsed_ms,
+                phase_tag,
+                fingerprint,
+            );
             for local_y in 0..area.height {
                 let protected = self
                     .lines
                     .get(usize::from(local_y))
                     .and_then(occupied_text_bounds);
-                let row_bg = column.color_at_y(area.y.saturating_add(local_y));
+                let row_bg = ramp
+                    .get(usize::from(local_y))
+                    .copied()
+                    .unwrap_or_else(|| column.color_at_y(area.y.saturating_add(local_y)));
                 for local_x in 0..area.width {
                     let is_protected = protected.is_some_and(|(start, end)| {
                         usize::from(local_x) >= start && usize::from(local_x) < end
@@ -757,215 +803,58 @@ impl ChatWidget {
         if self.ambient_life
             && let Some(inks) = self.ambient_inks
         {
-            render_ambient_life(
+            let cursor = crate::tui::ambient_life::AmbientCursor {
+                // Pointer column is refined by hover_layer when available; row
+                // participates in vertical flee proximity.
+                column: 0,
+                row: area.y.saturating_add(area.height / 2),
+                flee_elapsed_ms: self.fish_flee_elapsed_ms,
+            };
+            // Whale cameo rides the completion breath clock when present.
+            let whale = crate::tui::ambient_life::WhaleCameo {
+                elapsed_ms: self.ocean_column.and_then(|c| c.completion_elapsed_ms()),
+                anchor_x: area.x.saturating_add(area.width / 2),
+                anchor_y: area.y.saturating_add(area.height.saturating_mul(2) / 3),
+            };
+            crate::tui::ambient_life::render_ambient_life(
                 area,
                 buf,
                 inks,
                 &self.lines,
                 self.ocean_elapsed_ms,
                 self.ocean_animated,
-                self.fish_flee_elapsed_ms,
+                cursor,
+                whale,
             );
+            if let Some(column) = self.ocean_column {
+                crate::tui::ambient_life::apply_caustic_shimmer(
+                    area,
+                    buf,
+                    &column,
+                    self.ocean_elapsed_ms,
+                    self.ocean_animated,
+                    &self.lines,
+                );
+            }
         }
     }
 }
 
 fn occupied_text_bounds(line: &Line<'_>) -> Option<(usize, usize)> {
-    let text = line
-        .spans
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect::<String>();
-    if text.trim().is_empty() {
-        return None;
-    }
-
-    let leading = text
-        .chars()
-        .take_while(|ch| ch.is_whitespace())
-        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
-        .sum::<usize>();
-    let total = UnicodeWidthStr::width(text.as_str());
-    let trailing = text
-        .chars()
-        .rev()
-        .take_while(|ch| ch.is_whitespace())
-        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
-        .sum::<usize>();
-    Some((leading, total.saturating_sub(trailing)))
+    crate::tui::ambient_life::occupied_text_bounds(line)
 }
 
-fn render_ambient_life(
-    area: Rect,
-    buf: &mut Buffer,
-    inks: (Color, Color),
-    lines: &[Line<'static>],
-    elapsed_ms: u128,
-    animated: bool,
-    fish_flee_elapsed_ms: Option<u128>,
-) {
-    if area.width < crate::tui::ocean::AMBIENT_MIN_WIDTH
-        || area.height < crate::tui::ocean::AMBIENT_MIN_HEIGHT
-    {
-        return;
-    }
-
-    let span_a = (area.width / 6).clamp(10, 24);
-    let span_b = (area.width / 7).clamp(8, 20);
-    let span_c = (area.width / 8).clamp(7, 18);
-    let (drift_a, fish_a_forward) = if animated {
-        ambient_ping_pong(elapsed_ms, 480, span_a, 0)
-    } else {
-        (0, true)
-    };
-    let (drift_b, fish_b_forward) = if animated {
-        ambient_ping_pong(elapsed_ms, 560, span_b, 1_900)
-    } else {
-        (0, false)
-    };
-    let (drift_c, fish_c_forward) = if animated {
-        ambient_ping_pong(elapsed_ms, 640, span_c, 3_700)
-    } else {
-        (0, true)
-    };
-    let heading_sample_ms = u128::from(crate::tui::ui::UI_UNDERWATER_ANIMATION_MS);
-    let previous_elapsed_ms = elapsed_ms.saturating_sub(heading_sample_ms);
-    let next_elapsed_ms = elapsed_ms.saturating_add(heading_sample_ms);
-    let previous_drift_a = if animated {
-        ambient_ping_pong(previous_elapsed_ms, 480, span_a, 0).0
-    } else {
-        drift_a
-    };
-    let next_drift_a = if animated {
-        ambient_ping_pong(next_elapsed_ms, 480, span_a, 0).0
-    } else {
-        drift_a
-    };
-    let previous_drift_b = if animated {
-        ambient_ping_pong(previous_elapsed_ms, 560, span_b, 1_900).0
-    } else {
-        drift_b
-    };
-    let next_drift_b = if animated {
-        ambient_ping_pong(next_elapsed_ms, 560, span_b, 1_900).0
-    } else {
-        drift_b
-    };
-    let previous_drift_c = if animated {
-        ambient_ping_pong(previous_elapsed_ms, 640, span_c, 3_700).0
-    } else {
-        drift_c
-    };
-    let next_drift_c = if animated {
-        ambient_ping_pong(next_elapsed_ms, 640, span_c, 3_700).0
-    } else {
-        drift_c
-    };
-    let rise = if animated {
-        u16::try_from((elapsed_ms / 720) % 5).unwrap_or(0)
-    } else {
-        0
-    };
-    let bubble = if animated {
-        ["·", "˚", "°", "˚"][(elapsed_ms / 300) as usize % 4]
-    } else {
-        "°"
-    };
-    let flee = fish_flee_elapsed_ms.map_or(0, fish_flee_offset);
-    let previous_flee = fish_flee_elapsed_ms
-        .map(|elapsed| fish_flee_offset(elapsed.saturating_sub(heading_sample_ms)))
-        .unwrap_or(flee);
-    let next_flee = fish_flee_elapsed_ms
-        .map(|elapsed| fish_flee_offset(elapsed.saturating_add(heading_sample_ms)))
-        .unwrap_or(flee);
-    let max_fish_x = area.width.saturating_sub(3);
-    let fish_a_x = (area.width / 12 + drift_a)
-        .saturating_sub(flee)
-        .min(max_fish_x);
-    let fish_a_previous_x = (area.width / 12 + previous_drift_a)
-        .saturating_sub(previous_flee)
-        .min(max_fish_x);
-    let fish_a_next_x = (area.width / 12 + next_drift_a)
-        .saturating_sub(next_flee)
-        .min(max_fish_x);
-    let fish_b_x = (area.width * 5 / 6)
-        .saturating_sub(drift_b)
-        .saturating_add(flee)
-        .min(max_fish_x);
-    let fish_b_previous_x = (area.width * 5 / 6)
-        .saturating_sub(previous_drift_b)
-        .saturating_add(previous_flee)
-        .min(max_fish_x);
-    let fish_b_next_x = (area.width * 5 / 6)
-        .saturating_sub(next_drift_b)
-        .saturating_add(next_flee)
-        .min(max_fish_x);
-    let fish_c_x = (area.width / 3 + drift_c)
-        .saturating_sub(flee / 2)
-        .min(max_fish_x);
-    let fish_c_previous_x = (area.width / 3 + previous_drift_c)
-        .saturating_sub(previous_flee / 2)
-        .min(max_fish_x);
-    let fish_c_next_x = (area.width / 3 + next_drift_c)
-        .saturating_sub(next_flee / 2)
-        .min(max_fish_x);
-    let fish_a_faces_right =
-        fish_heading(fish_a_previous_x, fish_a_x, fish_a_next_x, fish_a_forward);
-    let fish_b_faces_right =
-        fish_heading(fish_b_previous_x, fish_b_x, fish_b_next_x, !fish_b_forward);
-    let fish_c_faces_right =
-        fish_heading(fish_c_previous_x, fish_c_x, fish_c_next_x, fish_c_forward);
-    let marks = [
-        (fish_a_x, area.height * 3 / 4, fish_mark(fish_a_faces_right)),
-        (fish_b_x, area.height * 3 / 8, fish_mark(fish_b_faces_right)),
-        (fish_c_x, area.height / 6, fish_mark(fish_c_faces_right)),
-        (
-            area.width * 3 / 4,
-            (area.height / 4).saturating_sub(rise),
-            bubble,
-        ),
-    ];
-    for (index, (local_x, local_y, mark)) in marks.into_iter().enumerate() {
-        let protected = lines
-            .get(usize::from(local_y))
-            .and_then(occupied_text_bounds);
-        let mark_width = UnicodeWidthStr::width(mark);
-        // A one-cell gap on either side keeps life from visually attaching
-        // to occupied text, not merely from overlapping it.
-        let collides = protected.is_some_and(|(start, end)| {
-            usize::from(local_x) < end.saturating_add(1)
-                && usize::from(local_x) + mark_width > start.saturating_sub(1)
-        });
-        if collides || local_x.saturating_add(mark_width as u16) > area.width {
-            continue;
-        }
-        for (offset, ch) in mark.chars().enumerate() {
-            buf[(area.x + local_x + offset as u16, area.y + local_y)]
-                .set_symbol(&ch.to_string())
-                .set_fg(if index == 1 { inks.1 } else { inks.0 });
-        }
-    }
-}
-
-/// One-shot flee arc: fish leave their ambient positions, peak halfway, then
-/// return to the same stable positions. The deterministic 800 ms envelope is
-/// keyed to the typed Working transition and never loops.
+#[cfg(test)]
 fn fish_flee_offset(elapsed_ms: u128) -> u16 {
-    let progress = elapsed_ms.min(800) as f32 / 800.0;
-    let excursion = (progress * std::f32::consts::PI).sin() * 9.0;
-    excursion.round().clamp(0.0, 9.0) as u16
+    crate::tui::ambient_life::fish_flee_offset(elapsed_ms)
 }
 
-#[must_use]
+#[cfg(test)]
 fn fish_mark(facing_right: bool) -> &'static str {
     if facing_right { "><>" } else { "<><" }
 }
 
-/// Prefer the next visible displacement, then the most recent displacement.
-/// The fallback matters only while easing leaves the fish in the same terminal
-/// cell for several frames. Crucially, callers pass the fallback in screen-x
-/// coordinates, so mirrored paths cannot accidentally swim backwards.
-#[must_use]
+#[cfg(test)]
 fn fish_heading(previous_x: u16, current_x: u16, next_x: u16, fallback_right: bool) -> bool {
     if next_x != current_x {
         next_x > current_x
@@ -974,27 +863,6 @@ fn fish_heading(previous_x: u16, current_x: u16, next_x: u16, fallback_right: bo
     } else {
         fallback_right
     }
-}
-
-/// A cosine-eased ping-pong path keeps the fish continuous and lets it settle
-/// gently before turning. The event loop supplies the shared underwater
-/// cadence; this function only maps elapsed time and never requests frames.
-fn ambient_ping_pong(elapsed_ms: u128, step_ms: u128, span: u16, phase_ms: u128) -> (u16, bool) {
-    if span == 0 || step_ms == 0 {
-        return (0, true);
-    }
-    let leg_ms = step_ms.saturating_mul(u128::from(span));
-    let period_ms = leg_ms.saturating_mul(2);
-    let phase = (elapsed_ms.saturating_add(phase_ms)) % period_ms;
-    let (leg_elapsed, forward) = if phase <= leg_ms {
-        (phase, true)
-    } else {
-        (phase.saturating_sub(leg_ms), false)
-    };
-    let progress = leg_elapsed as f64 / leg_ms as f64;
-    let eased = (1.0 - (progress * std::f64::consts::PI).cos()) * 0.5;
-    let position = if forward { eased } else { 1.0 - eased };
-    ((position * f64::from(span)).round() as u16, forward)
 }
 
 fn jump_to_latest_button_rect(area: Rect, has_scrollbar: bool) -> Option<Rect> {
@@ -1042,6 +910,16 @@ fn render_jump_to_latest_button(
 }
 
 const COMPOSER_PROMPT_GUTTER_WIDTH: u16 = 2;
+const COMPOSER_PANEL_MIN_WIDTH: u16 = 12;
+
+/// Whether the outer composer rect can carry both semantic border rows.
+///
+/// Keep this policy in outer-area coordinates. Input wrapping subtracts the
+/// prompt gutter later; using that narrower text width here made 12- and
+/// 13-column composers render as panels after reserving only the quiet rule.
+fn enclosed_composer_panel_fits(show_panel: bool, area_width: u16, area_height: u16) -> bool {
+    show_panel && area_height >= 3 && area_width >= COMPOSER_PANEL_MIN_WIDTH
+}
 
 /// Canonical horizontal geometry for composer input text.
 ///
@@ -1165,13 +1043,10 @@ impl<'a> ComposerWidget<'a> {
 
     fn wants_enclosed_panel(&self) -> bool {
         self.app.composer_border
-            && (self.app.is_history_search_active()
-                || self.app.composer_display_input().contains('\n')
-                || self.active_menu_row_count() > 0)
     }
 
     pub(crate) fn has_panel(&self, area: Rect) -> bool {
-        self.wants_enclosed_panel() && area.height >= 3 && area.width >= 12
+        enclosed_composer_panel_fits(self.wants_enclosed_panel(), area.width, area.height)
     }
 
     fn inner_area(&self, area: Rect) -> Rect {
@@ -1188,9 +1063,9 @@ impl<'a> ComposerWidget<'a> {
 
     fn mode_color(&self) -> Color {
         match self.app.mode {
-            AppMode::Agent | AppMode::Auto | AppMode::Yolo => palette::MODE_AGENT,
-            AppMode::Plan => palette::MODE_PLAN,
-            AppMode::Operate => palette::MODE_OPERATE,
+            AppMode::Agent | AppMode::Auto | AppMode::Yolo => self.app.ui_theme.mode_agent,
+            AppMode::Plan => self.app.ui_theme.mode_plan,
+            AppMode::Operate => self.app.ui_theme.mode_operate,
         }
     }
 
@@ -1238,11 +1113,6 @@ impl Renderable for ComposerWidget<'_> {
             );
         let is_draft_mode = input_text.contains('\n') || visible_lines.len() > 1;
         if has_panel {
-            let border_color = if input_text.trim().is_empty() {
-                palette::BORDER_COLOR
-            } else {
-                self.mode_color()
-            };
             let hint_line = if self.app.is_history_search_active() {
                 Some(Line::from(vec![
                     Span::styled(
@@ -1295,36 +1165,39 @@ impl Renderable for ComposerWidget<'_> {
                         if self.app.offline_mode {
                             (Some("↵ offline queue".to_string()), palette::STATUS_WARNING)
                         } else if self.app.mode == crate::tui::app::AppMode::Operate {
+                            // Ctrl+G sends an already-queued item now; with only
+                            // composer text it stashes the draft (#440). Double-↵
+                            // after queueing steers the just-queued task.
                             let label = if queue_count > 0 {
                                 format!(
-                                    "↵ queue task ({} waiting, double-↵ to steer)",
+                                    "↵ queue task ({} waiting) · double-↵/⇧↵ steer · Ctrl+G send queued",
                                     queue_count.saturating_add(1)
                                 )
                             } else {
-                                "↵ queue task (double-↵ to steer)".to_string()
+                                "↵ queue task · double-↵/⇧↵ steer".to_string()
                             };
                             (Some(label), palette::WHALE_INFO)
                         } else {
                             let label = if queue_count > 0 {
                                 format!(
-                                    "↵ queue ({} waiting, double-↵ to steer)",
+                                    "↵ queue ({} waiting) · double-↵/⇧↵ steer · Ctrl+G send queued",
                                     queue_count.saturating_add(1)
                                 )
                             } else {
-                                "↵ queue (double-↵ to steer)".to_string()
+                                "↵ queue · double-↵/⇧↵ steer".to_string()
                             };
                             (Some(label), palette::TEXT_MUTED)
                         }
                     }
-                    // Steer reached via double-tap Enter or Ctrl+Enter override.
+                    // Steer reached via double-tap Enter, Shift+Enter, or Ctrl+Enter.
                     SubmitDisposition::Steer => {
                         (Some("↵ steering".to_string()), palette::WHALE_INFO)
                     }
                     SubmitDisposition::QueueFollowUp => (
                         Some(if self.app.mode == crate::tui::app::AppMode::Operate {
-                            "↵ queued task (double-↵ to steer)".to_string()
+                            "↵ queued task · double-↵/⇧↵ steer · Ctrl+G send queued".to_string()
                         } else {
-                            "↵ queued (double-↵ to steer)".to_string()
+                            "↵ queued · double-↵/⇧↵ steer · Ctrl+G send queued".to_string()
                         }),
                         palette::TEXT_MUTED,
                     ),
@@ -1339,19 +1212,27 @@ impl Renderable for ComposerWidget<'_> {
                 None
             };
 
-            let mut block = Block::default()
-                .borders(Borders::TOP | Borders::BOTTOM)
-                .border_style(Style::default().fg(border_color))
+            // Warm permission ramp: Ask is amber, Auto-Review is Signal Gold,
+            // and Full Access is coral. The bottom edge independently carries
+            // the cool Plan -> Act -> Operate mode ramp.
+            let permission_color = match self.app.approval_mode {
+                ApprovalMode::Suggest | ApprovalMode::Never => self.app.ui_theme.permission_ask,
+                ApprovalMode::Auto => self.app.ui_theme.permission_auto_review,
+                ApprovalMode::Bypass => self.app.ui_theme.permission_full_access,
+            };
+            let mut top_border = Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(permission_color))
                 .style(background);
             if self.app.is_history_search_active() || is_draft_mode {
-                block = if self.app.is_history_search_active() {
-                    block.title(Line::from(Span::styled(
+                top_border = if self.app.is_history_search_active() {
+                    top_border.title(Line::from(Span::styled(
                         self.app
                             .tr(crate::localization::MessageId::HistorySearchTitle),
                         Style::default().fg(palette::TEXT_MUTED),
                     )))
                 } else {
-                    block.title(Line::from(Span::styled(
+                    top_border.title(Line::from(Span::styled(
                         "Draft",
                         Style::default().fg(palette::TEXT_MUTED),
                     )))
@@ -1363,12 +1244,18 @@ impl Renderable for ComposerWidget<'_> {
             if self.app.ocean_treatment.is_classic()
                 && let Some(chrome) = composer_top_right_chrome(self.app, area.width)
             {
-                block = block.title_top(chrome.right_aligned());
+                top_border = top_border.title_top(chrome.right_aligned());
             }
+            top_border.render(area, buf);
+
+            let mut bottom_border = Block::default()
+                .borders(Borders::BOTTOM)
+                .border_style(Style::default().fg(self.mode_color()))
+                .style(background);
             if let Some(hint_line) = hint_line {
-                block = block.title_bottom(hint_line);
+                bottom_border = bottom_border.title_bottom(hint_line);
             }
-            block.render(area, buf);
+            bottom_border.render(area, buf);
         } else if area.height >= 2 {
             let mut block = Block::default()
                 .borders(Borders::TOP)
@@ -1741,7 +1628,7 @@ impl Renderable for ComposerWidget<'_> {
     fn desired_height(&self, width: u16) -> u16 {
         composer_height(
             self.app.composer_display_input(),
-            width.saturating_sub(2),
+            width,
             self.max_height.min(self.max_height_cap()),
             self.active_menu_reserved_rows(),
             self.app.composer_density,
@@ -3437,14 +3324,18 @@ fn composer_max_height(density: ComposerDensity) -> u16 {
 
 fn composer_height(
     input: &str,
-    width: u16,
+    area_width: u16,
     available_height: u16,
     extra_lines: usize,
     density: ComposerDensity,
     show_panel: bool,
 ) -> u16 {
-    let has_panel = show_panel && available_height >= 3 && width >= 12;
-    let content_width = usize::from(width.max(1));
+    let has_panel = enclosed_composer_panel_fits(show_panel, area_width, available_height);
+    let content_width = usize::from(
+        area_width
+            .saturating_sub(COMPOSER_PROMPT_GUTTER_WIDTH)
+            .max(1),
+    );
     let mut line_count = wrap_input_lines(input, content_width).len();
     if line_count == 0 {
         line_count = 1;
@@ -3579,7 +3470,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
                     command_key,
                     &prefix_lower,
                     locale,
-                    &user_commands,
+                    &all_user_commands,
                 );
             }
 
@@ -3608,7 +3499,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
                         cmd.name,
                         &prefix_lower,
                         locale,
-                        &user_commands,
+                        &all_user_commands,
                     );
                 }
             }
@@ -3626,7 +3517,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
                         &cmd.name,
                         &prefix_lower,
                         locale,
-                        &user_commands,
+                        &all_user_commands,
                     );
                 }
             }
@@ -3655,7 +3546,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
                         cmd.name,
                         &prefix_lower,
                         locale,
-                        &user_commands,
+                        &all_user_commands,
                     );
                 }
             }
@@ -3676,7 +3567,7 @@ pub(crate) fn slash_completion_hints_with_model_candidates(
                         &cmd.name,
                         &prefix_lower,
                         locale,
-                        &user_commands,
+                        &all_user_commands,
                     );
                 }
             }
@@ -3896,11 +3787,9 @@ fn push_command_entry(
             .description
             .clone()
             .unwrap_or_else(|| String::from("User-defined command"));
-        if let Some(hint) = &command.argument_hint
-            && !hint.trim().is_empty()
-        {
+        if let Some(hint) = command.display_usage() {
             description.push_str("  ");
-            description.push_str(hint.trim());
+            description.push_str(hint);
         }
         let alias_hint = if !command_key.to_ascii_lowercase().starts_with(prefix_lower) {
             command
@@ -3917,24 +3806,29 @@ fn push_command_entry(
         };
         (description, alias_hint)
     } else if let Some(info) = commands::get_command_info(command_key) {
+        let unshadowed_aliases = info
+            .aliases
+            .iter()
+            .copied()
+            .filter(|alias| !user_command_shadows_builtin_alias(alias, user_commands))
+            .collect::<Vec<_>>();
         let hint = if !command_key.to_ascii_lowercase().starts_with(prefix_lower) {
-            info.aliases
+            unshadowed_aliases
                 .iter()
+                .copied()
                 .find(|a| {
                     a.to_ascii_lowercase().starts_with(prefix_lower)
                         || a.to_ascii_lowercase().contains(prefix_lower)
                         || fuzzy_chars_in_order(prefix_lower, &a.to_ascii_lowercase())
                 })
-                .map(|a| a.to_string())
+                .map(str::to_string)
         } else {
             None
         };
         // Omit aliases already shown in the label (`/clear or /qingping`) so
         // the description does not repeat them (#3990).
-        let remaining_aliases: Vec<&str> = info
-            .aliases
-            .iter()
-            .copied()
+        let remaining_aliases: Vec<&str> = unshadowed_aliases
+            .into_iter()
             .filter(|alias| hint.as_deref() != Some(*alias))
             .collect();
         let desc = if remaining_aliases.is_empty() {
@@ -4255,17 +4149,17 @@ fn line_spans_with_selection<'a>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ACTIVE_REVISION_DOMAIN, ApprovalWidget, COMPOSER_PANEL_HEIGHT, COMPOSER_PLACEHOLDER,
-        ChatWidget, ComposerWidget, Renderable, SlashMenuEntry, active_entry_revision,
-        ambient_ping_pong, apply_detail_target_highlight, apply_selection_to_line,
-        apply_send_flash, approval_palette, approval_truncation_hint, build_empty_state_lines,
-        composer_content_geometry, composer_empty_hint_text, composer_height, composer_max_height,
-        composer_min_input_rows, composer_top_padding, cursor_row_col, empty_composer_visual_rows,
-        fish_flee_offset, fish_heading, fish_mark, history_entry_revision, layout_input,
-        layout_input_with_scroll, pad_lines_to_bottom, placeholder_visual_lines,
-        push_command_entry, receipt_is_settling, revision_in_domain, should_render_empty_state,
-        slash_completion_hints, tool_run_summary_revision, wrap_input_lines,
-        wrap_input_lines_for_mouse, wrap_text,
+        ACTIVE_REVISION_DOMAIN, ApprovalMode, ApprovalWidget, COMPOSER_PANEL_HEIGHT,
+        COMPOSER_PLACEHOLDER, COMPOSER_PROMPT_GUTTER_WIDTH, ChatWidget, ComposerWidget, Renderable,
+        SlashMenuEntry, active_entry_revision, apply_detail_target_highlight,
+        apply_selection_to_line, apply_send_flash, approval_palette, approval_truncation_hint,
+        build_empty_state_lines, composer_content_geometry, composer_empty_hint_text,
+        composer_height, composer_max_height, composer_min_input_rows, composer_top_padding,
+        cursor_row_col, empty_composer_visual_rows, enclosed_composer_panel_fits, fish_flee_offset,
+        fish_heading, fish_mark, history_entry_revision, layout_input, layout_input_with_scroll,
+        pad_lines_to_bottom, placeholder_visual_lines, push_command_entry, receipt_is_settling,
+        revision_in_domain, should_render_empty_state, slash_completion_hints,
+        tool_run_summary_revision, wrap_input_lines, wrap_input_lines_for_mouse, wrap_text,
     };
     use crate::config::{ApiProvider, Config};
     use crate::localization::Locale;
@@ -4912,6 +4806,70 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_hints_discover_debt_from_compat_aliases() {
+        for alias in ["slop", "canzha"] {
+            let hints = slash_completion_hints(
+                &format!("/{alias}"),
+                128,
+                &[],
+                Locale::En,
+                None,
+                ApiProvider::Deepseek,
+            );
+            let debt = hints
+                .iter()
+                .find(|hint| hint.name == "/debt")
+                .unwrap_or_else(|| panic!("/debt should appear for /{alias}"));
+            assert_eq!(debt.alias_hint.as_deref(), Some(alias));
+        }
+    }
+
+    #[test]
+    fn slash_completion_debt_aliases_prefer_user_command_shadows() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("slop.md"),
+            "---\ndescription: User slop workflow\n---\ncustom slop",
+        )
+        .unwrap();
+        std::fs::write(
+            commands_dir.join("review.md"),
+            "---\ndescription: User canzha workflow\nalias: canzha\n---\ncustom canzha",
+        )
+        .unwrap();
+
+        for (alias, canonical, description, alias_hint) in [
+            ("slop", "/slop", "User slop workflow", None),
+            ("canzha", "/review", "User canzha workflow", Some("canzha")),
+        ] {
+            let hints = slash_completion_hints(
+                &format!("/{alias}"),
+                128,
+                &[],
+                Locale::En,
+                Some(tmp.path()),
+                ApiProvider::Deepseek,
+            );
+            let user_command = hints
+                .iter()
+                .find(|hint| hint.name == canonical)
+                .unwrap_or_else(|| panic!("{canonical} should own /{alias} completion"));
+            assert_eq!(user_command.description, description);
+            assert_eq!(user_command.alias_hint.as_deref(), alias_hint);
+            let hint_names = hints
+                .iter()
+                .map(|hint| hint.name.as_str())
+                .collect::<Vec<_>>();
+            assert!(
+                !hints.iter().any(|hint| hint.name == "/debt"),
+                "/debt must not complete through user-shadowed /{alias}: {hint_names:?}"
+            );
+        }
+    }
+
+    #[test]
     fn slash_completion_hints_rank_exact_alias_above_prefix_alias() {
         // `/q` should rank `/exit` (exact alias `q`) above `/clear` (alias
         // `qingping` only matches by prefix). Before #1811 the entries were
@@ -5072,6 +5030,61 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_uses_frontmatter_name_and_usage() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("workflow-file.md"),
+            "---\nname: inspect\ndescription: Inspect target\nusage: /inspect <path>\narguments: <path>\n---\ninspect",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/ins",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+        let entry = hints
+            .iter()
+            .find(|hint| hint.name == "/inspect")
+            .expect("frontmatter name should complete");
+
+        assert_eq!(entry.description, "Inspect target  /inspect <path>");
+        assert!(!hints.iter().any(|hint| hint.name == "/workflow-file"));
+    }
+
+    #[test]
+    fn slash_completion_uses_arguments_when_usage_and_legacy_hint_are_absent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("deploy.md"),
+            "---\ndescription: Deploy target\narguments: <environment>\n---\ndeploy",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/deploy",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+        let entry = hints
+            .iter()
+            .find(|hint| hint.name == "/deploy")
+            .expect("custom command should be present");
+
+        assert_eq!(entry.description, "Deploy target  <environment>");
+    }
+
+    #[test]
     fn slash_completion_hints_exclude_hidden_user_commands() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
@@ -5092,6 +5105,29 @@ mod tests {
         );
 
         assert!(!hints.iter().any(|hint| hint.name == "/secret"));
+    }
+
+    #[test]
+    fn hidden_name_override_filters_shadowed_builtin_from_slash_completion() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("private-help.md"),
+            "---\nname: help\nhidden: true\n---\nprivate help",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/help",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+
+        assert!(!hints.iter().any(|hint| hint.name == "/help"));
     }
 
     #[test]
@@ -5123,6 +5159,38 @@ mod tests {
     }
 
     #[test]
+    fn slash_completion_omits_rejected_user_alias_collisions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("alpha.md"),
+            "---\ndescription: Alpha command\nalias: beta\n---\nalpha",
+        )
+        .unwrap();
+        std::fs::write(
+            commands_dir.join("beta.md"),
+            "---\ndescription: Beta command\n---\nbeta",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/bet",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+
+        assert!(hints.iter().any(|hint| hint.name == "/beta"));
+        assert!(
+            !hints.iter().any(|hint| hint.name == "/alpha"),
+            "a command must not match through an alias rejected by the registry"
+        );
+    }
+
+    #[test]
     fn slash_completion_hints_keep_builtin_canonical_when_only_builtin_alias_is_shadowed() {
         let tmp = tempfile::TempDir::new().unwrap();
         let commands_dir = tmp.path().join(".codewhale").join("commands");
@@ -5142,9 +5210,15 @@ mod tests {
             ApiProvider::Deepseek,
         );
 
+        let attach = canonical_hints
+            .iter()
+            .find(|hint| hint.name == "/attach")
+            .expect(
+                "canonical /attach should remain visible when only its /image alias is shadowed",
+            );
         assert!(
-            canonical_hints.iter().any(|hint| hint.name == "/attach"),
-            "canonical /attach should remain visible when only its /image alias is shadowed"
+            !attach.description.contains("/image"),
+            "canonical completion must not advertise a user-shadowed alias"
         );
 
         let alias_hints = slash_completion_hints(
@@ -5164,6 +5238,41 @@ mod tests {
             !alias_hints.iter().any(|hint| hint.name == "/attach"),
             "built-in /attach should not complete through shadowed /image alias"
         );
+    }
+
+    #[test]
+    fn slash_completion_hints_hide_shadowed_debt_aliases_from_canonical_copy() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let commands_dir = tmp.path().join(".codewhale").join("commands");
+        std::fs::create_dir_all(&commands_dir).unwrap();
+        std::fs::write(
+            commands_dir.join("slop.md"),
+            "---\ndescription: Internal cleanup\nhidden: true\n---\ninternal cleanup",
+        )
+        .unwrap();
+        std::fs::write(
+            commands_dir.join("custom-debt.md"),
+            "---\ndescription: Custom debt flow\nalias: canzha\n---\ncustom debt",
+        )
+        .unwrap();
+
+        let hints = slash_completion_hints(
+            "/debt",
+            128,
+            &[],
+            Locale::En,
+            Some(tmp.path()),
+            ApiProvider::Deepseek,
+        );
+        let debt = hints
+            .iter()
+            .find(|hint| hint.name == "/debt")
+            .expect("canonical /debt should remain visible when only aliases are shadowed");
+
+        assert_eq!(debt.alias_hint, None);
+        assert!(debt.description.contains("/cleanup"));
+        assert!(!debt.description.contains("/slop"));
+        assert!(!debt.description.contains("/canzha"));
     }
 
     #[test]
@@ -5381,17 +5490,13 @@ mod tests {
             ComposerDensity::Comfortable,
             true,
         );
-        let has_panel = available_height >= 3 && width >= 12;
+        let has_panel = enclosed_composer_panel_fits(true, width, available_height);
         let chrome_height = if has_panel {
             usize::from(COMPOSER_PANEL_HEIGHT)
         } else {
-            0
+            1
         };
-        let content_width = if has_panel {
-            usize::from(width.saturating_sub(2).max(1))
-        } else {
-            usize::from(width.max(1))
-        };
+        let content_width = usize::from(width.saturating_sub(COMPOSER_PROMPT_GUTTER_WIDTH).max(1));
         let input_height_budget = usize::from(height)
             .saturating_sub(menu_lines)
             .saturating_sub(chrome_height)
@@ -5414,6 +5519,52 @@ mod tests {
     fn composer_height_prefers_panel_shape_when_space_allows() {
         let height = composer_height("", 40, 8, 0, ComposerDensity::Comfortable, true);
         assert_eq!(height, 5);
+    }
+
+    #[test]
+    fn composer_panel_height_and_render_policy_agree_at_width_boundary() {
+        let mut app = create_test_app();
+        app.composer_border = true;
+        app.composer_density = ComposerDensity::Comfortable;
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
+        let mention_menu_entries = Vec::<String>::new();
+        let widget = ComposerWidget::new(&app, 8, &slash_menu_entries, &mention_menu_entries);
+
+        for (width, expected_panel, expected_height) in
+            [(11, false, 4), (12, true, 5), (13, true, 5), (14, true, 5)]
+        {
+            let height = widget.desired_height(width);
+            let area = Rect::new(0, 0, width, height);
+
+            assert_eq!(height, expected_height, "width={width}");
+            assert_eq!(widget.has_panel(area), expected_panel, "width={width}");
+            assert_eq!(
+                widget.inner_area(area).height,
+                3,
+                "width={width} must reserve every rendered border row"
+            );
+
+            let mut buf = Buffer::empty(area);
+            widget.render(area, &mut buf);
+            assert_eq!(
+                buf[(1, area.bottom().saturating_sub(1))].symbol() == "\u{2500}",
+                expected_panel,
+                "width={width} bottom border disagrees with height policy"
+            );
+        }
+    }
+
+    #[test]
+    fn composer_expands_for_multiline_input_and_collapses_again() {
+        let height_for =
+            |input| composer_height(input, 40, 12, 0, ComposerDensity::Comfortable, true);
+
+        let collapsed = height_for("short");
+        let expanded = height_for("one\ntwo\nthree\nfour\nfive\nsix");
+        let collapsed_again = height_for("short");
+
+        assert!(expanded > collapsed);
+        assert_eq!(collapsed_again, collapsed);
     }
 
     #[test]
@@ -5492,16 +5643,15 @@ mod tests {
             height: 5,
         };
 
-        // Normal one-line composition uses only the top rule, preserving the
-        // reference's continuous water field instead of drawing a full box.
-        // inner_area: {x:0, y:1, w:40, h:4}
-        // input_rows_budget = 4
+        // The two border rows carry independent permission/mode signals.
+        // inner_area: {x:0, y:1, w:40, h:3}
+        // input_rows_budget = 3
         // The prompt and hint share one quiet row.
         assert_eq!(
-            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 40, 4),
+            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 40, 3),
             1
         );
-        assert_eq!(widget.cursor_pos(area), Some((2, 3)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 2)));
     }
 
     #[test]
@@ -5520,17 +5670,17 @@ mod tests {
             height: 5,
         };
 
-        // inner_area: {x:0, y:1, w:14, h:4}
-        // input_rows_budget = 4
+        // inner_area: {x:0, y:1, w:14, h:3}
+        // input_rows_budget = 3
         // placeholder_visual_lines(14) = 2
         // The narrow fallback still reserves one composer row; Paragraph
         // clipping keeps it from growing the shell.
         assert_eq!(placeholder_visual_lines(14), 2);
         assert_eq!(
-            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 14, 4),
+            empty_composer_visual_rows(Some(COMPOSER_PLACEHOLDER), 14, 3),
             1
         );
-        assert_eq!(widget.cursor_pos(area), Some((2, 3)));
+        assert_eq!(widget.cursor_pos(area), Some((2, 2)));
     }
 
     #[test]
@@ -5640,6 +5790,57 @@ mod tests {
         assert!(!rendered.contains("Composer"));
         assert!(rendered.contains("turn completed"));
         assert!(rendered.contains("tool(s) used"));
+    }
+
+    #[test]
+    fn composer_border_edges_encode_warm_permission_and_cool_mode_ramps() {
+        let slash_menu_entries = Vec::<SlashMenuEntry>::new();
+        let mention_menu_entries = Vec::<String>::new();
+        let area = Rect::new(0, 0, 40, 5);
+
+        for theme_id in palette::SELECTABLE_THEMES {
+            let theme = theme_id.ui_theme();
+            for (approval_mode, expected) in [
+                (ApprovalMode::Suggest, theme.permission_ask),
+                (ApprovalMode::Never, theme.permission_ask),
+                (ApprovalMode::Auto, theme.permission_auto_review),
+                (ApprovalMode::Bypass, theme.permission_full_access),
+            ] {
+                let mut app = create_test_app();
+                app.ui_theme = theme;
+                app.approval_mode = approval_mode;
+                let widget =
+                    ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+                let mut buf = Buffer::empty(area);
+                widget.render(area, &mut buf);
+                assert_eq!(
+                    buf[(1, area.top())].fg,
+                    expected,
+                    "{} {approval_mode:?}",
+                    theme_id.name()
+                );
+            }
+
+            for (mode, expected) in [
+                (AppMode::Plan, theme.mode_plan),
+                (AppMode::Agent, theme.mode_agent),
+                (AppMode::Operate, theme.mode_operate),
+            ] {
+                let mut app = create_test_app();
+                app.ui_theme = theme;
+                app.mode = mode;
+                let widget =
+                    ComposerWidget::new(&app, 5, &slash_menu_entries, &mention_menu_entries);
+                let mut buf = Buffer::empty(area);
+                widget.render(area, &mut buf);
+                assert_eq!(
+                    buf[(1, area.bottom().saturating_sub(1))].fg,
+                    expected,
+                    "{} {mode:?}",
+                    theme_id.name()
+                );
+            }
+        }
     }
 
     #[test]
@@ -5832,6 +6033,9 @@ mod tests {
             elapsed_since_output_ms: None,
             owner_agent_id: None,
             owner_agent_name: None,
+            current_tool: None,
+            role: None,
+            files_touched: 0,
         });
 
         assert!(!should_render_empty_state(&app));
@@ -5877,13 +6081,46 @@ mod tests {
         let mut app = create_test_app();
         app.low_motion = false;
         app.fancy_animations = true;
-        app.plan_prompt_pending = true;
+        app.view_stack
+            .push(crate::tui::views::HelpView::new_for_locale(app.ui_locale));
 
         let widget = ChatWidget::new(&mut app, Rect::new(0, 0, 100, 20));
 
         assert!(!widget.ocean_animated);
         assert!(!widget.ambient_life);
         assert!(!should_render_empty_state(&app));
+    }
+
+    #[test]
+    fn reduced_and_still_modes_clear_the_one_shot_send_flash() {
+        for (low_motion, fancy_animations) in [(true, true), (false, false)] {
+            let mut app = create_test_app();
+            app.low_motion = low_motion;
+            app.fancy_animations = fancy_animations;
+            app.last_send_at = Some(Instant::now());
+            app.add_message(HistoryCell::User {
+                content: "semantic receipt".to_string(),
+            });
+
+            let _widget = ChatWidget::new(&mut app, Rect::new(0, 0, 100, 20));
+            assert!(
+                app.last_send_at.is_none(),
+                "non-full motion must not retain a time-based flash"
+            );
+        }
+
+        let mut full = create_test_app();
+        full.low_motion = false;
+        full.fancy_animations = true;
+        full.last_send_at = Some(Instant::now());
+        full.add_message(HistoryCell::User {
+            content: "animated receipt".to_string(),
+        });
+        let _widget = ChatWidget::new(&mut full, Rect::new(0, 0, 100, 20));
+        assert!(
+            full.last_send_at.is_some(),
+            "full motion should retain the active send-flash window"
+        );
     }
 
     #[test]
@@ -5973,11 +6210,21 @@ mod tests {
 
         assert_ne!(buf[(0, 0)].bg, buf[(0, 19)].bg);
         let rendered = buffer_text(&buf, area);
-        let fish_count = rendered.matches("><>").count() + rendered.matches("<><").count();
-        assert_eq!(
-            fish_count, 3,
-            "wide idle water should contain three fish:\n{rendered}"
+        // One loose wedge school: an eyed lead plus plain members, all
+        // facing the same way (facing equals travel by construction).
+        let rightward = rendered.matches("><>").count() + rendered.matches("><o>").count();
+        let leftward = rendered.matches("<><").count() + rendered.matches("<o><").count();
+        assert!(
+            rightward == 0 || leftward == 0,
+            "one school shares one direction:\n{rendered}"
         );
+        let fish_count = rightward + leftward;
+        assert!(
+            (4..=7).contains(&fish_count),
+            "wide idle water should show one cohesive wedge school (got {fish_count}):\n{rendered}"
+        );
+        let leads = rendered.matches("><o>").count() + rendered.matches("<o><").count();
+        assert_eq!(leads, 1, "exactly one eyed lead fish:\n{rendered}");
 
         let context = "codewhale · /tmp/codewhale-test-workspace · no git · mcp 0";
         let context_x = ((100usize - UnicodeWidthStr::width(context)) / 2) as u16;
@@ -6212,27 +6459,6 @@ mod tests {
         assert_ne!(first[(0, 0)].bg, first[(0, 19)].bg);
         assert_eq!(first[(0, 0)].bg, second[(0, 0)].bg);
         assert_eq!(first[(11, 14)].symbol(), second[(11, 14)].symbol());
-    }
-
-    #[test]
-    fn ambient_path_reverses_without_teleporting() {
-        let step = 620;
-        let span = 11;
-        assert_eq!(ambient_ping_pong(0, step, span, 0), (0, true));
-        assert_eq!(ambient_ping_pong(step * 11, step, span, 0), (11, true));
-        let after_turn = ambient_ping_pong(step * 12, step, span, 0);
-        assert!(!after_turn.1);
-        assert!(
-            after_turn.0 >= 10,
-            "the eased turn must not jump: {after_turn:?}"
-        );
-        let near_origin = ambient_ping_pong(step * 21, step, span, 0);
-        assert!(!near_origin.1);
-        assert!(
-            near_origin.0 <= 1,
-            "the eased return should settle: {near_origin:?}"
-        );
-        assert_eq!(ambient_ping_pong(step * 22, step, span, 0), (0, true));
     }
 
     #[test]

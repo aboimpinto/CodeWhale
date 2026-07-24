@@ -701,14 +701,7 @@ fn truncate_route_cell(route: &str, max_chars: usize) -> String {
 }
 
 fn humanize_age(d: std::time::Duration) -> String {
-    let secs = d.as_secs();
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
-    }
+    crate::elapsed::format_elapsed_secs(d.as_secs())
 }
 
 #[cfg(test)]

@@ -2057,8 +2057,8 @@ pub fn scopes_overlap(left: &[String], right: &[String]) -> bool {
 }
 
 fn scope_overlaps(left: &str, right: &str) -> bool {
-    let left = normalize_scope(left);
-    let right = normalize_scope(right);
+    let left = normalize_file_scope_root(left);
+    let right = normalize_file_scope_root(right);
 
     if left == right || left == "." || right == "." {
         return true;
@@ -2073,7 +2073,10 @@ fn scope_overlaps(left: &str, right: &str) -> bool {
     left_path.starts_with(right_path) || right_path.starts_with(left_path)
 }
 
-fn normalize_scope(scope: &str) -> String {
+/// Normalize the suffix-glob spelling accepted by declarative workflow
+/// `file_scope` into the concrete directory root enforced at runtime.
+#[must_use]
+pub fn normalize_file_scope_root(scope: &str) -> String {
     let trimmed = scope.trim().trim_start_matches("./").trim_end_matches('/');
     trimmed
         .strip_suffix("/**")

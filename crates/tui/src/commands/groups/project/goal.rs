@@ -71,15 +71,11 @@ fn hunt(app: &mut App, arg: Option<&str>) -> CommandResult {
                     .hunt
                     .time_used_seconds
                     .gt(&0)
-                    .then(|| {
-                        crate::tui::notifications::humanize_duration(
-                            std::time::Duration::from_secs(app.hunt.time_used_seconds),
-                        )
-                    })
+                    .then(|| crate::elapsed::format_elapsed_secs(app.hunt.time_used_seconds))
                     .or_else(|| {
                         app.hunt
                             .started_at
-                            .map(|t| crate::tui::notifications::humanize_duration(t.elapsed()))
+                            .map(|t| crate::elapsed::format_elapsed_secs(t.elapsed().as_secs()))
                     })
                     .unwrap_or_else(|| "unknown".to_string());
                 let budget_str = app
@@ -233,12 +229,11 @@ fn hunt_verdict_label(verdict: HuntVerdict) -> &'static str {
 /// Humanized elapsed time for a closed goal, frozen at the finish instant so
 /// the close-out message doesn't drift further each time it's read.
 fn goal_elapsed_at_close(hunt: &crate::tui::app::HuntState) -> String {
-    use crate::tui::notifications::humanize_duration;
     match (hunt.started_at, hunt.finished_at) {
-        (Some(started), Some(finished)) => {
-            humanize_duration(finished.saturating_duration_since(started))
-        }
-        (Some(started), None) => humanize_duration(started.elapsed()),
+        (Some(started), Some(finished)) => crate::elapsed::format_elapsed_secs(
+            finished.saturating_duration_since(started).as_secs(),
+        ),
+        (Some(started), None) => crate::elapsed::format_elapsed_secs(started.elapsed().as_secs()),
         (None, _) => "unknown".to_string(),
     }
 }
@@ -312,7 +307,7 @@ fn write_trophy_card(app: &App, verdict: HuntVerdict) -> Result<std::path::PathB
         .hunt
         .started_at
         .as_ref()
-        .map(|t| crate::tui::notifications::humanize_duration(t.elapsed()))
+        .map(|t| crate::elapsed::format_elapsed_secs(t.elapsed().as_secs()))
         .unwrap_or_else(|| "unknown".to_string());
     let verdict_str = hunt_verdict_name(verdict);
     let tokens = if app.hunt.tokens_used > 0 {
@@ -566,6 +561,13 @@ mod tests {
 
     #[test]
     fn test_close_hunt_freezes_elapsed_timer() {
+        // close_hunt writes a trophy card under CODEWHALE_HOME/trophies. Isolate
+        // the home dir so sandbox/readonly HOME cannot turn a successful close
+        // into a trophy path error (and so we never touch the real home).
+        let _lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().expect("isolated CODEWHALE_HOME");
+        let _codewhale_home = crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+
         let mut app = create_test_app();
         let _ = hunt(&mut app, Some("Freeze the timer on close"));
         assert!(
@@ -582,7 +584,8 @@ mod tests {
                 .as_deref()
                 .unwrap_or_default()
                 .contains("Goal hunted. Elapsed:"),
-            "close-out message should report a frozen elapsed"
+            "close-out message should report a frozen elapsed; got {:?}",
+            result.message
         );
         assert_eq!(app.hunt.verdict, HuntVerdict::Hunted);
         assert!(

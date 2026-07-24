@@ -6,13 +6,14 @@ use std::time::Instant;
 use crate::hooks::HookEvent;
 use crate::tools::ReviewOutput;
 use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
+use crate::tools::canonical_action::canonical_action_alias;
 use crate::tools::plan::PlanSnapshot;
 use crate::tools::spec::{ToolError, ToolResult};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::app::{App, ToolDetailRecord, ToolEvidence};
 use crate::tui::history::{
-    DiffPreviewCell, ExecCell, ExecSource, ExploringEntry, GenericToolCell, HistoryCell,
-    McpToolCell, PatchSummaryCell, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus, ViewImageCell,
+    ExecCell, ExecSource, ExploringEntry, GenericToolCell, HistoryCell, McpToolCell,
+    PatchSummaryCell, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus, ViewImageCell,
     WebSearchCell, output_looks_like_diff, summarize_mcp_output, summarize_tool_args,
     summarize_tool_output,
 };
@@ -32,6 +33,7 @@ pub(super) fn handle_tool_call_started(
     // the turn-loop gate — it processes the denial (exit code 2).
 
     let id = id.to_string();
+    let semantic_name = canonical_action_alias(name, input);
 
     // All in-flight tool work for the current turn lives in `app.active_cell`
     // until the turn completes. This mirrors Codex's contract: ONE active cell
@@ -42,8 +44,8 @@ pub(super) fn handle_tool_call_started(
         app.active_cell = Some(ActiveCell::new());
     }
 
-    if is_exploring_tool(name) {
-        let label = exploring_label(name, input);
+    if is_exploring_tool(semantic_name) {
+        let label = exploring_label(semantic_name, input);
         // ensure_exploring + append_to_exploring keeps all parallel exploring
         // starts in a single ExploringCell entry.
         let active = app.active_cell.as_mut().expect("active_cell just ensured");
@@ -72,10 +74,10 @@ pub(super) fn handle_tool_call_started(
     // hold both an exploring aggregate AND independent tool entries
     // simultaneously, which is exactly the case CX#7 fixes.
 
-    if is_exec_tool(name) {
+    if is_exec_tool(semantic_name) {
         let command = exec_target_from_input(input);
         let source = exec_source_from_input(input);
-        let interaction = exec_interaction_summary(name, input);
+        let interaction = exec_interaction_summary(semantic_name, input);
         let mut is_wait = false;
 
         if let Some((summary, wait)) = interaction.as_ref() {
@@ -152,7 +154,7 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    if name == "update_plan" {
+    if semantic_name == "update_plan" {
         let snapshot = parse_plan_input(input);
         push_active_tool_cell(
             app,
@@ -167,8 +169,8 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    if name == "apply_patch" {
-        let (path, summary) = parse_patch_summary(input);
+    if matches!(semantic_name, "write_file" | "edit_file" | "apply_patch") {
+        let (path, summary) = parse_file_mutation_summary(semantic_name, input);
         push_active_tool_cell(
             app,
             &id,
@@ -179,12 +181,13 @@ pub(super) fn handle_tool_call_started(
                 summary,
                 status: ToolStatus::Running,
                 error: None,
+                receipt: None,
             })),
         );
         return;
     }
 
-    if name == "review" {
+    if semantic_name == "review" {
         let target = review_target_label(input);
         push_active_tool_cell(
             app,
@@ -201,7 +204,7 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    if is_mcp_tool(name) {
+    if is_mcp_tool(semantic_name) {
         push_active_tool_cell(
             app,
             &id,
@@ -217,7 +220,7 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    if is_view_image_tool(name) {
+    if is_view_image_tool(semantic_name) {
         if let Some(path) = input.get("path").and_then(|v| v.as_str()) {
             let raw_path = PathBuf::from(path);
             let display_path = raw_path
@@ -235,7 +238,7 @@ pub(super) fn handle_tool_call_started(
         return;
     }
 
-    if is_web_search_tool(name) {
+    if is_web_search_tool(semantic_name) {
         let query = web_search_query(input);
         push_active_tool_cell(
             app,
@@ -284,7 +287,7 @@ pub(super) fn handle_tool_call_started(
         name,
         input,
         HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-            name: name.to_string(),
+            name: semantic_name.to_string(),
             status: ToolStatus::Running,
             input_summary,
             output: None,
@@ -438,9 +441,6 @@ fn record_spillover_artifact_if_any(
     result: &Result<ToolResult, ToolError>,
 ) {
     let Ok(tool_result) = result else { return };
-    if !tool_result.success {
-        return;
-    }
     let Some(path) = tool_result
         .metadata
         .as_ref()
@@ -491,6 +491,52 @@ fn record_spillover_artifact_if_any(
         ));
 }
 
+pub(super) fn evidence_completion_should_be_ignored(
+    app: &App,
+    id: &str,
+    result: &Result<ToolResult, ToolError>,
+) -> bool {
+    evidence_completion_identity_should_be_ignored(
+        app.current_session_id.as_deref(),
+        app.session_artifacts
+            .iter()
+            .map(|artifact| (artifact.id.as_str(), artifact.tool_call_id.as_str())),
+        id,
+        result,
+    )
+}
+
+fn evidence_completion_identity_should_be_ignored<'a>(
+    current_session: Option<&str>,
+    known_artifacts: impl IntoIterator<Item = (&'a str, &'a str)>,
+    id: &str,
+    result: &Result<ToolResult, ToolError>,
+) -> bool {
+    let Some(metadata) = result
+        .as_ref()
+        .ok()
+        .and_then(|result| result.metadata.as_ref())
+    else {
+        return false;
+    };
+    let origin = metadata
+        .get("artifact_session_id")
+        .and_then(serde_json::Value::as_str);
+    if let (Some(origin), Some(current)) = (origin, current_session)
+        && origin != current
+    {
+        return true;
+    }
+    metadata
+        .get("artifact_id")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|artifact_id| {
+            known_artifacts
+                .into_iter()
+                .any(|(known_id, known_call)| known_id == artifact_id && known_call == id)
+        })
+}
+
 /// #3031: shell/tasks tools embed the literal `"(no output)"` into successful
 /// `ToolResult` content (the model-facing transcript needs a non-empty tool
 /// result). Treat it as no output on the TUI side so the compact-mode
@@ -513,6 +559,20 @@ pub(super) fn handle_tool_call_complete(
     if app.ignored_tool_calls.remove(id) {
         return;
     }
+    // Preserve the execution/audit name while recovering the action-qualified
+    // semantic name from the registered call input. Active entries and
+    // already-flushed history use separate detail stores.
+    let semantic_name = app
+        .active_tool_details
+        .get(id)
+        .or_else(|| {
+            app.tool_cells
+                .get(id)
+                .and_then(|cell_index| app.tool_details_by_cell.get(cell_index))
+        })
+        .map_or(name, |detail| canonical_action_alias(name, &detail.input))
+        .to_string();
+
     // Roll any child-LLM token usage the tool reports into the
     // session-cost counter. Runs unconditionally so future tools that
     // spawn their own LLM calls (RLM, summarizers, retrieval helpers)
@@ -559,6 +619,16 @@ pub(super) fn handle_tool_call_complete(
     let in_active = cell_index >= app.history.len();
 
     let status = tool_status_from_result(result);
+    let mutation_receipt = matches!(
+        semantic_name.as_str(),
+        "write_file" | "edit_file" | "apply_patch"
+    )
+    .then(|| {
+        result.as_ref().ok().and_then(|tool_result| {
+            crate::tui::history::FileMutationReceipt::from_success(&app.workspace, tool_result)
+        })
+    })
+    .flatten();
     let mut workflow_panel_output: Option<String> = None;
 
     if let Some(cell) = app.cell_at_virtual_index_mut(cell_index) {
@@ -646,14 +716,18 @@ pub(super) fn handle_tool_call_complete(
             }
             HistoryCell::Tool(ToolCell::PatchSummary(patch)) => {
                 patch.status = status;
+                patch.receipt = mutation_receipt;
                 match result.as_ref() {
-                    Ok(tool_result) => {
+                    Ok(tool_result) if tool_result.success => {
                         if let Ok(json) =
                             serde_json::from_str::<serde_json::Value>(&tool_result.content)
                             && let Some(message) = json.get("message").and_then(|v| v.as_str())
                         {
                             patch.summary = message.to_string();
                         }
+                    }
+                    Ok(tool_result) => {
+                        patch.error = Some(tool_result.content.clone());
                     }
                     Err(err) => {
                         patch.error = Some(err.to_string());
@@ -757,7 +831,7 @@ pub(super) fn handle_tool_call_complete(
         refresh_active_tool_completion_timestamp(app, cell_index);
     }
 
-    if refreshes_workspace_context_on_completion(name) && status != ToolStatus::Running {
+    if refreshes_workspace_context_on_completion(&semantic_name) && status != ToolStatus::Running {
         workspace_context::refresh_now(app, Instant::now());
     }
 
@@ -1181,8 +1255,9 @@ fn history_cell_has_running_tool(cell: &HistoryCell) -> bool {
 /// every tool result is visible somewhere; the alternative (silently
 /// dropping it) hides errors and breaks debuggability.
 ///
-/// Choice of cell type: we use `GenericToolCell` because we have no input
-/// payload to reconstruct a more specific cell. The pager remains usable —
+/// Choice of cell type: success-only mutation metadata is sufficient to
+/// reconstruct a structured File receipt; other orphans stay generic because
+/// no input payload remains. The pager remains usable in both cases because
 /// `tool_details_by_cell` is populated with the result text.
 ///
 /// ## Index drift
@@ -1213,16 +1288,35 @@ fn push_orphan_tool_completion(
         .map(std::path::PathBuf::from);
     let output_summary = output.as_deref().map(summarize_tool_output);
     let is_diff = output.as_deref().is_some_and(output_looks_like_diff);
-    app.add_message(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-        name: name.to_string(),
-        status,
-        input_summary: None,
-        output,
-        prompts: None,
-        spillover_path,
-        output_summary,
-        is_diff,
-    })));
+    let mutation_receipt = result.as_ref().ok().and_then(|tool_result| {
+        crate::tui::history::FileMutationReceipt::from_success(&app.workspace, tool_result)
+    });
+    let cell = if let Some(receipt) = mutation_receipt {
+        let path = receipt
+            .files
+            .first()
+            .map_or_else(|| "<file>".to_string(), |file| file.path.clone());
+        let summary = receipt.semantic_summary();
+        HistoryCell::Tool(ToolCell::PatchSummary(PatchSummaryCell {
+            path,
+            summary,
+            status,
+            error: None,
+            receipt: Some(receipt),
+        }))
+    } else {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: name.to_string(),
+            status,
+            input_summary: None,
+            output,
+            prompts: None,
+            spillover_path,
+            output_summary,
+            is_diff,
+        }))
+    };
+    app.add_message(cell);
     let cell_index = app.history.len().saturating_sub(1);
     app.tool_details_by_cell.insert(
         cell_index,
@@ -1308,7 +1402,12 @@ fn is_exploring_tool(name: &str) -> bool {
 fn is_exec_tool(name: &str) -> bool {
     matches!(
         name,
-        "exec_shell" | "exec_shell_wait" | "exec_shell_interact" | "exec_wait" | "exec_interact"
+        "exec_shell"
+            | "exec_shell_wait"
+            | "exec_shell_interact"
+            | "exec_shell_cancel"
+            | "exec_wait"
+            | "exec_interact"
     )
 }
 
@@ -1318,10 +1417,14 @@ pub(super) fn refreshes_workspace_context_on_completion(name: &str) -> bool {
         "exec_shell"
             | "exec_shell_wait"
             | "exec_shell_interact"
+            | "exec_shell_cancel"
             | "exec_wait"
             | "exec_interact"
             | "task_shell_start"
             | "task_shell_wait"
+            | "write_file"
+            | "edit_file"
+            | "apply_patch"
     )
 }
 
@@ -1418,7 +1521,22 @@ fn parse_plan_input(input: &serde_json::Value) -> PlanSnapshot {
     PlanSnapshot::from_tool_input(input)
 }
 
-fn parse_patch_summary(input: &serde_json::Value) -> (String, String) {
+fn parse_file_mutation_summary(semantic_name: &str, input: &serde_json::Value) -> (String, String) {
+    if semantic_name != "apply_patch" {
+        let path = input
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .filter(|path| !path.trim().is_empty())
+            .unwrap_or("<file>")
+            .to_string();
+        let summary = match semantic_name {
+            "write_file" => "Writing file",
+            "edit_file" => "Editing file",
+            _ => "Changing file",
+        }
+        .to_string();
+        return (path, summary);
+    }
     let patch_text = match normalize_apply_patch_input(input) {
         Ok(NormalizedApplyPatchInput::Replacement {
             entries: changes, ..
@@ -1495,60 +1613,6 @@ fn extract_patch_paths(patch: &str) -> Vec<String> {
     paths
 }
 
-pub(super) fn maybe_add_patch_preview(app: &mut App, input: &serde_json::Value) {
-    match normalize_apply_patch_input(input) {
-        Ok(NormalizedApplyPatchInput::Patch(patch)) => {
-            app.add_message(HistoryCell::Tool(ToolCell::DiffPreview(DiffPreviewCell {
-                title: "Patch Preview".to_string(),
-                diff: patch.to_string(),
-            })));
-            app.mark_history_updated();
-        }
-        Ok(NormalizedApplyPatchInput::Replacement { entries, .. }) => {
-            let preview = format_changes_preview(entries);
-            if !preview.trim().is_empty() {
-                app.add_message(HistoryCell::Tool(ToolCell::DiffPreview(DiffPreviewCell {
-                    title: "Changes Preview".to_string(),
-                    diff: preview,
-                })));
-                app.mark_history_updated();
-            }
-        }
-        Err(_) => {}
-    }
-}
-
-fn format_changes_preview(changes: &[serde_json::Value]) -> String {
-    let mut out = String::new();
-    for change in changes {
-        let path = change
-            .get("path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("<file>");
-        let content = change.get("content").and_then(|v| v.as_str()).unwrap_or("");
-
-        out.push_str(&format!("diff --git a/{path} b/{path}\n"));
-        out.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
-        out.push_str("@@ -0,0 +1,1 @@\n");
-
-        let mut count = 0usize;
-        for line in content.lines() {
-            out.push('+');
-            out.push_str(line);
-            out.push('\n');
-            count += 1;
-            if count >= 20 {
-                out.push_str("+... (truncated)\n");
-                break;
-            }
-        }
-        if content.is_empty() {
-            out.push_str("+\n");
-        }
-    }
-    out
-}
-
 fn count_patch_changes(patch: &str) -> (usize, usize) {
     let mut adds = 0;
     let mut removes = 0;
@@ -1601,6 +1665,22 @@ fn exec_interaction_summary(name: &str, input: &serde_json::Value) -> Option<(St
 
     let is_wait_tool = matches!(name, "exec_shell_wait" | "exec_wait");
     let is_interact_tool = matches!(name, "exec_shell_interact" | "exec_interact");
+    let is_cancel_tool = name == "exec_shell_cancel";
+
+    if is_cancel_tool {
+        let summary = if input.get("all").and_then(serde_json::Value::as_bool) == Some(true) {
+            "Cancelled all background commands".to_string()
+        } else if let Some(task_id) = input
+            .get("task_id")
+            .or_else(|| input.get("id"))
+            .and_then(serde_json::Value::as_str)
+        {
+            format!("Cancelled command {task_id}")
+        } else {
+            "Cancelled background command".to_string()
+        };
+        return Some((summary, false));
+    }
 
     if is_interact_tool || interaction_input.is_some() {
         let preview = interaction_input.map(summarize_interaction_input);
@@ -1655,6 +1735,32 @@ mod tests {
     use super::*;
     use crate::tools::plan::StepStatus;
     use serde_json::json;
+
+    #[test]
+    fn adaptive_evidence_late_foreign_and_duplicate_completions_are_ignored() {
+        let result = Ok(ToolResult::success("bounded").with_metadata(json!({
+            "artifact_session_id": "session-a",
+            "artifact_id": "art_call-a"
+        })));
+        assert!(evidence_completion_identity_should_be_ignored(
+            Some("session-b"),
+            std::iter::empty(),
+            "call-a",
+            &result,
+        ));
+        assert!(evidence_completion_identity_should_be_ignored(
+            Some("session-a"),
+            [("art_call-a", "call-a")],
+            "call-a",
+            &result,
+        ));
+        assert!(!evidence_completion_identity_should_be_ignored(
+            Some("session-a"),
+            std::iter::empty(),
+            "call-a",
+            &result,
+        ));
+    }
 
     #[test]
     fn web_search_presentation_reads_source_degradation_and_citation_count() {
@@ -1764,8 +1870,9 @@ mod tests {
             "content": "fn replacement() {}\n"
         }]);
 
-        let canonical = parse_patch_summary(&json!({"replace": replacements.clone()}));
-        let legacy = parse_patch_summary(&json!({"changes": replacements}));
+        let canonical =
+            parse_file_mutation_summary("apply_patch", &json!({"replace": replacements.clone()}));
+        let legacy = parse_file_mutation_summary("apply_patch", &json!({"changes": replacements}));
 
         assert_eq!(canonical, legacy);
     }

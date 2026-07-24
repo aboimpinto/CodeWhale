@@ -20,7 +20,7 @@ impl PlanUpdateCell {
     pub fn lines_with_motion(&self, width: u16, low_motion: bool) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         lines.push(render_tool_header(
-            "Strategy",
+            "Legacy plan",
             tool_status_label(self.status),
             self.status,
             None,

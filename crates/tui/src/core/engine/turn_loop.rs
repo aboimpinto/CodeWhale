@@ -11,6 +11,7 @@ use super::stuck_guard::{
     RUNTIME_NOTICE as STUCK_RUNTIME_NOTICE, StepFingerprint, StuckGuard, StuckSignal,
 };
 use super::*;
+use crate::core::authority::{ToolPermission, resolve_tool_permission};
 use crate::core::ops::UserInputProvenance;
 use crate::prompt_zones::PinnedPrefix;
 use crate::runtime_handoff::{
@@ -43,13 +44,16 @@ pub(super) fn registered_tool_approval_required(
     requirement: ApprovalRequirement,
     auto_approve: bool,
 ) -> bool {
-    if requirement == ApprovalRequirement::Auto {
-        return false;
-    }
-    if registered_tool_requires_non_bypassable_approval(tool_name) {
-        return true;
-    }
-    !auto_approve
+    // Single permission contract (#4412): fold the session auto_approve bit
+    // into TurnAuthority and ask the shared resolver. Prompt means the tool
+    // must surface an approval request; Allow/Deny keep the call unprompted
+    // (Deny is UI-layer Never posture and is not produced here).
+    let authority = crate::core::authority::TurnAuthority::for_tool_approval_decision(auto_approve);
+    let is_non_bypassable = registered_tool_requires_non_bypassable_approval(tool_name);
+    matches!(
+        resolve_tool_permission(&authority, requirement, is_non_bypassable),
+        ToolPermission::Prompt
+    )
 }
 
 pub(super) fn registered_tool_blocked_in_full_access(
@@ -57,6 +61,9 @@ pub(super) fn registered_tool_blocked_in_full_access(
     requirement: ApprovalRequirement,
     auto_approve: bool,
 ) -> bool {
+    // Full Access does not open tool-approval modals. Non-bypassable holds
+    // that would still Prompt under Full Access are blocked at the engine
+    // instead of opening a contradictory modal (#3866).
     auto_approve && registered_tool_forces_prompt(tool_name, requirement)
 }
 
@@ -215,7 +222,9 @@ fn normalize_domain_candidate(value: &str) -> Option<String> {
 }
 
 fn registered_tool_requires_non_bypassable_approval(tool_name: &str) -> bool {
-    matches!(tool_name, "rlm_eval" | "start_mcp_server")
+    // `rlm_eval` (and the unified `rlm` tool whose eval action inherits the
+    // same Required approval) must never bypass explicit approval (#3866).
+    matches!(tool_name, "rlm_eval" | "rlm" | "start_mcp_server")
 }
 
 impl Engine {
@@ -280,7 +289,6 @@ impl Engine {
         tool_registry: Option<&crate::tools::ToolRegistry>,
         tools: Option<Vec<Tool>>,
         mode: AppMode,
-        force_update_plan_first: bool,
         dynamic_active_tools: Vec<&'static str>,
     ) -> (TurnOutcomeStatus, Option<String>) {
         // Only interactive TUI hosts own terminal chrome. Headless exec,
@@ -419,10 +427,15 @@ impl Engine {
                     .send(Event::status("Auto-compacting context...".to_string()))
                     .await;
                 let auto_messages_before = self.session.messages.len();
+                let mut auto_compaction_config = self.config.compaction.clone();
+                let live = self.capture_compaction_live_state().await;
+                if !live.is_empty() {
+                    auto_compaction_config.live_state = Some(live);
+                }
                 match compact_messages_safe(
                     client.as_ref(),
                     &self.session.messages,
-                    &self.config.compaction,
+                    &auto_compaction_config,
                     Some(&self.session.workspace),
                     Some(&compaction_pins),
                     Some(&compaction_paths),
@@ -517,21 +530,11 @@ impl Engine {
             // model sees compile errors before its next reasoning step.
             self.flush_pending_lsp_diagnostics().await;
 
-            // #159: layered context seam checkpoint. This is opt-in for
-            // v0.7.5 while #200 audits cache-hit behavior; when enabled it
-            // appends <archived_context> blocks rather than replacing history.
-            self.layered_context_checkpoint().await;
-
             // Build the request
-            let force_update_plan_this_step = force_update_plan_first && !turn.has_tool_calls();
             let mut active_tools = if tool_catalog.is_empty() {
                 None
             } else {
-                Some(active_tools_for_step(
-                    &tool_catalog,
-                    &active_tool_names,
-                    force_update_plan_this_step,
-                ))
+                Some(active_tools_for_step(&tool_catalog, &active_tool_names))
             };
             if self.config.strict_tool_mode
                 && let Some(tools) = active_tools.as_mut()
@@ -1408,8 +1411,9 @@ impl Engine {
                 // finished while we were inferring), surface their
                 // `<codewhale:subagent.done>` sentinels into the transcript and
                 // resume instead of ending the turn. This fulfils the contract
-                // already documented in `prompts/constitution.md`: the parent is
-                // promised it'll see the sentinel when a child finishes.
+                // already documented in the constitution (`prompts/text.rs`,
+                // `BASE_PROMPT`): the parent is promised it'll see the sentinel
+                // when a child finishes.
                 let subagent_completions = self.drain_subagent_completion_events("").await;
                 if subagent_completions == 0 {
                     // #3216: do NOT barrier the parent on running children.
@@ -2769,7 +2773,6 @@ impl Engine {
             let mut step_error_categories: Vec<ErrorCategory> = Vec::new();
             let mut step_error_tool_names: Vec<String> = Vec::new();
             let mut step_error_tool_inputs: Vec<serde_json::Value> = Vec::new();
-            let mut stop_after_plan_tool = false;
             // #dogfood 0.8.67: if the model mutates the goal mid-turn via
             // create_goal/update_goal, push the change to the sidebar right after
             // this tool batch instead of waiting for turn end — otherwise the
@@ -2825,9 +2828,6 @@ impl Engine {
                 if matches!(outcome.name.as_str(), "create_goal" | "update_goal") {
                     goal_tool_ran = true;
                 }
-                let should_stop_this_turn =
-                    should_stop_after_plan_tool(mode, &outcome.name, &result);
-
                 match result {
                     Ok(output) => {
                         emit_tool_audit(json!({
@@ -2940,9 +2940,6 @@ impl Engine {
                         .await;
                     }
                 }
-
-                turn.record_tool_call();
-                stop_after_plan_tool |= should_stop_this_turn;
             }
 
             // Reflect a mid-turn goal change on the sidebar immediately (idempotent:
@@ -2977,10 +2974,6 @@ impl Engine {
                     let _ = self.tx_event.send(Event::status(reason)).await;
                     return (TurnOutcomeStatus::Failed, Some(reason.to_string()));
                 }
-            }
-
-            if stop_after_plan_tool {
-                break;
             }
 
             if !pending_steers.is_empty() {
@@ -3509,8 +3502,9 @@ fn resolve_tool_definition<'a>(
         .iter()
         .find(|def| def.name.as_str() == tool_name.as_str());
 
-    // Resolve hallucinated tool names before policy gates run, so aliases like
-    // ReadFile are checked against the canonical registered tool name.
+    // Resolve hallucinated tool names before policy gates run. Hidden legacy
+    // handlers keep their executable name, while policy uses the canonical
+    // model-facing family definition.
     if tool_def.is_none()
         && let Some(registry) = tool_registry
         && let Some(canonical) = registry.resolve(tool_name.as_str())
@@ -3518,7 +3512,15 @@ fn resolve_tool_definition<'a>(
         crate::logging::info(format!(
             "Resolved hallucinated tool name '{tool_name}' -> '{canonical}'"
         ));
-        tool_def = tool_catalog.iter().find(|d| d.name == canonical);
+        let catalog_name = match canonical {
+            "read_file" | "write_file" | "edit_file" | "list_dir" | "grep_files"
+            | "file_search" | "apply_patch" => "File",
+            "git_status" | "git_diff" | "git_log" | "git_show" | "git_blame" => "Git",
+            "run_tests" | "run_verifiers" => "Run",
+            "web_search" | "fetch_url" | "wait_for_dev_server" => "Web",
+            _ => canonical,
+        };
+        tool_def = tool_catalog.iter().find(|d| d.name == catalog_name);
         if tool_def.is_some() {
             *tool_name = canonical.to_string();
         }

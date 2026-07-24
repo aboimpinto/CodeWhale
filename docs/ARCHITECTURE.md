@@ -1,13 +1,16 @@
-# codewhale Architecture
+# Codewhale Architecture
 
 This document provides an overview of the codewhale architecture for developers and contributors.
 
 Current boundary note (v0.9.1):
 - `crates/tui` is still the live end-user runtime for the TUI, runtime API, task manager, and tool execution loop.
 - Other workspace crates are being split out incrementally, but they are not yet the sole runtime source of truth.
-- The LSP subsystem (`crates/tui/src/lsp/`) is fully wired into the engine's post-tool-execution path
-  (`core/engine/lsp_hooks.rs`), providing inline diagnostics after every edit_file/apply_patch/write_file.
-- The swarm agent system was removed in v0.8.5. The active sub-agent surface is the single `agent` tool; persistent RLM sessions remain available through `rlm_open` / `rlm_eval` / `rlm_configure` / `rlm_close`.
+- The LSP subsystem (`crates/tui/src/lsp/`) is fully wired into the engine's
+  post-tool-execution path (`core/engine/lsp_hooks.rs`), providing inline
+  diagnostics after `File` write, edit, and patch actions.
+- The swarm agent system was removed in v0.8.5. The active sub-agent surface is
+  the single `agent` tool; persistent RLM sessions are available through the
+  deferred `rlm` action family.
   No model-visible swarm tool remains in the active codebase.
 
 ## High-Level Overview
@@ -169,7 +172,9 @@ drives turns through Chat Completions.
   - `mod.rs` - Sandbox type definitions
   - `policy.rs` - Sandbox policy configuration
   - `seatbelt.rs` - macOS Seatbelt profile generation
+  - `bwrap.rs` - opt-in Linux bubblewrap command wrapper
   - `landlock.rs` - Linux Landlock detection and future helper contract
+  - `seccomp.rs` - dormant Linux seccomp implementation; not wired into commands
   - `windows.rs` - Windows helper contract; not advertised until a Job
     Object process-containment helper exists
 
@@ -207,18 +212,18 @@ drives turns through Chat Completions.
 3. While degraded/offline, new prompts are queued in-memory and mirrored to `~/.codewhale/sessions/checkpoints/offline_queue.json`
 4. Queue edits (`/queue ...`) are persisted continuously so drafts and queued prompts survive restarts
 5. Successful turn completion clears the active checkpoint and writes a durable session snapshot
-6. Agent/Yolo turns also take pre/post-turn side-git workspace snapshots under `~/.codewhale/snapshots/<project_hash>/<worktree_hash>/.git`; `/restore N` and `revert_turn` restore file state without changing conversation history or the user's `.git`
+6. Action-capable turns also take pre/post-turn side-git workspace snapshots under `~/.codewhale/snapshots/<project_hash>/<worktree_hash>/.git`; `/restore N` and `revert_turn` restore file state without changing conversation history or the user's `.git`
 
 ### Tool Execution
 
 1. LLM requests tool via `tool_use` content block
 2. Tool registry looks up handler
 3. Pre-execution hooks run
-4. Approval requested if needed (non-yolo mode)
-5. Tool executed (possibly sandboxed on macOS)
+4. Approval requested when the effective permission posture and policy require it
+5. Tool executed (possibly wrapped by Seatbelt on macOS or opt-in bubblewrap on Linux)
 6. Post-execution hooks run
 7. Result metadata is retained on runtime item records
-8. **LSP post-edit hook**: if the tool was `edit_file`/`apply_patch`/`write_file` and LSP is enabled, the engine runs `run_post_edit_lsp_hook()` to collect diagnostics
+8. **LSP post-edit hook**: after a `File` write, edit, or patch action (including a replay-only legacy alias), the engine runs `run_post_edit_lsp_hook()` when LSP is enabled to collect diagnostics
 9. **Diagnostics flush**: before the next API request, `flush_pending_lsp_diagnostics()` injects any collected errors as a synthetic user message
 10. Result returned to agent loop
 
@@ -273,7 +278,12 @@ ordinary durable tasks.
 
 1. Create skill directory with `SKILL.md`
 2. Define skill prompt and optional scripts
-3. Place in `~/.codewhale/skills/`
+3. Place in a CodeWhale-owned root (`~/.codewhale/skills/` or
+   `<workspace>/.codewhale/skills/`), or import from a compatible harness root
+   through `/skills`
+
+See [SKILLS.md](SKILLS.md) for the Skills Manager, audit inventory, and the
+rule that compatible roots (`.claude`, `.agents`, …) are never mutated in place.
 
 ### Adding Hooks
 
@@ -288,12 +298,15 @@ command = "echo 'Running tool: $TOOL_NAME'"
 ## Key Design Decisions
 
 1. **Streaming-first**: All LLM responses stream for responsiveness
-2. **Tool safety**: Non-YOLO mode requires approval for destructive operations, including side-effectful MCP tools
+2. **Tool safety**: Ask and Auto-Review require approval according to tool and
+   managed policy; Full Access removes ordinary prompts but not hard safety
+   holds. Side-effectful MCP tools use the same boundary.
 3. **Extensibility**: MCP, skills, and hooks allow customization without code changes
 4. **Cross-platform**: Core works on Linux/macOS/Windows. Sandbox guarantees
-   are platform-specific: macOS Seatbelt is the active policy path; Linux and
-   Windows require helper enforcement before they should be treated as full OS
-   sandboxing.
+   are platform-specific: macOS uses Seatbelt when available; Linux uses an
+   installed bubblewrap executable only when explicitly enabled; Windows has
+   no advertised OS command sandbox. Landlock, seccomp, and the Windows helper
+   contract are not wired into command execution.
 5. **Minimal dependencies**: Careful dependency selection for build speed
 6. **Local-first runtime API**: HTTP/SSE endpoints are intended for trusted localhost access and are served by the `crates/tui` runtime today
 

@@ -86,6 +86,8 @@ impl Locale {
 pub enum MessageId {
     ComposerPlaceholder,
     ComposerDispatchFailedRestored,
+    DispatchFailedQueued,
+    DispatchFailedInitial,
     HistorySearchPlaceholder,
     HistorySearchTitle,
     HistoryHintMove,
@@ -181,6 +183,70 @@ pub enum MessageId {
     ConfigDefaultValue,
     ConfigDefaultReasoning,
     ConfigUnavailable,
+    ConfigLabelProvider,
+    ConfigLabelBaseUrlDeepseek,
+    ConfigLabelProviderUrl,
+    ConfigLabelModel,
+    ConfigLabelFastModel,
+    ConfigLabelDefaultModel,
+    ConfigLabelReasoningEffort,
+    ConfigLabelApprovalMode,
+    ConfigLabelPermissionPosture,
+    ConfigLabelApprovalPolicy,
+    ConfigLabelManagedApprovalPolicy,
+    ConfigLabelDefaultMode,
+    ConfigLabelAllowShell,
+    ConfigLabelManagedAllowShell,
+    ConfigLabelStreamTimeout,
+    ConfigLabelTheme,
+    ConfigLabelLocale,
+    ConfigLabelBackground,
+    ConfigLabelOceanTreatment,
+    ConfigLabelWorkSurfacePlacement,
+    ConfigLabelTopHeight,
+    ConfigLabelSideWidth,
+    ConfigLabelCalmMode,
+    ConfigLabelLowMotion,
+    ConfigLabelFancyAnimations,
+    ConfigLabelLaunchScreen,
+    ConfigLabelShowThinking,
+    ConfigLabelShowToolDetails,
+    ConfigLabelInlineDiffs,
+    ConfigLabelStatusIndicator,
+    ConfigLabelSynchronizedOutput,
+    ConfigLabelCostCurrency,
+    ConfigLabelTranscriptSpacing,
+    ConfigLabelToolCollapse,
+    ConfigLabelComposerDensity,
+    ConfigLabelComposerBorder,
+    ConfigLabelComposerVimMode,
+    ConfigLabelBracketedPaste,
+    ConfigLabelPasteBurstDetection,
+    ConfigLabelMentionMenuLimit,
+    ConfigLabelMentionMenuBehavior,
+    ConfigLabelMentionWalkDepth,
+    ConfigLabelWorkspaceFollowSymlinks,
+    ConfigLabelSidebarWidth,
+    ConfigLabelSidebarFocus,
+    ConfigLabelContextPanel,
+    ConfigLabelAutoCompact,
+    ConfigLabelAutoCompactThreshold,
+    ConfigLabelMaxHistory,
+    ConfigLabelPreferExternalPdftotext,
+    ConfigLabelMcpConfigPath,
+    ConfigLabelFleetSpawnDepth,
+    ConfigLabelGoalCommand,
+    ConfigLabelWorkflow,
+    ConfigLabelFeaturePrefix,
+    ConfigColumnSetting,
+    ConfigColumnValue,
+    ConfigColumnScope,
+    ConfigActionOpenProvider,
+    ConfigActionOpenModel,
+    ConfigActionToggle,
+    ConfigActionChoose,
+    ConfigActionEdit,
+    ConfigActionReadOnly,
     ModelPickerAutoNetworkHint,
     ModelPickerAutoLocalHint,
     ModelPickerAutoLastRoute,
@@ -288,7 +354,7 @@ pub enum MessageId {
     CmdSidebarDescription,
     CmdSkillDescription,
     CmdSkillsDescription,
-    CmdSlopDescription,
+    CmdDebtDescription,
     CmdStashDescription,
     CmdStatusDescription,
     CmdStatuslineDescription,
@@ -362,6 +428,7 @@ pub enum MessageId {
     KbShellControls,
     KbExitEmpty,
     KbCommandPalette,
+    KbSettings,
     KbCancelBackgroundShellJobs,
     KbFuzzyFilePicker,
     KbCompactInspector,
@@ -469,6 +536,7 @@ pub enum MessageId {
     OnboardApiKeyPlaceholder,
     OnboardApiKeyLabel,
     OnboardApiKeyFooter,
+    OnboardApiKeyRejectedEnv,
     // Onboarding screens — workspace trust prompt.
     OnboardTrustTitle,
     OnboardTrustQuestion,
@@ -948,6 +1016,9 @@ pub enum MessageId {
     PhaseIdle,
     PhaseDraft,
     PhaseWorking,
+    PhaseReasoning,
+    PhaseReading,
+    PhaseUsingTool,
     /// Metered verification pass (tests/checks) — distinct from `working`
     /// so checking reads differently from searching (ocean state model).
     PhaseVerifying,
@@ -1137,6 +1208,45 @@ pub enum MessageId {
     SidebarDestructiveArmed,
     WorkSurfaceTodoProgress,
     WorkSurfaceStopConfirmHint,
+    CoordinationWorkTitle,
+    CoordinationSummaryDecisions,
+    CoordinationSummaryContentions,
+    CoordinationSummaryReconciled,
+    CoordinationSchema,
+    CoordinationSequence,
+    CoordinationPerSectionLimit,
+    CoordinationDecisionsHeading,
+    CoordinationNone,
+    CoordinationNoneValue,
+    CoordinationStatus,
+    CoordinationOwner,
+    CoordinationVersion,
+    CoordinationWriteClaimsHeading,
+    CoordinationIsolated,
+    CoordinationSharedWorkspace,
+    CoordinationPaths,
+    CoordinationContracts,
+    CoordinationContentionsHeading,
+    CoordinationClaimant,
+    CoordinationDisposition,
+    CoordinationNeutralReconciliationHeading,
+    CoordinationCandidates,
+    CoordinationRetry,
+    CoordinationReviewer,
+    CoordinationVerifier,
+    CoordinationVerification,
+    CoordinationContextProjectionsHeading,
+    CoordinationContextDecisions,
+    CoordinationBytes,
+    CoordinationDeduplicated,
+    CoordinationOmitted,
+    CoordinationActiveHotPathsHeading,
+    CoordinationActiveClaims,
+    CoordinationMetricsNoteHeading,
+    CoordinationMetricsNoAuthoritativeSource,
+    CoordinationStatusProposed,
+    CoordinationStatusAccepted,
+    CoordinationStatusSuperseded,
     // Composer slash menu.
     ComposerSlashMenuHint,
     // Approval modal — repository law band.
@@ -1159,6 +1269,8 @@ pub enum MessageId {
 pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ComposerPlaceholder,
     MessageId::ComposerDispatchFailedRestored,
+    MessageId::DispatchFailedQueued,
+    MessageId::DispatchFailedInitial,
     MessageId::HistorySearchPlaceholder,
     MessageId::HistorySearchTitle,
     MessageId::HistoryHintMove,
@@ -1252,6 +1364,70 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::ConfigDefaultValue,
     MessageId::ConfigDefaultReasoning,
     MessageId::ConfigUnavailable,
+    MessageId::ConfigLabelProvider,
+    MessageId::ConfigLabelBaseUrlDeepseek,
+    MessageId::ConfigLabelProviderUrl,
+    MessageId::ConfigLabelModel,
+    MessageId::ConfigLabelFastModel,
+    MessageId::ConfigLabelDefaultModel,
+    MessageId::ConfigLabelReasoningEffort,
+    MessageId::ConfigLabelApprovalMode,
+    MessageId::ConfigLabelPermissionPosture,
+    MessageId::ConfigLabelApprovalPolicy,
+    MessageId::ConfigLabelManagedApprovalPolicy,
+    MessageId::ConfigLabelDefaultMode,
+    MessageId::ConfigLabelAllowShell,
+    MessageId::ConfigLabelManagedAllowShell,
+    MessageId::ConfigLabelStreamTimeout,
+    MessageId::ConfigLabelTheme,
+    MessageId::ConfigLabelLocale,
+    MessageId::ConfigLabelBackground,
+    MessageId::ConfigLabelOceanTreatment,
+    MessageId::ConfigLabelWorkSurfacePlacement,
+    MessageId::ConfigLabelTopHeight,
+    MessageId::ConfigLabelSideWidth,
+    MessageId::ConfigLabelCalmMode,
+    MessageId::ConfigLabelLowMotion,
+    MessageId::ConfigLabelFancyAnimations,
+    MessageId::ConfigLabelLaunchScreen,
+    MessageId::ConfigLabelShowThinking,
+    MessageId::ConfigLabelShowToolDetails,
+    MessageId::ConfigLabelInlineDiffs,
+    MessageId::ConfigLabelStatusIndicator,
+    MessageId::ConfigLabelSynchronizedOutput,
+    MessageId::ConfigLabelCostCurrency,
+    MessageId::ConfigLabelTranscriptSpacing,
+    MessageId::ConfigLabelToolCollapse,
+    MessageId::ConfigLabelComposerDensity,
+    MessageId::ConfigLabelComposerBorder,
+    MessageId::ConfigLabelComposerVimMode,
+    MessageId::ConfigLabelBracketedPaste,
+    MessageId::ConfigLabelPasteBurstDetection,
+    MessageId::ConfigLabelMentionMenuLimit,
+    MessageId::ConfigLabelMentionMenuBehavior,
+    MessageId::ConfigLabelMentionWalkDepth,
+    MessageId::ConfigLabelWorkspaceFollowSymlinks,
+    MessageId::ConfigLabelSidebarWidth,
+    MessageId::ConfigLabelSidebarFocus,
+    MessageId::ConfigLabelContextPanel,
+    MessageId::ConfigLabelAutoCompact,
+    MessageId::ConfigLabelAutoCompactThreshold,
+    MessageId::ConfigLabelMaxHistory,
+    MessageId::ConfigLabelPreferExternalPdftotext,
+    MessageId::ConfigLabelMcpConfigPath,
+    MessageId::ConfigLabelFleetSpawnDepth,
+    MessageId::ConfigLabelGoalCommand,
+    MessageId::ConfigLabelWorkflow,
+    MessageId::ConfigLabelFeaturePrefix,
+    MessageId::ConfigColumnSetting,
+    MessageId::ConfigColumnValue,
+    MessageId::ConfigColumnScope,
+    MessageId::ConfigActionOpenProvider,
+    MessageId::ConfigActionOpenModel,
+    MessageId::ConfigActionToggle,
+    MessageId::ConfigActionChoose,
+    MessageId::ConfigActionEdit,
+    MessageId::ConfigActionReadOnly,
     MessageId::ModelPickerAutoNetworkHint,
     MessageId::ModelPickerAutoLocalHint,
     MessageId::ModelPickerAutoLastRoute,
@@ -1354,7 +1530,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::CmdSidebarDescription,
     MessageId::CmdSkillDescription,
     MessageId::CmdSkillsDescription,
-    MessageId::CmdSlopDescription,
+    MessageId::CmdDebtDescription,
     MessageId::CmdStashDescription,
     MessageId::CmdStatusDescription,
     MessageId::CmdStatuslineDescription,
@@ -1433,6 +1609,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::KbShellControls,
     MessageId::KbExitEmpty,
     MessageId::KbCommandPalette,
+    MessageId::KbSettings,
     MessageId::KbCancelBackgroundShellJobs,
     MessageId::KbFuzzyFilePicker,
     MessageId::KbCompactInspector,
@@ -1538,6 +1715,7 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::OnboardApiKeyPlaceholder,
     MessageId::OnboardApiKeyLabel,
     MessageId::OnboardApiKeyFooter,
+    MessageId::OnboardApiKeyRejectedEnv,
     MessageId::OnboardTrustTitle,
     MessageId::OnboardTrustQuestion,
     MessageId::OnboardTrustLocationPrefix,
@@ -1986,6 +2164,9 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::PhaseIdle,
     MessageId::PhaseDraft,
     MessageId::PhaseWorking,
+    MessageId::PhaseReasoning,
+    MessageId::PhaseReading,
+    MessageId::PhaseUsingTool,
     MessageId::PhaseVerifying,
     MessageId::PhaseWaitingOnYou,
     MessageId::PhaseDone,
@@ -2159,6 +2340,45 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::SidebarDestructiveArmed,
     MessageId::WorkSurfaceTodoProgress,
     MessageId::WorkSurfaceStopConfirmHint,
+    MessageId::CoordinationWorkTitle,
+    MessageId::CoordinationSummaryDecisions,
+    MessageId::CoordinationSummaryContentions,
+    MessageId::CoordinationSummaryReconciled,
+    MessageId::CoordinationSchema,
+    MessageId::CoordinationSequence,
+    MessageId::CoordinationPerSectionLimit,
+    MessageId::CoordinationDecisionsHeading,
+    MessageId::CoordinationNone,
+    MessageId::CoordinationNoneValue,
+    MessageId::CoordinationStatus,
+    MessageId::CoordinationOwner,
+    MessageId::CoordinationVersion,
+    MessageId::CoordinationWriteClaimsHeading,
+    MessageId::CoordinationIsolated,
+    MessageId::CoordinationSharedWorkspace,
+    MessageId::CoordinationPaths,
+    MessageId::CoordinationContracts,
+    MessageId::CoordinationContentionsHeading,
+    MessageId::CoordinationClaimant,
+    MessageId::CoordinationDisposition,
+    MessageId::CoordinationNeutralReconciliationHeading,
+    MessageId::CoordinationCandidates,
+    MessageId::CoordinationRetry,
+    MessageId::CoordinationReviewer,
+    MessageId::CoordinationVerifier,
+    MessageId::CoordinationVerification,
+    MessageId::CoordinationContextProjectionsHeading,
+    MessageId::CoordinationContextDecisions,
+    MessageId::CoordinationBytes,
+    MessageId::CoordinationDeduplicated,
+    MessageId::CoordinationOmitted,
+    MessageId::CoordinationActiveHotPathsHeading,
+    MessageId::CoordinationActiveClaims,
+    MessageId::CoordinationMetricsNoteHeading,
+    MessageId::CoordinationMetricsNoAuthoritativeSource,
+    MessageId::CoordinationStatusProposed,
+    MessageId::CoordinationStatusAccepted,
+    MessageId::CoordinationStatusSuperseded,
     MessageId::ComposerSlashMenuHint,
     MessageId::ApprovalRepoLawBadge,
     MessageId::ApprovalRepoLawTitle,
@@ -2450,14 +2670,77 @@ mod tests {
         }
     }
 
-    fn raw_locale_keys(locale: Locale) -> std::collections::BTreeSet<String> {
+    #[test]
+    fn coordination_work_chrome_is_explicitly_localized() {
+        for locale in Locale::shipped_complete() {
+            if *locale == Locale::En {
+                continue;
+            }
+            assert_ne!(
+                tr(*locale, MessageId::CoordinationWorkTitle),
+                tr(Locale::En, MessageId::CoordinationWorkTitle),
+                "{} fell back to the English Coordination Work title",
+                locale.tag()
+            );
+            assert_ne!(
+                tr(*locale, MessageId::CoordinationMetricsNoAuthoritativeSource),
+                tr(
+                    Locale::En,
+                    MessageId::CoordinationMetricsNoAuthoritativeSource
+                ),
+                "{} fell back to the English coordination metrics note",
+                locale.tag()
+            );
+        }
+    }
+
+    fn raw_locale_messages(locale: Locale) -> serde_json::Map<String, serde_json::Value> {
         serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(locale_json_source(
             locale,
         ))
         .unwrap_or_else(|err| panic!("{} locale json should parse: {err}", locale.tag()))
-        .keys()
-        .cloned()
-        .collect()
+    }
+
+    fn raw_locale_keys(locale: Locale) -> std::collections::BTreeSet<String> {
+        raw_locale_messages(locale).keys().cloned().collect()
+    }
+
+    fn message_placeholders(value: &str) -> std::collections::BTreeSet<String> {
+        value
+            .split('{')
+            .skip(1)
+            .filter_map(|suffix| suffix.split_once('}').map(|(name, _)| name.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn coordination_complete_packs_have_raw_key_and_placeholder_parity() {
+        let english = raw_locale_messages(Locale::En);
+        let coordination_keys = english
+            .keys()
+            .filter(|key| key.starts_with("Coordination"))
+            .collect::<Vec<_>>();
+        assert_eq!(coordination_keys.len(), 39);
+
+        for locale in Locale::shipped_complete() {
+            let pack = raw_locale_messages(*locale);
+            for key in &coordination_keys {
+                let english_value = english
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("English {key} must be a string"));
+                let translated = pack
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_else(|| panic!("{} is missing raw key {key}", locale.tag()));
+                assert_eq!(
+                    message_placeholders(translated),
+                    message_placeholders(english_value),
+                    "{} changed placeholders for {key}",
+                    locale.tag()
+                );
+            }
+        }
     }
 
     /// `missing_message_ids` is blind to keys that exist in en but not in a

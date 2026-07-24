@@ -69,8 +69,9 @@ impl OceanTreatment {
 /// Minimum empty-water size that earns decorative ambient life. Below this,
 /// content and controls own every cell. Shared by the renderer and the idle
 /// animation scheduler so redraws are never scheduled for invisible life.
-pub const AMBIENT_MIN_WIDTH: u16 = 68;
-pub const AMBIENT_MIN_HEIGHT: u16 = 15;
+/// Lowered in v0.9.1 so smaller windows still retain some life.
+pub const AMBIENT_MIN_WIDTH: u16 = 40;
+pub const AMBIENT_MIN_HEIGHT: u16 = 10;
 
 /// Ambient-life inks for a theme, independent of the ombre ramp. Fish use two
 /// sunk sky-blue shades so seafoam remains reserved for live work.
@@ -140,6 +141,42 @@ impl OceanColumn {
         } else {
             self.ramp.color_at(row, self.height)
         }
+    }
+
+    /// Elapsed milliseconds of the completion breath, when active. Ambient
+    /// life uses this to time the rare whale cameo on successful turns.
+    #[must_use]
+    pub fn completion_elapsed_ms(self) -> Option<u128> {
+        self.completion_elapsed_ms
+    }
+
+    /// Compact phase discriminator for [`crate::tui::ambient_life::OceanRampCache`].
+    #[must_use]
+    pub fn phase_tag(self) -> u8 {
+        match self.phase {
+            ShellPhase::Idle => 0,
+            ShellPhase::Typing => 1,
+            ShellPhase::Working => 2,
+            ShellPhase::Verifying => 3,
+            ShellPhase::Waiting => 4,
+            ShellPhase::Approval => 5,
+            ShellPhase::Done => 6,
+            ShellPhase::Failed => 7,
+        }
+    }
+
+    /// Fingerprint of the ramp palette + animation flags for cache invalidation.
+    #[must_use]
+    pub fn ramp_fingerprint(self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        // Color is not Hash; hash the discriminant path via Debug-ish tags.
+        self.animated.hash(&mut h);
+        self.completion_elapsed_ms.is_some().hash(&mut h);
+        self.phase_tag().hash(&mut h);
+        self.top.hash(&mut h);
+        self.height.hash(&mut h);
+        h.finish()
     }
 
     #[must_use]
@@ -299,7 +336,7 @@ fn color((r, g, b): (u8, u8, u8)) -> Color {
 }
 
 #[must_use]
-fn mix_colors(from: Color, to: Color, amount: f32) -> Color {
+pub fn mix_colors(from: Color, to: Color, amount: f32) -> Color {
     match (rgb(from), rgb(to)) {
         (Some(from), Some(to)) => color(mix(from, to, amount)),
         _ => from,
@@ -307,7 +344,7 @@ fn mix_colors(from: Color, to: Color, amount: f32) -> Color {
 }
 
 #[must_use]
-fn scale_color(value: Color, brightness: f32) -> Color {
+pub fn scale_color(value: Color, brightness: f32) -> Color {
     let Some((r, g, b)) = rgb(value) else {
         return value;
     };

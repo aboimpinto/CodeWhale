@@ -1,6 +1,9 @@
-# Tool-Surface Lifecycle Policy (v0.8.53)
+# Historical Tool-Surface Lifecycle Policy (v0.8.53)
 
-**Status:** Design doc / policy. No catalog code lands in this cycle — the code
+**Status:** Historical design record, not current runtime documentation. The
+v0.9.1 canonical action surface and replay-only alias contract are documented in
+[`RUNTIME_SIMPLIFICATION_DESIGN.md`](RUNTIME_SIMPLIFICATION_DESIGN.md) and
+[`TOOL_SURFACE.md`](TOOL_SURFACE.md). No catalog code landed in this old cycle — the code
 work is **deferred**. This document is the umbrella policy for GitHub **#2681**,
 with **#2682** and **#2683** as concrete instances of the planned diet. It
 describes *what will be done* and the invariants any future diet PR must hold.

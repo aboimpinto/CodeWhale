@@ -223,8 +223,10 @@ fn endpoint_preserves_raw_model_ids(provider: ProviderKind, base_url: &str) -> b
     ) || provider_preserves_custom_base_url_model(provider, base_url)
 }
 
-/// Build the upstream URL.
-fn upstream_url(endpoint: &ResolvedModelEndpoint) -> String {
+/// Build the upstream URL. DeepSeek strict function calls are a beta feature,
+/// so only requests that actually carry `function.strict = true` preserve the
+/// configured `/beta` route. Ordinary requests continue to use `/v1`.
+fn upstream_url(endpoint: &ResolvedModelEndpoint, body: &Value) -> String {
     let base = endpoint.base_url.trim_end_matches('/');
     match endpoint.path_suffix.as_deref() {
         Some(suffix) if !suffix.trim().is_empty() => format!(
@@ -234,16 +236,34 @@ fn upstream_url(endpoint: &ResolvedModelEndpoint) -> String {
         ),
         _ => {
             let mut versioned = versioned_base_url(base);
-            if versioned
-                .rsplit('/')
-                .next()
-                .is_some_and(|segment| segment.eq_ignore_ascii_case("beta"))
+            let deepseek_strict_beta = endpoint.provider == ProviderKind::Deepseek
+                && provider_base_url_is_official(endpoint.provider, base)
+                && versioned
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|segment| segment.eq_ignore_ascii_case("beta"))
+                && body_uses_strict_tools(body);
+            if !deepseek_strict_beta
+                && versioned
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|segment| segment.eq_ignore_ascii_case("beta"))
             {
                 versioned = format!("{}/v1", unversioned_base_url(base));
             }
             format!("{}/chat/completions", versioned.trim_end_matches('/'))
         }
     }
+}
+
+fn body_uses_strict_tools(body: &Value) -> bool {
+    body.get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|tool| tool.pointer("/function/strict").and_then(Value::as_bool) == Some(true))
+        })
 }
 
 fn versioned_base_url(base_url: &str) -> String {
@@ -347,7 +367,7 @@ pub(crate) async fn chat_completions_handler(
     // provider wire ids before forwarding.
     body["model"] = serde_json::Value::String(endpoint.model.clone());
 
-    let url = upstream_url(&endpoint);
+    let url = upstream_url(&endpoint, &body);
 
     if endpoint.insecure_skip_tls_verify {
         return (
@@ -1390,7 +1410,7 @@ api_key = {provider_api_key:?}
             wire_format: WireFormat::ChatCompletions,
         };
         assert_eq!(
-            upstream_url(&endpoint),
+            upstream_url(&endpoint, &serde_json::json!({})),
             "https://api.arcee.ai/v1/chat/completions"
         );
     }
@@ -1409,7 +1429,7 @@ api_key = {provider_api_key:?}
             wire_format: WireFormat::ChatCompletions,
         };
         assert_eq!(
-            upstream_url(&endpoint),
+            upstream_url(&endpoint, &serde_json::json!({})),
             "https://api.arcee.ai/api/v1/chat/completions"
         );
     }
@@ -1428,13 +1448,13 @@ api_key = {provider_api_key:?}
             wire_format: WireFormat::ChatCompletions,
         };
         assert_eq!(
-            upstream_url(&endpoint),
+            upstream_url(&endpoint, &serde_json::json!({})),
             "https://openrouter.ai/api/chat/completions"
         );
     }
 
     #[test]
-    fn upstream_url_beta_base_uses_standard_v1_chat_completions() {
+    fn upstream_url_beta_base_uses_v1_for_ordinary_chat_completions() {
         let endpoint = ResolvedModelEndpoint {
             provider: ProviderKind::Deepseek,
             base_url: "https://api.deepseek.com/beta".to_string(),
@@ -1447,8 +1467,38 @@ api_key = {provider_api_key:?}
             wire_format: WireFormat::ChatCompletions,
         };
         assert_eq!(
-            upstream_url(&endpoint),
+            upstream_url(&endpoint, &serde_json::json!({})),
             "https://api.deepseek.com/v1/chat/completions"
+        );
+    }
+
+    #[test]
+    fn upstream_url_beta_base_preserves_strict_chat_completions() {
+        let endpoint = ResolvedModelEndpoint {
+            provider: ProviderKind::Deepseek,
+            base_url: "https://api.deepseek.com/beta".to_string(),
+            model: "deepseek-v4-pro".to_string(),
+            api_key: None,
+            auth_disabled: false,
+            http_headers: BTreeMap::new(),
+            path_suffix: None,
+            insecure_skip_tls_verify: false,
+            wire_format: WireFormat::ChatCompletions,
+        };
+        let body = serde_json::json!({
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup",
+                    "strict": true,
+                    "parameters": {"type": "object"}
+                }
+            }]
+        });
+
+        assert_eq!(
+            upstream_url(&endpoint, &body),
+            "https://api.deepseek.com/beta/chat/completions"
         );
     }
 
@@ -1466,7 +1516,7 @@ api_key = {provider_api_key:?}
             wire_format: WireFormat::ChatCompletions,
         };
         assert_eq!(
-            upstream_url(&endpoint),
+            upstream_url(&endpoint, &serde_json::json!({})),
             "https://api.deepseek.com/v1/chat/completions"
         );
     }

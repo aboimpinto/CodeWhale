@@ -8,6 +8,11 @@ If you just want the short version, see the
 [main README](../README.md#install) or
 [简体中文 README](../README.zh-CN.md#安装).
 
+This branch describes the **v0.9.1 source candidate**. Install commands that use
+`latest` resolve to the latest published package or GitHub Release, which may
+trail the source candidate. A candidate is not a published install until the
+matching package, tag, checksums, and release assets exist.
+
 On macOS and Linux, the website installer is the shortest install/update path:
 
 ```bash
@@ -22,17 +27,18 @@ verifies them against `codewhale-artifacts-sha256.txt`, installs to
 
 ## 1. Supported platforms
 
-Codewhale ships matched `codewhale`, `codew`, and `codewhale-tui` prebuilt binaries for
-the supported platform/architecture combinations below. Android/Termux is a
-preview in v0.9.1 pending real-device QA. Linux ARM64 is available from v0.8.8
-onward. Linux RISC-V prebuilts are temporarily paused because the locked
+Published Codewhale releases ship matched `codewhale`, `codew`, and
+`codewhale-tui` prebuilt binaries for their supported platform/architecture
+combinations. The table below is the intended v0.9.1 candidate matrix;
+Android/Termux is preview pending real-device QA. Linux ARM64 is available from
+v0.8.8 onward. Linux RISC-V prebuilts are temporarily paused because the locked
 `rquickjs-sys` dependency does not ship `riscv64gc-unknown-linux-gnu` bindings.
 
 | Platform     | Architecture | npm install | `cargo install` | GitHub release asset                                  |
 | ------------ | ------------ | :---------: | :-------------: | ----------------------------------------------------- |
 | Linux        | x64 (x86_64) |     ✅      |       ✅        | `codewhale-linux-x64`, `codew-linux-x64`, `codewhale-tui-linux-x64`        |
 | Linux        | arm64        |     ✅      |       ✅        | `codewhale-linux-arm64`, `codew-linux-arm64`, `codewhale-tui-linux-arm64`    |
-| Android / Termux | arm64 (aarch64) | ❌¹ | ⚠️⁴ preview | `codewhale-android-arm64.tar.gz` preview archive when published |
+| Android / Termux | arm64 (aarch64) | ⚠️⁴ preview | ⚠️⁴ preview | `codewhale-android-arm64.tar.gz` preview archive when published |
 | Linux        | riscv64      |     ❌¹     |       ❌³       | temporarily unsupported until upstream bindings land |
 | macOS        | x64          |     ✅      |       ✅        | `codewhale-macos-x64`, `codew-macos-x64`, `codewhale-tui-macos-x64`        |
 | macOS        | arm64 (M-series) | ✅      |       ✅        | `codewhale-macos-arm64`, `codew-macos-arm64`, `codewhale-tui-macos-arm64`    |
@@ -47,9 +53,12 @@ onward. Linux RISC-V prebuilts are temporarily paused because the locked
   [Build from source](#7-build-from-source) below.
 ³ RISC-V source builds currently need upstream `rquickjs-sys` RISC-V bindings or
   a bindgen-enabled dependency build.
-⁴ The Android/Termux build and setup paths are implemented, but v0.9.1 remains
-  preview-only until the real-device compile, startup, approval, file-tool, and
-  update checks tracked in #4236 and #4242 are complete.
+⁴ The v0.9.1 source-candidate npm wrapper recognizes Android arm64 and resolves
+  the matching `codewhale`, `codew`, and `codewhale-tui` Android assets. npm
+  installation works only for a package version whose GitHub Release publishes
+  those matching assets. The Android/Termux path remains preview-only until the
+  real-device compile, startup, approval, file-tool, and update checks tracked
+  in #4236 and #4242 are complete.
 
 Android / Termux is not the same target as Linux arm64. Do not install the
 GNU libc `codewhale-linux-arm64` archive in Termux; use the Termux-specific
@@ -62,15 +71,15 @@ They have no glibc dependency and run on any x86_64 Linux, including Ubuntu
 binary through `rusqlite`, so no separate `libsqlite3` runtime package is needed.
 
 The Linux **arm64** release assets are still GNU libc (glibc) builds. They
-dynamically link normal Linux runtime libraries such as `libdbus-1` and `libc`,
-and are built on Ubuntu 24.04, so they can require `GLIBC_2.39`.
+dynamically link normal Linux runtime libraries such as `libdbus-1` and `libc`.
+The v0.9.1 candidate build runs on Ubuntu 24.04, so it can require `GLIBC_2.39`.
 
 ### Linux glibc floor (arm64)
 
 This floor applies only to the **GNU libc** arm64 asset. The static x64 (musl)
 asset has no `GLIBC_*` symbols, so it passes the install preflight and runs on
-older systems without error. The v0.9.1 GNU arm64 asset is built on Ubuntu
-24.04 and can require `GLIBC_2.39`. Ubuntu 22.04 ships glibc
+older systems without error. The v0.9.1 candidate GNU arm64 asset is built on
+Ubuntu 24.04 and can require `GLIBC_2.39`. Ubuntu 22.04 ships glibc
 2.35, so those arm64 binaries fail with errors such as:
 
 ```text
@@ -173,7 +182,7 @@ codewhale-tui --version
 Known limitations:
 
 - Commands inherit Android's per-app UID, SELinux, and seccomp protections and
-  any permissions granted to Termux. Codewhale's additional Landlock/bwrap
+  any permissions granted to Termux. Codewhale's opt-in bubblewrap
   child-process sandbox is Linux-only and is not built on Android, so approved
   commands receive no Codewhale-specific filesystem narrowing.
 - The Termux build has no supported Android Keystore or desktop Secret Service
@@ -226,15 +235,16 @@ a download sourced from an impersonating repository or mirror.
 
 ## 3. Install via npm
 
-npm is the recommended install path. The `codewhale` wrapper is published at
-v0.9.1 (Node 18+; wrapper available for v0.8.56 and later).
+npm is the recommended install path (Node 18+; wrapper available for v0.8.56
+and later). It installs the registry's latest published version, not an
+unpublished source candidate.
 
 ```bash
 npm install -g codewhale
-codewhale --version   # 0.9.1
+codewhale --version   # prints the published version that was installed
 ```
 
-`postinstall` downloads the right pair of binaries from the matching GitHub
+`postinstall` downloads the matching three binaries from the GitHub
 release, verifies a SHA-256 manifest, and exposes `codewhale`, `codew`, and
 `codewhale-tui` on your `PATH`.
 
@@ -264,8 +274,9 @@ Useful environment variables:
 ## 4. Install via Cargo (any Tier-1 Rust target)
 
 If GitHub releases are slow, blocked, or you're on an unsupported architecture,
-install from crates.io directly. Both crates are required — the dispatcher
-delegates to the TUI runtime at runtime.
+install from crates.io directly. Two Cargo packages are required:
+`codewhale-cli` installs the `codewhale` and `codew` commands, while
+`codewhale-tui` installs the `codewhale-tui` command used by the dispatcher.
 
 ```bash
 # Requires Rust 1.88+ (https://rustup.rs)
@@ -471,7 +482,7 @@ explicitly. Replace `X.Y.Z` with the version you want to restore.
 # npm wrapper, only for versions that were published to npm
 npm install -g codewhale@X.Y.Z
 
-# Cargo install path; both crates are required
+# Cargo path: two packages provide codewhale + codew + codewhale-tui
 cargo install codewhale-cli --version X.Y.Z --locked --force
 cargo install codewhale-tui --version X.Y.Z --locked --force
 ```
@@ -742,7 +753,8 @@ The legacy `DEEPSEEK_TUI_RELEASE_BASE_URL` name is still accepted.
 
 `codewhale update` normally contacts GitHub Releases for metadata and binary
 assets. On networks where GitHub is blocked or unreliable, use the CNB source
-mirror instead and install both binaries from the release tag:
+mirror instead and install both Cargo packages from the release tag. Together,
+they provide the `codewhale`, `codew`, and `codewhale-tui` commands:
 
 To check the latest release without downloading or replacing binaries, run
 `codewhale update --check`.
@@ -776,8 +788,9 @@ The package requires the Cargo feature called `edition2024`, but that feature
 is not stabilized in this version of Cargo
 ```
 
-Install current stable Rust through rustup, then rerun the two Cargo install
-commands from [Section 4](#4-install-via-cargo-any-tier-1-rust-target). For
+Install current stable Rust through rustup, then rerun the two Cargo package
+install commands from [Section 4](#4-install-via-cargo-any-tier-1-rust-target).
+Together they provide `codewhale`, `codew`, and `codewhale-tui`. For
 mainland China networks, this rsproxy-based sequence has been verified to work:
 
 ```bash
@@ -807,7 +820,8 @@ sudo apt-get install -y build-essential pkg-config libdbus-1-dev
 WSL2 uses the same Linux source-build path as Ubuntu. If `cargo install
 codewhale-tui --locked` fails while compiling the keyring or D-Bus secret
 storage crates, install the Linux build dependencies inside the WSL distro,
-then rerun both Cargo install commands:
+then rerun the two Cargo package install commands. Together they install
+`codewhale`, `codew`, and `codewhale-tui`:
 
 ```bash
 sudo apt-get update
@@ -911,9 +925,9 @@ Use one of these paths:
 3. Install via Cargo, which builds locally and does not download GitHub release
    assets. See [Section 4](#4-install-via-cargo-any-tier-1-rust-target).
 
-4. Download both `codewhale` and `codewhale-tui` manually from the
-   [Releases page](https://github.com/Hmbown/CodeWhale/releases), place them
-   in a directory on `PATH`, and make them executable. See
+4. Download all three matching `codewhale`, `codew`, and `codewhale-tui`
+   binaries from the [Releases page](https://github.com/Hmbown/CodeWhale/releases),
+   place them in a directory on `PATH`, and make them executable. See
    [Section 6](#6-manual-download-from-github-releases).
 
 ---

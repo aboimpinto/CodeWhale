@@ -63,11 +63,22 @@ pub struct SettingsSection {
     pub fancy_animations: bool,
     pub ocean_treatment: OceanTreatmentValue,
     pub work_surface_placement: WorkSurfacePlacementValue,
+    #[schemars(range(min = 2, max = 16))]
+    pub work_surface_top_height: u16,
+    #[schemars(range(min = 26, max = 80))]
+    pub work_surface_side_width: u16,
     pub paste_burst_detection: bool,
     pub show_thinking: bool,
     pub show_tool_details: bool,
+    pub inline_diffs: InlineDiffValue,
     pub locale: UiLocale,
     pub theme: UiThemeValue,
+    #[schemars(
+        title = "Custom theme name",
+        description = "Theme slug from the fixed Codewhale themes directory; used only when theme is custom."
+    )]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub custom_theme_name: Option<String>,
     #[schemars(
         title = "Background color",
         description = "Optional Blue Stage background override as #RRGGBB. Leave empty to keep the named theme."
@@ -210,6 +221,8 @@ pub enum UiThemeValue {
     Dracula,
     GruvboxDark,
     Matrix,
+    Uwu,
+    Custom,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -251,6 +264,14 @@ pub enum TranscriptSpacingValue {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+pub enum InlineDiffValue {
+    Full,
+    Summary,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkSurfacePlacementValue {
     Top,
     Left,
@@ -259,9 +280,11 @@ pub enum WorkSurfacePlacementValue {
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
+#[schemars(description = "Startup mode: Act (agent wire), Plan, or Operate")]
 pub enum DefaultModeValue {
     Agent,
     Plan,
+    Operate,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
@@ -368,11 +391,21 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             fancy_animations: settings.fancy_animations,
             ocean_treatment: settings.ocean_treatment.as_str().into(),
             work_surface_placement: settings.work_surface_placement.as_str().into(),
+            work_surface_top_height: settings.work_surface_top_height,
+            work_surface_side_width: settings.work_surface_side_width,
             paste_burst_detection: settings.paste_burst_detection,
             show_thinking: settings.show_thinking,
             show_tool_details: settings.show_tool_details,
+            inline_diffs: settings.inline_diffs.as_str().into(),
             locale: UiLocale::from_setting(&settings.locale)?,
             theme: UiThemeValue::from_setting(&settings.theme)?,
+            custom_theme_name: crate::palette::normalize_user_theme_selector(&settings.theme)
+                .map_err(anyhow::Error::msg)?
+                .map(|selector| {
+                    selector
+                        .trim_start_matches(crate::palette::USER_THEME_PREFIX)
+                        .to_string()
+                }),
             background_color: settings.background_color.clone(),
             bracketed_paste: settings.bracketed_paste,
             composer_density: settings.composer_density.as_str().into(),
@@ -533,6 +566,7 @@ pub fn apply_document(
     persist: bool,
 ) -> Result<ConfigUiApplyOutcome> {
     validate_document(&doc, app, config)?;
+    let theme_setting = theme_setting_for_document(&doc)?;
     let mut notes = Vec::new();
     let previous_compaction = app.compaction_config();
     let previous_reasoning_effort = app.reasoning_effort;
@@ -550,6 +584,14 @@ pub fn apply_document(
             doc.settings.work_surface_placement.as_setting(),
         ),
         (
+            "work_surface_top_height",
+            &doc.settings.work_surface_top_height.to_string(),
+        ),
+        (
+            "work_surface_side_width",
+            &doc.settings.work_surface_side_width.to_string(),
+        ),
+        (
             "paste_burst_detection",
             bool_str(doc.settings.paste_burst_detection),
         ),
@@ -558,8 +600,9 @@ pub fn apply_document(
             "show_tool_details",
             bool_str(doc.settings.show_tool_details),
         ),
+        ("inline_diffs", doc.settings.inline_diffs.as_setting()),
         ("locale", doc.settings.locale.as_setting()),
-        ("theme", doc.settings.theme.as_setting()),
+        ("theme", theme_setting.as_str()),
         (
             "background_color",
             doc.settings
@@ -743,7 +786,26 @@ fn validate_document(doc: &ConfigUiDocument, app: &App, config: &Config) -> Resu
     if doc.config.mcp_config_path.trim().is_empty() {
         bail!("mcp_config_path cannot be empty");
     }
+    let _ = theme_setting_for_document(doc)?;
     Ok(())
+}
+
+fn theme_setting_for_document(doc: &ConfigUiDocument) -> Result<String> {
+    let setting = if doc.settings.theme == UiThemeValue::Custom {
+        let name = doc
+            .settings
+            .custom_theme_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| anyhow::anyhow!("custom theme requires custom_theme_name"))?;
+        format!("{}{}", crate::palette::USER_THEME_PREFIX, name)
+    } else {
+        doc.settings.theme.as_setting().to_string()
+    };
+    crate::palette::resolve_theme_setting(&setting, None)
+        .map(|(normalized, _, _)| normalized)
+        .map_err(anyhow::Error::msg)
 }
 
 fn validate_and_normalize_model(
@@ -885,10 +947,18 @@ impl UiThemeValue {
             Self::Dracula => "dracula",
             Self::GruvboxDark => "gruvbox-dark",
             Self::Matrix => "matrix",
+            Self::Uwu => "uwu",
+            Self::Custom => "custom",
         }
     }
 
     fn from_setting(value: &str) -> Result<Self> {
+        if crate::palette::normalize_user_theme_selector(value)
+            .map_err(anyhow::Error::msg)?
+            .is_some()
+        {
+            return Ok(Self::Custom);
+        }
         match crate::palette::normalize_theme_name(value) {
             Some("system") => Ok(Self::System),
             Some("dark") => Ok(Self::Dark),
@@ -899,6 +969,7 @@ impl UiThemeValue {
             Some("dracula") => Ok(Self::Dracula),
             Some("gruvbox-dark") => Ok(Self::GruvboxDark),
             Some("matrix") => Ok(Self::Matrix),
+            Some("uwu") => Ok(Self::Uwu),
             Some(other) => bail!("unsupported theme '{other}'"),
             None => bail!("invalid theme '{value}'"),
         }
@@ -980,6 +1051,26 @@ impl TranscriptSpacingValue {
     }
 }
 
+impl InlineDiffValue {
+    fn as_setting(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Summary => "summary",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl From<&str> for InlineDiffValue {
+    fn from(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "summary" => Self::Summary,
+            "off" => Self::Off,
+            _ => Self::Full,
+        }
+    }
+}
+
 impl WorkSurfacePlacementValue {
     fn as_setting(self) -> &'static str {
         match self {
@@ -1005,6 +1096,26 @@ impl DefaultModeValue {
         match self {
             Self::Agent => "agent",
             Self::Plan => "plan",
+            Self::Operate => "operate",
+        }
+    }
+
+    /// User-facing label in config UI (wire values stay agent/plan/operate).
+    #[allow(dead_code)] // reserved for config UI option rendering / chrome
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Agent => "Act",
+            Self::Plan => "Plan",
+            Self::Operate => "Operate",
+        }
+    }
+
+    #[allow(dead_code)]
+    fn description(self) -> &'static str {
+        match self {
+            Self::Agent => "Do the work in this session.",
+            Self::Plan => "Design first; implement after you approve.",
+            Self::Operate => "Dispatch workers; keep the parent free for steers.",
         }
     }
 }
@@ -1113,10 +1224,15 @@ impl From<&str> for TranscriptSpacingValue {
 
 impl From<&str> for DefaultModeValue {
     fn from(value: &str) -> Self {
-        match AppMode::from_setting(value) {
-            AppMode::Agent | AppMode::Operate | AppMode::Yolo => Self::Agent,
-            AppMode::Plan => Self::Plan,
-            AppMode::Auto => Self::Agent,
+        match value.trim().to_ascii_lowercase().as_str() {
+            "operate" | "operation" | "ops" => Self::Operate,
+            // yolo was a mode+permission bundle; startup mode becomes Act and
+            // permission posture is migrated separately on load.
+            other => match AppMode::from_setting(other) {
+                AppMode::Plan => Self::Plan,
+                AppMode::Operate => Self::Operate,
+                AppMode::Agent | AppMode::Yolo | AppMode::Auto => Self::Agent,
+            },
         }
     }
 }
@@ -1293,11 +1409,14 @@ mod tests {
     #[test]
     fn legacy_startup_mode_values_project_to_agent_in_config_ui() {
         assert_eq!(DefaultModeValue::from("agent"), DefaultModeValue::Agent);
-        assert_eq!(DefaultModeValue::from("operate"), DefaultModeValue::Agent);
+        assert_eq!(DefaultModeValue::from("operate"), DefaultModeValue::Operate);
         assert_eq!(DefaultModeValue::from("yolo"), DefaultModeValue::Agent);
         assert_eq!(DefaultModeValue::from("plan"), DefaultModeValue::Plan);
         assert_eq!(DefaultModeValue::Agent.as_setting(), "agent");
         assert_eq!(DefaultModeValue::Plan.as_setting(), "plan");
+        assert_eq!(DefaultModeValue::Operate.as_setting(), "operate");
+        assert_eq!(DefaultModeValue::Agent.label(), "Act");
+        assert_eq!(DefaultModeValue::Operate.label(), "Operate");
     }
 
     #[test]
@@ -1387,6 +1506,39 @@ background_color = "#1A1B26"
     }
 
     #[test]
+    fn custom_theme_round_trips_through_typed_config_document() {
+        let _lock = lock_test_env();
+        let temp_root = tempfile::tempdir().expect("isolated Codewhale home");
+        let codewhale_home = temp_root.path().join(".codewhale");
+        let themes_dir = codewhale_home.join("themes");
+        fs::create_dir_all(&themes_dir).expect("themes dir");
+        fs::write(
+            themes_dir.join("ocean.json"),
+            r##"{"schema_version":1,"base":"dark","colors":{"accent_primary":"#123456"}}"##,
+        )
+        .expect("custom theme");
+        fs::write(
+            codewhale_home.join("settings.toml"),
+            r#"theme = "custom:ocean"
+"#,
+        )
+        .expect("settings");
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", &codewhale_home);
+
+        let mut app = app();
+        let mut config = Config::default();
+        let doc = build_document(&app, &config).expect("document");
+        assert_eq!(doc.settings.theme, UiThemeValue::Custom);
+        assert_eq!(doc.settings.custom_theme_name.as_deref(), Some("ocean"));
+
+        apply_document(doc, &mut app, &mut config, false).expect("apply custom theme");
+        assert_eq!(
+            app.ui_theme.accent_primary,
+            ratatui::style::Color::Rgb(0x12, 0x34, 0x56)
+        );
+    }
+
+    #[test]
     fn schema_contains_typed_enums() {
         let schema = build_schema();
         assert_eq!(schema["title"], serde_json::json!("Codewhale Config"));
@@ -1409,8 +1561,31 @@ background_color = "#1A1B26"
             approval_mode,
             &serde_json::json!(["auto", "bypass", "suggest", "never"])
         );
-        let default_mode = &schema["$defs"]["DefaultModeValue"]["enum"];
-        assert_eq!(default_mode, &serde_json::json!(["agent", "plan"]));
+        let default_mode_def = &schema["$defs"]["DefaultModeValue"];
+        let default_mode = default_mode_def
+            .get("enum")
+            .cloned()
+            .or_else(|| {
+                default_mode_def.get("oneOf").and_then(|ones| {
+                    let mut vals = Vec::new();
+                    for item in ones.as_array()? {
+                        if let Some(v) = item.get("const") {
+                            vals.push(v.clone());
+                        } else if let Some(arr) = item.get("enum").and_then(|e| e.as_array()) {
+                            vals.extend(arr.iter().cloned());
+                        }
+                    }
+                    Some(serde_json::Value::Array(vals))
+                })
+            })
+            .unwrap_or(serde_json::Value::Null);
+        assert_eq!(
+            default_mode,
+            serde_json::json!(["agent", "plan", "operate"]),
+            "DefaultModeValue schema: {default_mode_def}"
+        );
+        let inline_diffs = &schema["$defs"]["InlineDiffValue"]["enum"];
+        assert_eq!(inline_diffs, &serde_json::json!(["full", "summary", "off"]));
         let locale = &schema["$defs"]["UiLocale"]["enum"];
         assert_eq!(
             locale,
@@ -1428,7 +1603,9 @@ background_color = "#1A1B26"
                 "tokyo-night",
                 "dracula",
                 "gruvbox-dark",
-                "matrix"
+                "matrix",
+                "uwu",
+                "custom"
             ])
         );
     }

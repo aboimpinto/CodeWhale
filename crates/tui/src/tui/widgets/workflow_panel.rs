@@ -730,12 +730,12 @@ impl WorkflowPanel {
         // timestamps) which would otherwise render multi-year elapsed times.
         if self.started_at_ms == 0 {
             if let Some(completed) = self.completed_at_ms {
-                return format_elapsed(completed);
+                return crate::elapsed::format_elapsed_ms(completed);
             }
             return "0s".to_string();
         }
         let end = self.completed_at_ms.unwrap_or_else(now_ms);
-        format_elapsed(end.saturating_sub(self.started_at_ms))
+        crate::elapsed::format_elapsed_ms(end.saturating_sub(self.started_at_ms))
     }
 
     /// Compact summary line content (without card chrome). Callers in
@@ -843,7 +843,7 @@ impl WorkflowPanel {
                         mark = role_mark(row.profile.as_deref()),
                         label = short_label(&row.label, 14),
                         track = lane_track(row, max_elapsed, 16, now_ms()),
-                        elapsed = format_elapsed(row_elapsed_ms(row, now_ms())),
+                        elapsed = crate::elapsed::format_elapsed_ms(row_elapsed_ms(row, now_ms())),
                         status = row.status.display_label(self.locale),
                     ),
                     content_width,
@@ -1302,12 +1302,8 @@ impl WorkflowPanel {
         let (done, total) = self.done_total();
         let (failed, cancelled) = self.failure_cancel_counts();
         let phases = self.phase_count();
-        let budget = match (self.budget_spent, self.budget_remaining, self.budget_total) {
-            (spent, Some(remaining), _) => format!(" budget {spent}/{remaining} left"),
-            (spent, None, Some(total)) => format!(" budget {spent}/{total}"),
-            (spent, None, None) if spent > 0 => format!(" budget {spent}"),
-            _ => String::new(),
-        };
+        let budget =
+            format_budget_chrome(self.budget_spent, self.budget_remaining, self.budget_total);
         let cancel_hint = if self.lifecycle.is_running() {
             " · [c] cancel"
         } else {
@@ -1315,7 +1311,7 @@ impl WorkflowPanel {
         };
         let elapsed = {
             let end = self.completed_at_ms.unwrap_or_else(now_ms);
-            format_elapsed(end.saturating_sub(self.started_at_ms))
+            crate::elapsed::format_elapsed_ms(end.saturating_sub(self.started_at_ms))
         };
         let focus = if self.keyboard_focus { "*" } else { "" };
         let raw = format!(
@@ -1433,7 +1429,7 @@ impl WorkflowPanel {
 
     fn render_row_line(&self, row: &WorkflowPanelRow, width: usize, now_ms: u64) -> Line<'static> {
         let elapsed_ms = row_elapsed_ms(row, now_ms);
-        let elapsed = format_elapsed(elapsed_ms);
+        let elapsed = crate::elapsed::format_elapsed_ms(elapsed_ms);
         let role = row.profile.as_deref().unwrap_or("-");
         let model = match (row.model.as_deref(), row.strength.as_deref()) {
             (Some(m), Some(s)) => format!("{m}/{s}"),
@@ -1563,6 +1559,34 @@ fn opt_str(value: &Value, key: &str) -> Option<String> {
         .map(str::to_string)
 }
 
+/// Honest workflow budget chrome: "used / budget" (or "X left of Y").
+/// Never renders confusing "spent/0 left" when remaining is zeroed while
+/// spent is large — that read as an inverted kill-budget signal.
+#[must_use]
+pub(crate) fn format_budget_chrome(
+    spent: u64,
+    remaining: Option<u64>,
+    total: Option<u64>,
+) -> String {
+    let total = total.or_else(|| remaining.map(|left| spent.saturating_add(left)));
+    match (spent, remaining, total) {
+        (spent, _, Some(total)) if total > 0 => {
+            let left = remaining.unwrap_or_else(|| total.saturating_sub(spent));
+            format!(" budget {spent} used / {total} ({left} left)")
+        }
+        (spent, Some(remaining), None) => {
+            let total = spent.saturating_add(remaining);
+            if total == 0 {
+                String::new()
+            } else {
+                format!(" budget {spent} used / {total} ({remaining} left)")
+            }
+        }
+        (spent, None, None) if spent > 0 => format!(" budget {spent} used"),
+        _ => String::new(),
+    }
+}
+
 fn short_label(text: &str, max: usize) -> String {
     let trimmed = text.trim();
     if trimmed.width() <= max {
@@ -1623,20 +1647,6 @@ fn lane_track(row: &WorkflowPanelRow, max_elapsed_ms: u64, width: usize, now_ms:
         end,
         "-".repeat(body_width.saturating_sub(active))
     )
-}
-
-/// Format an elapsed duration for panel headers and history cards. Shared with
-/// direct sub-agent cards so both surfaces use the same vocabulary.
-#[must_use]
-pub fn format_elapsed(ms: u64) -> String {
-    let secs = ms / 1000;
-    if secs < 60 {
-        format!("{secs}s")
-    } else if secs < 3600 {
-        format!("{}m{:02}s", secs / 60, secs % 60)
-    } else {
-        format!("{}h{:02}m", secs / 3600, (secs % 3600) / 60)
-    }
 }
 
 fn now_ms() -> u64 {
@@ -1775,6 +1785,24 @@ mod tests {
     }
 
     #[test]
+    fn budget_chrome_uses_honest_used_of_total_labels() {
+        assert_eq!(
+            format_budget_chrome(839_866, Some(0), None),
+            " budget 839866 used / 839866 (0 left)"
+        );
+        assert_eq!(
+            format_budget_chrome(1_200, Some(8_800), Some(10_000)),
+            " budget 1200 used / 10000 (8800 left)"
+        );
+        assert_eq!(
+            format_budget_chrome(500, None, Some(2_000)),
+            " budget 500 used / 2000 (1500 left)"
+        );
+        assert_eq!(format_budget_chrome(42, None, None), " budget 42 used");
+        assert_eq!(format_budget_chrome(0, None, None), "");
+    }
+
+    #[test]
     fn header_shows_lifecycle_counts_budget_and_expand_glyph() {
         let mut panel = started_panel();
         panel.apply_event(WorkflowPanelEvent::BudgetUpdated {
@@ -1792,7 +1820,9 @@ mod tests {
         assert!(header.contains("0 fail"), "{header}");
         assert!(header.contains("0 cancel"), "{header}");
         assert!(
-            header.contains("budget 1200/8800 left") || header.contains("budget 1"),
+            header.contains("budget 1200 used / 10000")
+                || header.contains("budget 1.2k used / 10k")
+                || header.contains("budget 1200 used"),
             "{header}"
         );
     }

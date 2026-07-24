@@ -12,6 +12,8 @@
 // === Submodules ===
 
 pub mod active_cell;
+pub(crate) mod agent_details;
+pub mod ambient_life;
 pub mod app;
 pub mod approval;
 pub mod auto_review;
@@ -25,7 +27,9 @@ pub mod composer_chrome;
 pub mod composer_ui;
 pub mod context_inspector;
 pub mod context_menu;
+pub(crate) mod coordination_detail;
 pub mod diff_render;
+pub mod display_refresh;
 pub mod event_broker;
 pub mod external_editor;
 pub mod feedback_picker;
@@ -37,9 +41,13 @@ pub mod file_tree;
 pub mod footer_ui;
 pub mod format_helpers;
 pub mod frame_rate_limiter;
+pub mod git_status;
 pub mod glyphs;
 pub mod history;
+pub mod hot_tail;
 pub mod hotbar;
+pub mod hover_hit;
+pub mod hover_layer;
 pub mod key_actions;
 pub mod key_shortcuts;
 pub mod keybindings;
@@ -60,8 +68,6 @@ pub mod paste;
 pub mod paste_burst;
 pub mod persistence_actor;
 pub mod phase_strip;
-pub mod plan_prompt;
-pub mod plan_todo_bridge;
 pub mod prompt_suggestion;
 pub mod provider_picker;
 pub mod scrolling;
@@ -91,6 +97,7 @@ pub mod vim_mode;
 pub mod widgets;
 pub mod work_surface;
 pub mod workspace_context;
+pub mod worktree_manager;
 
 // === Re-exports ===
 

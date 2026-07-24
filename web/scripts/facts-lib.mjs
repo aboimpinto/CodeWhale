@@ -5,11 +5,12 @@
  *
  * Sources of truth:
  *   - <repo>/Cargo.toml                         → version, workspace crates
- *   - <repo>/crates/tui/src/sandbox/*.rs        → sandbox backends
+ *   - <repo>/crates/tui/src/sandbox/mod.rs      → enforced sandbox markers
  *   - <repo>/crates/tui/src/config.rs           → provider list (ApiProvider enum), DEFAULT_TEXT_MODEL
  *   - <repo>/npm/codewhale/package.json         → node engines
  *   - <repo>/crates/tui/src/tools/*.rs          → tool count (ToolSpec impls)
  *   - <repo>/LICENSE                            → license
+ *   - <repo>/web/data/latest-published-release.json → latest published release
  */
 import { readFileSync, readdirSync, existsSync } from "node:fs";
 import { join, dirname, resolve } from "node:path";
@@ -41,15 +42,16 @@ export function deriveCrates() {
 }
 
 export function deriveSandboxBackends() {
-  const dir = join(REPO_ROOT, "crates/tui/src/sandbox");
-  if (!existsSync(dir)) return [];
-  const files = readdirSync(dir)
-    .filter((f) => f.endsWith(".rs"))
-    .map((f) => f.replace(/\.rs$/, ""))
-    .filter((f) => !["mod", "policy", "backend", "opensandbox", "windows"].includes(f))
-    .sort();
-  const map = { seatbelt: "seatbelt (macOS)", landlock: "landlock (Linux)" };
-  return files.map((f) => map[f] ?? f);
+  const source = read("crates/tui/src/sandbox/mod.rs");
+  return source ? deriveSandboxBackendsFromSource(source) : [];
+}
+
+export function deriveSandboxBackendsFromSource(source) {
+  const marker = source.match(
+    /pub const PUBLIC_SANDBOX_BACKENDS\s*:\s*&\[&str\]\s*=\s*&\[([\s\S]*?)\];/,
+  );
+  if (!marker) return [];
+  return [...marker[1].matchAll(/"([^"]+)"/g)].map((match) => match[1]);
 }
 
 /**
@@ -93,6 +95,7 @@ const PROVIDER_LABEL_MAP = {
   Sakana: { id: "sakana", label: "Sakana AI", env: "FUGU_API_KEY / SAKANA_API_KEY" },
   LongCat: { id: "longcat", label: "Meituan LongCat", env: "LONGCAT_API_KEY" },
   Meta: { id: "meta", label: "Meta Model API", env: "META_MODEL_API_KEY / MODEL_API_KEY" },
+  Telecomjs: { id: "telecomjs", label: "TelecomJS TokenHub", env: "TELECOMJS_API_KEY" },
   Xai: { id: "xai", label: "xAI", env: "XAI_API_KEY" },
 };
 
@@ -181,6 +184,28 @@ export function deriveLicense() {
   return first.trim();
 }
 
+export function deriveLatestPublishedRelease() {
+  const raw = read("web/data/latest-published-release.json");
+  if (!raw) return null;
+  try {
+    const release = JSON.parse(raw);
+    if (
+      typeof release.tag !== "string" ||
+      typeof release.version !== "string" ||
+      release.tag !== `v${release.version}` ||
+      typeof release.publishedAt !== "string" ||
+      !Number.isFinite(Date.parse(release.publishedAt)) ||
+      typeof release.url !== "string" ||
+      release.url !== `https://github.com/Hmbown/CodeWhale/releases/tag/${release.tag}`
+    ) {
+      return null;
+    }
+    return release;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Re-derive all mechanical facts from the current workspace. The returned
  * object is the same shape as web/lib/facts.generated.ts → RepoFacts.
@@ -194,6 +219,11 @@ export function buildFacts() {
 
   const facts = {
     generatedAt: new Date().toISOString(),
+    // next.config.ts injects these from the exact checkout into the built
+    // artifact. They stay null in the tracked snapshot to avoid a
+    // self-referential generated-file diff after every commit.
+    sourceRevision: null,
+    sourceCommittedAt: null,
     version: deriveVersion(),
     crates: deriveCrates(),
     sandboxBackends: deriveSandboxBackends(),
@@ -202,7 +232,7 @@ export function buildFacts() {
     nodeEngines: deriveNodeEngines(),
     toolCount: deriveToolCount(),
     license: deriveLicense(),
-    latestRelease: null, // populated at runtime by facts-drift cron
+    latestPublishedRelease: deriveLatestPublishedRelease(),
   };
 
   return facts;

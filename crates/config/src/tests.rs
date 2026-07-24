@@ -871,6 +871,9 @@ struct EnvGuard {
     xai_api_key: Option<OsString>,
     xai_base_url: Option<OsString>,
     xai_model: Option<OsString>,
+    telecomjs_api_key: Option<OsString>,
+    telecomjs_base_url: Option<OsString>,
+    telecomjs_model: Option<OsString>,
     opencode_go_api_key: Option<OsString>,
     opencode_go_base_url: Option<OsString>,
     opencode_go_model: Option<OsString>,
@@ -900,6 +903,9 @@ impl EnvGuard {
             xai_api_key: env::var_os("XAI_API_KEY"),
             xai_base_url: env::var_os("XAI_BASE_URL"),
             xai_model: env::var_os("XAI_MODEL"),
+            telecomjs_api_key: env::var_os("TELECOMJS_API_KEY"),
+            telecomjs_base_url: env::var_os("TELECOMJS_BASE_URL"),
+            telecomjs_model: env::var_os("TELECOMJS_MODEL"),
             opencode_go_api_key: env::var_os("OPENCODE_GO_API_KEY"),
             opencode_go_base_url: env::var_os("OPENCODE_GO_BASE_URL"),
             opencode_go_model: env::var_os("OPENCODE_GO_MODEL"),
@@ -1022,6 +1028,9 @@ impl EnvGuard {
             env::remove_var("XAI_API_KEY");
             env::remove_var("XAI_BASE_URL");
             env::remove_var("XAI_MODEL");
+            env::remove_var("TELECOMJS_API_KEY");
+            env::remove_var("TELECOMJS_BASE_URL");
+            env::remove_var("TELECOMJS_MODEL");
             env::remove_var("OPENCODE_GO_API_KEY");
             env::remove_var("OPENCODE_GO_BASE_URL");
             env::remove_var("OPENCODE_GO_MODEL");
@@ -1167,6 +1176,9 @@ impl Drop for EnvGuard {
             Self::restore_var("XAI_API_KEY", self.xai_api_key.take());
             Self::restore_var("XAI_BASE_URL", self.xai_base_url.take());
             Self::restore_var("XAI_MODEL", self.xai_model.take());
+            Self::restore_var("TELECOMJS_API_KEY", self.telecomjs_api_key.take());
+            Self::restore_var("TELECOMJS_BASE_URL", self.telecomjs_base_url.take());
+            Self::restore_var("TELECOMJS_MODEL", self.telecomjs_model.take());
             Self::restore_var("OPENCODE_GO_API_KEY", self.opencode_go_api_key.take());
             Self::restore_var("OPENCODE_GO_BASE_URL", self.opencode_go_base_url.take());
             Self::restore_var("OPENCODE_GO_MODEL", self.opencode_go_model.take());
@@ -2937,6 +2949,29 @@ fn load_project_config_rejects_symlinked_primary_config() {
     );
 }
 
+#[test]
+fn load_project_config_keeps_unknown_provider_names_strict() {
+    let workspace = tempfile::tempdir().expect("workspace tempdir");
+    let config_dir = workspace.path().join(CODEWHALE_APP_DIR);
+    fs::create_dir_all(&config_dir).expect("mkdir project config");
+    fs::write(
+        config_dir.join(CONFIG_FILE_NAME),
+        r#"provider = "opencode_zen"
+model = "must-not-apply"
+
+[providers.opencode_zen]
+kind = "openai-compatible"
+base_url = "https://opencode.example/v1"
+"#,
+    )
+    .expect("write project config");
+
+    assert!(
+        load_project_config(workspace.path()).is_none(),
+        "project overlays must not gain named-provider authority"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn load_sibling_permissions_rejects_symlink_file() {
@@ -3653,6 +3688,90 @@ fn unknown_provider_error_lists_huggingface() {
 }
 
 #[test]
+fn config_store_preserves_named_custom_provider_identity_across_typed_dispatch_reads() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        r#"# written by the TUI custom-provider flow
+provider = "opencode_zen"
+
+[providers.opencode_zen]
+kind = "openai-compatible"
+base_url = "https://opencode.example/v1"
+model = "deepseek-v4-flash-free"
+api_key_env = "OPENCODE_ZEN_API_KEY"
+"#,
+    )
+    .expect("custom provider fixture");
+
+    let mut store = ConfigStore::load(Some(path.clone())).expect("dispatcher config should load");
+    assert_eq!(store.config.provider, ProviderKind::Custom);
+    assert_eq!(store.config.provider_id(), "opencode_zen");
+    assert_eq!(
+        store.config.get_value("provider").as_deref(),
+        Some("opencode_zen")
+    );
+    assert_eq!(
+        store
+            .config
+            .list_values()
+            .get("provider")
+            .map(String::as_str),
+        Some("opencode_zen")
+    );
+
+    let resolved = store
+        .config
+        .resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.provider, ProviderKind::Custom);
+    assert_eq!(resolved.provider_source, ProviderSource::Config);
+    assert_eq!(resolved.base_url, "https://opencode.example/v1");
+    assert_eq!(resolved.model, "deepseek-v4-flash-free");
+
+    store
+        .config
+        .set_value("telemetry", "false")
+        .expect("unrelated typed mutation");
+    let rendered = store
+        .rendered_body()
+        .expect("render custom provider config");
+    assert!(
+        rendered.contains("provider = \"opencode_zen\""),
+        "{rendered}"
+    );
+    assert!(!rendered.contains("provider = \"custom\""), "{rendered}");
+    assert!(!rendered.contains("[providers.custom]"), "{rendered}");
+
+    store.save().expect("save custom provider config");
+    let reloaded = ConfigStore::load(Some(path)).expect("reload custom provider config");
+    assert_eq!(reloaded.config.provider_id(), "opencode_zen");
+}
+
+#[test]
+fn named_custom_root_provider_requires_a_matching_openai_compatible_table() {
+    for body in [
+        "provider = \"opencode_zen\"\n",
+        r#"provider = "opencode_zen"
+
+[providers.opencode_zen]
+kind = "anthropic-messages"
+base_url = "https://opencode.example/v1"
+"#,
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.toml");
+        fs::write(&path, body).expect("invalid custom provider fixture");
+        let err = ConfigStore::load(Some(path)).expect_err("invalid custom route should fail");
+        let message = format!("{err:#}");
+        assert!(message.contains("opencode_zen"), "{message}");
+        assert!(message.contains("openai-compatible") || message.contains("matching"));
+    }
+}
+
+#[test]
 fn provider_kind_accepts_legacy_deepseek_cn_aliases() {
     for alias in [
         "deepseek-cn",
@@ -3872,6 +3991,74 @@ model = "opencode-go/glm-5.2"
     assert_eq!(resolved.base_url, "https://go-gateway.example/v1");
     assert_eq!(resolved.model, DEFAULT_OPENCODE_GO_MODEL);
     assert_eq!(resolved.api_key, None);
+}
+
+#[test]
+fn telecomjs_resolves_key_scoped_chat_completions_route() {
+    let _lock = env_lock();
+    let _env = EnvGuard::without_deepseek_runtime_overrides();
+
+    for alias in [
+        "telecomjs",
+        "telecom-js",
+        "telecom_js",
+        "telecomjs-cn",
+        "tokenhub",
+    ] {
+        assert_eq!(ProviderKind::parse(alias), Some(ProviderKind::Telecomjs));
+
+        let parsed: ConfigToml =
+            toml::from_str(&format!("provider = \"{alias}\"")).expect("TelecomJS alias");
+        assert_eq!(parsed.provider, ProviderKind::Telecomjs);
+    }
+
+    let metadata = provider::resolve_provider("tokenhub").expect("provider metadata");
+    assert_eq!(metadata.id(), "telecomjs");
+    assert_eq!(metadata.display_name(), "TelecomJS TokenHub");
+    assert_eq!(metadata.provider_config_key(), "telecomjs");
+    assert_eq!(metadata.default_base_url(), DEFAULT_TELECOMJS_BASE_URL);
+    assert_eq!(metadata.default_model(), DEFAULT_TELECOMJS_MODEL);
+    assert_eq!(metadata.env_vars(), &["TELECOMJS_API_KEY"]);
+    assert_eq!(metadata.wire(), provider::WireFormat::ChatCompletions);
+
+    let config: ConfigToml = toml::from_str(
+        r#"
+provider = "telecomjs"
+
+[providers.telecomjs]
+api_key = "telecom-config-key"
+model = "glm-5.2"
+"#,
+    )
+    .expect("TelecomJS provider table");
+    let resolved = config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.provider, ProviderKind::Telecomjs);
+    assert_eq!(resolved.base_url, DEFAULT_TELECOMJS_BASE_URL);
+    assert_eq!(resolved.model, "glm-5.2");
+    assert_eq!(resolved.api_key.as_deref(), Some("telecom-config-key"));
+    assert_eq!(
+        resolved.api_key_source,
+        Some(RuntimeApiKeySource::ConfigFile)
+    );
+
+    unsafe {
+        std::env::set_var("TELECOMJS_API_KEY", "telecom-env-key");
+        std::env::set_var("TELECOMJS_MODEL", "kimi-k2.5");
+    }
+    assert_eq!(
+        codewhale_secrets::env_for("tokenhub").as_deref(),
+        Some("telecom-env-key")
+    );
+
+    let env_config = ConfigToml {
+        provider: ProviderKind::Telecomjs,
+        ..ConfigToml::default()
+    };
+    let resolved = env_config.resolve_runtime_options(&CliRuntimeOverrides::default());
+    assert_eq!(resolved.base_url, DEFAULT_TELECOMJS_BASE_URL);
+    assert_eq!(resolved.model, "kimi-k2.5");
+    assert_eq!(resolved.api_key.as_deref(), Some("telecom-env-key"));
+    assert_eq!(resolved.api_key_source, Some(RuntimeApiKeySource::Env));
 }
 
 #[test]

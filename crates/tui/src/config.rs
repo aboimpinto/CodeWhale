@@ -72,6 +72,8 @@ pub enum ApiProvider {
     OpencodeGo,
     Meta,
     Xai,
+    /// Jiangsu Telecom TokenHub — OpenAI-compatible AI gateway.
+    Telecomjs,
     /// User-defined OpenAI-compatible endpoint (#1519).
     ///
     /// Selected when `provider = "<name>"` names a `[providers.<name>]
@@ -227,7 +229,7 @@ impl ApiProvider {
 
     /// `ApiProvider` discriminant → `ProviderKind` lookup.
     /// Index 1 is `None` for the legacy `DeepseekCN` variant.
-    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 36] = [
+    const KIND_LOOKUP: [Option<codewhale_config::ProviderKind>; 37] = [
         Some(codewhale_config::ProviderKind::Deepseek),
         None, // DeepseekCN
         Some(codewhale_config::ProviderKind::DeepseekAnthropic),
@@ -263,11 +265,12 @@ impl ApiProvider {
         Some(codewhale_config::ProviderKind::OpencodeGo),
         Some(codewhale_config::ProviderKind::Meta),
         Some(codewhale_config::ProviderKind::Xai),
+        Some(codewhale_config::ProviderKind::Telecomjs),
         Some(codewhale_config::ProviderKind::Custom),
     ];
 
     /// `ProviderKind` discriminant → `ApiProvider` lookup.
-    const FROM_KIND_LOOKUP: [Self; 35] = [
+    const FROM_KIND_LOOKUP: [Self; 36] = [
         Self::Deepseek,
         Self::DeepseekAnthropic,
         Self::NvidiaNim,
@@ -302,6 +305,7 @@ impl ApiProvider {
         Self::OpencodeGo,
         Self::Meta,
         Self::Xai,
+        Self::Telecomjs,
         Self::Custom,
     ];
 
@@ -1313,6 +1317,19 @@ pub fn model_completion_names_for_provider(provider: ApiProvider) -> Vec<&'stati
             XAI_GROK_4_20_0309_REASONING_MODEL,
             XAI_GROK_4_20_0309_NON_REASONING_MODEL,
         ],
+        ApiProvider::Telecomjs => vec![
+            DEFAULT_TELECOMJS_MODEL,
+            "deepseek-v4-flash",
+            "DeepSeek-R1",
+            "qwen3.7-plus",
+            "qwen3-max",
+            "glm-5.2",
+            "glm-5.1",
+            "GLM-5.0",
+            "Minimax-M2.5",
+            "kimi-k2.7-code",
+            "Doubao-Seed-2.0-Pro",
+        ],
         // Custom endpoints expose no built-in completion names; the user
         // supplies their own model id (#1519).
         ApiProvider::Custom => Vec::new(),
@@ -1785,19 +1802,6 @@ impl StatusItem {
         ]
     }
 
-    /// Items that belong in the footer's left cluster (steady identity).
-    #[must_use]
-    pub fn is_left_cluster(self) -> bool {
-        matches!(
-            self,
-            StatusItem::Mode
-                | StatusItem::Model
-                | StatusItem::Cost
-                | StatusItem::Status
-                | StatusItem::Balance
-        )
-    }
-
     /// Whether this item is relevant for `provider`.  Provider-specific
     /// items return `false` for unsupported providers so the picker doesn't
     /// offer toggles that can never show useful data.
@@ -1822,49 +1826,40 @@ pub struct RetryPolicy {
     pub exponential_base: f64,
 }
 
-impl RetryPolicy {
-    /// Compute the backoff delay for a retry attempt.
-    #[must_use]
-    #[allow(dead_code)] // used by runtime_api; will be wired into client retry loop
-    pub fn delay_for_attempt(&self, attempt: u32) -> std::time::Duration {
-        let exponent = i32::try_from(attempt).unwrap_or(i32::MAX);
-        let delay = self.initial_delay * self.exponential_base.powi(exponent);
-        let delay = delay.min(self.max_delay);
-        // Clamp to a sane range to guard against NaN/negative from misconfigured values
-        let delay = delay.clamp(0.0, 300.0);
-        std::time::Duration::from_secs_f64(delay)
-    }
-}
-
-/// Context management configuration (append-only layered context with Flash seams).
+/// Context management configuration.
+///
+/// The append-only "Flash seam" layered-context system (#159) was removed on
+/// 2026-07-23 — it never left its opt-in default and compaction owns context
+/// reduction now. Its keys remain parsed-but-ignored so existing config files
+/// keep loading; `project_pack` is the only live setting.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ContextConfig {
-    /// Master enable for layered context management. Default: false while
-    /// v0.7.5 audits V4 prefix-cache behavior.
+    /// Ignored (was: master enable for the removed layered-context system).
     #[serde(default)]
     pub enabled: Option<bool>,
     /// Include a deterministic project context pack in the stable prompt
     /// prefix. Default: true; set `[context] project_pack = false` to disable.
     #[serde(default)]
     pub project_pack: Option<bool>,
-    /// Verbatim window: last N turns never summarized. Default: 16.
+    /// Ignored (was: seam verbatim window).
     #[serde(default)]
     pub verbatim_window_turns: Option<usize>,
-    /// Soft seam thresholds based on the active request input estimate.
+    /// Ignored (was: seam thresholds).
     #[serde(default)]
     pub l1_threshold: Option<usize>,
     #[serde(default)]
     pub l2_threshold: Option<usize>,
     #[serde(default)]
     pub l3_threshold: Option<usize>,
-    /// Model used for seam/briefing work. Default: "deepseek-v4-flash".
+    /// Ignored (was: seam model).
     #[serde(default)]
     pub seam_model: Option<String>,
 }
 
-/// Sub-agent model overrides. Keys in `models` can be role names (`worker`,
-/// `explorer`, `awaiter`) or type names (`general`, `explore`, `plan`,
-/// `review`, `custom`). Per-call explicit model choices still win.
+/// Fleet-role model overrides for delegated workers. Canonical keys in
+/// `models` are `worker`, `scout`, `planner`, `reviewer`, `builder`,
+/// `verifier`, and `custom`. Legacy sub-agent type names remain accepted for
+/// v0.9.x compatibility. Per-call explicit model choices still win.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct SubagentsConfig {
     /// Top-level switch for the model-facing `agent` tool. `None` preserves
@@ -1876,11 +1871,11 @@ pub struct SubagentsConfig {
     pub default_model: Option<String>,
     #[serde(default)]
     pub worker_model: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "scout_model", alias = "explorer_model")]
     pub explorer_model: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "planner_model", alias = "awaiter_model")]
     pub awaiter_model: Option<String>,
-    #[serde(default)]
+    #[serde(default, rename = "reviewer_model", alias = "review_model")]
     pub review_model: Option<String>,
     #[serde(default)]
     pub custom_model: Option<String>,
@@ -1975,6 +1970,28 @@ pub struct SubagentProviderConfig {
 pub struct AutoConfig {
     #[serde(default)]
     pub cost_saving: Option<bool>,
+    /// Optional explicit auto-router classifier route (`[auto.router]`).
+    #[serde(default)]
+    pub router: Option<AutoRouterConfig>,
+}
+
+/// Explicit classifier route for Auto model mode (`[auto.router]`).
+///
+/// When `provider` + `model` are set, Auto mode's classifier call goes to
+/// that route instead of the built-in DeepSeek flash default. When unset,
+/// the legacy behavior stands: `deepseek-v4-flash` via DeepSeek when a
+/// DeepSeek key exists, else the local heuristic with no classifier call.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct AutoRouterConfig {
+    /// Provider id for the classifier route (e.g. `"deepseek"`, `"zai"`).
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Model id on that provider (e.g. `"deepseek-v4-flash"`).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Thinking tier for the classifier call (e.g. `"off"`). Defaults to off.
+    #[serde(default)]
+    pub thinking: Option<String>,
 }
 
 fn default_update_check_for_updates() -> bool {
@@ -2084,8 +2101,8 @@ pub struct Config {
     /// Optional API key for the external sandbox backend (sent as Bearer token).
     #[serde(alias = "sandboxApiKey")]
     pub sandbox_api_key: Option<String>,
-    /// When true and `/usr/bin/bwrap` is present on Linux, route exec_shell
-    /// through bubblewrap instead of relying solely on Landlock (#2184).
+    /// When true and `/usr/bin/bwrap` is executable on Linux, route exec_shell
+    /// through bubblewrap (#2184).
     /// Defaults to false. Requires the `bubblewrap` package to be installed
     /// separately — we do NOT vendor bwrap.
     #[serde(alias = "preferBwrap")]
@@ -2184,7 +2201,8 @@ pub struct Config {
     #[serde(default)]
     pub lsp: Option<LspConfigToml>,
 
-    /// Append-only layered context management with Flash seam manager (#159).
+    /// Context configuration (project context pack; legacy seam keys are
+    /// parsed but ignored since the 2026-07-23 removal).
     #[serde(default)]
     pub context: ContextConfig,
 
@@ -2488,21 +2506,6 @@ pub struct SkillsConfig {
 }
 
 impl SkillsConfig {
-    /// Resolve the registry URL with the bundled default.
-    #[must_use]
-    pub fn registry_url(&self) -> String {
-        self.registry_url
-            .clone()
-            .unwrap_or_else(|| crate::skills::install::DEFAULT_REGISTRY_URL.to_string())
-    }
-
-    /// Resolve the max install size with the bundled default.
-    #[must_use]
-    pub fn max_install_size_bytes(&self) -> u64 {
-        self.max_install_size_bytes
-            .unwrap_or(crate::skills::install::DEFAULT_MAX_SIZE_BYTES)
-    }
-
     /// Resolve whether session-time discovery should ignore cross-tool skill
     /// directories. Defaults to the compatibility-preserving broad scan.
     #[must_use]
@@ -2824,6 +2827,14 @@ pub struct ProvidersConfig {
     pub meta: ProviderConfig,
     #[serde(default, alias = "x-ai", alias = "x_ai", alias = "grok")]
     pub xai: ProviderConfig,
+    #[serde(
+        default,
+        alias = "telecom-js",
+        alias = "telecom_js",
+        alias = "telecomjs-cn",
+        alias = "tokenhub"
+    )]
+    pub telecomjs: ProviderConfig,
     /// Arbitrary user-named custom providers (#1519).
     ///
     /// Captures every `[providers.<name>]` table whose key is not one of the
@@ -4132,6 +4143,7 @@ impl Config {
             ApiProvider::OpencodeGo => &providers.opencode_go,
             ApiProvider::Meta => &providers.meta,
             ApiProvider::Xai => &providers.xai,
+            ApiProvider::Telecomjs => &providers.telecomjs,
             // Handled by the name-keyed early return above (#1519).
             ApiProvider::Custom => unreachable!("custom provider resolved by name above"),
         })
@@ -4197,6 +4209,7 @@ impl Config {
             ApiProvider::OpencodeGo => &mut providers.opencode_go,
             ApiProvider::Meta => &mut providers.meta,
             ApiProvider::Xai => &mut providers.xai,
+            ApiProvider::Telecomjs => &mut providers.telecomjs,
             // Handled by the name-keyed early return above (#1519).
             ApiProvider::Custom => unreachable!("custom provider resolved by name above"),
         }
@@ -4530,6 +4543,7 @@ impl Config {
             ApiProvider::OpencodeGo => DEFAULT_OPENCODE_GO_MODEL,
             ApiProvider::Meta => DEFAULT_META_MODEL,
             ApiProvider::Xai => DEFAULT_XAI_MODEL,
+            ApiProvider::Telecomjs => DEFAULT_TELECOMJS_MODEL,
             // Custom endpoints have no built-in default model; pass through the
             // descriptor placeholder when nothing is configured (#1519).
             ApiProvider::Custom => codewhale_config::ProviderKind::Custom
@@ -4587,7 +4601,8 @@ impl Config {
             | ApiProvider::LongCat
             | ApiProvider::OpencodeGo
             | ApiProvider::Meta
-            | ApiProvider::Xai => None,
+            | ApiProvider::Xai
+            | ApiProvider::Telecomjs => None,
             ApiProvider::Custom if self.uses_legacy_literal_custom_route() => self.base_url.clone(),
             // Named custom routes read their base URL from `provider_base`.
             ApiProvider::Custom => None,
@@ -4653,6 +4668,7 @@ impl Config {
                         ApiProvider::OpencodeGo => DEFAULT_OPENCODE_GO_BASE_URL,
                         ApiProvider::Meta => DEFAULT_META_BASE_URL,
                         ApiProvider::Xai => DEFAULT_XAI_BASE_URL,
+                        ApiProvider::Telecomjs => DEFAULT_TELECOMJS_BASE_URL,
                         // No built-in endpoint; descriptor placeholder keeps the
                         // fallback total. A real custom route configures
                         // `[providers.<name>] base_url` which wins above (#1519).
@@ -5610,10 +5626,13 @@ impl Config {
         insert("default", &cfg.default_model);
         insert("worker", &cfg.worker_model);
         insert("general", &cfg.worker_model);
+        insert("scout", &cfg.explorer_model);
         insert("explorer", &cfg.explorer_model);
         insert("explore", &cfg.explorer_model);
+        insert("planner", &cfg.awaiter_model);
         insert("awaiter", &cfg.awaiter_model);
         insert("plan", &cfg.awaiter_model);
+        insert("reviewer", &cfg.review_model);
         insert("review", &cfg.review_model);
         insert("custom", &cfg.custom_model);
 
@@ -5834,12 +5853,21 @@ pub(crate) fn save_workspace_trust(workspace: &Path) -> Result<PathBuf> {
 
 fn workspace_trust_level_from_doc<'a>(doc: &'a toml::Value, workspace: &Path) -> Option<&'a str> {
     let workspace = canonicalize_or_keep(workspace);
-    let projects = doc.get("projects")?.as_table()?;
-    for (raw_path, project) in projects {
-        let project_path = canonicalize_or_keep(&expand_path(raw_path));
-        if project_path == workspace {
-            return project.get("trust_level").and_then(toml::Value::as_str);
+    // Trust records may sit at the top level or — from the historic
+    // extras-nesting write bug (healed on mutation since 2026-07-23) — under
+    // one or more literal `extras` tables. Read tolerantly so a not-yet-
+    // healed config file still recognizes its trusted workspaces.
+    let mut scope = Some(doc);
+    while let Some(current) = scope {
+        if let Some(projects) = current.get("projects").and_then(toml::Value::as_table) {
+            for (raw_path, project) in projects {
+                let project_path = canonicalize_or_keep(&expand_path(raw_path));
+                if project_path == workspace {
+                    return project.get("trust_level").and_then(toml::Value::as_str);
+                }
+            }
         }
+        scope = current.get("extras");
     }
     None
 }
@@ -5964,6 +5992,7 @@ fn provider_env_base_url_override(provider: ApiProvider) -> Option<String> {
         ApiProvider::Huggingface => &["HUGGINGFACE_BASE_URL", "HF_BASE_URL"],
         ApiProvider::Meta => &["META_MODEL_API_BASE_URL", "MODEL_API_BASE_URL"],
         ApiProvider::Xai => &["XAI_BASE_URL"],
+        ApiProvider::Telecomjs => &["TELECOMJS_BASE_URL"],
         ApiProvider::OpencodeGo => &["OPENCODE_GO_BASE_URL"],
         ApiProvider::Deepseek
         | ApiProvider::DeepseekCN
@@ -6245,6 +6274,13 @@ fn apply_env_overrides(config: &mut Config) {
                     .xai
                     .base_url = Some(value);
             }
+            ApiProvider::Telecomjs => {
+                config
+                    .providers
+                    .get_or_insert_with(ProvidersConfig::default)
+                    .telecomjs
+                    .base_url = Some(value);
+            }
             // Custom resolves to the named `[providers.<name>]` table; route the
             // override through the exact route while retaining the released
             // root-literal custom storage shape (#1519, #4334).
@@ -6444,6 +6480,16 @@ fn apply_env_overrides(config: &mut Config) {
             .xai
             .base_url = Some(value);
     }
+    if matches!(config.api_provider(), ApiProvider::Telecomjs)
+        && let Ok(value) = std::env::var("TELECOMJS_BASE_URL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .telecomjs
+            .base_url = Some(value);
+    }
     if let Ok(value) =
         std::env::var("CODEWHALE_HTTP_HEADERS").or_else(|_| std::env::var("DEEPSEEK_HTTP_HEADERS"))
         && let Ok(headers) = parse_http_headers(&value)
@@ -6505,6 +6551,7 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::OpencodeGo => &mut providers.opencode_go,
                 ApiProvider::Meta => &mut providers.meta,
                 ApiProvider::Xai => &mut providers.xai,
+                ApiProvider::Telecomjs => &mut providers.telecomjs,
                 ApiProvider::Custom => providers
                     .custom
                     .entry(custom_key.expect("custom key captured for custom provider"))
@@ -6689,6 +6736,16 @@ fn apply_env_overrides(config: &mut Config) {
             .opencode_go
             .model = Some(value);
     }
+    if matches!(config.api_provider(), ApiProvider::Telecomjs)
+        && let Ok(value) = std::env::var("TELECOMJS_MODEL")
+        && !value.trim().is_empty()
+    {
+        config
+            .providers
+            .get_or_insert_with(ProvidersConfig::default)
+            .telecomjs
+            .model = Some(value);
+    }
     if let Some(value) = codewhale_env_var("CODEWHALE_MODEL", "DEEPSEEK_MODEL")
         .ok()
         .or_else(|| {
@@ -6766,6 +6823,7 @@ fn apply_env_overrides(config: &mut Config) {
                 ApiProvider::OpencodeGo => &mut providers.opencode_go,
                 ApiProvider::Meta => &mut providers.meta,
                 ApiProvider::Xai => &mut providers.xai,
+                ApiProvider::Telecomjs => &mut providers.telecomjs,
             };
             entry.model = Some(value);
         }
@@ -7048,6 +7106,7 @@ pub(crate) fn provider_passes_model_through(provider: ApiProvider) -> bool {
             | ApiProvider::Huggingface
             | ApiProvider::Meta
             | ApiProvider::Xai
+            | ApiProvider::Telecomjs
             // Custom OpenAI-compatible endpoints preserve user-supplied model
             // ids verbatim (#1519); never normalize/rewrite them.
             | ApiProvider::Custom
@@ -7262,25 +7321,64 @@ pub(crate) fn is_exact_kimi_code_k3_route(
         && model.trim().eq_ignore_ascii_case(KIMI_CODE_K3_MODEL)
 }
 
-/// Reject the Claude Code-only `k3[1m]` context hint when it is supplied as a
-/// Kimi Code API model id. Codewhale has a first-class context-window field,
-/// so silently rewriting this value would both send the wrong wire id and
-/// claim a plan entitlement the user may not have.
+/// Fail closed on known-bad K3 model/endpoint pairings (#4687).
+///
+/// - Reject Claude Code's `k3[1m]` context hint as a Kimi Code API model id.
+/// - Reject `kimi-k3` on the exact Kimi Code membership endpoint (use `k3`).
+/// - Reject bare `k3` on the exact Moonshot direct platform endpoint (use `kimi-k3`).
+///
+/// Custom Moonshot-compatible gateways are left alone: only the two canonical
+/// endpoints enforce the documented model IDs.
 pub(crate) fn validate_kimi_code_api_model_id(
     provider: ApiProvider,
     base_url: &str,
     model: &str,
 ) -> std::result::Result<(), String> {
-    if provider == ApiProvider::Moonshot
-        && moonshot_base_url_is_exact_kimi_code(base_url)
-        && model.trim().eq_ignore_ascii_case("k3[1m]")
+    if provider != ApiProvider::Moonshot {
+        return Ok(());
+    }
+    let model = model.trim();
+    if model.is_empty() {
+        return Ok(());
+    }
+
+    if moonshot_base_url_is_exact_kimi_code(base_url) {
+        if model.eq_ignore_ascii_case("k3[1m]") {
+            return Err(
+                "Kimi Code model `k3[1m]` is a Claude Code environment convention, not an API model id. Use model = \"k3\". If your Kimi Code plan includes 1M context, also set context_window = 1048576; otherwise keep the 262144 safe default."
+                    .to_string(),
+            );
+        }
+        if model.eq_ignore_ascii_case(MOONSHOT_KIMI_K3_MODEL) {
+            return Err(
+                "Kimi Code membership route (api.kimi.com/coding/v1) does not accept model = \"kimi-k3\". Use model = \"k3\" for this base_url. Direct Moonshot pay-as-you-go uses base_url = \"https://api.moonshot.ai/v1\" with model = \"kimi-k3\"."
+                    .to_string(),
+            );
+        }
+        return Ok(());
+    }
+
+    if moonshot_base_url_is_exact_direct_platform(base_url)
+        && model.eq_ignore_ascii_case(KIMI_CODE_K3_MODEL)
     {
         return Err(
-            "Kimi Code model `k3[1m]` is a Claude Code environment convention, not an API model id. Use model = \"k3\". If your Kimi Code plan includes 1M context, also set context_window = 1048576; otherwise keep the 262144 safe default."
+            "Moonshot direct route (api.moonshot.ai/v1) does not accept bare model = \"k3\". Use model = \"kimi-k3\" for this base_url. Kimi Code membership uses base_url = \"https://api.kimi.com/coding/v1\" with model = \"k3\"."
                 .to_string(),
         );
     }
+
     Ok(())
+}
+
+/// Short route label for header/diagnostics without credentials (#4687).
+pub(crate) fn moonshot_k3_route_display_name(base_url: &str, model: &str) -> Option<&'static str> {
+    if is_exact_kimi_code_k3_route(ApiProvider::Moonshot, base_url, model) {
+        return Some("Kimi Code membership / k3");
+    }
+    if is_exact_direct_moonshot_k3_route(ApiProvider::Moonshot, base_url, model) {
+        return Some("Moonshot direct / kimi-k3");
+    }
+    None
 }
 
 /// Credential help for a concrete provider route.
@@ -7748,6 +7846,7 @@ fn merge_providers(
             opencode_go: merge_provider_config(base.opencode_go, override_cfg.opencode_go),
             meta: merge_provider_config(base.meta, override_cfg.meta),
             xai: merge_provider_config(base.xai, override_cfg.xai),
+            telecomjs: merge_provider_config(base.telecomjs, override_cfg.telecomjs),
             custom: merge_custom_providers(base.custom, override_cfg.custom),
         }),
     }
@@ -8249,7 +8348,7 @@ reasoning_effort = "max"
 /// The default secret store is file-backed and prompt-free. An OS credential
 /// store is queried only when the user explicitly selects the system backend.
 ///
-/// Used by [`crate::tui::app::App::new`] to decide whether to gate
+/// Used by the TUI app constructor to decide whether to gate
 /// the user behind the in-TUI api-key onboarding screen — getting
 /// this wrong made users get prompted for credentials in situations
 /// where normal env/config auth was already available.

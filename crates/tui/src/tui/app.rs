@@ -31,11 +31,11 @@ use crate::palette::{self, UiTheme};
 use crate::pricing::{CostCurrency, CostEstimate};
 use crate::resource_telemetry::TokenThroughput;
 use crate::session_manager::{SessionContextReference, SessionMetadata, SessionWorkState};
-use crate::settings::Settings;
+use crate::settings::{InlineDiffMode, Settings};
 use crate::tools::plan::{PlanState, SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::new_shared_shell_manager;
 use crate::tools::spec::RuntimeToolServices;
-use crate::tools::subagent::SubAgentResult;
+use crate::tools::subagent::{AgentWorkerStatus, SubAgentResult};
 use crate::tools::todo::{SharedTodoList, TodoList, new_shared_todo_list};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::approval::ApprovalMode;
@@ -43,6 +43,7 @@ use crate::tui::clipboard::{ClipboardContent, ClipboardHandler};
 use crate::tui::file_mention::ContextReference;
 use crate::tui::history::{HistoryCell, TranscriptRenderOptions};
 use crate::tui::hotbar::HotbarActionRegistry;
+use crate::tui::motion::MotionPolicy;
 use crate::tui::paste_burst::{FlushResult, PasteBurst};
 use crate::tui::scrolling::{MouseScrollState, TranscriptLineMeta, TranscriptScroll};
 use crate::tui::selection::{SelectionAutoscroll, TranscriptSelection};
@@ -506,10 +507,126 @@ pub struct ProviderPickerMemory {
     pub selected_provider_id: Option<String>,
 }
 
+/// Bounded status vocabulary for the per-agent current-activity projection.
+///
+/// This is presentation state derived from structured worker/mailbox events;
+/// renderers map these variants to labels but never infer them from strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentCurrentActivityStatus {
+    Queued,
+    Starting,
+    Running,
+    ModelWait,
+    RunningTool,
+    Waiting,
+    Done,
+    Failed,
+    Canceled,
+    Interrupted,
+}
+
+impl From<AgentWorkerStatus> for AgentCurrentActivityStatus {
+    fn from(status: AgentWorkerStatus) -> Self {
+        match status {
+            AgentWorkerStatus::Queued => Self::Queued,
+            AgentWorkerStatus::Starting => Self::Starting,
+            AgentWorkerStatus::Running => Self::Running,
+            AgentWorkerStatus::WaitingForUser => Self::Waiting,
+            AgentWorkerStatus::ModelWait => Self::ModelWait,
+            AgentWorkerStatus::RunningTool => Self::RunningTool,
+            AgentWorkerStatus::Completed => Self::Done,
+            AgentWorkerStatus::Failed => Self::Failed,
+            AgentWorkerStatus::Cancelled => Self::Canceled,
+            AgentWorkerStatus::Interrupted => Self::Interrupted,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCurrentActivity {
+    pub status: AgentCurrentActivityStatus,
+    /// Safe bounded context, never a raw child transcript or tool result.
+    pub detail: Option<String>,
+    /// Safe display name for the one tool currently executing.
+    pub current_tool: Option<String>,
+    pub step: Option<u32>,
+}
+
+impl AgentCurrentActivity {
+    #[must_use]
+    pub fn bounded(
+        status: AgentCurrentActivityStatus,
+        detail: Option<String>,
+        current_tool: Option<String>,
+        step: Option<u32>,
+    ) -> Self {
+        fn bounded_nonempty(value: Option<String>) -> Option<String> {
+            value
+                .map(|value| bound_agent_activity_text(&value))
+                .filter(|value| !value.trim().is_empty())
+        }
+
+        Self {
+            status,
+            detail: bounded_nonempty(detail),
+            current_tool: bounded_nonempty(current_tool),
+            step,
+        }
+    }
+}
+
+/// Convert untrusted child-agent text into a compact UI-safe projection.
+/// Full transcript artifacts remain the source of truth; only summaries that
+/// can enter the parent transcript/sidebar pass through this seam.
+pub(crate) fn bound_agent_activity_text(value: &str) -> String {
+    let mut visible = String::with_capacity(value.len());
+    crate::tui::osc8::strip_ansi_into(value, &mut visible);
+    let redacted = codewhale_config::persistence::redact_secrets(&visible);
+    crate::tui::history::summarize_tool_output(&redacted)
+}
+
+/// One bounded, structured tool outcome for the Agent Details projection.
+///
+/// This is populated only from `ToolCallCompleted` mailbox envelopes. It is
+/// deliberately not inferred from free-form progress text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentRecentAction {
+    pub tool: String,
+    pub step: u32,
+    pub ok: bool,
+}
+
+impl AgentRecentAction {
+    #[must_use]
+    pub fn bounded(tool: &str, step: u32, ok: bool) -> Self {
+        Self {
+            tool: bound_agent_activity_text(tool),
+            step,
+            ok,
+        }
+    }
+}
+
+pub(crate) const MAX_AGENT_RECENT_ACTIONS: usize = 3;
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AgentProgressMeta {
     pub parent_run_id: Option<String>,
     pub spawn_depth: u32,
+    /// Structured, bounded answer to "what is this agent doing now?".
+    pub current_activity: Option<AgentCurrentActivity>,
+    /// Last tool observed running for this child. Cleared by the matching
+    /// completion envelope so Work never presents a settled tool as live.
+    pub current_tool: Option<String>,
+    /// Successful file mutations observed for this child in this session.
+    pub files_touched: u32,
+    /// At most three tool outcomes observed through structured lifecycle
+    /// envelopes, oldest to newest.
+    pub recent_actions: VecDeque<AgentRecentAction>,
+    /// Effective route facts observed from a real child token-usage envelope.
+    /// These stay absent until the provider actually reports usage.
+    pub resolved_provider: Option<String>,
+    pub resolved_model: Option<String>,
 }
 
 /// Per-turn LSP repair-loop summary for the Turn Inspector (#4107).
@@ -1635,6 +1752,9 @@ pub struct HuntState {
     pub tokens_used: u64,
     pub time_used_seconds: u64,
     pub continuation_count: u32,
+    /// Why an unfinished goal is paused. Kept separate from the four-state
+    /// hunt verdict so usage, budget, and run-limit stops stay distinguishable.
+    pub pause_reason: Option<crate::tools::goal::GoalPauseReason>,
     pub started_at: Option<Instant>,
     /// When the goal reached a terminal verdict (Hunted/Wounded/Escaped).
     /// While `None`, elapsed time keeps growing; once set, the sidebar freezes
@@ -1697,10 +1817,14 @@ pub enum SidebarRowAction {
     ToggleAgentDetails {
         agent_id: String,
     },
-    /// Drill into the child's transcript card (action tree, status, summary)
-    /// in the detail pager — registered on the expanded dossier rows (#2889
-    /// slice, dogfood A3).
+    /// Open the child's bounded, safe status projection. Exact transcript
+    /// evidence is a separate explicit action (#2889).
     OpenAgentDetail {
+        agent_id: String,
+    },
+    /// Open the child's artifact-first exact transcript. This is separate
+    /// from the safe default details projection (#2889).
+    OpenAgentTranscript {
         agent_id: String,
     },
     CancelAgent {
@@ -1724,6 +1848,7 @@ impl SidebarRowAction {
             | Self::HotbarSlot(_)
             | Self::ToggleAgentDetails { .. }
             | Self::OpenAgentDetail { .. }
+            | Self::OpenAgentTranscript { .. }
             | Self::CancelAgent { .. }
             | Self::InspectWork { .. } => None,
         }
@@ -1737,6 +1862,7 @@ impl SidebarRowAction {
             Self::CancelAgent { .. } => true,
             Self::ToggleAgentDetails { .. }
             | Self::OpenAgentDetail { .. }
+            | Self::OpenAgentTranscript { .. }
             | Self::InspectWork { .. }
             | Self::HotbarSlot(_) => false,
         }
@@ -1842,6 +1968,17 @@ pub(crate) struct PendingProviderSwitch {
     pub previous_api_key_env_only: bool,
 }
 
+/// Opaque completion returned by a spawned dispatch task. It carries the
+/// captured data needed to apply success or rollback on the event loop.
+pub type DispatchApplyFn = Box<
+    dyn FnOnce(
+            &mut App,
+            &crate::core::engine::EngineHandle,
+            &crate::config::Config,
+        ) -> anyhow::Result<()>
+        + Send,
+>;
+
 /// Global UI state for the TUI.
 #[allow(clippy::struct_excessive_bools)]
 pub struct App {
@@ -1877,6 +2014,15 @@ pub struct App {
     pub next_history_revision: u64,
     pub api_messages: Vec<Message>,
     pub is_loading: bool,
+    /// Sender for spawned dispatch tasks to report completion back to the
+    /// event loop. The closure is called with `&mut App` so the async phase
+    /// never needs `&mut App` while awaiting network I/O (#4605).
+    pub dispatch_completion_tx: Option<tokio::sync::mpsc::UnboundedSender<DispatchApplyFn>>,
+    /// True while a spawned dispatch task is in flight (#4605). Set in the
+    /// sync prepare phase and cleared when the completion closure runs, so a
+    /// submit after an Esc-cancel (which clears `is_loading`) still queues
+    /// instead of spawning a second dispatch that could reorder ops.
+    pub dispatch_in_flight: bool,
     /// Timestamp of the most recent Enter while the engine was busy.
     /// Used by `enter_with_double_tap()` to detect a double-tap within 500 ms.
     pub last_enter_instant: Option<Instant>,
@@ -1909,6 +2055,10 @@ pub struct App {
     /// Persisted model selections by provider name. Loaded from settings so
     /// `/model` and the picker can surface saved provider-specific choices.
     pub provider_models: HashMap<String, String>,
+    /// Additive provider-scoped model IDs enabled for the ordinary picker.
+    /// The catalog remains separately discoverable and selecting from it adds
+    /// to this set rather than replacing earlier enabled choices.
+    pub enabled_provider_models: HashMap<String, Vec<String>>,
     /// When true, the model is auto-selected based on request complexity
     /// rather than using a fixed model. The `/model auto` command sets this.
     /// `dispatch_user_message` calls `auto_model_heuristic` to resolve the
@@ -2091,6 +2241,9 @@ pub struct App {
     pub show_thinking: bool,
     pub verbose_transcript: bool,
     pub show_tool_details: bool,
+    /// Inline presentation mode for successful structured File mutations.
+    /// Exact evidence remains attached to each mutation receipt in all modes.
+    pub inline_diff_mode: InlineDiffMode,
     pub ui_locale: Locale,
     pub cost_currency: CostCurrency,
     /// Route payment truth. Model pricing alone cannot distinguish metered
@@ -2114,7 +2267,7 @@ pub struct App {
     /// Current hover tooltip text, if any.
     pub sidebar_hover_tooltip: Option<String>,
     /// Last successfully rendered Work panel summary. Transient mutex misses
-    /// should not wipe completed checklist/strategy state from the sidebar.
+    /// should not wipe settled To-do state from the sidebar.
     pub(crate) cached_work_summary: Option<SidebarWorkSummary>,
     /// Browsing context from the last dismissed `/model` picker, so reopening
     /// restores the view mode and highlighted row instead of resetting to the
@@ -2126,6 +2279,8 @@ pub struct App {
     pub last_mouse_pos: Option<(u16, u16)>,
     /// Whether the user is currently dragging the sidebar resize handle.
     pub sidebar_resizing: bool,
+    /// Whether the pointer is over the classic sidebar resize handle.
+    pub sidebar_resize_hovered: bool,
     /// Mouse column at the start of a sidebar-resize drag.
     pub sidebar_resize_anchor_x: u16,
     /// Sidebar width in columns at the start of a sidebar-resize drag.
@@ -2297,18 +2452,14 @@ pub struct App {
     pub project_doc: Option<String>,
     /// Plan state for tracking tasks
     pub plan_state: SharedPlanState,
-    /// Whether a plan follow-up prompt is waiting for user input
-    pub plan_prompt_pending: bool,
-    /// Exact graph proposal rendered in the current Plan confirmation. Plan
-    /// acceptance must present this identity again or fail closed.
-    pub pending_plan_proposal_id: Option<crate::work_graph::ProposalId>,
-    /// Whether update_plan was called during the current turn
-    pub plan_tool_used_in_turn: bool,
-    /// Todo list for `TodoWriteTool`. Read by the plan confirmation modal to
-    /// show the active checklist alongside the plan.
+    /// Todo list for the canonical `work_update` progress surface.
     pub todos: SharedTodoList,
     /// Durable runtime services exposed to model-visible task/automation tools.
     pub runtime_services: RuntimeToolServices,
+    /// Latest bounded coordination receipt delivered by the engine. This is
+    /// the same typed projection returned to headless inspection; the TUI does
+    /// not parse tool text to reconstruct it.
+    pub coordination_detail: Option<crate::tools::subagent::CoordinationDetailProjection>,
     /// Last MCP manager/discovery snapshot shown in the UI.
     pub mcp_snapshot: Option<crate::mcp::McpManagerSnapshot>,
     /// Number of MCP servers declared in the user's config at app boot.
@@ -2639,6 +2790,10 @@ pub struct TaskPanelEntry {
     pub elapsed_since_output_ms: Option<u64>,
     pub owner_agent_id: Option<String>,
     pub owner_agent_name: Option<String>,
+    /// #2889: structured current activity for the Work panel.
+    pub current_tool: Option<String>,
+    pub role: Option<String>,
+    pub files_touched: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2715,7 +2870,41 @@ fn default_composer_arrows_scroll_for_platform(use_mouse_capture: bool, _is_wind
     !use_mouse_capture
 }
 
+fn push_enabled_provider_model(
+    enabled: &mut HashMap<String, Vec<String>>,
+    provider: &str,
+    model: &str,
+) {
+    let provider = provider.trim();
+    let model = model.trim();
+    if provider.is_empty() || model.is_empty() || model.eq_ignore_ascii_case("auto") {
+        return;
+    }
+    let models = enabled.entry(provider.to_string()).or_default();
+    if !models
+        .iter()
+        .any(|existing| existing.eq_ignore_ascii_case(model))
+    {
+        models.push(model.to_string());
+    }
+}
+
 impl App {
+    pub fn enable_provider_model(&mut self, provider: &str, model: &str) {
+        push_enabled_provider_model(&mut self.enabled_provider_models, provider, model);
+    }
+
+    #[must_use]
+    pub fn provider_model_is_enabled(&self, provider: &str, model: &str) -> bool {
+        self.enabled_provider_models
+            .get(provider)
+            .is_some_and(|models| {
+                models
+                    .iter()
+                    .any(|enabled| enabled.eq_ignore_ascii_case(model))
+            })
+    }
+
     /// Advance and return the model-draft generation. Call when a draft is
     /// requested or a setup/fleet wizard opens; a spawned draft that captured
     /// an older generation is dropped on delivery.
@@ -2963,10 +3152,13 @@ impl App {
         let ocean_treatment = crate::tui::ocean::OceanTreatment::parse(&settings.ocean_treatment);
         let work_surface_placement =
             crate::tui::work_surface::WorkSurfacePlacement::parse(&settings.work_surface_placement);
+        let work_surface_top_height = settings.work_surface_top_height;
+        let work_surface_side_width = settings.work_surface_side_width;
         let synchronized_output_enabled = settings.synchronized_output_enabled();
         let status_indicator = settings.status_indicator.clone();
         let show_thinking = settings.show_thinking;
         let show_tool_details = settings.show_tool_details;
+        let inline_diff_mode = InlineDiffMode::parse(&settings.inline_diffs);
         let ui_locale = resolve_locale(&settings.locale);
         let cost_currency = match (settings.cost_currency.as_str(), ui_locale.tag()) {
             ("usd", "zh-Hans") => CostCurrency::Cny,
@@ -2986,16 +3178,27 @@ impl App {
         // Resolve the named theme from settings; unknown values were already
         // normalised to "system" in Settings::load. The background_color
         // setting still overlays on top.
-        let theme_id =
-            palette::ThemeId::from_name(&settings.theme).unwrap_or(palette::ThemeId::System);
-        let mut ui_theme = theme_id.ui_theme();
         let background_color_override = settings
             .background_color
             .as_deref()
             .and_then(palette::parse_hex_rgb_color);
-        if let Some(background) = background_color_override {
-            ui_theme = ui_theme.with_background_color(background);
-        }
+        let background_setting = background_color_override.and_then(palette::hex_rgb_string);
+        let resolved_theme =
+            palette::resolve_theme_setting(&settings.theme, background_setting.as_deref());
+        let theme_warning = resolved_theme.as_ref().err().map(|error| {
+            format!(
+                "⚠ configured theme '{}' could not be loaded — using System ({error})",
+                settings.theme
+            )
+        });
+        let (_, theme_id, ui_theme) = resolved_theme.unwrap_or_else(|_| {
+            let id = palette::ThemeId::System;
+            let mut theme = id.ui_theme();
+            if let Some(background) = background_color_override {
+                theme = theme.with_background_color(background);
+            }
+            (id.name().to_string(), id, theme)
+        });
         let provider_models = settings.provider_models.clone().unwrap_or_default();
         let model = provider_models
             .get(&provider_identity)
@@ -3011,6 +3214,11 @@ impl App {
             })
             .unwrap_or(model);
         let auto_model = model.trim().eq_ignore_ascii_case("auto");
+        let mut enabled_provider_models = settings.enabled_models.clone().unwrap_or_default();
+        for (saved_provider, saved_model) in &provider_models {
+            push_enabled_provider_model(&mut enabled_provider_models, saved_provider, saved_model);
+        }
+        push_enabled_provider_model(&mut enabled_provider_models, &provider_identity, &model);
         let active_context_window_override = config.context_window_for_provider_config(provider);
         let configured_route_base_url = effective_auth_config.deepseek_base_url();
         let (active_route_limits, active_route_base_url, active_context_window_source) =
@@ -3174,13 +3382,14 @@ impl App {
         let configured_approval_mode = explicit_approval_mode
             .or(saved_permission_posture)
             .unwrap_or_default();
+        let configured_trust_mode = configured_approval_mode == ApprovalMode::Bypass;
         let mode_prefs = ModeSessionPrefs {
             agent_allow_shell: if yolo_compat || matches!(initial_mode, AppMode::Yolo) {
                 config.interactive_allow_shell()
             } else {
                 allow_shell
             },
-            agent_trust_mode: false,
+            agent_trust_mode: configured_trust_mode,
             // The YOLO-compat launch elevates the *live* approval mirror to
             // Bypass below; the durable Agent baseline keeps the configured
             // policy so a YOLO -> Agent downshift restores it.
@@ -3274,8 +3483,10 @@ impl App {
                 selection_anchor: None,
             },
             viewport: ViewportState::default(),
-            work_surface: crate::tui::work_surface::WorkSurfaceState::with_placement(
+            work_surface: crate::tui::work_surface::WorkSurfaceState::with_layout(
                 work_surface_placement,
+                work_surface_top_height,
+                work_surface_side_width,
             ),
             hunt: HuntState::default(),
             session: SessionState::default(),
@@ -3289,6 +3500,8 @@ impl App {
             next_history_revision: 1,
             api_messages: Vec::new(),
             is_loading: false,
+            dispatch_completion_tx: None,
+            dispatch_in_flight: false,
             last_enter_instant: None,
             provider_wait_incident_logged: false,
             prompt_suggestion: None,
@@ -3297,12 +3510,15 @@ impl App {
             turn_error_posted: false,
             // Surface parse warnings so the user knows their config file is
             // broken instead of silently losing all settings.
-            status_message: settings_parse_warning.or(tui_prefs_warning),
+            status_message: settings_parse_warning
+                .or(tui_prefs_warning)
+                .or(theme_warning),
             status_toasts: VecDeque::new(),
             sticky_status: None,
             last_status_message_seen: None,
             model,
             provider_models,
+            enabled_provider_models,
             auto_model,
             last_effective_model: None,
             last_effective_provider: None,
@@ -3368,6 +3584,7 @@ impl App {
             show_thinking,
             verbose_transcript: false,
             show_tool_details,
+            inline_diff_mode,
             ui_locale,
             cost_currency,
             billing_presentation: crate::route_billing::for_route(config, provider),
@@ -3386,6 +3603,7 @@ impl App {
             provider_picker_memory: None,
             last_mouse_pos: None,
             sidebar_resizing: false,
+            sidebar_resize_hovered: false,
             sidebar_resize_anchor_x: 0,
             sidebar_resize_anchor_width: 0,
             last_sidebar_area: None,
@@ -3455,7 +3673,7 @@ impl App {
             last_known_work_state: None,
             current_session_metadata: None,
             session_artifacts: Vec::new(),
-            trust_mode: yolo_compat || initial_mode == AppMode::Yolo,
+            trust_mode: yolo_compat || initial_mode == AppMode::Yolo || configured_trust_mode,
             translation_enabled: false,
             status_items: config
                 .tui
@@ -3464,15 +3682,13 @@ impl App {
                 .unwrap_or_else(crate::config::StatusItem::default_footer),
             project_doc: None,
             plan_state,
-            plan_prompt_pending: false,
-            pending_plan_proposal_id: None,
-            plan_tool_used_in_turn: false,
             todos,
             runtime_services: RuntimeToolServices {
                 shell_manager: Some(shell_manager),
                 work: Some(work_runtime),
                 ..RuntimeToolServices::default()
             },
+            coordination_detail: None,
             mcp_snapshot: None,
             // Read the MCP config once at boot to know how many servers
             // the user has declared. The footer chip uses this even when
@@ -3734,12 +3950,6 @@ impl App {
             self.trust_mode = policy.trust_mode;
             self.approval_mode = policy.approval_mode;
             self.yolo = matches!(policy.approval_mode, ApprovalMode::Bypass);
-        }
-
-        if mode != AppMode::Plan {
-            self.plan_prompt_pending = false;
-            self.pending_plan_proposal_id = None;
-            self.plan_tool_used_in_turn = false;
         }
 
         // Execute mode change hooks
@@ -4047,14 +4257,19 @@ impl App {
         );
     }
 
-    /// Update the durable Act approval choice without changing its saved shell
-    /// or trust choices. Plan remains read-only.
+    /// Update the durable Act approval choice. Entering Full Access enables
+    /// trust mode; leaving it removes that implicit elevation while preserving
+    /// an independently enabled trust baseline in other posture transitions.
+    /// Plan remains read-only.
     pub fn set_agent_approval_posture(&mut self, next: ApprovalMode) {
-        self.set_agent_runtime_baseline(
-            self.mode_prefs.agent_allow_shell,
-            self.mode_prefs.agent_trust_mode,
-            next,
-        );
+        let trust_mode = if next == ApprovalMode::Bypass {
+            true
+        } else if self.mode_prefs.agent_approval_mode == ApprovalMode::Bypass {
+            false
+        } else {
+            self.mode_prefs.agent_trust_mode
+        };
+        self.set_agent_runtime_baseline(self.mode_prefs.agent_allow_shell, trust_mode, next);
     }
 
     #[must_use]
@@ -4090,7 +4305,6 @@ impl App {
     pub fn attention_hold_active(&self) -> bool {
         !self.view_stack.is_empty()
             || self.pending_user_input_prompt.is_some()
-            || self.plan_prompt_pending
             || self
                 .task_panel
                 .iter()
@@ -4444,6 +4658,50 @@ impl App {
         // one — the cache will reuse those. Callers that mutate a specific
         // cell's content must call `bump_history_cell(idx)` instead.
         self.resync_history_revisions();
+        self.needs_redraw = true;
+    }
+
+    /// Invalidate only transcript rows whose visible liveness marker is
+    /// time-based. Animation redraws must not churn settled history, but they
+    /// do need fresh cache keys for running history and active-cell entries.
+    pub(crate) fn mark_live_motion_updated(&mut self) {
+        self.mark_live_motion_updated_inner(true);
+    }
+
+    /// Invalidate only committed live rows. The translation placeholder path
+    /// already bumps the whole active-cell cache when it changes, so the UI
+    /// uses this narrower path to avoid bumping that revision twice.
+    pub(crate) fn mark_live_history_motion_updated(&mut self) {
+        self.mark_live_motion_updated_inner(false);
+    }
+
+    fn mark_live_motion_updated_inner(&mut self, invalidate_active_cell: bool) {
+        self.resync_history_revisions();
+        let live_history_indices: Vec<usize> = self
+            .history
+            .iter()
+            .enumerate()
+            .filter_map(|(index, cell)| cell.has_live_motion().then_some(index))
+            .collect();
+        for index in live_history_indices {
+            let revision = self.fresh_history_revision();
+            if let Some(slot) = self.history_revisions.get_mut(index) {
+                *slot = revision;
+            }
+        }
+
+        let active_has_live_motion = self
+            .active_cell
+            .as_ref()
+            .is_some_and(|active| active.entries().iter().any(HistoryCell::has_live_motion));
+        if invalidate_active_cell && active_has_live_motion {
+            self.active_cell_revision = self.active_cell_revision.wrapping_add(1);
+            if let Some(active) = self.active_cell.as_mut() {
+                active.bump_revision();
+            }
+        }
+
+        self.history_version = self.history_version.wrapping_add(1);
         self.needs_redraw = true;
     }
 
@@ -4847,14 +5105,33 @@ impl App {
             *streaming = false;
         }
 
-        let drained = active.drain();
         let base_index = self.history.len();
+        // Completed tools are removed from `tool_cells` before the active
+        // group flushes, but `ActiveCell` deliberately keeps the stable
+        // tool-to-entry binding until drain. Capture that binding first so
+        // sequential or parallel tools in one model turn retain distinct raw
+        // detail records instead of all falling back to the first cell.
+        let detail_cell_indices: HashMap<String, usize> = self
+            .active_tool_details
+            .keys()
+            .filter_map(|tool_id| {
+                active
+                    .entry_index_for_tool(tool_id)
+                    .map(|entry_idx| (tool_id.clone(), base_index + entry_idx))
+            })
+            .collect();
+        let drained = active.drain();
 
         let mut details = std::mem::take(&mut self.active_tool_details);
         self.active_tool_entry_completed_at.clear();
         for (tool_id, detail) in details.drain() {
+            let cell_index = detail_cell_indices
+                .get(&tool_id)
+                .copied()
+                .or_else(|| self.tool_cells.get(&tool_id).copied())
+                .unwrap_or(base_index);
             self.tool_details_by_cell
-                .entry(self.tool_cells.get(&tool_id).copied().unwrap_or(base_index))
+                .entry(cell_index)
                 .or_insert(detail);
         }
 
@@ -5048,18 +5325,46 @@ impl App {
         }
     }
 
+    /// Default lifetime for sticky error toasts. Long enough to read, short
+    /// enough that a failed workflow does not permanently occupy footer chrome.
+    pub const STICKY_ERROR_TTL_MS: u64 = 8_000;
+
     pub fn set_sticky_status(
         &mut self,
         text: impl Into<String>,
         level: StatusToastLevel,
         ttl_ms: Option<u64>,
     ) {
+        // Cap sticky errors so a missing TTL never becomes permanent chrome.
+        // Explicit shorter TTLs still win; longer/None fall back to the default.
+        let ttl_ms = match level {
+            StatusToastLevel::Error => Some(
+                ttl_ms
+                    .unwrap_or(Self::STICKY_ERROR_TTL_MS)
+                    .min(Self::STICKY_ERROR_TTL_MS),
+            ),
+            _ => ttl_ms,
+        };
         self.sticky_status = Some(StatusToast::new(text, level, ttl_ms));
         self.needs_redraw = true;
     }
 
     pub fn clear_sticky_status(&mut self) {
-        self.sticky_status = None;
+        if self.sticky_status.take().is_some() {
+            self.needs_redraw = true;
+        }
+    }
+
+    /// Drop sticky error chrome when the user resumes typing so a prior
+    /// workflow/provider failure does not linger over the next draft.
+    pub fn acknowledge_sticky_on_composer_activity(&mut self) {
+        if self
+            .sticky_status
+            .as_ref()
+            .is_some_and(|toast| matches!(toast.level, StatusToastLevel::Error))
+        {
+            self.clear_sticky_status();
+        }
     }
 
     pub fn set_sidebar_focus(&mut self, focus: SidebarFocus) {
@@ -5089,7 +5394,11 @@ impl App {
             || has("aborted")
             || has("critical")
         {
-            return (StatusToastLevel::Error, Some(15_000), true);
+            return (
+                StatusToastLevel::Error,
+                Some(Self::STICKY_ERROR_TTL_MS),
+                true,
+            );
         }
         // A success keyword under a negation ("not saved", "no longer
         // found", "could not enable") is a failure the coarse keyword match
@@ -5212,14 +5521,36 @@ impl App {
             .or_else(|| self.status_toasts.back().cloned())
     }
 
+    /// Resolve one motion policy for every surface that can request or paint
+    /// animation. `fancy_animations = false` is a true still mode even when
+    /// the separate accessibility preference is left at its default.
+    #[must_use]
+    pub(crate) fn motion_policy(&self) -> MotionPolicy {
+        MotionPolicy::from_settings(
+            self.low_motion,
+            self.fancy_animations,
+            self.constrained_frame_rate,
+        )
+    }
+
+    /// Bridge the centralized policy into transcript renderers that still
+    /// accept the legacy boolean motion contract.
+    #[must_use]
+    pub(crate) fn effective_low_motion_for_status(&self) -> bool {
+        self.motion_policy().as_low_motion()
+    }
+
     pub fn transcript_render_options(&self) -> TranscriptRenderOptions {
         TranscriptRenderOptions {
             show_thinking: self.show_thinking,
             verbose: self.verbose_transcript,
             show_tool_details: self.show_tool_details,
+            inline_diff_mode: self.inline_diff_mode,
             calm_mode: self.calm_mode,
-            low_motion: self.low_motion,
+            low_motion: self.effective_low_motion_for_status(),
+            motion_mode: self.motion_policy().mode(),
             spacing: self.transcript_spacing,
+            palette_mode: self.ui_theme.mode,
         }
     }
 
@@ -5545,6 +5876,7 @@ impl App {
     }
 
     pub fn insert_char(&mut self, c: char) {
+        self.acknowledge_sticky_on_composer_activity();
         self.clear_input_history_navigation();
         self.auto_expand_oversized_paste();
         self.delete_selection();
@@ -6438,6 +6770,8 @@ impl App {
         self.history_index = None;
         self.history_navigation_draft = None;
         self.clear_input();
+        // Collapse recent-only Work chrome on the next accepted turn (#4688).
+        self.work_surface.note_user_turn_or_new_operation();
         Some(input)
     }
 
@@ -6680,6 +7014,11 @@ impl App {
         if self.offline_mode {
             return SubmitDisposition::Queue;
         }
+        // A spawned dispatch is still resolving route/sending the op (#4605);
+        // queue rather than spawn a second dispatch that could reorder ops.
+        if self.dispatch_in_flight {
+            return SubmitDisposition::Queue;
+        }
         if !self.is_loading {
             return SubmitDisposition::Immediate;
         }
@@ -6698,6 +7037,10 @@ impl App {
     /// Enter within 500 ms triggers Steer (interrupt the current turn to
     /// inject the new instruction immediately). When idle, Enter submits
     /// immediately.
+    ///
+    /// The first Enter clears the composer, so the UI path must also call
+    /// [`Self::take_queued_for_double_tap_steer`] on an empty second Enter to
+    /// escalate the just-queued message — otherwise double-tap never fires.
     #[must_use]
     pub fn enter_with_double_tap(&mut self) -> Option<SubmitDisposition> {
         let disposition = self.decide_submit_disposition();
@@ -6717,6 +7060,30 @@ impl App {
                 Some(other)
             }
         }
+    }
+
+    /// True when a second bare Enter should escalate the most recent queued
+    /// follow-up into a live steer (composer already emptied by the first tap).
+    #[must_use]
+    pub fn can_double_tap_steer_queued(&self) -> bool {
+        if self.offline_mode || !self.is_loading || self.dispatch_in_flight {
+            return false;
+        }
+        if self.queued_messages.is_empty() {
+            return false;
+        }
+        self.last_enter_instant
+            .is_some_and(|instant| instant.elapsed() < Duration::from_millis(500))
+    }
+
+    /// Pop the most recently queued message when a double-tap steer window is
+    /// still open. Clears the window so a third Enter does not re-steer.
+    pub fn take_queued_for_double_tap_steer(&mut self) -> Option<QueuedMessage> {
+        if !self.can_double_tap_steer_queued() {
+            return None;
+        }
+        self.last_enter_instant = None;
+        self.queued_messages.pop_back()
     }
 
     /// Mark the in-flight streaming Assistant cell as interrupted: prepend
@@ -6892,7 +7259,6 @@ impl App {
         workspace: &Path,
         state: Option<&SessionWorkState>,
     ) -> Result<(), String> {
-        self.pending_plan_proposal_id = None;
         if let Some(work) = self.runtime_services.work.as_ref() {
             let empty = SessionWorkState::default();
             let state = state.unwrap_or(&empty);
@@ -7474,6 +7840,8 @@ pub enum AppAction {
     },
     OpenConfigEditor(ConfigUiMode),
     OpenConfigView,
+    /// Open the native git worktree manager.
+    OpenWorktreeManager,
     /// Open the `/model` two-pane picker (Pro/Flash + Off/High/Max).
     OpenModelPicker,
     /// Open the `/provider` picker modal — DeepSeek / NVIDIA NIM / OpenRouter
@@ -7504,6 +7872,8 @@ pub enum AppAction {
     OpenFeedbackPicker,
     /// Open the `/theme` picker modal with live preview of every preset.
     OpenThemePicker,
+    /// Open the `/skills` manager — audit inventory + owned mutations.
+    OpenSkillsManager,
     /// Open the `/fleet` roster — the saved-party view of the agent team.
     OpenFleetRoster,
     /// Open the `/fleet` profile authoring wizard.
@@ -7573,7 +7943,11 @@ pub enum AppAction {
     /// Open the live transcript overlay through a terminal-safe command path.
     OpenLiveTranscript,
     OpenContextInspector,
-    CompactContext,
+    CompactContext {
+        /// Optional user focus from `/compact <focus>`, forwarded into the
+        /// successor-brief summary prompt.
+        focus: Option<String>,
+    },
     PurgeContext,
     TaskAdd {
         prompt: String,
@@ -7660,6 +8034,16 @@ pub enum McpUiAction {
         scopes: Vec<String>,
     },
     Logout {
+        name: String,
+    },
+    /// List consent-gated external MCP import candidates with provenance.
+    ImportList,
+    /// Approve importing one discovered external server into user mcp.json.
+    ImportApprove {
+        name: String,
+    },
+    /// Decline an external candidate (durable until source content changes).
+    ImportDecline {
         name: String,
     },
     Validate,

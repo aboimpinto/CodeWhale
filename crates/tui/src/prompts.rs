@@ -1,18 +1,21 @@
 #![allow(dead_code)]
 //! System prompts for different modes.
 //!
-//! Prompts are assembled from composable layers loaded at compile time:
-//!   constitution.md + personality overlay → message[0] (byte-stable).
+//! Prompts are assembled from composable layers loaded at compile time from
+//! the single [`text`] module:
+//!   constitution + personality overlay → `message[0]` (byte-stable).
 //!   mode delta + tool taxonomy + approval policy → request-time runtime metadata.
 //!
-//! This keeps each concern in its own file and makes prompt tuning
-//! a single-file operation.
+//! Keeping every layer's text in one module makes prompt tuning a
+//! single-file operation.
 
 use crate::models::{SystemBlock, SystemPrompt};
 use crate::project_context::{ProjectContext, load_project_context_with_parents};
 use crate::tui::app::AppMode;
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
+
+pub(crate) mod text;
 
 #[derive(Debug, Clone)]
 pub struct PromptSessionContext<'a> {
@@ -380,24 +383,22 @@ fn user_constitution_disabled_by_setup_state() -> bool {
 }
 
 // ── Prompt layers loaded at compile time ──────────────────────────────
-
-/// Core: task execution, tool-use rules, output format, toolbox reference,
-/// "When NOT to use" guidance, sub-agent sentinel protocol.
-///
-/// This markdown is the single hand-maintained source of the constitutional
-/// system prompt. The earlier YAML + Python-renderer generation pipeline
-/// (`constitution.yaml` / `render_constitution.py`) was retired because it
-/// had drifted from this file since the v4 "zero ceremony" adoption and the
-/// renderer could no longer reproduce it byte-for-byte. The layered runtime
-/// assembly composes this core with mode / approval / skills /
-/// context-management / compaction / authority-recap layers at runtime (see
-/// `system_prompt_for_mode_with_context_skills_and_session`). Edit this file
-/// directly; `constitution_md_carries_required_structure` guards its skeleton.
-pub const BASE_PROMPT: &str = include_str!("prompts/constitution.md");
-/// Language mirroring law, split from the compact constitution in 0.9.0.
-pub const LANGUAGE_PROMPT: &str = include_str!("prompts/language.md");
-/// Terminal-facing output formatting law, split from the compact constitution.
-pub const OUTPUT_PROMPT: &str = include_str!("prompts/output.md");
+//
+// Every bundled prompt layer lives in `prompts/text.rs` as a compile-time
+// constant (consolidated from the retired per-layer `prompts/*.md` files;
+// each constant is byte-identical to the file it replaced, trailing newline
+// included). The constants are re-exported here so the existing
+// `crate::prompts::NAME` paths used across the crate are unchanged. Edit
+// prompt text in `text.rs` directly; the test suite below guards content
+// and ordering invariants (constitution structure and binding gates #4032,
+// byte-stable prefix ordering, prefix privacy #4632).
+pub use text::{
+    AGENT_MODE, BASE_PROMPT, CALM_PERSONALITY, COMPACT_TEMPLATE, CORE_EXECUTION_PROFILE_PROMPT,
+    GOAL_CONTINUATION_PROMPT, LANGUAGE_PROMPT, MEMORY_GUIDANCE, OPERATE_MODE, OUTPUT_PROMPT,
+    PLAN_MODE, PLAYFUL_PERSONALITY,
+};
+#[cfg(test)]
+use text::{AGENT_PROMPT, AUTO_APPROVAL, NEVER_APPROVAL, SUGGEST_APPROVAL, YOLO_MODE};
 
 // ── Embedder prompt overrides ──
 // Let an embedder replace these compile-time prompt constants at startup,
@@ -873,22 +874,6 @@ dự án có là tiếng Anh, quá trình suy nghĩ của bạn cũng không đ�
 tích lũy trong ngữ cảnh. Trừ khi người dùng yêu cầu rõ ràng việc chuyển đổi (ví dụ \"think in English\"), \
 hãy tiếp tục suy nghĩ và trả lời bằng tiếng Việt.";
 
-/// Personality overlays — voice and tone.
-pub const CALM_PERSONALITY: &str = include_str!("prompts/personalities/calm.md");
-pub const PLAYFUL_PERSONALITY: &str = include_str!("prompts/personalities/playful.md");
-
-/// Mode deltas — permissions, workflow expectations, mode-specific rules.
-pub const AGENT_MODE: &str = include_str!("prompts/modes/agent.md");
-pub const PLAN_MODE: &str = include_str!("prompts/modes/plan.md");
-pub const YOLO_MODE: &str = include_str!("prompts/modes/yolo.md");
-pub const OPERATE_MODE: &str = include_str!("prompts/modes/operate.md");
-
-/// Approval-policy overlays — whether tool calls are auto-approved,
-/// require confirmation, or are blocked.
-pub const AUTO_APPROVAL: &str = include_str!("prompts/approvals/auto.md");
-pub const SUGGEST_APPROVAL: &str = include_str!("prompts/approvals/suggest.md");
-pub const NEVER_APPROVAL: &str = include_str!("prompts/approvals/never.md");
-
 /// Shell policy guidance for `allow_shell=false`. Referenced from the
 /// Runtime Policy Reference so the model can adapt without mutating the
 /// static system-prompt prefix (preserves DeepSeek prefix cache across
@@ -896,32 +881,6 @@ pub const NEVER_APPROVAL: &str = include_str!("prompts/approvals/never.md");
 pub const SHELL_POLICY_DISABLED: &str = "Shell tools unavailable. For mandatory-use items referencing \
 `exec_shell`, use `code_execution` (Python sandbox). For GitHub triage, use \
 `github_issue_context` / `github_pr_context` as primary route.";
-
-/// Compaction relay template — written into the system prompt so the
-/// model knows the format to use when writing `.codewhale/handoff.md`.
-pub const COMPACT_TEMPLATE: &str = include_str!("prompts/compact.md");
-
-/// Goal continuation audit template — injected by the engine when a runtime
-/// goal is active and the assistant tries to end a turn without closing it.
-pub const GOAL_CONTINUATION_PROMPT: &str = include_str!("prompts/continuation.md");
-
-/// Memory hygiene guidance — appended to the system prompt only when the
-/// session has a non-empty user-memory block. Steers the model toward
-/// writing durable memories as declarative facts ("User prefers concise
-/// responses") rather than imperatives ("Always respond concisely"),
-/// because imperatives get re-read as directives in later sessions and
-/// can override the user's current request (#725).
-pub const MEMORY_GUIDANCE: &str = include_str!("prompts/memory_guidance.md");
-
-/// Lean execution layer shared by the default agent runtime. Product/UI
-/// tutorials remain outside the model-facing coding contract.
-pub const CORE_EXECUTION_PROFILE_PROMPT: &str = include_str!("prompts/core_execution.md");
-
-// ── Legacy prompt constants (kept for backwards compatibility) ────────
-
-/// Legacy base prompt (agent.txt — now decomposed into constitution.md + overlays).
-/// Still available for callers that haven't migrated to the layered API.
-pub const AGENT_PROMPT: &str = include_str!("prompts/agent.txt");
 
 // ── Personality selection ─────────────────────────────────────────────
 
@@ -979,9 +938,9 @@ fn apply_model_template(
     prompt.replace("{model_id}", model_id)
 }
 
-const TOOL_TAXONOMY_DISCOVERY: &[&str] = &["grep_files", "file_search"];
-const TOOL_TAXONOMY_GIT: &[&str] = &["git_status", "git_diff"];
-const TOOL_TAXONOMY_VERIFICATION: &[&str] = &["run_tests", "run_verifiers"];
+const TOOL_TAXONOMY_DISCOVERY: &[&str] = &["File"];
+const TOOL_TAXONOMY_GIT: &[&str] = &["Git"];
+const TOOL_TAXONOMY_VERIFICATION: &[&str] = &["Run"];
 
 /// Return the core tool taxonomy body **without** a markdown heading.
 /// Suitable for embedding under a mode-specific sub-heading in the
@@ -999,9 +958,9 @@ pub(crate) fn render_core_tool_taxonomy_body(mode: AppMode) -> String {
     if let Some(verification) = render_core_tool_group(TOOL_TAXONOMY_VERIFICATION, &core_tools) {
         sentences.push(format!("Use {verification} for verification."));
     }
-    if core_tools.contains(&"run_verifiers") {
+    if core_tools.contains(&"Run") {
         sentences.push(
-            "For long build/test/lint verifier suites, call `run_verifiers` with `background: true` or use `task_shell_start`, then poll while continuing independent inspection."
+            "For long build/test/lint suites, call `Run` with `action: \"verifiers\"` and `background: true`, then continue independent inspection."
                 .to_string(),
         );
     }
@@ -1018,7 +977,7 @@ fn core_taxonomy_tools_for_mode(mode: AppMode) -> Vec<&'static str> {
     core_tools
         .iter()
         .copied()
-        .filter(|tool| mode != AppMode::Plan || !matches!(*tool, "run_tests" | "run_verifiers"))
+        .filter(|tool| mode != AppMode::Plan || *tool != "Run")
         .collect()
 }
 
@@ -1418,7 +1377,7 @@ fn render_route_fragment(session_context: &PromptSessionContext<'_>) -> String {
 /// This is the Codex-parity assembly point: constitution stays byte-stable for
 /// prefix caching; volatile concerns live in `WorldState` fragments with
 /// markers, caps, and `render_diff` retain-unchanged behavior. Callers that
-/// still need a flat string can use [`WorldStateSnapshot::render_text`].
+/// still need a flat string can use `WorldStateSnapshot::render_text`.
 pub fn system_prompt_with_world_state(
     constitution: impl Into<String>,
     world_state: crate::model_context::WorldState,
@@ -1481,8 +1440,8 @@ mod tests {
     use crate::tools::apply_patch::ApplyPatchTool;
     use crate::tools::file::{EditFileTool, WriteFileTool};
     use crate::tools::handle::HandleReadTool;
-    use crate::tools::rlm::{RlmCloseTool, RlmConfigureTool, RlmEvalTool, RlmOpenTool};
-    use crate::tools::shell::ExecShellTool;
+    use crate::tools::rlm::RlmTool;
+    use crate::tools::shell::BashTool;
     use crate::tools::spec::ToolSpec;
     use tempfile::tempdir;
 
@@ -1669,11 +1628,15 @@ mod tests {
     #[test]
     fn agent_mode_carries_execution_discipline_block() {
         for phrase in [
-            "Execution Discipline",
-            "Do not end with \"I'll check\"",
-            "After spawning a background shell or sub-agent",
-            "<codewhale:subagent.done>",
-            "verify load-bearing claims",
+            "Execute the user's task autonomously",
+            "Keep `work_update` current",
+            "verify load-bearing child",
+            "never manufacture completion sentinels",
+            // Live progress upkeep (2026-07-23 user report: models wrote the
+            // list once and never updated it while working).
+            "exactly one item in_progress before you
+start it",
+            "never batch completions",
         ] {
             assert!(
                 AGENT_MODE.contains(phrase),
@@ -1913,9 +1876,9 @@ mod tests {
         let patch = ApplyPatchTool.description();
         assert!(patch.contains("unified-diff") && patch.contains("transactional"));
 
-        let shell = ExecShellTool.description();
+        let shell_tool = BashTool::new("Bash");
+        let shell = shell_tool.description();
         assert!(shell.contains("background=true"));
-        assert!(shell.contains("task_shell_start"));
         assert!(shell.contains(">5 seconds"));
     }
 
@@ -2080,16 +2043,8 @@ mod tests {
 
     #[test]
     fn execution_discipline_lives_in_agent_mode_after_core_constitution() {
-        let discipline_at = AGENT_MODE
-            .find("###### Execution Discipline")
-            .expect("Execution Discipline anchor present");
-        let longevity_at = AGENT_MODE
-            .find("###### Session Longevity")
-            .expect("Session Longevity anchor present");
-        assert!(
-            longevity_at < discipline_at,
-            "agent-mode execution discipline should follow the shorter mode/longevity delta"
-        );
+        assert!(AGENT_MODE.contains("Execute the user's task autonomously"));
+        assert!(AGENT_MODE.contains("verify load-bearing child"));
         assert!(
             !BASE_PROMPT.contains("Execution Discipline")
                 && !BASE_PROMPT.contains("<tool_persistence>"),
@@ -2098,14 +2053,15 @@ mod tests {
     }
 
     #[test]
-    fn plan_mode_prompt_uses_update_plan_as_confirmation_handoff() {
+    fn plan_mode_prompt_uses_one_progress_surface() {
         assert!(
-            PLAN_MODE.contains("call `update_plan`"),
-            "Plan mode must tell the model to finish plans through update_plan"
+            PLAN_MODE.contains("canonical list in `work_update`"),
+            "Plan mode must keep progress in the canonical list"
         );
+        assert!(!PLAN_MODE.contains("call `update_plan`"));
         assert!(
-            PLAN_MODE.contains("accept / revise / exit prompt"),
-            "Plan mode must explain why update_plan is the UI handoff signal"
+            PLAN_MODE.contains("switch to Act (`/mode act`)"),
+            "Plan mode must use a normal conversational handoff"
         );
     }
 
@@ -2938,18 +2894,14 @@ mod tests {
     fn agent_mode_prompt_keeps_safety_invariants_after_compression() {
         let prompt = AGENT_MODE.replace("\r\n", "\n").replace('\r', "\n");
         for must in [
-            "Agent mode",
+            "autonomously",
+            "`File`",
+            "`Git`",
+            "`Run`",
+            "`Bash`",
             "work_update",
-            "update_plan",
-            "workflow",
-            "request_user_input",
-            "agent(action=\"wait\")",
-            "type: \"explore\"",
-            "fork_context",
-            "rlm_open",
-            "Bare `/workflow` means orchestrate current work without re-asking",
-            "stop and synthesize",
-            "Do NOT explain, announce, or mention to the user that you are running in Agent mode",
+            "Delegate independent work",
+            "Do not announce the mode",
         ] {
             assert!(
                 prompt.contains(must),
@@ -2978,14 +2930,10 @@ mod tests {
             let word_count = normalized.split_whitespace().count();
             let estimated_tokens =
                 crate::compaction::estimate_text_tokens_conservative(&normalized);
-            // 2026-07-20: agent mode compressed (661 -> ~560 words) while
-            // preserving every tested approval, orchestration, subagent-brief,
-            // sentinel, workflow, and fork-context invariant. Keep the budget
-            // tight so procedural detail stays out of the system prefix.
-            let max_words = if name == "agent" { 580 } else { 350 };
-            // The auto-fork contract sentence (#4599-adjacent cache work)
-            // costs a handful of tokens over the original compression target.
-            let max_tokens = if name == "agent" { 1360 } else { 700 };
+            // 2026-07-21: mode deltas contain permissions and durable behavior
+            // only. Action recipes belong to the canonical tool schemas.
+            let max_words = 120;
+            let max_tokens = 320;
 
             assert!(
                 word_count <= max_words,
@@ -3031,7 +2979,7 @@ mod tests {
         }
 
         assert!(
-            PLAN_MODE.contains("All writes and patches are blocked"),
+            PLAN_MODE.contains("All writes, patches, shell commands"),
             "Plan may summarize the user-facing mode delta"
         );
         assert!(
@@ -3150,8 +3098,12 @@ mod tests {
     fn agent_mode_tool_guidance_avoids_defensive_tool_suppression() {
         let prompt = compose_prompt(Personality::Calm);
         assert!(!prompt.contains("Tool Selection Guide"));
-        assert!(AGENT_MODE.contains("Delegate only independent, fire-and-forget work"));
-        assert!(AGENT_MODE.contains("Use `rlm_open`"));
+        for tool in ["`File`", "`Git`", "`Run`", "`Bash`"] {
+            assert!(AGENT_MODE.contains(tool));
+        }
+        for legacy in ["read_file", "git_status", "run_tests", "exec_shell"] {
+            assert!(!AGENT_MODE.contains(legacy));
+        }
         assert!(
             !AGENT_MODE.contains("When NOT to use certain tools"),
             "agent mode should steer tool choice without training the model to avoid available tools"
@@ -3269,25 +3221,21 @@ mod tests {
 
     #[test]
     fn rlm_specialty_tool_guidance_present() {
-        assert!(AGENT_MODE.contains("Large Context Tools"));
-        for tool in [
-            "rlm_open",
-            "rlm_eval",
-            "rlm_configure",
-            "rlm_close",
-            "handle_read",
-        ] {
-            assert!(
-                AGENT_MODE.contains(tool),
-                "AGENT_MODE should mention `{tool}`"
-            );
-        }
+        assert!(!AGENT_MODE.contains("Large Context Tools"));
 
         let descriptions = [
-            RlmOpenTool.description().to_string(),
-            RlmEvalTool::new(None).description().to_string(),
-            RlmConfigureTool.description().to_string(),
-            RlmCloseTool.description().to_string(),
+            RlmTool::alias("rlm_open", "open", None)
+                .description()
+                .to_string(),
+            RlmTool::alias("rlm_eval", "eval", None)
+                .description()
+                .to_string(),
+            RlmTool::alias("rlm_configure", "configure", None)
+                .description()
+                .to_string(),
+            RlmTool::alias("rlm_close", "close", None)
+                .description()
+                .to_string(),
             HandleReadTool.description().to_string(),
         ]
         .join("\n");
@@ -3334,17 +3282,8 @@ mod tests {
 
     #[test]
     fn prompt_uses_single_agent_and_rlm_surface() {
-        for tool in [
-            "rlm_open",
-            "rlm_eval",
-            "rlm_configure",
-            "rlm_close",
-            "handle_read",
-        ] {
-            assert!(
-                AGENT_MODE.contains(tool),
-                "AGENT_MODE should mention tool `{tool}`"
-            );
+        for tool in ["rlm_open", "rlm_eval", "rlm_configure", "rlm_close"] {
+            assert!(!AGENT_MODE.contains(tool));
         }
         assert!(AGENT_MODE.contains("sub-agent"));
     }
@@ -3352,104 +3291,65 @@ mod tests {
     #[test]
     fn prompt_documents_fork_context_prefix_cache_contract() {
         let source = include_str!("tools/subagent/mod.rs");
-        for haystack in [AGENT_MODE, source] {
-            assert!(haystack.contains("fork_context"));
-            assert!(haystack.contains("byte-identical"));
-            assert!(haystack.contains("DeepSeek prefix-cache reuse"));
-        }
-        assert!(AGENT_MODE.contains("`fork_context` is auto-chosen"));
-        assert!(AGENT_MODE.contains("write-capable, isolated, or re-routed children start fresh"));
+        assert!(source.contains("fork_context"));
+        assert!(!AGENT_MODE.contains("fork_context"));
     }
 
     #[test]
     fn prompt_documents_explicit_subagent_model_strength() {
-        let prompt = AGENT_MODE;
-        assert!(prompt.contains("model_strength: \"same\""));
-        assert!(prompt.contains("model_strength: \"faster\""));
-        assert!(prompt.contains("type: \"explore\""));
-        assert!(include_str!("tools/subagent/mod.rs").contains("Overrides model_strength"));
-        assert!(prompt.contains("defaults to `model_strength: \"faster\"`"));
-        assert!(prompt.contains("2-4 `type: \"explore\"` sub-agents"));
-        assert!(prompt.contains("self-reports"));
+        let source = include_str!("tools/subagent/mod.rs");
+        assert!(source.contains("model_strength"));
+        assert!(!AGENT_MODE.contains("model_strength"));
     }
 
     #[test]
     fn prompt_documents_structured_subagent_briefs() {
-        let prompt = AGENT_MODE;
-        for field in [
-            "Subagent Brief",
-            "QUESTION",
-            "SCOPE",
-            "ALREADY_KNOWN",
-            "EFFORT",
-            "STOP_CONDITION",
-            "VERDICT",
-            "EVIDENCE",
-            "GAPS",
-            "NEXT",
+        assert!(!AGENT_MODE.contains("Subagent Brief"));
+        for heading in [
+            "### SUMMARY",
+            "### EVIDENCE",
+            "### CHANGES",
+            "### RISKS",
+            "### BLOCKERS",
         ] {
-            assert!(
-                prompt.contains(field),
-                "main prompt should include Subagent Brief field `{field}`"
-            );
+            assert!(text::SUBAGENT_OUTPUT_FORMAT.contains(heading));
         }
-        assert!(prompt.contains("Brief sub-agents with a compact Subagent Brief"));
     }
 
     #[test]
     fn prompt_bounds_explore_without_tiny_cap_for_implementers() {
-        let prompt = AGENT_MODE;
-        assert!(prompt.contains("Explore briefs default to `quick`"));
-        assert!(prompt.contains("read-only"));
-        assert!(prompt.contains("3-5 tool calls"));
-        assert!(prompt.contains("Review/verifier children stop after decisive evidence"));
-        assert!(prompt.contains("No fan-out without a fan-in owner"));
+        assert!(AGENT_MODE.contains("Delegate independent work"));
+        assert!(!AGENT_MODE.contains("3-5 tool calls"));
+        assert!(!AGENT_MODE.contains("No fan-out without a fan-in owner"));
     }
 
     #[test]
     fn agent_mode_prompt_teaches_automatic_workflow_use() {
-        // #4125: parent decides Workflow without the user saying the word;
-        // indicates the shape and may ask setup questions before launch.
-        let prompt = AGENT_MODE;
-        for phrase in [
-            "You decide when to use Workflow",
-            "need **not** say \"workflow\"",
-            "broad, independent, or staged",
-            "This looks set up for a Workflow",
-            "`request_user_input`",
-            "TUI question modal",
-            "Pass **paths**, not file contents",
-            "Prefer `responseSchema`",
-            "one compact summary",
+        for recipe in [
+            "Workflow",
+            "responseSchema",
+            "request_user_input",
+            ".workflow.js",
         ] {
-            assert!(
-                prompt.contains(phrase),
-                "AGENT_MODE missing automatic-workflow phrase {phrase:?}"
-            );
+            assert!(!AGENT_MODE.contains(recipe));
         }
-        // Explicitly not the old opt-in-only framing.
-        assert!(
-            !prompt.contains("The `workflow` tool is opt-in"),
-            "AGENT_MODE must not describe Workflow as opt-in only"
-        );
     }
 
     #[test]
     fn operate_mode_prompt_keeps_multitask_simple_and_async() {
         for phrase in [
-            "ordinary user messages",
-            "Answer conversation",
-            "honor that request even for read-only work",
-            "silently collapse it into parent-local discovery",
-            "Use ordinary tools directly",
-            "same approval posture, sandbox, shell configuration",
-            "Prefer one or more `agent` workers",
-            "Delegation is not mandatory",
-            "background",
-            "Treat each queued user message as another task",
-            "Use `workflow` only when",
-            "scheduling emphasis, not tool authority",
-            "Keep internal mechanics internal",
+            "ordinary messages",
+            "small or tightly coupled tasks directly",
+            "Dispatching background workers is the default",
+            "queued user message as a new task",
+            "approval, sandbox, and repository policies",
+            "lifecycle claims stay exact",
+            "internal control-plane mechanics",
+            "Goal first",
+            "Dispatch is not completion",
+            "verification evidence",
+            "best-of-n",
+            "parent stays free",
         ] {
             assert!(
                 OPERATE_MODE.contains(phrase),
@@ -3460,6 +3360,7 @@ mod tests {
             "risk` is exactly",
             "parallel([() =>",
             "terminal Workflow receipt",
+            "/multitask",
         ] {
             assert!(
                 !OPERATE_MODE.contains(implementation_detail),
@@ -3470,11 +3371,10 @@ mod tests {
 
     #[test]
     fn subagent_done_sentinel_section_present() {
-        assert!(AGENT_MODE.contains("<codewhale:subagent.done>"));
-        assert!(AGENT_MODE.contains("not user input"));
-        assert!(AGENT_MODE.contains("verify load-bearing claims"));
-        assert!(AGENT_MODE.contains("never generate fake sentinels"));
-        assert!(AGENT_MODE.contains("Do not tell the user they pasted sentinels"));
+        assert!(AGENT_MODE.contains("completion events as internal evidence"));
+        assert!(AGENT_MODE.contains("verify load-bearing child"));
+        assert!(AGENT_MODE.contains("never manufacture completion sentinels"));
+        assert!(!AGENT_MODE.contains("<codewhale:subagent.done>"));
     }
 
     #[test]
@@ -3653,6 +3553,45 @@ mod tests {
         assert!(super::render_instructions_block(empty).is_none());
     }
 
+    /// #4632 — The system prompt prefix (the byte-stable part cached by
+    /// inference servers) must never contain private content: absolute
+    /// filesystem paths, API keys, or home-directory references.
+    #[test]
+    fn system_prompt_prefix_never_leaks_private_content() {
+        let tmp = tempdir().expect("tempdir");
+        let workspace = tmp.path();
+        let prompt = match system_prompt_for_mode_with_context(workspace, None) {
+            SystemPrompt::Text(text) => text,
+            SystemPrompt::Blocks(blocks) => blocks
+                .iter()
+                .map(|block| block.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        };
+
+        // No absolute paths (Unix or Windows).
+        let offending: Vec<&str> = prompt
+            .lines()
+            .filter(|line| {
+                line.contains("/Users/") || line.contains("/home/") || line.contains("C:\\")
+            })
+            .collect();
+        assert!(
+            offending.is_empty(),
+            "system prompt must not contain absolute user paths, found: {offending:?}"
+        );
+        // No API key patterns.
+        assert!(
+            !prompt.contains("sk-") && !prompt.contains("api_key") && !prompt.contains("API_KEY"),
+            "system prompt must not contain API key material"
+        );
+        // The workspace path itself must not appear.
+        assert!(
+            !prompt.contains(workspace.to_str().unwrap_or("/nonexistent")),
+            "system prompt must not embed the workspace path"
+        );
+    }
+
     #[test]
     fn render_instructions_block_skips_missing_files_with_warning() {
         let tmp = tempdir().expect("tempdir");
@@ -3820,17 +3759,17 @@ mod tests {
         );
     }
 
-    /// #2953 — the Calm overlay (calm.md) stays out of the default
+    /// #2953 — the Calm overlay (`CALM_PERSONALITY`) stays out of the default
     /// model-prompt path to keep the static prefix slim. Voice and tone
     /// guidance travels via the constitution preamble instead.
     #[test]
     fn default_prompt_does_not_include_calm_personality_overlay() {
         let prompt = compose_prompt(Personality::Calm);
-        let calm_text = include_str!("prompts/personalities/calm.md");
+        let calm_text = CALM_PERSONALITY;
         let first_calm_line = calm_text.lines().find(|l| !l.is_empty()).unwrap_or("");
         assert!(
             !prompt.contains(first_calm_line),
-            "default agent prompt must not include calm.md overlay"
+            "default agent prompt must not include the calm personality overlay"
         );
     }
 
@@ -3975,9 +3914,9 @@ mod tests {
 fn core_execution_profile_is_runtime_only() {
     for required in [
         "repository instructions",
-        "smallest coherent change",
-        "relevant verification",
-        "typed outcome",
+        "inspect the narrow owner",
+        "verify it",
+        "Report changed files",
     ] {
         assert!(CORE_EXECUTION_PROFILE_PROMPT.contains(required));
     }

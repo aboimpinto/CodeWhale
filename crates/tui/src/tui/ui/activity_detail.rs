@@ -260,7 +260,9 @@ fn reasoning_timeline_text(app: &App, selected_cell_index: usize) -> Option<Stri
         };
         if let Some(duration_secs) = duration_secs {
             status.push_str(" · ");
-            status.push_str(&format!("{duration_secs:.1}s"));
+            status.push_str(&crate::elapsed::format_elapsed_ms(
+                (duration_secs * 1000.0) as u64,
+            ));
         }
         sections.push(format!("Thinking chunk {position} of {total}{marker}"));
         sections.push(format!("Status: {status}"));
@@ -322,7 +324,9 @@ fn activity_status_line(cell: &HistoryCell) -> Option<String> {
             };
             if let Some(duration_secs) = duration_secs {
                 line.push_str(" · ");
-                line.push_str(&format!("{duration_secs:.1}s"));
+                line.push_str(&crate::elapsed::format_elapsed_ms(
+                    (duration_secs * 1000.0) as u64,
+                ));
             }
             Some(line)
         }
@@ -331,7 +335,7 @@ fn activity_status_line(cell: &HistoryCell) -> Option<String> {
             let mut line = format!("Status: {}", activity_status_label(status));
             if let Some(duration_ms) = tool_duration_for_activity(tool) {
                 line.push_str(" · ");
-                line.push_str(&format_activity_duration_ms(duration_ms));
+                line.push_str(&crate::elapsed::format_elapsed_ms(duration_ms));
             }
             Some(line)
         }
@@ -400,14 +404,6 @@ fn activity_status_label(status: ToolStatus) -> &'static str {
         ToolStatus::Success => "done",
         ToolStatus::Hydrated => "tool loaded - retry required",
         ToolStatus::Failed => "failed",
-    }
-}
-
-fn format_activity_duration_ms(ms: u64) -> String {
-    if ms < 1000 {
-        format!("{ms}ms")
-    } else {
-        format!("{:.1}s", ms as f64 / 1000.0)
     }
 }
 
@@ -556,30 +552,92 @@ pub(super) fn open_tool_details_pager(app: &mut App) -> bool {
 }
 
 /// Build the trailing "Spillover" section for the tool-details pager
-/// (#500). Returns `None` when the cell at `cell_index` is not a
-/// `GenericToolCell` with a recorded spillover path, or when the
-/// spillover file is missing or unreadable. Failures fall back to a
-/// short notice in the section so the user understands why the full
-/// content can't be loaded — better than silent truncation.
+/// (#500). Session artifact records are authoritative for every tool family
+/// (including specialized Bash and MCP cells); the historical generic-cell
+/// path is only a UI compatibility fallback. The pager deliberately keeps the
+/// backing path and operating-system error private: a detail surface may be
+/// captured or shared, and neither is useful evidence for the user.
 pub(super) fn spillover_pager_section(app: &App, cell_index: usize) -> Option<String> {
     use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell};
 
     let cell = app.cell_at_virtual_index(cell_index)?;
-    let HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
-        spillover_path: Some(path),
-        ..
-    })) = cell
-    else {
+    let current_session = app.current_session_id.as_deref();
+    let session_artifact = app
+        .tool_detail_record_for_cell(cell_index)
+        .and_then(|detail| {
+            app.session_artifacts.iter().find(|artifact| {
+                artifact.kind == crate::artifacts::ArtifactKind::ToolOutput
+                    && artifact.tool_call_id == detail.tool_id
+                    && current_session == Some(artifact.session_id.as_str())
+            })
+        });
+    let legacy_path = match cell {
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            spillover_path: Some(path),
+            ..
+        })) => Some(path.clone()),
+        _ => None,
+    };
+    if session_artifact.is_none() && legacy_path.is_none() {
         return None;
-    };
-    let path_str = path.display().to_string();
-    let body = match std::fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(err) => format!("(could not read spillover file: {err})"),
-    };
-    Some(format!(
-        "── Full output (spillover) ──\nFile: {path_str}\n\n{body}"
-    ))
+    }
+    let body = session_artifact
+        .and_then(read_owned_session_artifact)
+        .or_else(|| {
+            legacy_path.as_deref().and_then(|path| {
+                current_session.and_then(|session_id| read_owned_legacy_spillover(path, session_id))
+            })
+        })
+        .unwrap_or_else(|| "(retained output is unavailable)".to_string());
+    Some(format!("── Full output (spillover) ──\n\n{body}"))
+}
+
+fn read_owned_session_artifact(artifact: &crate::artifacts::ArtifactRecord) -> Option<String> {
+    if artifact.storage_path.is_absolute() {
+        return None;
+    }
+    let root = crate::artifacts::session_artifact_absolute_path(
+        &artifact.session_id,
+        std::path::Path::new(crate::artifacts::ARTIFACTS_DIR_NAME),
+    )?;
+    let candidate = crate::artifacts::session_artifact_absolute_path(
+        &artifact.session_id,
+        &artifact.storage_path,
+    )?;
+    let path = canonical_owned_file(&candidate, &root)?;
+    std::fs::read_to_string(path).ok()
+}
+
+fn read_owned_legacy_spillover(path: &std::path::Path, session_id: &str) -> Option<String> {
+    let root = crate::tools::truncate::spillover_root()?;
+    let path = canonical_owned_file(path, &root)?;
+    let ownership = crate::tools::truncate::read_legacy_spillover_ownership(&path).ok()?;
+    if ownership.origin_session != session_id {
+        return None;
+    }
+    let bytes = std::fs::read(path).ok()?;
+    if ownership.size_bytes != u64::try_from(bytes.len()).unwrap_or(u64::MAX)
+        || ownership.digest != crate::hashing::sha256_hex(&bytes)
+    {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn canonical_owned_file(
+    candidate: &std::path::Path,
+    root: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if std::fs::symlink_metadata(candidate)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let root = root.canonicalize().ok()?;
+    let candidate = candidate.canonicalize().ok()?;
+    (candidate.is_file() && candidate.starts_with(root)).then_some(candidate)
 }
 
 pub(crate) fn open_details_pager_for_cell(app: &mut App, cell_index: usize) -> bool {
@@ -597,15 +655,27 @@ pub(crate) fn open_details_pager_for_cell(app: &mut App, cell_index: usize) -> b
         // stays above as `Output:` so the user can compare what the
         // model received against the full payload.
         let spillover_section = spillover_pager_section(app, cell_index);
+        let mutation_section = match app.cell_at_virtual_index(cell_index) {
+            Some(HistoryCell::Tool(ToolCell::PatchSummary(cell))) => cell
+                .receipt
+                .as_ref()
+                .map(|receipt| format!("── Exact File change ──\n{}", receipt.inspect_text())),
+            _ => None,
+        };
 
         // Frame the body as leaf-level raw detail for the selected item. The
         // Tool ID / Input / Output / spillover content below is unchanged — only
         // the leading intro line is new, so existing raw-output visibility is
         // preserved (#4105).
-        let content = if let Some(section) = spillover_section {
+        let trailing_sections = [mutation_section, spillover_section]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        let content = if !trailing_sections.is_empty() {
             format!(
                 "{RAW_DETAIL_PAGER_INTRO}\n\nTool ID: {}\nTool: {}\n\nInput:\n{}\n\nOutput:\n{}\n\n{}",
-                detail.tool_id, detail.tool_name, input, output, section
+                detail.tool_id, detail.tool_name, input, output, trailing_sections
             )
         } else {
             format!(
@@ -775,7 +845,7 @@ pub(crate) fn detail_target_label(app: &App, cell_index: usize) -> Option<String
             explore.entries.len(),
             if explore.entries.len() == 1 { "" } else { "s" }
         )),
-        HistoryCell::Tool(ToolCell::PlanUpdate(_)) => Some("update Strategy".to_string()),
+        HistoryCell::Tool(ToolCell::PlanUpdate(_)) => Some("legacy plan update".to_string()),
         HistoryCell::Tool(ToolCell::PatchSummary(patch)) => Some(format!("patch {}", patch.path)),
         HistoryCell::Tool(ToolCell::Review(review)) => {
             let target = one_line_summary(&review.target, 80);
@@ -927,7 +997,7 @@ pub(super) fn turn_inspector_text(app: &App) -> String {
         push_section(&mut out, "Selected item", vec![line]);
     }
 
-    push_section(&mut out, "Strategy / To-do", turn_plan_lines(app));
+    push_section(&mut out, "To-do", turn_todo_lines(app));
     push_section(
         &mut out,
         "Turn timeline",
@@ -993,11 +1063,11 @@ pub(crate) fn turn_handoff_markdown(app: &App) -> String {
 
     push_md_section(&mut out, "Intent", vec![turn_intent_line(app, start)]);
 
-    // Strategy / To-do is optional context: include it only when a plan or
-    // To-do tool actually ran, to keep the handoff compact.
-    let plan = turn_plan_lines(app);
-    if !plan.is_empty() {
-        push_md_section(&mut out, "Strategy / To-do", md_bullets(plan));
+    // To-do is optional context: include it only when the canonical list has
+    // items, keeping the handoff compact without recreating a second plan.
+    let todos = turn_todo_lines(app);
+    if !todos.is_empty() {
+        push_md_section(&mut out, "To-do", md_bullets(todos));
     }
 
     push_md_section(
@@ -1108,47 +1178,14 @@ fn selected_item_context_line(app: &App) -> Option<String> {
     Some(format!("{label}{hint}"))
 }
 
-/// Section 2 — Strategy metadata and/or To-do state when those tools ran.
-fn turn_plan_lines(app: &App) -> Vec<String> {
+/// Section 2 — canonical To-do state.
+fn turn_todo_lines(app: &App) -> Vec<String> {
     let mut lines = Vec::new();
-
-    if let Ok(plan) = app.plan_state.try_lock()
-        && !plan.is_empty()
-    {
-        let snapshot = plan.snapshot();
-        let headline = snapshot
-            .title
-            .as_deref()
-            .or(snapshot.objective.as_deref())
-            .map(str::trim)
-            .filter(|s: &&str| !s.is_empty());
-        if let Some(headline) = headline {
-            lines.push(format!(
-                "Strategy: {}",
-                truncate_line_to_width(headline, 64)
-            ));
-        }
-        let (pending, in_progress, completed) = plan.counts();
-        let total = pending + in_progress + completed;
-        if total > 0 {
-            lines.push(format!(
-                "Route steps: {completed}/{total} done ({}%)",
-                plan.progress_percent()
-            ));
-        }
-        for item in &snapshot.items {
-            lines.push(format!(
-                "{} {}",
-                step_status_glyph(&item.status),
-                truncate_line_to_width(&item.step, 72)
-            ));
-        }
-    }
 
     if let Ok(todos) = app.todos.try_lock() {
         let snapshot = todos.snapshot();
         if !snapshot.items.is_empty() {
-            lines.push(format!("To-do: {}% complete", snapshot.completion_pct));
+            lines.push(format!("To-do: {}% settled", snapshot.completion_pct));
             for item in &snapshot.items {
                 lines.push(format!(
                     "{} {}",
@@ -1162,19 +1199,12 @@ fn turn_plan_lines(app: &App) -> Vec<String> {
     lines
 }
 
-fn step_status_glyph(status: &crate::tools::plan::StepStatus) -> &'static str {
-    match status {
-        crate::tools::plan::StepStatus::Completed => "[x]",
-        crate::tools::plan::StepStatus::InProgress => "[~]",
-        crate::tools::plan::StepStatus::Pending => "[ ]",
-    }
-}
-
 fn todo_status_glyph(status: &crate::tools::todo::TodoStatus) -> &'static str {
     match status {
         crate::tools::todo::TodoStatus::Completed => "[x]",
         crate::tools::todo::TodoStatus::InProgress => "[~]",
         crate::tools::todo::TodoStatus::Pending => "[ ]",
+        crate::tools::todo::TodoStatus::Cancelled => "[-]",
     }
 }
 
@@ -1197,7 +1227,8 @@ fn turn_timeline_lines(app: &App, start: usize, end: usize) -> Vec<String> {
             } => {
                 let summary = one_line_summary(content, 88);
                 let status = streaming.then_some("running").unwrap_or("done");
-                let duration = duration_secs.map(|secs| format!("{secs:.1}s"));
+                let duration = duration_secs
+                    .map(|secs| crate::elapsed::format_elapsed_ms((secs * 1000.0) as u64));
                 let actions = timeline_cell_actions(app, idx, cell);
                 rows.push(timeline_row(
                     "reasoning",
@@ -1209,7 +1240,8 @@ fn turn_timeline_lines(app: &App, start: usize, end: usize) -> Vec<String> {
             }
             HistoryCell::Tool(tool) => {
                 let (kind, summary) = timeline_tool_summary(app, idx, tool);
-                let duration = tool_duration_for_activity(tool).map(format_activity_duration_ms);
+                let duration =
+                    tool_duration_for_activity(tool).map(crate::elapsed::format_elapsed_ms);
                 let status = tool_status_for_activity(tool).map(activity_status_label);
                 let actions = timeline_cell_actions(app, idx, cell);
                 rows.push(timeline_row(
@@ -1271,7 +1303,7 @@ fn timeline_tool_summary(app: &App, idx: usize, tool: &ToolCell) -> (&'static st
                 if explore.entries.len() == 1 { "" } else { "s" }
             ),
         ),
-        ToolCell::PlanUpdate(_) => ("Strategy", "Strategy metadata updated".to_string()),
+        ToolCell::PlanUpdate(_) => ("legacy plan", "Legacy plan metadata replayed".to_string()),
         ToolCell::PatchSummary(patch) => {
             let summary = one_line_summary(&patch.summary, 72);
             if summary.is_empty() {

@@ -68,7 +68,7 @@ impl<W: Write> ColorCompatBackend<W> {
             forced_size: None,
             terminal_size: None,
             render_debug: RenderDebugLog::from_env(),
-            ascii_safe: env_flag_enabled(std::env::var(ASCII_SAFE_ENV).ok().as_deref()),
+            ascii_safe: ascii_safe_enabled(),
         }
     }
 
@@ -285,6 +285,14 @@ fn env_flag_enabled(value: Option<&str>) -> bool {
     )
 }
 
+/// Whether terminal chrome must use portable ASCII spellings. Text producers
+/// that would otherwise compose multi-cell Unicode labels share this decision
+/// with the backend's single-cell glyph adapter.
+#[must_use]
+pub(crate) fn ascii_safe_enabled() -> bool {
+    env_flag_enabled(std::env::var(ASCII_SAFE_ENV).ok().as_deref())
+}
+
 /// Narrow every CodeWhale-authored decorative glyph to a semantic ASCII
 /// alternative. Scope is deliberate: box drawing, block elements (whale
 /// mark, meters, rails), braille state markers, geometric role/state marks,
@@ -455,6 +463,7 @@ mod tests {
             ("│", "|"),
             ("┌", "+"),
             ("▶", ">"),
+            ("▷", ">"),
             ("▼", "v"),
             ("✓", "Y"),
             ("✕", "X"),

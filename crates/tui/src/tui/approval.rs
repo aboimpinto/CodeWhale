@@ -30,6 +30,7 @@
 use crate::localization::{Locale, MessageId, tr};
 use crate::sandbox::SandboxPolicy;
 use crate::tools::apply_patch::{NormalizedApplyPatchInput, normalize_apply_patch_input};
+use crate::tools::canonical_action::canonical_action_alias;
 use crate::tui::views::{ModalKind, ModalView, ViewAction, ViewEvent};
 use crate::tui::widgets::{ApprovalWidget, ElevationWidget, Renderable};
 use codewhale_config::ToolAskRule;
@@ -44,7 +45,8 @@ use std::time::{Duration, Instant};
 pub mod policy;
 
 pub use policy::{
-    ApprovalStakes, RiskLevel, ToolCategory, classify_risk, classify_stakes, get_tool_category,
+    ApprovalStakes, RiskLevel, ToolCategory, classify_risk, classify_stakes,
+    get_tool_category_for_call,
 };
 
 /// Determines when tool executions require user approval
@@ -227,7 +229,8 @@ impl ApprovalRequest {
         intent_summary: Option<&str>,
         workspace: &Path,
     ) -> Self {
-        let category = get_tool_category(tool_name);
+        let semantic_tool_name = canonical_action_alias(tool_name, params);
+        let category = get_tool_category_for_call(tool_name, params);
         let risk = classify_risk(tool_name, category, params);
         let approval_grouping_key =
             crate::tools::approval_cache::build_approval_grouping_key(tool_name, params).0;
@@ -238,7 +241,7 @@ impl ApprovalRequest {
             description: description.to_string(),
             category,
             risk,
-            impacts: build_impact_summary(tool_name, category, params),
+            impacts: build_impact_summary(semantic_tool_name, category, params),
             params: params.clone(),
             approval_key: approval_key.to_string(),
             approval_grouping_key,
@@ -250,7 +253,7 @@ impl ApprovalRequest {
                     Some(summary.to_string())
                 }
             }),
-            persistent_ask_rules: build_persistent_ask_rules(tool_name, params, workspace),
+            persistent_ask_rules: build_persistent_ask_rules(semantic_tool_name, params, workspace),
         }
     }
 
@@ -271,9 +274,10 @@ impl ApprovalRequest {
     }
 
     pub fn impacts_for_locale(&self, locale: Locale) -> Vec<String> {
+        let semantic_tool_name = canonical_action_alias(&self.tool_name, &self.params);
         match locale {
             Locale::ZhHans => {
-                build_impact_summary_zh_hans(&self.tool_name, self.category, &self.params)
+                build_impact_summary_zh_hans(semantic_tool_name, self.category, &self.params)
             }
             _ => self.impacts.clone(),
         }
@@ -307,15 +311,16 @@ impl ApprovalRequest {
     /// Extract the most important params for the approval card.
     #[must_use]
     pub fn prominent_detail_items(&self, locale: Locale) -> Vec<ApprovalDetail> {
-        build_prominent_details(&self.tool_name, self.category, &self.params)
+        let semantic_tool_name = canonical_action_alias(&self.tool_name, &self.params);
+        build_prominent_details(semantic_tool_name, self.category, &self.params)
             .into_iter()
             .map(|mut detail| {
                 let is_preview = detail.label == "Preview";
                 detail.label = localize_detail_label(&detail.label, locale).to_string();
                 if is_preview && let Some(lines) = detail.shell_lines.as_mut() {
                     for line in lines.iter_mut() {
-                        *line =
-                            localize_preview_shell_line(&self.tool_name, line, locale).to_string();
+                        *line = localize_preview_shell_line(semantic_tool_name, line, locale)
+                            .to_string();
                     }
                     detail.value = lines.join("\n");
                 }
@@ -778,12 +783,9 @@ fn file_write_preview_lines(tool_name: &str, params: &Value) -> Option<Vec<Strin
             ))
         }
         "edit_file" => {
-            let search = param_text(params, &["search"])?;
-            let replace = param_text(params, &["replace"])?;
-            let mut lines = Vec::new();
-            lines.extend(prefixed_preview_lines("replace this", "- ", &search, 3));
-            lines.extend(prefixed_preview_lines("with this", "+ ", &replace, 3));
-            Some(lines)
+            // Keep the per-frame card preview bounded. The details pager builds the
+            // complete version lazily when the reviewer asks for it.
+            edit_file_preview_lines(params, 3)
         }
         "apply_patch" => match normalize_apply_patch_input(params) {
             Ok(NormalizedApplyPatchInput::Patch(patch)) => apply_patch_preview_lines(patch),
@@ -795,6 +797,75 @@ fn file_write_preview_lines(tool_name: &str, params: &Value) -> Option<Vec<Strin
         _ => None,
     }
     .filter(|lines| !lines.is_empty())
+}
+
+fn edit_file_preview_lines(params: &Value, max_lines: usize) -> Option<Vec<String>> {
+    let search = param_text(params, &["search"])?;
+    let replace = param_text(params, &["replace"])?;
+    let mut lines = Vec::new();
+    lines.extend(prefixed_preview_lines(
+        "replace this",
+        "- ",
+        &search,
+        max_lines,
+    ));
+    lines.extend(prefixed_preview_lines(
+        "with this",
+        "+ ",
+        &replace,
+        max_lines,
+    ));
+    Some(lines)
+}
+
+fn exact_edit_file_preview_lines(params: &Value, locale: Locale) -> Option<Vec<String>> {
+    let search = param_text(params, &["search"])?;
+    let replace = param_text(params, &["replace"])?;
+    let mut lines = vec![tr(locale, MessageId::ApprovalLabelReplaceThis).into_owned()];
+    lines.extend(exact_preview_body_lines("- ", &search));
+    lines.push(tr(locale, MessageId::ApprovalLabelWithThis).into_owned());
+    lines.extend(exact_preview_body_lines("+ ", &replace));
+    Some(lines)
+}
+
+fn exact_preview_body_lines(prefix: &str, content: &str) -> Vec<String> {
+    if content.is_empty() {
+        return vec![format!("{prefix}\"\"")];
+    }
+
+    content
+        .split_inclusive('\n')
+        .map(|chunk| {
+            let (body, ending) = if let Some(body) = chunk.strip_suffix("\r\n") {
+                (body, "\\r\\n")
+            } else if let Some(body) = chunk.strip_suffix('\n') {
+                (body, "\\n")
+            } else {
+                (chunk, "")
+            };
+            exact_preview_body_line(prefix, body, ending)
+        })
+        .collect()
+}
+
+fn exact_preview_body_line(prefix: &str, body: &str, ending: &str) -> String {
+    let mut line = String::with_capacity(prefix.len() + body.len() + ending.len() + 2);
+    line.push_str(prefix);
+    line.push('"');
+    for ch in body.chars() {
+        match ch {
+            '\\' => line.push_str("\\\\"),
+            '"' => line.push_str("\\\""),
+            ' ' => line.push_str("\\x20"),
+            '\t' => line.push_str("\\t"),
+            '\r' => line.push_str("\\r"),
+            ch if ch.is_whitespace() || ch.is_control() => line.extend(ch.escape_unicode()),
+            ch => line.push(ch),
+        }
+    }
+    line.push_str(ending);
+    line.push('"');
+    line
 }
 
 fn prefixed_preview_lines(
@@ -1337,6 +1408,17 @@ impl ApprovalView {
             content.push('\n');
         }
         content.push('\n');
+        if canonical_action_alias(&self.request.tool_name, &self.request.params) == "edit_file"
+            && let Some(preview_lines) = exact_edit_file_preview_lines(&self.request.params, locale)
+        {
+            content.push_str(&tr(locale, MessageId::ApprovalLabelPreview));
+            content.push_str(":\n");
+            for line in preview_lines {
+                content.push_str(&line);
+                content.push('\n');
+            }
+            content.push('\n');
+        }
         content.push_str(
             &serde_json::to_string_pretty(&self.request.params)
                 .unwrap_or_else(|_| self.request.params.to_string()),
@@ -1755,6 +1837,7 @@ impl ModalView for ElevationView {
 
 #[cfg(test)]
 mod tests {
+    use super::policy::get_tool_category;
     use super::*;
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
@@ -3012,6 +3095,89 @@ diff --git a/src/b.rs b/src/b.rs
     }
 
     #[test]
+    fn edit_file_details_pager_includes_complete_search_replace_preview() {
+        let request = ApprovalRequest::new(
+            "test-id",
+            "edit_file",
+            "Edit a file on disk",
+            &json!({
+                "path": "src/lib.rs",
+                "search": "  old_1();\r\n\told_2();\nold  3();\nold_4();\nold_5();\n",
+                "replace": "\tnew_1();\nnew  2();\r\nnew_3();\nnew_4();\nnew_5();"
+            }),
+            "tool:edit_file",
+        );
+        let mut view = ApprovalView::new(request);
+
+        let action = view.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+        let ViewAction::Emit(ViewEvent::OpenTextPager { content, .. }) = action else {
+            panic!("Alt+V should open the edit details pager");
+        };
+
+        let expected_preview = [
+            "Preview:",
+            "replace this",
+            "- \"\\x20\\x20old_1();\\r\\n\"",
+            "- \"\\told_2();\\n\"",
+            "- \"old\\x20\\x203();\\n\"",
+            "- \"old_4();\\n\"",
+            "- \"old_5();\\n\"",
+            "with this",
+            "+ \"\\tnew_1();\\n\"",
+            "+ \"new\\x20\\x202();\\r\\n\"",
+            "+ \"new_3();\\n\"",
+            "+ \"new_4();\\n\"",
+            "+ \"new_5();\"",
+        ]
+        .join("\n");
+        assert!(
+            content.contains(&expected_preview),
+            "details pager omitted part of the edit preview:\n{content}"
+        );
+
+        let pager = crate::tui::pager::PagerView::from_text("Tool Params", &content, 200);
+        let displayed = pager.body_text();
+        assert!(
+            displayed.contains(&expected_preview),
+            "details pager display changed exact whitespace or line endings:\n{displayed}"
+        );
+    }
+
+    #[test]
+    fn edit_file_details_pager_localizes_preview_headers_for_every_locale() {
+        for &locale in Locale::shipped() {
+            let request = ApprovalRequest::new(
+                "test-id",
+                "edit_file",
+                "Edit a file on disk",
+                &json!({
+                    "path": "src/lib.rs",
+                    "search": "old();",
+                    "replace": "new();"
+                }),
+                "tool:edit_file",
+            );
+            let mut view = ApprovalView::new_for_locale(request, locale);
+
+            let action = view.handle_key(KeyEvent::new(KeyCode::Char('v'), KeyModifiers::ALT));
+            let ViewAction::Emit(ViewEvent::OpenTextPager { content, .. }) = action else {
+                panic!("Alt+V should open the edit details pager for {locale:?}");
+            };
+            let expected_headers = format!(
+                "{}:\n{}\n- \"old();\"\n{}\n+ \"new();\"",
+                tr(locale, MessageId::ApprovalLabelPreview),
+                tr(locale, MessageId::ApprovalLabelReplaceThis),
+                tr(locale, MessageId::ApprovalLabelWithThis),
+            );
+
+            assert!(
+                content.contains(&expected_headers),
+                "details pager did not localize edit preview headers for {locale:?}:\n{content}"
+            );
+        }
+    }
+
+    #[test]
     fn test_approval_view_current_decision_mapping() {
         let mut view = ApprovalView::new(benign_request());
 
@@ -3973,5 +4139,100 @@ diff --git a/src/b.rs b/src/b.rs
             Some(ApprovalMode::Never)
         );
         assert_eq!(ApprovalMode::from_config_value("unknown"), None);
+    }
+
+    #[test]
+    fn canonical_bash_keeps_original_name_but_uses_shell_approval_semantics() {
+        let request = ApprovalRequest::new_with_intent(
+            "bash-1",
+            "Bash",
+            "Run command",
+            &json!({"action": "run", "command": "cargo test", "cwd": "/workspace"}),
+            "tool:Bash",
+            None,
+            Path::new("/workspace"),
+        );
+
+        assert_eq!(request.tool_name, "Bash");
+        assert_eq!(request.category, ToolCategory::Shell);
+        assert_eq!(request.risk, RiskLevel::Destructive);
+        assert_eq!(
+            request.persistent_ask_rules,
+            vec![ToolAskRule::exec_shell("cargo test")]
+        );
+        let details = request.prominent_detail_items(Locale::En);
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.label == "Command" && detail.value == "cargo test")
+        );
+    }
+
+    #[test]
+    fn canonical_file_mutations_get_legacy_previews_and_scoped_ask_rules() {
+        let cases = [
+            (
+                "write",
+                json!({
+                    "action": "write",
+                    "path": "/workspace/src/lib.rs",
+                    "content": "pub fn whale() {}\n"
+                }),
+                "write_file",
+                "+ pub fn whale() {}",
+            ),
+            (
+                "edit",
+                json!({
+                    "action": "edit",
+                    "path": "/workspace/src/lib.rs",
+                    "search": "old",
+                    "replace": "new"
+                }),
+                "edit_file",
+                "- old",
+            ),
+            (
+                "patch",
+                json!({
+                    "action": "patch",
+                    "patch": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+                }),
+                "apply_patch",
+                "-old",
+            ),
+        ];
+
+        for (action, params, rule_tool, preview_fragment) in cases {
+            let request = ApprovalRequest::new_with_intent(
+                action,
+                "File",
+                "Mutate file",
+                &params,
+                "tool:File",
+                None,
+                Path::new("/workspace"),
+            );
+            assert_eq!(request.tool_name, "File", "{action}");
+            assert_eq!(request.category, ToolCategory::FileWrite, "{action}");
+            assert_eq!(request.risk, RiskLevel::Destructive, "{action}");
+            assert!(
+                request
+                    .persistent_ask_rules
+                    .iter()
+                    .any(|rule| rule.tool == rule_tool),
+                "{action}: {:?}",
+                request.persistent_ask_rules
+            );
+            let preview = request
+                .prominent_detail_items(Locale::En)
+                .into_iter()
+                .find(|detail| detail.label == "Preview")
+                .expect("canonical file mutation must show a preview");
+            assert!(
+                preview.value.contains(preview_fragment),
+                "{action}: {preview:?}"
+            );
+        }
     }
 }

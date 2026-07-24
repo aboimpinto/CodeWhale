@@ -22,6 +22,7 @@
 #![allow(unused_imports)]
 
 mod compat;
+mod digest;
 mod events;
 mod ids;
 mod liveness;
@@ -35,6 +36,7 @@ mod validate;
 mod tests;
 
 pub use compat::{PlanProjection, TodoProjection, project_plan, project_todos};
+pub use digest::{format_operation_digest, format_operation_digest_parts};
 pub use events::{
     ApprovalRef, CancelOutcome, ChangeCtx, ChangeReceipt, ObservationSummary, OperationObservation,
     OwnerState, ProposedNodeUpdate, WorkGraphChange, WorkGraphProposal, WorkNodePatch,

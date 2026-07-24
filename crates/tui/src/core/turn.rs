@@ -35,7 +35,6 @@ pub struct TurnContext {
     pub max_steps: u32,
 
     /// Number of tool calls made in this turn.
-    tool_call_count: usize,
 
     /// Whether the turn has been cancelled
     #[allow(dead_code)]
@@ -58,7 +57,6 @@ impl TurnContext {
             started_at: Instant::now(),
             step: 0,
             max_steps,
-            tool_call_count: 0,
             cancelled: false,
             usage: Usage {
                 input_tokens: 0,
@@ -78,16 +76,6 @@ impl TurnContext {
     /// Check if the turn has reached max steps
     pub fn at_max_steps(&self) -> bool {
         self.step >= self.max_steps
-    }
-
-    /// Record that a tool call occurred.
-    pub fn record_tool_call(&mut self) {
-        self.tool_call_count += 1;
-    }
-
-    /// Whether this turn has executed at least one tool call.
-    pub fn has_tool_calls(&self) -> bool {
-        self.tool_call_count > 0
     }
 
     /// Cancel the turn

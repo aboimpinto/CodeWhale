@@ -5,10 +5,9 @@
 //! exposed by [`crate::palette`], keeping the older module path for source
 //! compatibility.
 //!
-//! The only consumers today are the plan and tool cell renderers in
-//! [`crate::tui::history`] and the sidebar section chrome in
-//! [`crate::tui::ui`]. All other call sites continue to use [`crate::palette`]
-//! directly until they are migrated in a later slice.
+//! The only consumers today are tool cell renderers in [`crate::tui::history`]
+//! and sidebar section chrome in [`crate::tui::ui`]. All other call sites
+//! continue to use [`crate::palette`] directly until they are migrated.
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{BorderType, Borders, Padding};
@@ -25,7 +24,7 @@ pub enum Variant {
     Grayscale,
 }
 
-/// Centralized visual tokens for sidebar, plan, and tool rendering.
+/// Centralized visual tokens for sidebar and tool rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Theme {
     pub variant: Variant,
@@ -45,14 +44,6 @@ pub struct Theme {
     pub tool_running_accent: Color,
     pub tool_success_accent: Color,
     pub tool_failed_accent: Color,
-
-    // Plan cell color tokens
-    pub plan_progress_color: Color,
-    pub plan_summary_color: Color,
-    pub plan_explanation_color: Color,
-    pub plan_pending_color: Color,
-    pub plan_in_progress_color: Color,
-    pub plan_completed_color: Color,
 }
 
 impl Theme {
@@ -78,12 +69,6 @@ impl Theme {
             tool_running_accent: palette::ACCENT_TOOL_LIVE,
             tool_success_accent: palette::STATUS_SUCCESS,
             tool_failed_accent: palette::STATUS_ERROR,
-            plan_progress_color: palette::STATUS_SUCCESS,
-            plan_summary_color: palette::TEXT_MUTED,
-            plan_explanation_color: palette::TEXT_DIM,
-            plan_pending_color: palette::TEXT_MUTED,
-            plan_in_progress_color: palette::MODE_PLAN,
-            plan_completed_color: palette::STATUS_SUCCESS,
         }
     }
 
@@ -104,12 +89,6 @@ impl Theme {
             tool_running_accent: palette::LIGHT_LIVE,
             tool_success_accent: palette::LIGHT_SUCCESS_FG,
             tool_failed_accent: palette::LIGHT_DANGER,
-            plan_progress_color: palette::LIGHT_SUCCESS_FG,
-            plan_summary_color: palette::LIGHT_TEXT_MUTED,
-            plan_explanation_color: palette::LIGHT_TEXT_HINT,
-            plan_pending_color: palette::LIGHT_TEXT_MUTED,
-            plan_in_progress_color: palette::LIGHT_MODE_PLAN,
-            plan_completed_color: palette::LIGHT_SUCCESS_FG,
         }
     }
 
@@ -130,12 +109,6 @@ impl Theme {
             tool_running_accent: palette::SOLARIZED_BLUE,
             tool_success_accent: palette::SOLARIZED_CYAN,
             tool_failed_accent: palette::SOLARIZED_RED,
-            plan_progress_color: palette::SOLARIZED_BLUE,
-            plan_summary_color: palette::SOLARIZED_TEXT_MUTED,
-            plan_explanation_color: palette::SOLARIZED_TEXT_DIM,
-            plan_pending_color: palette::SOLARIZED_TEXT_MUTED,
-            plan_in_progress_color: palette::SOLARIZED_CYAN,
-            plan_completed_color: palette::SOLARIZED_BLUE,
         }
     }
 
@@ -156,12 +129,6 @@ impl Theme {
             tool_running_accent: palette::GRAYSCALE_TEXT_SOFT,
             tool_success_accent: palette::GRAYSCALE_TEXT_HINT,
             tool_failed_accent: palette::GRAYSCALE_TEXT_BODY,
-            plan_progress_color: palette::GRAYSCALE_TEXT_SOFT,
-            plan_summary_color: palette::GRAYSCALE_TEXT_MUTED,
-            plan_explanation_color: palette::GRAYSCALE_TEXT_HINT,
-            plan_pending_color: palette::GRAYSCALE_TEXT_MUTED,
-            plan_in_progress_color: palette::GRAYSCALE_TEXT_BODY,
-            plan_completed_color: palette::GRAYSCALE_TEXT_SOFT,
         }
     }
 
@@ -243,7 +210,6 @@ mod tests {
         assert_eq!(theme.tool_running_accent, palette::ACCENT_TOOL_LIVE);
         assert_eq!(theme.tool_success_accent, palette::STATUS_SUCCESS);
         assert_eq!(theme.tool_failed_accent, palette::STATUS_ERROR);
-        assert_eq!(theme.plan_in_progress_color, palette::MODE_PLAN);
     }
 
     #[test]
@@ -257,7 +223,6 @@ mod tests {
         assert_eq!(theme.section_title_color, palette::LIGHT_ACTION);
         assert_eq!(theme.tool_running_accent, palette::LIGHT_LIVE);
         assert_eq!(theme.tool_success_accent, palette::LIGHT_SUCCESS_FG);
-        assert_eq!(theme.plan_summary_color, palette::LIGHT_TEXT_MUTED);
     }
 
     #[test]
@@ -268,22 +233,6 @@ mod tests {
         assert_eq!(theme.section_border_color, palette::GRAYSCALE_BORDER);
         assert_eq!(theme.tool_running_accent, palette::GRAYSCALE_TEXT_SOFT);
         assert_eq!(theme.tool_failed_accent, palette::GRAYSCALE_TEXT_BODY);
-        assert_eq!(theme.plan_summary_color, palette::GRAYSCALE_TEXT_MUTED);
-    }
-
-    #[test]
-    fn every_theme_distinguishes_active_and_completed_plan_steps() {
-        for (name, theme) in [
-            ("dark", Theme::dark()),
-            ("light", Theme::light()),
-            ("solarized-light", Theme::solarized_light()),
-            ("grayscale", Theme::grayscale()),
-        ] {
-            assert_ne!(
-                theme.plan_in_progress_color, theme.plan_completed_color,
-                "{name} must keep active and completed Plan steps visually distinct"
-            );
-        }
     }
 
     #[test]

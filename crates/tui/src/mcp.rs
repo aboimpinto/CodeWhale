@@ -20,6 +20,7 @@ use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use sha2::Digest as _;
 
+pub mod external_import;
 mod headers;
 pub mod oauth;
 mod sse;
@@ -1528,7 +1529,7 @@ fn find_sse_event_separator(buffer: &str) -> Option<(usize, usize)> {
     }
 }
 
-/// Byte-oriented twin of [`find_sse_event_separator`]. Used by the SSE
+/// Byte-oriented twin of `find_sse_event_separator`. Used by the SSE
 /// transport so it can accumulate RAW bytes and decode only complete event
 /// blocks — a multi-byte UTF-8 char split across two network reads is never
 /// corrupted to U+FFFD (the `\n`/`\r` separators are ASCII and can never fall

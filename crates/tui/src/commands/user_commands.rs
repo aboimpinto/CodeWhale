@@ -2,11 +2,13 @@
 //! workspace-local `<workspace>/.codewhale/commands/<name>.md`.
 //!
 //! Users drop `.md` files into a commands directory and the filename
-//! (without `.md` extension) becomes a slash command. When invoked via
-//! `/name`, the file contents are sent as a user message.
+//! (without `.md` extension) becomes the default slash-command name. A
+//! frontmatter `name` may replace it. When invoked, the file contents are sent
+//! as a user message.
 //!
 //! Files may include optional YAML-like frontmatter between `---` markers.
-//! Supported fields are `description`, `argument-hint`, `allowed-tools`, and `pausable`.
+//! Supported fields are `name`, `description`, `usage`, `arguments`,
+//! `argument-hint`, `allowed-tools`, `pausable`, `alias`/`aliases`, and `hidden`.
 //! Frontmatter is stripped before the command body is sent to the model.
 //!
 //! ## Precedence
@@ -60,6 +62,76 @@ pub(crate) fn commands_dirs(workspace: Option<&Path>) -> Vec<PathBuf> {
     dirs.push(global_commands_dir());
     dirs.push(legacy_global_commands_dir());
     dirs
+}
+
+/// Saved-workflow slash commands (#4121 packaging): `*.workflow.js` files
+/// under these directories become `/name` commands that start the workflow
+/// through the `workflow` tool with the slash arguments forwarded as the
+/// run's `args`. Workspace definitions shadow the user-global store.
+pub(crate) fn workflow_dirs(workspace: Option<&Path>) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(ws) = workspace {
+        dirs.push(ws.join(".codewhale").join("workflows"));
+    }
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("~"));
+    dirs.push(home.join(".codewhale").join("workflows"));
+    dirs
+}
+
+/// Canonical saved-workflow source suffix.
+pub(crate) const WORKFLOW_SOURCE_SUFFIX: &str = ".workflow.js";
+
+/// Scan one workflow directory and synthesize a markdown command definition
+/// per `*.workflow.js` file. Returns `(name, content, source_path)` tuples;
+/// unreadable entries are skipped.
+pub(crate) fn load_workflow_commands_from_dir(dir: &Path) -> Vec<(String, String, PathBuf)> {
+    let mut commands = Vec::new();
+    if !dir.is_dir() {
+        return commands;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return commands;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(stem) = file_name.strip_suffix(WORKFLOW_SOURCE_SUFFIX) else {
+            continue;
+        };
+        let name = stem.to_lowercase();
+        if name.is_empty() {
+            continue;
+        }
+        let description = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|source| workflow_headline(&source))
+            .unwrap_or_else(|| format!("Run the saved workflow {name}"));
+        let content = synthesize_workflow_command(&name, &description, &path);
+        commands.push((name, content, path));
+    }
+    commands.sort_by(|a, b| a.0.cmp(&b.0));
+    commands
+}
+
+/// First `//` comment line of a workflow source, used as the command
+/// description in palettes and help.
+fn workflow_headline(source: &str) -> Option<String> {
+    source.lines().find_map(|line| {
+        let comment = line.trim().strip_prefix("//")?.trim();
+        (!comment.is_empty()).then(|| comment.split_whitespace().collect::<Vec<_>>().join(" "))
+    })
+}
+
+fn synthesize_workflow_command(name: &str, description: &str, path: &Path) -> String {
+    // Frontmatter values must stay single-line; the headline is already one
+    // line but defend against pathological sources.
+    let description = description.replace(['\r', '\n'], " ");
+    format!(
+        "---\ndescription: {description}\nusage: /{name} [args...]\narguments: forwarded to the workflow run's args\n---\nStart the saved workflow `{name}` now: call the `workflow` tool with action=\"start\", source_path=\"{path}\", and args built from this argument text: $ARGUMENTS\nIf the argument text is empty, start the run without args. Report the run_id, monitor with the workflow tool's status action, and when the run settles present its receipt summary (status, phases, failures, artifacts). The durable report lands under .codewhale/reports/<run_id>.md.",
+        path = path.display(),
+    )
 }
 
 /// Scan a single commands directory for `.md` files and return
@@ -685,6 +757,7 @@ mod tests {
             app.plan_state
                 .try_lock()
                 .expect("plan_state lock")
+                .snapshot()
                 .is_empty(),
             "previous command's plan must be cleared on new command dispatch"
         );
@@ -794,5 +867,23 @@ mod tests {
             "Scan nested git repositories".to_string()
         )));
         assert!(metadata.contains(&("argument-hint".to_string(), "<root>".to_string())));
+    }
+
+    #[test]
+    fn parser_preserves_layer_5_1_frontmatter_fields() {
+        let (metadata, body) = parse_frontmatter(
+            "---\nname: inspect\ndescription: Inspect a target\nusage: /inspect <path>\narguments: <path>\nhidden: false\nallowed-tools: Read_File, Grep_Files\n---\ninspect $ARGUMENTS",
+        );
+
+        assert!(metadata.contains(&("name".to_string(), "inspect".to_string())));
+        assert!(metadata.contains(&("description".to_string(), "Inspect a target".to_string())));
+        assert!(metadata.contains(&("usage".to_string(), "/inspect <path>".to_string())));
+        assert!(metadata.contains(&("arguments".to_string(), "<path>".to_string())));
+        assert!(metadata.contains(&("hidden".to_string(), "false".to_string())));
+        assert!(metadata.contains(&(
+            "allowed-tools".to_string(),
+            "Read_File, Grep_Files".to_string()
+        )));
+        assert_eq!(body, "inspect $ARGUMENTS");
     }
 }

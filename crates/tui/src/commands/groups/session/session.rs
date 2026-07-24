@@ -298,13 +298,18 @@ pub fn load(app: &mut App, path: Option<&str>) -> CommandResult {
     CommandResult::action(crate::tui::app::AppAction::LoadSession(load_path))
 }
 
-/// Trigger context compaction
-pub fn compact(_app: &mut App) -> CommandResult {
-    // Trigger immediate compaction via engine
-    CommandResult::with_message_and_action(
-        "Context compaction triggered...".to_string(),
-        AppAction::CompactContext,
-    )
+/// Trigger context compaction. An optional argument becomes the summary
+/// focus (`/compact the auth refactor`), forwarded into the successor brief.
+pub fn compact(_app: &mut App, arg: Option<&str>) -> CommandResult {
+    let focus = arg
+        .map(str::trim)
+        .filter(|focus| !focus.is_empty())
+        .map(str::to_string);
+    let receipt = match focus.as_deref() {
+        Some(focus) => format!("Context compaction triggered (focus: {focus})..."),
+        None => "Context compaction triggered...".to_string(),
+    };
+    CommandResult::with_message_and_action(receipt, AppAction::CompactContext { focus })
 }
 
 /// Trigger agent-driven context purging.
@@ -776,6 +781,9 @@ mod tests {
             elapsed_since_output_ms: None,
             owner_agent_id: None,
             owner_agent_name: None,
+            current_tool: None,
+            role: None,
+            files_touched: 0,
         });
 
         let result = load(&mut app, Some("does-not-exist.json"));
@@ -1110,11 +1118,40 @@ mod tests {
         let tmpdir = TempDir::new().unwrap();
         let mut app = create_test_app_with_tmpdir(&tmpdir);
 
-        let result = compact(&mut app);
+        let result = compact(&mut app, None);
         assert!(result.message.is_some());
         let msg = result.message.unwrap();
         assert!(msg.contains("compaction") || msg.contains("Compact"));
-        assert!(matches!(result.action, Some(AppAction::CompactContext)));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::CompactContext { focus: None })
+        ));
+    }
+
+    #[test]
+    fn compact_command_forwards_a_trimmed_focus_argument() {
+        let tmpdir = TempDir::new().unwrap();
+        let mut app = create_test_app_with_tmpdir(&tmpdir);
+
+        let result = compact(&mut app, Some("  the auth refactor  "));
+        assert!(matches!(
+            result.action,
+            Some(AppAction::CompactContext { focus: Some(ref focus) }) if focus == "the auth refactor"
+        ));
+        assert!(
+            result
+                .message
+                .as_deref()
+                .is_some_and(|msg| msg.contains("focus: the auth refactor")),
+            "{result:?}"
+        );
+
+        // Whitespace-only arguments behave like no focus at all.
+        let blank = compact(&mut app, Some("   "));
+        assert!(matches!(
+            blank.action,
+            Some(AppAction::CompactContext { focus: None })
+        ));
     }
 
     #[test]

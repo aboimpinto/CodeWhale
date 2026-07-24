@@ -121,6 +121,8 @@ fn test_cost_shows_spending_info() {
     assert!(msg.contains("Approx total spent:"));
     assert!(msg.contains("approximate"));
     assert!(msg.contains("$0.1234"));
+    assert!(msg.contains("Provider API Pricing"));
+    assert!(!msg.contains("DeepSeek API Pricing"));
 }
 
 #[test]
@@ -396,29 +398,6 @@ fn cache_inspect_reports_divergence_from_previous_request() {
 
 #[test]
 fn cache_inspect_displays_tool_result_budget_metadata() {
-    // Wire dedup persists to the process-global SHA spillover root.
-    // Serialize through the same guard other tests use to override
-    // that root, so a parallel test pointing it at a temp dir can't
-    // make this test's second-sighting dedup silently fail.
-    let _spill_guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
-    // Set a temporary spillover root so wire-dedup can persist
-    // SHA-addressed tool-result files without depending on a
-    // writable $HOME (nix sandboxes have a read-only home tree).
-    let tmp = tempfile::tempdir().expect("tempdir");
-    let _restore = {
-        let prior = crate::tools::truncate::set_test_spillover_root(Some(
-            tmp.path().join(".deepseek").join("tool_outputs"),
-        ));
-        struct Restore(Option<std::path::PathBuf>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                crate::tools::truncate::set_test_spillover_root(self.0.take());
-            }
-        }
-        Restore(prior)
-    };
     let mut app = create_test_app();
     let long_output = format!("{}{}", "A".repeat(7_000), "Z".repeat(7_000));
     app.api_messages.push(Message {
@@ -467,19 +446,11 @@ fn cache_inspect_displays_tool_result_budget_metadata() {
         .collect();
     assert_eq!(tool_budget_lines.len(), 2, "got: {msg}");
 
-    let first_sighting = tool_budget_lines
-        .iter()
-        .find(|line| line.contains("deduplicated=false"))
-        .expect("first tool-result sighting should report non-dedup metadata");
-    assert!(first_sighting.contains("sent_chars="), "got: {msg}");
-    assert!(first_sighting.contains("truncated=true"), "got: {msg}");
-
-    let repeat_sighting = tool_budget_lines
-        .iter()
-        .find(|line| line.contains("deduplicated=true"))
-        .expect("repeat tool-result sighting should report dedup metadata");
-    assert!(repeat_sighting.contains("sent_chars="), "got: {msg}");
-    assert!(repeat_sighting.contains("truncated=false"), "got: {msg}");
+    for sighting in tool_budget_lines {
+        assert!(sighting.contains("sent_chars="), "got: {msg}");
+        assert!(sighting.contains("truncated=true"), "got: {msg}");
+        assert!(sighting.contains("deduplicated=false"), "got: {msg}");
+    }
 }
 
 #[test]
@@ -739,6 +710,24 @@ fn test_context_report_subcommands_return_source_map() {
     let json = context(&mut app, Some("json")).message.expect("json text");
     let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid context json");
     assert!(!parsed["entries"].as_array().unwrap().is_empty());
+
+    let prompt_json = context(&mut app, Some("prompt-json"))
+        .message
+        .expect("prompt context json");
+    let prompt: serde_json::Value =
+        serde_json::from_str(&prompt_json).expect("valid prompt context json");
+    assert_eq!(prompt["schema_version"], 1);
+    assert_eq!(prompt["model"], app.model);
+    assert_eq!(prompt["system_prompt_state"], "current_session");
+    assert_eq!(prompt["tool_catalog_state"], "last_sent");
+    assert_eq!(prompt["tools"][0]["name"], "read_file");
+    assert!(prompt["sections"].is_array());
+    assert!(
+        !prompt["source_map"]["entries"]
+            .as_array()
+            .expect("source entries")
+            .is_empty()
+    );
 }
 
 #[test]

@@ -5,7 +5,7 @@
 //! - Background process execution
 //! - Process output retrieval
 //! - Process termination
-//! - Sandbox support (macOS Seatbelt)
+//! - Sandbox support (macOS Seatbelt and opt-in Linux bubblewrap)
 //! - Streaming output (future)
 
 use anyhow::{Context, Result, anyhow};
@@ -1094,11 +1094,16 @@ impl ShellManager {
 
     /// Enable or disable bubblewrap passthrough (#2184).
     ///
-    /// When enabled and `/usr/bin/bwrap` is present on Linux, exec_shell
+    /// When enabled and `/usr/bin/bwrap` is executable on Linux, exec_shell
     /// commands are routed through bubblewrap for filesystem isolation.
-    #[allow(dead_code)] // Wired from EngineConfig in follow-up PR
     pub fn set_prefer_bwrap(&mut self, prefer: bool) {
         self.sandbox_manager.set_prefer_bwrap(prefer);
+    }
+
+    /// Return the OS sandbox wrapper this shell manager is configured and able
+    /// to apply to commands.
+    pub fn configured_sandbox_type(&self) -> Option<SandboxType> {
+        self.sandbox_manager.configured_sandbox()
     }
 
     /// Request that the active foreground shell wait detach and leave its
@@ -2456,9 +2461,11 @@ fn exec_shell_input_starts_detached(input: &serde_json::Value) -> bool {
             || input.get("tty").and_then(serde_json::Value::as_bool) == Some(true))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_foreground_via_background(
     context: &ToolContext,
     command: &str,
+    working_dir: Option<String>,
     timeout_ms: u64,
     stdin_data: Option<&str>,
     tty: bool,
@@ -2474,7 +2481,7 @@ async fn execute_foreground_via_background(
         manager.clear_foreground_background_request();
         manager.execute_with_options_env_for_owner_and_work(
             command,
-            None,
+            working_dir.as_deref(),
             timeout_ms,
             true,
             stdin_data,
@@ -2540,26 +2547,59 @@ async fn execute_foreground_via_background(
     }
 }
 
-/// Tool for executing shell commands.
-pub struct ExecShellTool;
+/// Unified shell tool (#4625).
+///
+/// The model sees one tool: `Bash` with an `action` parameter
+/// (run | wait | interact | cancel). Legacy names (`exec_shell`,
+/// `exec_shell_wait`, etc.) stay registered as hidden compat aliases
+/// that force the action so saved transcripts replay correctly.
+pub struct BashTool {
+    name: &'static str,
+    forced_action: Option<&'static str>,
+}
+
+impl BashTool {
+    pub const fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            forced_action: None,
+        }
+    }
+
+    pub const fn alias(name: &'static str, action: &'static str) -> Self {
+        Self {
+            name,
+            forced_action: Some(action),
+        }
+    }
+}
 
 #[async_trait]
-impl ToolSpec for ExecShellTool {
+impl ToolSpec for BashTool {
     fn name(&self) -> &'static str {
-        "exec_shell"
+        self.name
+    }
+
+    fn model_visible(&self) -> bool {
+        self.name == "Bash"
     }
 
     fn description(&self) -> &'static str {
-        "Execute a shell command in the workspace directory. Foreground mode is for bounded commands; use background=true or task_shell_start for work expected to take >5 seconds. Background jobs return immediately and report completion through task/status state instead of resuming the model."
+        "Execute a shell command in the workspace. Action \"run\" (default) executes a command; \"wait\" polls a background task; \"interact\" sends stdin to a background task; \"cancel\" kills a background task. Foreground mode is for bounded commands; use background=true for work expected to take >5 seconds."
     }
 
     fn input_schema(&self) -> serde_json::Value {
         json!({
             "type": "object",
             "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["run", "wait", "interact", "cancel"],
+                    "description": "Action to perform (default: run)"
+                },
                 "command": {
                     "type": "string",
-                    "description": "The shell command to execute"
+                    "description": "The shell command to execute (action=run)"
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -2567,7 +2607,7 @@ impl ToolSpec for ExecShellTool {
                 },
                 "background": {
                     "type": "boolean",
-                    "description": "Run in background and return task_id (default: false). Returns immediately; completion is tracked in task/status state. Prefer this for commands expected to take >5 seconds, including builds, test suites, servers, CI polling, sleep, or other long-running work. Use exec_shell_wait only when you need early output, final output, or a true dependency barrier."
+                    "description": "Run in background and return task_id (default: false). Prefer this for commands expected to take >5 seconds."
                 },
                 "interactive": {
                     "type": "boolean",
@@ -2575,7 +2615,7 @@ impl ToolSpec for ExecShellTool {
                 },
                 "stdin": {
                     "type": "string",
-                    "description": "Optional stdin data to send before waiting (non-interactive only)"
+                    "description": "Stdin data to send (action=run: before waiting; action=interact: to the background task)"
                 },
                 "cwd": {
                     "type": "string",
@@ -2587,10 +2627,25 @@ impl ToolSpec for ExecShellTool {
                 },
                 "combined_output": {
                     "type": "boolean",
-                    "description": "Capture stdout and stderr as one chronological PTY stream (default false). In foreground mode, waits for completion; in background mode, implies tty."
+                    "description": "Capture stdout and stderr as one chronological PTY stream (default false)"
+                },
+                "task_id": {
+                    "type": "string",
+                    "description": "Task ID for action=wait/interact/cancel"
+                },
+                "wait": {
+                    "type": "boolean",
+                    "description": "Block until task completes (action=wait, default: false)"
+                },
+                "close_stdin": {
+                    "type": "boolean",
+                    "description": "Close stdin after sending (action=interact)"
+                },
+                "all": {
+                    "type": "boolean",
+                    "description": "Cancel all running background tasks (action=cancel)"
                 }
-            },
-            "required": ["command"]
+            }
         })
     }
 
@@ -2631,6 +2686,18 @@ impl ToolSpec for ExecShellTool {
         input: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolResult, ToolError> {
+        let action = self.forced_action.unwrap_or_else(|| {
+            input
+                .get("action")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("run")
+        });
+        match action {
+            "wait" => return self.execute_wait(&input, context).await,
+            "interact" => return self.execute_interact(&input, context).await,
+            "cancel" => return self.execute_cancel(&input, context).await,
+            _ => {}
+        }
         let command = required_str(&input, "command")?;
         match context.shell_policy {
             ShellPolicy::None => {
@@ -2737,7 +2804,10 @@ impl ToolSpec for ExecShellTool {
                 let resolved = context.resolve_path(dir)?;
                 Some(resolved.to_string_lossy().to_string())
             }
-            None => None,
+            // Default to the tool context's workspace (which reflects the
+            // child agent's worktree when `worktree: true` was used), not the
+            // shared ShellManager's parent-workspace default_workspace.
+            None => Some(context.workspace.display().to_string()),
         };
 
         // #456 — collect env from any configured `shell_env` hooks. Runs
@@ -2917,6 +2987,7 @@ impl ToolSpec for ExecShellTool {
             execute_foreground_via_background(
                 context,
                 command,
+                working_dir,
                 timeout_ms,
                 stdin_data.as_deref(),
                 combined_output,
@@ -3087,26 +3158,189 @@ impl ToolSpec for ExecShellTool {
     }
 }
 
-pub struct ShellWaitTool {
-    name: &'static str,
-}
-
 /// Maximum deliberate dependency-barrier wait accepted by `exec_shell_wait`.
 pub(crate) const EXEC_SHELL_WAIT_MAX_TIMEOUT_MS: u64 = 600_000;
 
-impl ShellWaitTool {
-    pub const fn new(name: &'static str) -> Self {
-        Self { name }
+impl BashTool {
+    async fn execute_wait(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let task_id = required_task_id(input)?;
+        let wait = optional_bool(input, "wait", false);
+        let timeout_ms = optional_u64(input, "timeout_ms", 30_000);
+
+        let (delta, wait_canceled) = if wait {
+            wait_for_shell_delta_cancellable(context, task_id, timeout_ms).await?
+        } else {
+            let mut manager = context
+                .shell_manager
+                .lock()
+                .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+            let delta = manager
+                .get_output_delta(task_id, false, timeout_ms)
+                .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+            (delta, false)
+        };
+
+        let status = delta.result.status.clone();
+        let mut result = build_shell_delta_tool_result(delta, context);
+        if wait_canceled {
+            if matches!(status, ShellStatus::Running) {
+                result.content = format!(
+                    "Wait canceled; background shell task {task_id} is still running.\n\n{}",
+                    result.content
+                );
+            }
+            if let Some(metadata) = result.metadata.as_mut()
+                && let Some(object) = metadata.as_object_mut()
+            {
+                object.insert("wait_canceled".to_string(), json!(true));
+            }
+        }
+
+        Ok(result)
     }
-}
 
-pub struct ShellInteractTool {
-    name: &'static str,
-}
+    async fn execute_interact(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let task_id = required_task_id(input)?;
+        let close_stdin = optional_bool(input, "close_stdin", false);
+        let timeout_ms = optional_u64(input, "timeout_ms", 1_000);
+        let interaction_input = input
+            .get("input")
+            .or_else(|| input.get("stdin"))
+            .or_else(|| input.get("data"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
 
-impl ShellInteractTool {
-    pub const fn new(name: &'static str) -> Self {
-        Self { name }
+        {
+            let mut manager = context
+                .shell_manager
+                .lock()
+                .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+            if !interaction_input.is_empty() || close_stdin {
+                manager
+                    .write_stdin(task_id, interaction_input, close_stdin)
+                    .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+            }
+        }
+
+        let mut elapsed = 0u64;
+        loop {
+            if context
+                .cancel_token
+                .as_ref()
+                .is_some_and(|token| token.is_cancelled())
+            {
+                let mut manager = context
+                    .shell_manager
+                    .lock()
+                    .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+                let delta = manager
+                    .get_output_delta(task_id, false, 0)
+                    .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+                let mut result = build_shell_delta_tool_result(delta, context);
+                if let Some(metadata) = result.metadata.as_mut()
+                    && let Some(object) = metadata.as_object_mut()
+                {
+                    object.insert("wait_canceled".to_string(), json!(true));
+                }
+                return Ok(result);
+            }
+
+            let delta = {
+                let mut manager = context
+                    .shell_manager
+                    .lock()
+                    .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+                manager
+                    .get_output_delta(task_id, false, 0)
+                    .map_err(|err| ToolError::execution_failed(err.to_string()))?
+            };
+
+            if !delta.result.stdout.is_empty()
+                || !delta.result.stderr.is_empty()
+                || delta.result.status != ShellStatus::Running
+                || elapsed >= timeout_ms
+            {
+                return Ok(build_shell_delta_tool_result(delta, context));
+            }
+
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            elapsed = elapsed.saturating_add(50);
+        }
+    }
+
+    async fn execute_cancel(
+        &self,
+        input: &serde_json::Value,
+        context: &ToolContext,
+    ) -> Result<ToolResult, ToolError> {
+        let cancel_all = optional_bool(input, "all", false);
+        let mut manager = context
+            .shell_manager
+            .lock()
+            .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
+
+        if cancel_all {
+            let results = manager
+                .kill_running()
+                .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+            if results.is_empty() {
+                return Ok(ToolResult {
+                    content: "No running background commands.".to_string(),
+                    success: true,
+                    metadata: Some(json!({
+                        "status": "Noop",
+                        "canceled": 0,
+                        "task_ids": [],
+                    })),
+                });
+            }
+
+            let task_ids = results
+                .iter()
+                .filter_map(|result| result.task_id.clone())
+                .collect::<Vec<_>>();
+            return Ok(ToolResult {
+                content: format!(
+                    "Canceled {} background command{}: {}",
+                    task_ids.len(),
+                    if task_ids.len() == 1 { "" } else { "s" },
+                    task_ids.join(", ")
+                ),
+                success: true,
+                metadata: Some(json!({
+                    "status": "Killed",
+                    "canceled": task_ids.len(),
+                    "task_ids": task_ids,
+                })),
+            });
+        }
+
+        let task_id = required_task_id(input)?;
+        let result = manager
+            .kill(task_id)
+            .map_err(|err| ToolError::execution_failed(err.to_string()))?;
+        let task_id = result
+            .task_id
+            .clone()
+            .unwrap_or_else(|| task_id.to_string());
+        Ok(ToolResult {
+            content: format!("Canceled background command: {task_id}"),
+            success: true,
+            metadata: Some(json!({
+                "status": format!("{:?}", result.status),
+                "task_id": task_id,
+                "exit_code": result.exit_code,
+                "duration_ms": result.duration_ms,
+            })),
+        })
     }
 }
 
@@ -3315,335 +3549,6 @@ fn shell_delta_with_accumulated_output(
         result,
         stdout_total_len,
         stderr_total_len,
-    }
-}
-
-pub struct ShellCancelTool;
-
-#[async_trait]
-impl ToolSpec for ShellCancelTool {
-    fn name(&self) -> &'static str {
-        "exec_shell_cancel"
-    }
-
-    fn description(&self) -> &'static str {
-        "Cancel a running background shell task by task_id, or cancel all running background shell tasks with all=true."
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task_id": {
-                    "type": "string",
-                    "description": "Task ID returned by exec_shell or task_shell_start"
-                },
-                "id": {
-                    "type": "string",
-                    "description": "Alias for task_id"
-                },
-                "all": {
-                    "type": "boolean",
-                    "description": "Cancel all currently running background shell tasks"
-                }
-            }
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::RequiresApproval]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Required
-    }
-
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: &ToolContext,
-    ) -> Result<ToolResult, ToolError> {
-        let cancel_all = optional_bool(&input, "all", false);
-        let mut manager = context
-            .shell_manager
-            .lock()
-            .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
-
-        if cancel_all {
-            let results = manager
-                .kill_running()
-                .map_err(|err| ToolError::execution_failed(err.to_string()))?;
-            if results.is_empty() {
-                return Ok(ToolResult {
-                    content: "No running background commands.".to_string(),
-                    success: true,
-                    metadata: Some(json!({
-                        "status": "Noop",
-                        "canceled": 0,
-                        "task_ids": [],
-                    })),
-                });
-            }
-
-            let task_ids = results
-                .iter()
-                .filter_map(|result| result.task_id.clone())
-                .collect::<Vec<_>>();
-            return Ok(ToolResult {
-                content: format!(
-                    "Canceled {} background command{}: {}",
-                    task_ids.len(),
-                    if task_ids.len() == 1 { "" } else { "s" },
-                    task_ids.join(", ")
-                ),
-                success: true,
-                metadata: Some(json!({
-                    "status": "Killed",
-                    "canceled": task_ids.len(),
-                    "task_ids": task_ids,
-                })),
-            });
-        }
-
-        let task_id = required_task_id(&input)?;
-        let result = manager
-            .kill(task_id)
-            .map_err(|err| ToolError::execution_failed(err.to_string()))?;
-        let task_id = result
-            .task_id
-            .clone()
-            .unwrap_or_else(|| task_id.to_string());
-        Ok(ToolResult {
-            content: format!("Canceled background command: {task_id}"),
-            success: true,
-            metadata: Some(json!({
-                "status": format!("{:?}", result.status),
-                "task_id": task_id,
-                "exit_code": result.exit_code,
-                "exit_code_hex": exit_code_hex(result.exit_code),
-                "duration_ms": result.duration_ms,
-            })),
-        })
-    }
-}
-
-#[async_trait]
-impl ToolSpec for ShellWaitTool {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn model_visible(&self) -> bool {
-        // `exec_wait` is a legacy alias; only `exec_shell_wait` is model-visible.
-        self.name == "exec_shell_wait"
-    }
-
-    fn description(&self) -> &'static str {
-        "Inspect a background shell task and return incremental output without blocking by default. Set wait=true only for a deliberate dependency barrier. Turn cancellation stops waiting but leaves the background task running."
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task_id": {
-                    "type": "string",
-                    "description": "Task ID returned by exec_shell"
-                },
-                "timeout_ms": {
-                    "type": "integer",
-                    "description": "Timeout in milliseconds (default: 30000, max: 600000). Use a higher value for long-running builds, CI watchers, and interactive commands that are expected to keep producing output."
-                },
-                "wait": {
-                    "type": "boolean",
-                    "default": false,
-                    "description": "Snapshot the latest background output and return immediately (default). Background job completions are tracked in task/status state, so normally do not wait. Set wait=true only for a deliberate barrier at a true dependency or final gate."
-                }
-            },
-            "required": ["task_id"]
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![ToolCapability::ReadOnly]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Auto
-    }
-
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: &ToolContext,
-    ) -> Result<ToolResult, ToolError> {
-        let task_id = required_task_id(&input)?;
-        let wait = optional_bool(&input, "wait", false);
-        let timeout_ms = optional_u64(&input, "timeout_ms", 30_000);
-
-        let (delta, wait_canceled) = if wait {
-            wait_for_shell_delta_cancellable(context, task_id, timeout_ms).await?
-        } else {
-            let mut manager = context
-                .shell_manager
-                .lock()
-                .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
-            let delta = manager
-                .get_output_delta(task_id, false, timeout_ms)
-                .map_err(|err| ToolError::execution_failed(err.to_string()))?;
-            (delta, false)
-        };
-
-        let status = delta.result.status.clone();
-        let mut result = build_shell_delta_tool_result(delta, context);
-        if wait_canceled {
-            if matches!(status, ShellStatus::Running) {
-                result.content = format!(
-                    "Wait canceled; background shell task {task_id} is still running.\n\n{}",
-                    result.content
-                );
-            }
-            if let Some(metadata) = result.metadata.as_mut()
-                && let Some(object) = metadata.as_object_mut()
-            {
-                object.insert("wait_canceled".to_string(), json!(true));
-            }
-        }
-
-        Ok(result)
-    }
-}
-
-#[async_trait]
-impl ToolSpec for ShellInteractTool {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-
-    fn model_visible(&self) -> bool {
-        // `exec_interact` is a legacy alias; only `exec_shell_interact` is model-visible.
-        self.name == "exec_shell_interact"
-    }
-
-    fn description(&self) -> &'static str {
-        "Send input to a background shell task and return incremental output."
-    }
-
-    fn input_schema(&self) -> serde_json::Value {
-        json!({
-            "type": "object",
-            "properties": {
-                "task_id": {
-                    "type": "string",
-                    "description": "Task ID returned by exec_shell"
-                },
-                "input": {
-                    "type": "string",
-                    "description": "Input to send to the task's stdin"
-                },
-                "stdin": {
-                    "type": "string",
-                    "description": "Alias for input"
-                },
-                "data": {
-                    "type": "string",
-                    "description": "Alias for input"
-                },
-                "timeout_ms": {
-                    "type": "integer",
-                    "description": "Wait for output after sending input (default: 1000)"
-                },
-                "close_stdin": {
-                    "type": "boolean",
-                    "description": "Close stdin after sending input"
-                }
-            },
-            "required": ["task_id"]
-        })
-    }
-
-    fn capabilities(&self) -> Vec<ToolCapability> {
-        vec![
-            ToolCapability::ExecutesCode,
-            ToolCapability::RequiresApproval,
-        ]
-    }
-
-    fn approval_requirement(&self) -> ApprovalRequirement {
-        ApprovalRequirement::Required
-    }
-
-    async fn execute(
-        &self,
-        input: serde_json::Value,
-        context: &ToolContext,
-    ) -> Result<ToolResult, ToolError> {
-        let task_id = required_task_id(&input)?;
-        let close_stdin = optional_bool(&input, "close_stdin", false);
-        let timeout_ms = optional_u64(&input, "timeout_ms", 1_000);
-        let interaction_input = input
-            .get("input")
-            .or_else(|| input.get("stdin"))
-            .or_else(|| input.get("data"))
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("");
-
-        {
-            let mut manager = context
-                .shell_manager
-                .lock()
-                .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
-            if !interaction_input.is_empty() || close_stdin {
-                manager
-                    .write_stdin(task_id, interaction_input, close_stdin)
-                    .map_err(|err| ToolError::execution_failed(err.to_string()))?;
-            }
-        }
-
-        let mut elapsed = 0u64;
-        loop {
-            if context
-                .cancel_token
-                .as_ref()
-                .is_some_and(|token| token.is_cancelled())
-            {
-                let mut manager = context
-                    .shell_manager
-                    .lock()
-                    .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
-                let delta = manager
-                    .get_output_delta(task_id, false, 0)
-                    .map_err(|err| ToolError::execution_failed(err.to_string()))?;
-                let mut result = build_shell_delta_tool_result(delta, context);
-                if let Some(metadata) = result.metadata.as_mut()
-                    && let Some(object) = metadata.as_object_mut()
-                {
-                    object.insert("wait_canceled".to_string(), json!(true));
-                }
-                return Ok(result);
-            }
-
-            let delta = {
-                let mut manager = context
-                    .shell_manager
-                    .lock()
-                    .map_err(|_| ToolError::execution_failed("shell manager lock poisoned"))?;
-                manager
-                    .get_output_delta(task_id, false, 0)
-                    .map_err(|err| ToolError::execution_failed(err.to_string()))?
-            };
-
-            if !delta.result.stdout.is_empty()
-                || !delta.result.stderr.is_empty()
-                || delta.result.status != ShellStatus::Running
-                || elapsed >= timeout_ms
-            {
-                return Ok(build_shell_delta_tool_result(delta, context));
-            }
-
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            elapsed = elapsed.saturating_add(50);
-        }
     }
 }
 

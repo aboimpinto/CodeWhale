@@ -235,6 +235,7 @@ fn node_state_from_todo(status: TodoStatus) -> NodeState {
         TodoStatus::Pending => NodeState::Ready,
         TodoStatus::InProgress => NodeState::Active,
         TodoStatus::Completed => NodeState::Completed,
+        TodoStatus::Cancelled => NodeState::Cancelled,
     }
 }
 

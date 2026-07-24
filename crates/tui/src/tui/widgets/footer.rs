@@ -77,7 +77,7 @@ pub struct FooterProps {
     /// Compact nonempty Work indicator when terminal width suppresses the
     /// sidebar. Empty when Work is visible or explicitly hidden.
     pub work: Vec<Span<'static>>,
-    /// Cumulative model-work chip spans ("worked 3h 12m"). Sums the
+    /// Cumulative model-work chip spans ("worked 3m 12s"). Sums the
     /// elapsed time of completed turns (from `App::cumulative_turn_duration`),
     /// **not** wall-clock since launch — an idle TUI shouldn't claim
     /// it's been "working." Empty until cumulative turn time crosses
@@ -204,12 +204,12 @@ pub fn footer_agents_chip(running: usize, locale: Locale) -> Vec<Span<'static>> 
     vec![Span::styled(text, Style::default().fg(palette::WHALE_INFO))]
 }
 
-/// Build the cumulative-elapsed chip ("worked 3h 12m") for the
+/// Build the cumulative-elapsed chip ("worked 3m 12s") for the
 /// footer's right cluster (#448). Hidden during the first minute of
 /// a session so a fresh launch doesn't render a noisy `worked 5s`
 /// indicator that immediately starts ticking. Above the threshold,
-/// reuses [`crate::tui::notifications::humanize_duration`] for
-/// consistent w/d/h/m formatting.
+/// reuses [`crate::elapsed::format_elapsed_secs`] for the shared
+/// m/s duration grammar.
 #[must_use]
 pub fn footer_worked_chip(elapsed: std::time::Duration, locale: Locale) -> Vec<Span<'static>> {
     if elapsed < std::time::Duration::from_secs(60) {
@@ -217,7 +217,7 @@ pub fn footer_worked_chip(elapsed: std::time::Duration, locale: Locale) -> Vec<S
     }
     let label = tr(locale, MessageId::FooterWorkedChip).replace(
         "{duration}",
-        &crate::tui::notifications::humanize_duration(elapsed),
+        &crate::elapsed::format_elapsed_secs(elapsed.as_secs()),
     );
     vec![Span::styled(
         label,
@@ -903,8 +903,8 @@ mod tests {
         );
 
         // A real turn finishes for 90s of model work — chip lights up.
-        // (`humanize_duration` keeps both units when both are non-zero,
-        // so 90s renders as `1m 30s`, not `1m`.)
+        // (The shared elapsed formatter keeps both units when minutes
+        // appear, so 90s renders as `1m 30s`, not `90s`.)
         app.cumulative_turn_duration = std::time::Duration::from_secs(90);
 
         // Pin the locale to English so the assertion below is deterministic.
@@ -936,18 +936,18 @@ mod tests {
         // 1 minute on the dot — boundary, must render.
         let chip = super::footer_worked_chip(Duration::from_secs(60), Locale::En);
         let text: String = chip.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "worked 1m");
+        assert_eq!(text, "worked 1m 00s");
 
-        // 3h 12m — the issue's golden example.
+        // 3h 12m 30s — clamps at the minute/second representation.
         let chip = super::footer_worked_chip(Duration::from_secs(11_550), Locale::En);
         let text: String = chip.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "worked 3h 12m");
+        assert_eq!(text, "worked 192m 30s");
 
-        // Multi-day session — exercises the d/h band.
+        // Multi-day session — minutes keep growing, no hours/days unit.
         let chip =
             super::footer_worked_chip(Duration::from_secs(2 * 86_400 + 5 * 3600), Locale::En);
         let text: String = chip.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text, "worked 2d 5h");
+        assert_eq!(text, "worked 3180m 00s");
     }
 
     #[test]

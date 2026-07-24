@@ -31,17 +31,39 @@ notes, and relevant issue/PR comments.
 <summary><strong>v0.9.1 — provider and runtime hardening</strong></summary>
 
 - **[h3c-hexin](https://github.com/h3c-hexin)** — calendar-anchored hourly
-  automation recurrence across DST and lifecycle transitions (PR #4381)
+  automation recurrence across DST and lifecycle transitions (PR #4381),
+  explicit limits for unknown local models (PR #4656 / #4655), and
+  idle-timeout progress telemetry (PR #4657)
+- **[gaord](https://github.com/gaord)** — Runtime API provider registry and
+  atomic provider-switch endpoints (PR #4658)
+- **[SamhandsomeLee](https://github.com/SamhandsomeLee)** — the unified
+  `/skills` root catalog, audit/provenance model, validated mutations, manager
+  UI, and acceptance coverage (PR #4679), plus Enter-send lag diagnosis and
+  fix direction for #4605 (PR #4654; landed through the release-lane
+  async-dispatch split)
+- **[Paulo Aboim Pinto / aboimpinto](https://github.com/aboimpinto)** — the
+  Layer 5.1 user-command registry boundary from PR #3278; the exact authored
+  evidence commit from PR #4046, preserved intact in the integration graph;
+  and the #2870 follow-up audit whose metadata and malformed-sibling gaps
+  shaped the final corrections. Paulo also provided the structured, redacted
+  Agent Details and `current_activity` design direction preserved from
+  #2694/#2889 and the real-PTY lifecycle acceptance direction from #2886
+- **[baendlorel](https://github.com/baendlorel)** — TelecomJS TokenHub provider
+  and key-scoped live-catalog direction, source-partitioned refresh behavior,
+  and both refresh-order regressions from PR #4370, harvested into the current
+  provider architecture with co-authorship preserved
 - **[zhangweiii](https://github.com/zhangweiii)** and
   **[Sterne Lee / sternelee](https://github.com/sternelee)** — the original
   first-class OpenCode Go implementations in PRs #773 and #1050, harvested
-  into the current provider architecture with co-authorship planned for the
+  into the current provider architecture with co-authorship preserved in the
   landing commit
 - **[Sean Tse / seanthefuturegorilla](https://github.com/seanthefuturegorilla)**
   — the canonical OpenCode Go/Zen provider request and acceptance direction in
   #1481
-- **[nightt5879](https://github.com/nightt5879)** — the Solarized Light
-  background preservation fix for the underwater shell (PR #4471)
+- **[nightt5879](https://github.com/nightt5879)** — `/debt` compatibility
+  aliases with dispatch-consistent user-command shadowing across help and
+  slash discovery (PR #4680), plus the Solarized Light background preservation
+  fix for the underwater shell (PR #4471)
 - **[AiurArtanis](https://github.com/AiurArtanis)** — the Solarized Light
   v0.9.0 regression report and reproduction (#4457)
 - **[shenjackyuanjie](https://github.com/shenjackyuanjie)** — the HarmonyOS
@@ -61,6 +83,17 @@ notes, and relevant issue/PR comments.
 - **[Sh1Zuku / SparkofSpike](https://github.com/SparkofSpike)** — the Windows
   Ctrl+O reproduction that exposed pre-pager result truncation and conflicting
   composer shortcut routing (#4482)
+- **[Lu Shihan / Angel-Hair](https://github.com/Angel-Hair)** — session-owned
+  read-before-edit tracking and the explicit, backwards-compatible
+  `apply_patch` replacement contract (PRs #4475 and #4476)
+- **[dmitri-0](https://github.com/dmitri-0)** — configurable cache-hit
+  visibility in the phase strip (PR #4474)
+- **[Fred Leitz / fleitz](https://github.com/fleitz)** — canonical `Bash`
+  no-`cwd` workspace resolution and its regression test, keeping isolated
+  sub-agent commands inside their selected worktree (PR #4673; issue #4674)
+- **[Sh1Zuku / SparkofSpike](https://github.com/SparkofSpike)** — exact
+  Vim-space regression reproduction and verification that the v0.9.1 input
+  path already contains the needed global binding (PR #4477)
 
 </details>
 

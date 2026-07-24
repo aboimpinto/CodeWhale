@@ -10,6 +10,64 @@ use ratatui::style::Color;
 #[allow(dead_code)]
 mod palette;
 
+// Local stand-in for the binary crate's `src/test_support.rs`.
+//
+// `palette_audit` `#[path]`-includes `src/palette/mod.rs`, which transitively
+// compiles `src/palette/user_theme.rs`. That module's inline tests call
+// `crate::test_support::{lock_test_env, EnvVarGuard}`. In the binary crate
+// those resolve to the real helpers; in this separate integration-test crate
+// there is no such module, so this minimal shim provides the same surface and
+// keeps the transitive tests serialized within this process.
+#[allow(dead_code)]
+mod test_support {
+    use std::ffi::{OsStr, OsString};
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    fn lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(Mutex::default)
+    }
+
+    pub(super) struct TestEnvLock {
+        _guard: MutexGuard<'static, ()>,
+    }
+
+    pub(super) fn lock_test_env() -> TestEnvLock {
+        let guard = match lock().lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        TestEnvLock { _guard: guard }
+    }
+
+    pub(super) struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        pub(super) fn set(key: &'static str, value: impl AsRef<OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            // SAFETY: callers hold the process-wide test env mutex.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            // SAFETY: callers hold the process-wide test env mutex until drop.
+            unsafe {
+                if let Some(value) = self.previous.take() {
+                    std::env::set_var(self.key, value);
+                } else {
+                    std::env::remove_var(self.key);
+                }
+            }
+        }
+    }
+}
+
 fn color_to_rgb(color: Color) -> (u8, u8, u8) {
     match color {
         Color::Rgb(r, g, b) => (r, g, b),

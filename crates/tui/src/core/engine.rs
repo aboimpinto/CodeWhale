@@ -25,7 +25,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::client::DeepSeekClient;
 use crate::compaction::{
-    CompactionConfig, compact_messages_safe, merge_system_prompts, should_compact,
+    CompactionConfig, CompactionLiveState, compact_messages_safe, merge_system_prompts,
+    should_compact,
 };
 use crate::config::{ApiProvider, Config, DEFAULT_MAX_SUBAGENTS, DEFAULT_TEXT_MODEL};
 use crate::core::model_client::SharedModelClient;
@@ -46,9 +47,10 @@ use crate::route_runtime::resolve_runtime_route;
 use crate::route_runtime::{
     ResolvedRuntimeRoute, ValidatedRuntimeRoute, resolve_runtime_route_for_identity,
 };
-use crate::seam_manager::{SeamConfig, SeamManager};
-use crate::tools::goal::{GoalSnapshot, GoalStatus, SharedGoalState, new_shared_goal_state};
-use crate::tools::plan::{PlanSnapshot, SharedPlanState, new_shared_plan_state};
+use crate::tools::goal::{
+    GoalPauseReason, GoalSnapshot, GoalStatus, SharedGoalState, new_shared_goal_state,
+};
+use crate::tools::plan::{SharedPlanState, new_shared_plan_state};
 use crate::tools::shell::{SharedShellManager, new_shared_shell_manager};
 use crate::tools::spec::{
     ApprovalRequirement, ResourceClaim, ToolError, ToolExecutionOutcome, ToolResult,
@@ -57,9 +59,9 @@ use crate::tools::spec::{
     RuntimeToolServices, SharedFileReadTracker, new_shared_file_read_tracker,
 };
 use crate::tools::subagent::{
-    Mailbox, MailboxMessage, SharedSubAgentManager, SubAgentCompletion, SubAgentForkContext,
-    SubAgentResult, SubAgentRuntime, SubAgentStatus, SubAgentThinking, SubAgentType,
-    agent_worker_owner_snapshot, ensure_subagent_model_for_provider,
+    FleetRole, Mailbox, MailboxMessage, SharedSubAgentManager, SubAgentCompletion,
+    SubAgentForkContext, SubAgentManager, SubAgentResult, SubAgentRuntime, SubAgentStatus,
+    SubAgentThinking, agent_worker_owner_snapshot, ensure_subagent_model_for_provider,
     new_shared_subagent_manager_with_timeout, resolve_subagent_assignment_route,
 };
 use crate::tools::todo::{SharedTodoList, TodoListSnapshot, new_shared_todo_list};
@@ -84,6 +86,13 @@ use super::turn::{TurnContext, post_turn_snapshot, pre_turn_snapshot};
 const ENGINE_OP_CHANNEL_CAPACITY: usize = 32;
 const GOAL_CONTINUATION_FAILURE_DETAIL_MAX_BYTES: usize = 512;
 
+fn agent_list_event(manager: &SubAgentManager) -> Event {
+    Event::AgentList {
+        agents: manager.list(),
+        coordination: manager.coordination_detail_projection(None, 24),
+    }
+}
+
 /// Snapshot of parent state that can be passed to forked sub-agents without
 /// rewriting the parent transcript.
 #[derive(Debug, Clone, Default)]
@@ -93,7 +102,6 @@ struct StructuredState {
     cwd: Option<PathBuf>,
     working_set_summary: Option<String>,
     todo_snapshot: Option<TodoListSnapshot>,
-    plan_snapshot: Option<PlanSnapshot>,
     subagent_snapshots: Vec<SubAgentResult>,
 }
 
@@ -104,7 +112,6 @@ impl StructuredState {
         cwd: Option<PathBuf>,
         working_set: &WorkingSet,
         todos: &SharedTodoList,
-        plan_state: &SharedPlanState,
         subagents: Option<&SharedSubAgentManager>,
     ) -> Self {
         let working_set_summary = working_set.summary_block(&workspace);
@@ -116,15 +123,6 @@ impl StructuredState {
                 None
             } else {
                 Some(snap)
-            }
-        };
-
-        let plan_snapshot = {
-            let guard = plan_state.lock().await;
-            if guard.is_empty() {
-                None
-            } else {
-                Some(guard.snapshot())
             }
         };
 
@@ -146,7 +144,6 @@ impl StructuredState {
             cwd,
             working_set_summary,
             todo_snapshot,
-            plan_snapshot,
             subagent_snapshots,
         }
     }
@@ -161,57 +158,16 @@ impl StructuredState {
             out.push_str(&format!("- Cwd: `{}`\n", cwd.display()));
         }
 
-        if self.todo_snapshot.is_some() || self.plan_snapshot.is_some() {
+        if self.todo_snapshot.is_some() {
             out.push_str("\n### Work\n");
         }
 
         if let Some(todos) = self.todo_snapshot.as_ref() {
-            out.push_str(&format!(
-                "\nChecklist ({}% complete)\n",
-                todos.completion_pct
-            ));
-            for item in &todos.items {
-                let marker = match item.status {
-                    crate::tools::todo::TodoStatus::Pending => "[ ]",
-                    crate::tools::todo::TodoStatus::InProgress => "[~]",
-                    crate::tools::todo::TodoStatus::Completed => "[x]",
-                };
-                out.push_str(&format!("- {marker} {}\n", item.content));
-            }
-        }
-
-        if let Some(plan) = self.plan_snapshot.as_ref() {
-            out.push_str("\nStrategy metadata\n");
-            append_plan_field(&mut out, "Title", plan.title.as_deref());
-            append_plan_field(&mut out, "Objective", plan.objective.as_deref());
-            append_plan_field(&mut out, "Context", plan.context_summary.as_deref());
-            append_plan_field(&mut out, "Explanation", plan.explanation.as_deref());
-            append_plan_list(&mut out, "Source", &plan.sources_used);
-            append_plan_list(&mut out, "Critical file", &plan.critical_files);
-            append_plan_list(&mut out, "Constraint", &plan.constraints);
-            append_plan_field(
-                &mut out,
-                "Recommended approach",
-                plan.recommended_approach.as_deref(),
-            );
-            append_plan_field(
-                &mut out,
-                "Verification plan",
-                plan.verification_plan.as_deref(),
-            );
-            append_plan_field(
-                &mut out,
-                "Risks and unknowns",
-                plan.risks_and_unknowns.as_deref(),
-            );
-            append_plan_field(&mut out, "Handoff packet", plan.handoff_packet.as_deref());
-            for item in &plan.items {
-                let marker = match item.status {
-                    crate::tools::plan::StepStatus::Pending => "[ ]",
-                    crate::tools::plan::StepStatus::InProgress => "[~]",
-                    crate::tools::plan::StepStatus::Completed => "[x]",
-                };
-                out.push_str(&format!("- {marker} {}\n", item.step));
+            out.push_str(&format!("\nTo-do ({}% settled)\n", todos.completion_pct));
+            for line in todos.plain_text().lines() {
+                // IDs are useful in the canonical digest because work_update
+                // addresses later transitions by stable item identity.
+                out.push_str(&format!("- {line}\n"));
             }
         }
 
@@ -257,21 +213,6 @@ fn user_shell_turn_outcome(
         TurnOutcomeStatus::Completed
     } else {
         TurnOutcomeStatus::Failed
-    }
-}
-
-fn append_plan_field(out: &mut String, label: &str, value: Option<&str>) {
-    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
-        out.push_str(&format!("- {label}: {value}\n"));
-    }
-}
-
-fn append_plan_list(out: &mut String, label: &str, values: &[String]) {
-    for value in values {
-        let value = value.trim();
-        if !value.is_empty() {
-            out.push_str(&format!("- {label}: {value}\n"));
-        }
     }
 }
 
@@ -439,9 +380,8 @@ pub struct EngineConfig {
     /// Native tools that should stay in the model-visible catalog even when
     /// they are outside the small default core surface (#2076).
     pub tools_always_load: HashSet<String>,
-    /// When true and `/usr/bin/bwrap` is present on Linux, route exec_shell
-    /// through bubblewrap instead of relying solely on Landlock (#2184).
-    #[allow(dead_code)] // Wired through ShellManager in follow-up PR
+    /// When true and `/usr/bin/bwrap` is executable on Linux, route exec_shell
+    /// through bubblewrap (#2184).
     pub prefer_bwrap: bool,
     /// Tool override and plugin configuration (`[tools]` table in config.toml).
     /// Applied to the per-turn tool registry after built-in tools are registered.
@@ -678,9 +618,6 @@ pub struct Engine {
     /// user-facing message names a cause.
     pub(super) cancel_reason: Arc<StdMutex<Option<CancelReason>>>,
     tool_exec_lock: Arc<RwLock<()>>,
-    /// Append-only layered context manager (#159). Opt-in for v0.7.5 while
-    /// cache-hit behavior is audited.
-    seam_manager: Option<SeamManager>,
     turn_counter: u64,
     /// Post-edit LSP diagnostics injection (#136). Populated unconditionally
     /// — when LSP is disabled in config, this is an inert manager that
@@ -732,6 +669,7 @@ enum GoalContinuationAction {
     },
     Stopped {
         message: String,
+        reason: GoalPauseReason,
     },
 }
 
@@ -967,11 +905,6 @@ impl Engine {
         self.deepseek_client_error = None;
         self.session.model = model;
         self.config.model.clone_from(&self.session.model);
-        self.seam_manager = self
-            .seam_manager
-            .as_ref()
-            .filter(|manager| manager.config().enabled)
-            .map(|manager| SeamManager::new(client, manager.config().clone()));
     }
 
     /// Activate a structurally resolved route at the engine boundary. Normal
@@ -1011,16 +944,10 @@ impl Engine {
             Ok(client) => {
                 self.deepseek_client = Some(client.clone());
                 self.deepseek_client_error = None;
-                self.seam_manager = self
-                    .seam_manager
-                    .as_ref()
-                    .filter(|manager| manager.config().enabled)
-                    .map(|manager| SeamManager::new(client, manager.config().clone()));
             }
             Err(err) => {
                 self.deepseek_client = None;
                 self.deepseek_client_error = Some(err.to_string());
-                self.seam_manager = None;
             }
         }
         self.session.model = model;
@@ -1165,38 +1092,11 @@ impl Engine {
             .shell_manager
             .clone()
             .unwrap_or_else(|| new_shared_shell_manager(config.workspace.clone()));
+        match shell_manager.lock() {
+            Ok(mut manager) => manager.set_prefer_bwrap(config.prefer_bwrap),
+            Err(poisoned) => poisoned.into_inner().set_prefer_bwrap(config.prefer_bwrap),
+        }
         let file_read_tracker = new_shared_file_read_tracker();
-        // Create Flash seam manager for layered context (#159). v0.7.5 keeps
-        // this opt-in until the prefix-cache audit proves when seam production
-        // is worth the extra request and transcript mutation.
-        let seam_manager = deepseek_client.as_ref().map(|main_client| {
-            let seam_config = SeamConfig {
-                enabled: api_config.context.enabled.unwrap_or(false),
-                verbatim_window_turns: api_config
-                    .context
-                    .verbatim_window_turns
-                    .unwrap_or(crate::seam_manager::VERBATIM_WINDOW_TURNS),
-                l1_threshold: api_config
-                    .context
-                    .l1_threshold
-                    .unwrap_or(crate::seam_manager::DEFAULT_L1_THRESHOLD),
-                l2_threshold: api_config
-                    .context
-                    .l2_threshold
-                    .unwrap_or(crate::seam_manager::DEFAULT_L2_THRESHOLD),
-                l3_threshold: api_config
-                    .context
-                    .l3_threshold
-                    .unwrap_or(crate::seam_manager::DEFAULT_L3_THRESHOLD),
-                seam_model: api_config
-                    .context
-                    .seam_model
-                    .clone()
-                    .unwrap_or_else(|| crate::seam_manager::DEFAULT_SEAM_MODEL.to_string()),
-            };
-            SeamManager::new(main_client.clone(), seam_config)
-        });
-
         let lsp_manager = Arc::new(match config.lsp_config.clone() {
             Some(cfg) => crate::lsp::LspManager::new(cfg, config.workspace.clone()),
             None => crate::lsp::LspManager::disabled(),
@@ -1209,13 +1109,9 @@ impl Engine {
             std::sync::Arc<
                 tokio::sync::Mutex<crate::tools::large_output_router::WorkshopVariables>,
             >,
-        > = if config.workshop.is_some() {
-            Some(std::sync::Arc::new(tokio::sync::Mutex::new(
-                crate::tools::large_output_router::WorkshopVariables::default(),
-            )))
-        } else {
-            None
-        };
+        > = Some(std::sync::Arc::new(tokio::sync::Mutex::new(
+            crate::tools::large_output_router::WorkshopVariables::default(),
+        )));
 
         // External sandbox backend (#516). Logged but non-fatal: if the
         // backend fails to construct, the engine continues with local
@@ -1263,7 +1159,6 @@ impl Engine {
             shared_cancel_token: shared_cancel_token.clone(),
             cancel_reason: cancel_reason.clone(),
             tool_exec_lock,
-            seam_manager,
             turn_counter: 0,
             lsp_manager,
             pending_lsp_blocks: Vec::new(),
@@ -1855,8 +1750,8 @@ impl Engine {
                             GoalContinuationAction::Dispatch { content, snapshot } => {
                                 (content, *snapshot)
                             }
-                            GoalContinuationAction::Stopped { message } => {
-                                self.block_goal_continuation(message).await;
+                            GoalContinuationAction::Stopped { message, reason } => {
+                                self.pause_goal_continuation(reason, message).await;
                                 continue;
                             }
                         };
@@ -2004,7 +1899,7 @@ impl Engine {
                             &runtime,
                             None,
                             &prompt,
-                            &SubAgentType::General,
+                            &FleetRole::Worker,
                             ModelRoute::Inherit,
                             SubAgentThinking::Inherit,
                         )
@@ -2034,7 +1929,7 @@ impl Engine {
                             manager.spawn_background(
                                 Arc::clone(&self.subagent_manager),
                                 runtime,
-                                SubAgentType::General,
+                                FleetRole::Worker,
                                 prompt.clone(),
                                 None,
                             )
@@ -2073,17 +1968,18 @@ impl Engine {
                                 crate::tools::subagent::SUBAGENT_LIST_CLEANUP_MIN_INTERVAL,
                             )
                         };
-                        let agents = if due {
+                        let event = if due {
                             let mut manager = self.subagent_manager.write().await;
                             manager.cleanup(Duration::from_secs(60 * 60));
-                            manager.list()
+                            agent_list_event(&manager)
                         } else {
-                            self.subagent_manager.read().await.list()
+                            let manager = self.subagent_manager.read().await;
+                            agent_list_event(&manager)
                         };
                         // #3802: use non-blocking send — this is a refresh event
                         // that can safely be dropped when the channel is full.
                         // The next drain cycle will re-request the list.
-                        if let Err(_e) = self.tx_event.try_send(Event::AgentList { agents }) {
+                        if let Err(_e) = self.tx_event.try_send(event) {
                             tracing::debug!(
                                 "Event channel full; dropping ListSubAgents refresh (will retry next drain)"
                             );
@@ -2093,14 +1989,13 @@ impl Engine {
                         let result = {
                             let mut manager = self.subagent_manager.write().await;
                             match manager.cancel_agent(&agent_id) {
-                                Ok(_) => Ok(manager.list()),
+                                Ok(_) => Ok(agent_list_event(&manager)),
                                 Err(err) => Err(err),
                             }
                         };
                         match result {
-                            Ok(agents) => {
-                                if let Err(_e) = self.tx_event.try_send(Event::AgentList { agents })
-                                {
+                            Ok(event) => {
+                                if let Err(_e) = self.tx_event.try_send(event) {
                                     tracing::debug!(
                                         "Event channel full; dropping CancelSubAgent refresh"
                                     );
@@ -2931,26 +2826,38 @@ impl Engine {
             }
             crate::goal_loop::ContinuationDecision::Stop(reason) => {
                 tracing::info!(?reason, "goal continuation stopped");
-                let message = match reason {
-                    crate::goal_loop::StopReason::TokenBudget => format!(
-                        "Goal token budget reached ({} / {} tokens); automatic continuation stopped and the goal is blocked.",
-                        snapshot.tokens_used,
-                        snapshot.token_budget.unwrap_or_default(),
+                let (message, pause_reason) = match reason {
+                    crate::goal_loop::StopReason::TokenBudget => (
+                        format!(
+                            "Goal token budget reached ({} / {} tokens); automatic continuation paused. Raise the budget, then resume the goal.",
+                            snapshot.tokens_used,
+                            snapshot.token_budget.unwrap_or_default(),
+                        ),
+                        GoalPauseReason::BudgetLimit,
                     ),
-                    crate::goal_loop::StopReason::TimeBudget => format!(
-                        "Goal time budget reached ({} seconds); automatic continuation stopped and the goal is blocked.",
-                        snapshot.time_used_seconds,
+                    crate::goal_loop::StopReason::TimeBudget => (
+                        format!(
+                            "Goal time budget reached ({} seconds); automatic continuation paused.",
+                            snapshot.time_used_seconds,
+                        ),
+                        GoalPauseReason::BudgetLimit,
                     ),
-                    crate::goal_loop::StopReason::ContinuationLimit => {
-                        "Goal continuation limit reached; automatic continuation stopped and the goal is blocked."
-                            .to_string()
-                    }
+                    crate::goal_loop::StopReason::ContinuationLimit => (
+                        format!(
+                            "Goal paused after {} automatic continuations without a terminal result; inspect progress, then resume if useful.",
+                            crate::goal_loop::MAX_GOAL_CONTINUATIONS,
+                        ),
+                        GoalPauseReason::Backoff,
+                    ),
                     crate::goal_loop::StopReason::Completed
                     | crate::goal_loop::StopReason::Blocked => {
                         return GoalContinuationAction::Inactive;
                     }
                 };
-                GoalContinuationAction::Stopped { message }
+                GoalContinuationAction::Stopped {
+                    message,
+                    reason: pause_reason,
+                }
             }
         }
     }
@@ -2980,7 +2887,20 @@ impl Engine {
             SendMessageOutcome::Finished {
                 status: TurnOutcomeStatus::Interrupted,
                 ..
-            } => self.pause_goal_after_interruption().await,
+            } => {
+                // Goals are durable session objectives. An interrupted model
+                // turn (Esc, steer, compaction, cancel) must cancel only the
+                // auto-continuation timer — already done above — and leave the
+                // goal Active. pause_reason=User is reserved for explicit
+                // `/goal pause`. Requiring `/goal resume` after every interrupt
+                // was a dogfood lie (2026-07-24).
+                let _ = self
+                    .tx_event
+                    .send(Event::status(
+                        "Turn interrupted; session goal stays active.".to_string(),
+                    ))
+                    .await;
+            }
             SendMessageOutcome::Finished {
                 status: TurnOutcomeStatus::Completed,
                 ..
@@ -3051,18 +2971,18 @@ impl Engine {
         let _ = self.tx_event.send(Event::status(message)).await;
     }
 
-    /// A user cancellation is neither success nor a provider failure. Pause a
-    /// still-active goal so the sidebar and stable prompt do not claim that an
-    /// autonomous run remains live, and require an explicit `/goal resume`.
-    async fn pause_goal_after_interruption(&mut self) {
+    /// Pause a still-active goal with an inspectable reason and publish every
+    /// host projection in one ordered path.
+    async fn pause_goal_continuation(&mut self, reason: GoalPauseReason, message: String) {
         let snapshot = match self.config.goal_state.lock() {
             Ok(mut state) => {
                 if !state.is_active() {
                     return;
                 }
-                let objective = state.objective().map(str::to_string);
-                let budget = state.token_budget();
-                state.sync_from_host_status(objective.as_deref(), budget, GoalStatus::Paused);
+                if let Err(err) = state.mark_paused(reason) {
+                    tracing::warn!("failed to pause goal continuation: {err}");
+                    return;
+                }
                 state.snapshot()
             }
             Err(err) => {
@@ -3077,13 +2997,7 @@ impl Engine {
         self.refresh_system_prompt();
         self.emit_session_updated().await;
         let _ = self.tx_event.send(Event::GoalUpdated { snapshot }).await;
-        let _ = self
-            .tx_event
-            .send(Event::status(
-                "Goal paused because its model turn was interrupted; use /goal resume to continue."
-                    .to_string(),
-            ))
-            .await;
+        let _ = self.tx_event.send(Event::status(message)).await;
     }
 
     /// Handle `/goal pause|resume|clear|complete|blocked` by writing the new
@@ -3309,7 +3223,6 @@ impl Engine {
         self.session
             .working_set
             .observe_user_message(&content, &self.session.workspace);
-        let force_update_plan_first = should_force_update_plan_first(input_policy.mode, &content);
 
         // Add user message to session
         let user_msg = self.user_text_message_with_turn_metadata_for_route_and_provenance(
@@ -3384,7 +3297,6 @@ impl Engine {
                 std::env::current_dir().ok(),
                 &self.session.working_set,
                 &self.config.todos,
-                &self.config.plan_state,
                 Some(&self.subagent_manager),
             )
             .await;
@@ -3482,7 +3394,7 @@ impl Engine {
                 .with_parent_completion_tx(self.tx_subagent_completion.clone())
                 .with_parent_mode(input_policy.mode);
                 if matches!(input_policy.mode, AppMode::Plan) {
-                    rt.worker_profile = WorkerRuntimeProfile::for_role(SubAgentType::Plan);
+                    rt.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Planner);
                 }
                 // #4042: stamp the session's --disallowed-tools onto the parent
                 // runtime so every model-spawned sub-agent inherits the deny-list
@@ -3587,7 +3499,6 @@ impl Engine {
             tool_registry.as_ref(),
             tools,
             input_policy.mode,
-            force_update_plan_first,
             input_policy.dynamic_active_tools,
         ))
         .catch_unwind()
@@ -3672,6 +3583,68 @@ impl Engine {
         outcome
     }
 
+    /// Capture typed live state for post-compact rehydrate (todos, workers,
+    /// shells, mode, permission). Pure formatting lives in compaction.rs.
+    async fn capture_compaction_live_state(&self) -> CompactionLiveState {
+        let todos = {
+            let guard = self.config.todos.lock().await;
+            let snap = guard.snapshot();
+            if snap.is_empty() {
+                Vec::new()
+            } else {
+                snap.plain_text()
+                    .lines()
+                    .map(str::trim)
+                    .filter(|line| !line.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }
+        };
+
+        let running_workers = {
+            let mut guard = self.subagent_manager.write().await;
+            guard.cleanup(Duration::from_secs(60 * 60));
+            guard
+                .list()
+                .into_iter()
+                .filter(|s| matches!(s.status, SubAgentStatus::Running))
+                .map(|s| {
+                    let role = s.assignment.role.as_deref().unwrap_or("-");
+                    let goal = if s.assignment.objective.is_empty() {
+                        "(no objective)"
+                    } else {
+                        s.assignment.objective.as_str()
+                    };
+                    format!("`{}` (role: {role}) — {goal}", s.agent_id)
+                })
+                .collect()
+        };
+
+        let background_shells = match self.shell_manager.lock() {
+            Ok(mut manager) => manager
+                .list_jobs()
+                .into_iter()
+                .filter(|job| matches!(job.status, crate::tools::shell::ShellStatus::Running))
+                .map(|job| format!("`{}`: `{}`", job.id, job.command))
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+
+        CompactionLiveState {
+            mode: Some(self.current_mode.as_setting().to_string()),
+            permission_posture: Some(
+                self.session
+                    .approval_mode
+                    .permission_chip_label()
+                    .to_string(),
+            ),
+            todos,
+            background_shells,
+            running_workers,
+            open_approvals: Vec::new(),
+        }
+    }
+
     async fn handle_manual_compaction(&mut self) {
         let id = format!("compact_{}", &uuid::Uuid::new_v4().to_string()[..8]);
         let zero_usage = Usage {
@@ -3713,10 +3686,16 @@ impl Engine {
         let mut turn_status = TurnOutcomeStatus::Completed;
         let mut turn_error = None;
 
+        let mut compaction_config = self.config.compaction.clone();
+        let live = self.capture_compaction_live_state().await;
+        if !live.is_empty() {
+            compaction_config.live_state = Some(live);
+        }
+
         match compact_messages_safe(
             &client,
             &self.session.messages,
-            &self.config.compaction,
+            &compaction_config,
             Some(&self.session.workspace),
             Some(&compaction_pins),
             Some(&compaction_paths),
@@ -3949,6 +3928,10 @@ impl Engine {
             .token_threshold
             .min(target_budget.saturating_sub(1))
             .max(1);
+        let live = self.capture_compaction_live_state().await;
+        if !live.is_empty() {
+            forced_config.live_state = Some(live);
+        }
 
         // Preserve the working-set pins on the emergency/preflight path too.
         // Previously this passed None/None, so a compaction routed here (which,
@@ -4075,7 +4058,6 @@ impl Engine {
             &self.session.model,
             self.config.active_route_limits,
         ))
-        .with_review_plan_changes(matches!(mode, AppMode::Plan))
         .with_features(self.config.features.clone())
         .with_shell_manager(self.shell_manager.clone())
         .with_file_read_tracker(self.file_read_tracker.clone())
@@ -4108,15 +4090,12 @@ impl Engine {
             ctx = ctx.with_network_policy(decider.clone());
         }
 
-        // Wire the large-output router (#548). Only attaches when the
-        // [workshop] config table is present; sub-agents don't inherit the
-        // router (their ToolContext is built separately) to prevent recursive
-        // routing of the synthesis call itself.
-        if let Some(workshop_cfg) = self.config.workshop.as_ref()
-            && let Some(vars_arc) = self.workshop_vars.as_ref()
-        {
-            let router =
-                crate::tools::large_output_router::LargeOutputRouter::new(workshop_cfg.clone());
+        // Adaptive evidence routing is engine-native and always present.
+        // `[workshop]` only customizes thresholds; it no longer gates storage.
+        if let Some(vars_arc) = self.workshop_vars.as_ref() {
+            let router = crate::tools::large_output_router::LargeOutputRouter::new(
+                self.config.workshop.clone().unwrap_or_default(),
+            );
             ctx = ctx.with_large_output_router(router, vars_arc.clone());
         }
 
@@ -4329,112 +4308,6 @@ impl Engine {
 
     /// Handle a turn using the DeepSeek API.
     #[allow(clippy::too_many_lines)]
-    /// Run the pre-request layered-context checkpoint (#159). Checks whether
-    /// the active input estimate has crossed a soft-seam threshold and, if so,
-    /// produces an `<archived_context>` block via Flash and appends it as an
-    /// assistant message. Called from `handle_deepseek_turn` before each API
-    /// request so the model always has the latest navigation aids.
-    async fn layered_context_checkpoint(&mut self) {
-        if self.seam_manager.is_none() {
-            return;
-        }
-        if !self.seam_manager.as_ref().unwrap().config().enabled {
-            return;
-        }
-
-        // Compute the estimated token count *before* taking a long-lived
-        // `&SeamManager` borrow — `estimated_input_tokens` mutates the
-        // engine's token-estimate cache, which would conflict.
-        let estimated_tokens = self.estimated_input_tokens();
-        let seam_mgr = self.seam_manager.as_ref().unwrap();
-        let highest = seam_mgr.highest_level().await;
-        let Some(level) = seam_mgr.seam_level_for(estimated_tokens, highest) else {
-            return;
-        };
-
-        // Determine the message range to summarize: everything before the
-        // verbatim window. The verbatim window (last ~16 turns) stays
-        // untouched so the model always has ground-truth recent context.
-        let msg_count = self.session.messages.len();
-        let verbatim_start = seam_mgr.verbatim_window_start(msg_count);
-        if verbatim_start == 0 {
-            return; // Not enough messages to summarize.
-        }
-
-        let msg_range_end = verbatim_start;
-        let pinned = self
-            .session
-            .working_set
-            .pinned_message_indices(&self.session.messages, &self.session.workspace);
-
-        let _ = self
-            .tx_event
-            .send(Event::status(format!(
-                "⏻ producing L{level} context seam ({msg_range_end} messages)…"
-            )))
-            .await;
-
-        // If we have existing seams, recompact; otherwise produce fresh.
-        let existing_seams = seam_mgr.collect_seam_texts(&self.session.messages).await;
-        let seam_text = if existing_seams.is_empty() {
-            match seam_mgr
-                .produce_soft_seam(
-                    &self.session.messages,
-                    level,
-                    0,
-                    msg_range_end,
-                    Some(&self.session.workspace),
-                    &pinned,
-                )
-                .await
-            {
-                Ok(text) => text,
-                Err(err) => {
-                    crate::logging::warn(format!("L{level} soft seam failed: {err}"));
-                    return;
-                }
-            }
-        } else {
-            let recent: Vec<&Message> = (0..msg_range_end)
-                .filter_map(|i| self.session.messages.get(i))
-                .collect();
-            match seam_mgr
-                .recompact(&existing_seams, &recent, level, 0, msg_range_end)
-                .await
-            {
-                Ok(text) => text,
-                Err(err) => {
-                    crate::logging::warn(format!("L{level} recompact failed: {err}"));
-                    return;
-                }
-            }
-        };
-
-        if seam_text.is_empty() {
-            return;
-        }
-
-        // Capture seam count before the mutable borrow below.
-        let seam_count = seam_mgr.seam_count().await;
-
-        // Append the seam as an assistant message. This is an append-only
-        // operation — no messages are deleted. The prefix cache stays hot.
-        self.add_session_message(Message {
-            role: "assistant".to_string(),
-            content: vec![ContentBlock::Text {
-                text: seam_text,
-                cache_control: None,
-            }],
-        })
-        .await;
-
-        let _ = self
-            .tx_event
-            .send(Event::status(format!(
-                "⏻ L{level} seam complete ({seam_count} total, {msg_range_end} messages covered)"
-            )))
-            .await;
-    }
     /// Refresh the stable system prompt based on current non-mode context.
     fn refresh_system_prompt(&mut self) {
         let user_memory_block = crate::memory::compose_block(
@@ -4769,11 +4642,20 @@ pub(super) fn exec_shell_ask_rule_decision(
     workspace: &Path,
     approval_mode: crate::tui::approval::ApprovalMode,
 ) -> Option<ToolAskRuleDecision> {
-    if tool_name != "exec_shell" {
+    let policy_tool_name =
+        crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
+    if policy_tool_name != "exec_shell" {
         return None;
     }
     let command = tool_input.get("command").and_then(Value::as_str)?;
-    tool_ask_rule_decision_for_context(config, tool_name, command, None, workspace, approval_mode)
+    tool_ask_rule_decision_for_context(
+        config,
+        policy_tool_name,
+        command,
+        None,
+        workspace,
+        approval_mode,
+    )
 }
 
 pub(super) fn file_tool_ask_rule_decision(
@@ -4783,11 +4665,13 @@ pub(super) fn file_tool_ask_rule_decision(
     workspace: &Path,
     approval_mode: crate::tui::approval::ApprovalMode,
 ) -> Option<ToolAskRuleDecision> {
-    let paths = file_tool_permission_paths(tool_name, tool_input)?;
+    let policy_tool_name =
+        crate::tools::canonical_action::canonical_action_alias(tool_name, tool_input);
+    let paths = file_tool_permission_paths(policy_tool_name, tool_input)?;
     if paths.is_empty() {
         return tool_ask_rule_decision_for_context(
             config,
-            tool_name,
+            policy_tool_name,
             "",
             None,
             workspace,
@@ -4799,7 +4683,7 @@ pub(super) fn file_tool_ask_rule_decision(
     for path in paths {
         match tool_ask_rule_decision_for_context(
             config,
-            tool_name,
+            policy_tool_name,
             "",
             Some(&path),
             workspace,
@@ -5081,8 +4965,7 @@ use self::dispatch::{
     ToolExecutionBatch, ToolExecutionPlan, caller_allowed_for_tool, caller_type_for_tool_use,
     final_tool_input, format_tool_error_with_schema, malformed_tool_arguments_error,
     malformed_tool_arguments_input, mcp_tool_is_parallel_safe, parse_parallel_tool_calls,
-    parse_tool_input, plan_tool_execution_batches, should_force_update_plan_first,
-    should_stop_after_plan_tool, stamp_tool_result_approval,
+    parse_tool_input, plan_tool_execution_batches, stamp_tool_result_approval,
 };
 #[cfg(test)]
 use self::dispatch::{format_tool_error, should_parallelize_tool_batch};

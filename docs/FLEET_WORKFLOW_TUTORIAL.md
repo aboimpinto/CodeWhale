@@ -19,7 +19,7 @@ you do not need to write workflow files for ordinary multi-agent work. Details:
 This tutorial covers the **manual** Fleet task-spec / checked-in Workflow path
 for operators who want durable host workers and reviewable specs. A
 one-sentence request should still not silently generate `tasks.json`; worker
-cards and approval posture make dispatch visible without exposing authoring
+cards and permission posture make dispatch visible without exposing authoring
 mechanics.
 
 ## 1. Prepare The Workspace

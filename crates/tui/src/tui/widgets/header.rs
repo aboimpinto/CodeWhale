@@ -27,11 +27,9 @@ const CONTEXT_SIGNAL_WIDTH: usize = 4;
 const STATUS_INDICATOR_FRAME_MS: u128 = 420;
 
 /// Frames retained only for the explicitly selected classic treatment.
-const STATUS_INDICATOR_WHALE_FRAMES: &[&str] = &[
-    "🐳", "🐳.", "🐳..", "🐳...", "🐳..", "🐳.", "🐋", "🐋.", "🐋..", "🐋...", "🐋..", "🐋.",
-];
-
 /// Geometric replacement frames shipped between v0.8.x and v0.8.29.
+/// Every frame is one cell wide so the provider/model label never shifts
+/// while the animation advances.
 const STATUS_INDICATOR_DOT_FRAMES: &[&str] = &["◍", "◉", "◌", "◌", "◉", "◍"];
 
 /// Resolve the current status-indicator frame to render in the header
@@ -41,26 +39,24 @@ const STATUS_INDICATOR_DOT_FRAMES: &[&str] = &["◍", "◉", "◌", "◌", "◉"
 /// chip is *visible* but not animating — it's a chip, not a spinner. As
 /// soon as a turn starts, the elapsed time keys the cycle.
 ///
-/// `mode` accepts the canonical names `"whale"`, `"dots"`, `"off"` (any
-/// other value is treated as `"whale"` to mirror
-/// `StatusIndicatorValue::from(&str)`). `"off"` returns `None` so the
+/// `mode` accepts the canonical names `"cw"`, `"dots"`, `"off"`. The whale
+/// emoji chip is retired from the header (2026-07-23 product decision): the
+/// whale lives in the terminal window title and the idle water, never
+/// beside the model/mode chips. Legacy `"whale"` values (still present in
+/// persisted settings) normalize to the typographic `cw` mark; unknown
+/// values fall back to `"cw"` as well. `"off"` returns `None` so the
 /// caller can hide the chip outright.
 #[must_use]
 pub fn header_status_indicator_frame(
     turn_started_at: Option<Instant>,
     mode: &str,
 ) -> Option<&'static str> {
-    if matches!(
-        mode.trim().to_ascii_lowercase().as_str(),
-        "cw" | "mark" | "text"
-    ) {
-        return Some("cw");
-    }
     let frames: &[&str] = match mode.trim().to_ascii_lowercase().as_str() {
         "off" | "none" | "hidden" | "false" => return None,
         "dots" | "dot" => STATUS_INDICATOR_DOT_FRAMES,
-        "whale" | "🐳" | "🐋" => STATUS_INDICATOR_WHALE_FRAMES,
-        // Unknown values keep the owned typographic mark visible.
+        // Canonical mark, legacy whale opt-ins, and unknown values all land
+        // on the static typographic mark so the header never reintroduces
+        // an emoji chip beside the model/mode cluster.
         _ => return Some("cw"),
     };
     let elapsed_ms = turn_started_at
@@ -99,6 +95,9 @@ pub struct HeaderData<'a> {
     /// so the widget itself stays a pure pre-built render. `None` hides the
     /// chip entirely (e.g., `status_indicator = "off"`).
     pub status_indicator_frame: Option<&'static str>,
+    /// Live sub-agent count for the header chrome. `0` hides the chip.
+    /// Drill-in is the Agents sidebar / SubAgents modal — not a transcript shelf.
+    pub running_agents: usize,
 }
 
 impl<'a> HeaderData<'a> {
@@ -123,7 +122,15 @@ impl<'a> HeaderData<'a> {
             reasoning_effort_label: None,
             provider_label: None,
             status_indicator_frame: Some("cw"),
+            running_agents: 0,
         }
+    }
+
+    /// Live concurrent sub-agent count (`2 agents`). Hidden when zero.
+    #[must_use]
+    pub fn with_running_agents(mut self, count: usize) -> Self {
+        self.running_agents = count;
+        self
     }
 
     /// Attach a short reasoning-effort label for the header chip.
@@ -541,6 +548,24 @@ impl<'a> HeaderWidget<'a> {
                 Style::default().fg(palette::WHALE_INFO),
             ));
         }
+        // Sub-agent count: high-signal when workers are live; sits after
+        // route/mode so the left zone still names "where am I" first.
+        if self.data.running_agents > 0 {
+            let agents = if self.data.running_agents == 1 {
+                "1 agent".to_string()
+            } else {
+                format!("{} agents", self.data.running_agents)
+            };
+            if Self::span_width(&spans) + 3 + agents.width() <= max_width {
+                spans.push(Span::styled(" · ", Style::default().fg(palette::TEXT_DIM)));
+                spans.push(Span::styled(
+                    agents,
+                    Style::default()
+                        .fg(palette::WHALE_LIVE)
+                        .add_modifier(Modifier::BOLD),
+                ));
+            }
+        }
         spans
     }
 
@@ -635,7 +660,8 @@ mod tests {
             72,
         );
 
-        // Wave 7: the Agent mode chip reads "Act".
+        // Wave 7: the Agent mode chip reads "Act". Default brand is the
+        // typographic `cw` mark; the whale lives in the window title.
         assert!(rendered.contains("cw"));
         assert!(rendered.contains("act"));
         assert!(rendered.contains("deepseek-v4-pro"));
@@ -666,10 +692,10 @@ mod tests {
     }
 
     #[test]
-    fn narrow_header_drops_version_chip_before_dropping_mode() {
+    fn narrow_header_keeps_brand_and_context_after_dropping_version_and_mode() {
         // Very tight width budget — the version is among the first
-        // chips to disappear; the mode label must still render.
-        // YOLO is invisible Act+Bypass shorthand, so the chip reads "Act".
+        // chips to disappear. At this width the live brand and context receipt
+        // are the two surviving signals.
         let rendered = render_header(
             HeaderData::new(
                 AppMode::Yolo,
@@ -686,10 +712,8 @@ mod tests {
             !rendered.contains(&version),
             "version chip should drop under width pressure: {rendered:?}",
         );
-        assert!(
-            rendered.contains("act") || rendered.contains('a'),
-            "mode label must survive: {rendered:?}",
-        );
+        assert!(rendered.contains("cw"), "brand must survive: {rendered:?}");
+        assert!(rendered.contains('%'), "context must survive: {rendered:?}");
     }
 
     #[test]
@@ -727,7 +751,9 @@ mod tests {
     }
 
     #[test]
-    fn narrow_header_falls_back_to_mode_without_rendering_all_modes() {
+    fn narrow_header_keeps_brand_without_rendering_modes() {
+        // At width 6 the typographic brand and context meter survive; mode
+        // chips are the first expendable signal under pressure.
         let rendered = render_header(
             HeaderData::new(
                 AppMode::Yolo,
@@ -737,13 +763,10 @@ mod tests {
                 palette::WHALE_BG,
             )
             .with_usage(1_000, Some(10_000), 0.0, Some(4_000)),
-            8,
+            6,
         );
 
-        // YOLO renders as Act; under extreme width pressure only the first
-        // glyph of the mode chip remains.
         assert!(rendered.trim_start().starts_with("cw"));
-        assert!(rendered.contains("act"));
         assert!(!rendered.contains("Plan"));
         assert!(!rendered.contains("Operate"));
     }
@@ -819,11 +842,22 @@ mod tests {
     }
 
     #[test]
-    fn whale_indicator_idle_frame_is_first_whale_glyph() {
-        // No active turn = no animation, just the calm 🐳 glyph sitting
-        // next to the effort chip.
-        let frame = super::header_status_indicator_frame(None, "whale");
-        assert_eq!(frame, Some("🐳"));
+    fn legacy_whale_indicator_settings_normalize_to_the_cw_mark() {
+        // The whale emoji chip is retired from the header (2026-07-23):
+        // persisted `status_indicator = "whale"` opt-ins render the static
+        // typographic mark instead, idle or mid-turn.
+        for legacy in ["whale", "🐳", "🐋"] {
+            assert_eq!(
+                super::header_status_indicator_frame(None, legacy),
+                Some("cw"),
+                "legacy mode {legacy:?} must normalize to the cw mark"
+            );
+            assert_eq!(
+                super::header_status_indicator_frame(Some(std::time::Instant::now()), legacy),
+                Some("cw"),
+                "legacy mode {legacy:?} must stay static mid-turn"
+            );
+        }
     }
 
     #[test]
@@ -832,24 +866,6 @@ mod tests {
         assert_eq!(
             super::header_status_indicator_frame(Some(std::time::Instant::now()), "cw"),
             Some("cw")
-        );
-    }
-
-    #[test]
-    fn whale_indicator_advances_through_frames_then_breaches() {
-        use std::thread::sleep;
-        use std::time::Duration;
-        let start = std::time::Instant::now();
-        // Frame 0 immediately.
-        assert_eq!(
-            super::header_status_indicator_frame(Some(start), "whale"),
-            Some("🐳")
-        );
-        // After ~420ms one tick has elapsed → frame 1.
-        sleep(Duration::from_millis(430));
-        assert_eq!(
-            super::header_status_indicator_frame(Some(start), "whale"),
-            Some("🐳.")
         );
     }
 
@@ -869,9 +885,54 @@ mod tests {
     }
 
     #[test]
-    fn unknown_indicator_mode_defaults_to_cw_mark() {
+    fn unknown_indicator_mode_defaults_to_cw() {
         let frame = super::header_status_indicator_frame(None, "wahel-typo");
         assert_eq!(frame, Some("cw"));
+    }
+
+    #[test]
+    fn indicator_frames_keep_a_stable_width_within_each_mode() {
+        use unicode_width::UnicodeWidthStr;
+
+        // Animation must never shift the provider/model label: all frames of
+        // an animated mode share one cell width, and the static mark is
+        // rendered verbatim.
+        for frame in super::STATUS_INDICATOR_DOT_FRAMES {
+            let spans = HeaderWidget::new(
+                HeaderData::new(
+                    AppMode::Agent,
+                    "model",
+                    "workspace",
+                    true,
+                    palette::WHALE_BG,
+                )
+                .with_status_indicator(Some(frame)),
+            )
+            .status_indicator_spans();
+            assert_eq!(
+                spans[0].content.as_ref().width(),
+                1,
+                "dot frame {frame:?} shifted the header"
+            );
+        }
+        let spans = HeaderWidget::new(
+            HeaderData::new(
+                AppMode::Agent,
+                "model",
+                "workspace",
+                true,
+                palette::WHALE_BG,
+            )
+            .with_status_indicator(Some("cw")),
+        )
+        .status_indicator_spans();
+        assert_eq!(spans[0].content.as_ref(), "cw");
+    }
+
+    #[test]
+    fn whale_glyphs_have_narrow_ascii_fallbacks() {
+        assert_eq!(crate::tui::glyphs::ascii_fallback("🐳"), Some("w"));
+        assert_eq!(crate::tui::glyphs::ascii_fallback("🐋"), Some("w"));
     }
 
     #[test]
@@ -974,6 +1035,26 @@ mod tests {
         assert_eq!(cw[0].style.fg, Some(palette::WHALE_HUMAN));
         assert_eq!(live[0].style.fg, Some(palette::WHALE_INFO));
         assert_ne!(cw[0].style.fg, live[0].style.fg);
+    }
+
+    #[test]
+    fn header_shows_running_agent_count() {
+        let rendered = render_left(
+            HeaderData::new(AppMode::Agent, "glm-5.1", "CW", true, palette::WHALE_BG)
+                .with_status_indicator(Some("cw"))
+                .with_running_agents(2),
+            80,
+        );
+        assert!(
+            rendered.contains("2 agents"),
+            "live agent count belongs in header chrome: {rendered:?}"
+        );
+        let empty = render_left(
+            HeaderData::new(AppMode::Agent, "glm-5.1", "CW", false, palette::WHALE_BG)
+                .with_running_agents(0),
+            80,
+        );
+        assert!(!empty.contains("agent"), "{empty:?}");
     }
 
     #[test]

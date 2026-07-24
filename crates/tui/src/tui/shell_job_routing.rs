@@ -18,17 +18,6 @@ fn status_label(status: &ShellStatus, stale: bool) -> &'static str {
     }
 }
 
-fn format_elapsed(ms: u64) -> String {
-    if ms == 0 {
-        return "-".to_string();
-    }
-    if ms < 60_000 {
-        format!("{:.1}s", ms as f64 / 1000.0)
-    } else {
-        format!("{:.1}m", ms as f64 / 60_000.0)
-    }
-}
-
 pub(super) fn format_shell_job_list(jobs: &[ShellJobSnapshot]) -> String {
     if jobs.is_empty() {
         return "No live Bash jobs. Bash jobs are process-local; after a restart, inspect durable task artifacts for prior command output.".to_string();
@@ -48,7 +37,7 @@ pub(super) fn format_shell_job_list(jobs: &[ShellJobSnapshot]) -> String {
             "{}  {:8}  {}  exit={:?}{}",
             job.id,
             status_label(&job.status, job.stale),
-            format_elapsed(job.elapsed_ms),
+            crate::elapsed::format_elapsed_ms(job.elapsed_ms),
             job.exit_code,
             task
         ));
@@ -77,7 +66,7 @@ pub(super) fn format_shell_poll(result: &ShellResult) -> String {
             result.task_id.as_deref().unwrap_or("(unknown)"),
             status_label(&result.status, false),
             result.exit_code,
-            format_elapsed(result.duration_ms)
+            crate::elapsed::format_elapsed_ms(result.duration_ms)
         ),
         String::new(),
     ];
@@ -117,7 +106,10 @@ fn format_shell_job_detail(detail: &ShellJobDetail) -> String {
         format!("Status: {}", status_label(&job.status, job.stale)),
         format!("Command: {}", job.command),
         format!("Cwd: {}", crate::utils::display_path(&job.cwd)),
-        format!("Elapsed: {}", format_elapsed(job.elapsed_ms)),
+        format!(
+            "Elapsed: {}",
+            crate::elapsed::format_elapsed_ms(job.elapsed_ms)
+        ),
         format!("Exit Code: {:?}", job.exit_code),
         format!("Stdin Available: {}", job.stdin_available),
     ];

@@ -1,14 +1,15 @@
 use super::{
-    ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, PlanUpdateCell,
-    REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, TOOL_RUNNING_SYMBOLS,
+    ASSISTANT_GLYPH, ExecCell, ExecSource, GenericToolCell, HistoryCell, McpToolCell,
+    PlanUpdateCell, REASONING_CURSOR, REASONING_OPENER, REASONING_RAIL, TOOL_RUNNING_SYMBOLS,
     TOOL_STATUS_SYMBOL_MS, ToolCell, ToolStatus, TranscriptRenderOptions, USER_GLYPH,
-    WebSearchCell, assistant_label_style_for, extract_reasoning_summary, render_thinking,
-    running_status_label_with_elapsed,
+    WebSearchCell, assistant_label_style_for, extract_reasoning_summary,
+    render_spillover_annotation, render_thinking, running_status_label_with_elapsed,
 };
 use crate::deepseek_theme::Theme;
 use crate::models::{ContentBlock, Message};
 use crate::palette;
 use crate::tools::plan::{PlanSnapshot, StepStatus};
+use crate::tui::motion::MotionMode;
 use crate::tui::ui_text::{line_to_plain, slice_text, text_display_width};
 use ratatui::style::Modifier;
 use std::time::{Duration, Instant};
@@ -42,16 +43,16 @@ fn web_search_cell_renders_receipt_source_degradation_and_citations() {
 // Below 3s the label stays "running" — quick reads/greps shouldn't
 // visually churn. From 3s onward the badge appears and ticks each
 // second so the user can tell the call hasn't hung.
-// ---- #423 spillover-path UI annotation ----
+// ---- #4619 adaptive evidence UI receipt ----
 //
 // When a tool result carries a `spillover_path` (set by the
 // tool-routing layer when the tool's `metadata.spillover_path` is
-// populated), the live render appends a one-line muted hint
-// pointing at the file. Transcript-mode replay leaves the hint
-// off because the full output is already inline.
+// populated), expanded live detail appends a calm path-free receipt.
+// Transcript-mode replay leaves the hint off because the full output is
+// already inline.
 
 #[test]
-fn render_spillover_annotation_shows_path() {
+fn compact_live_row_does_not_leak_evidence_path() {
     use std::path::PathBuf;
     let cell = GenericToolCell {
         name: "read_file".to_string(),
@@ -418,9 +419,65 @@ fn render_spillover_annotation_truncates_to_width() {
         .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
         .collect();
     assert!(
-        !rendered.contains("full output:"),
-        "compact live rows should omit spillover annotations: {rendered:?}"
+        rendered.contains("Exact evidence retained"),
+        "compact live rows should expose the calm path-free receipt: {rendered:?}"
     );
+    assert!(!rendered.contains(long_path));
+}
+
+#[test]
+fn specialized_bash_and_mcp_cells_share_the_calm_evidence_receipt() {
+    let receipt = "[Exact evidence retained · 200 KiB · inspect with `retrieve_tool_result ref=art_call-big`]\n\nhead\n\n[final excerpt]\ntail";
+    let bash = ExecCell {
+        command: "cargo test".to_string(),
+        status: ToolStatus::Failed,
+        output: Some(receipt.to_string()),
+        live_output: None,
+        shell_task_id: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        started_at: None,
+        duration_ms: Some(50),
+        source: ExecSource::Assistant,
+        interaction: None,
+        output_summary: None,
+    };
+    let mcp = McpToolCell {
+        tool: "mcp_fixture".to_string(),
+        status: ToolStatus::Failed,
+        content: Some(receipt.to_string()),
+        is_image: false,
+    };
+    for rendered in [
+        lines_text(&ToolCell::Exec(bash).lines_with_motion(80, true)),
+        lines_text(&ToolCell::Mcp(mcp).lines_with_motion(80, true)),
+    ] {
+        assert!(rendered.contains("Exact evidence retained"), "{rendered}");
+        // Option+V is a global details affordance, not a per-card stamp (#4718).
+        assert!(!rendered.contains("Option+V to inspect"), "{rendered}");
+        assert!(!rendered.contains("retrieve_tool_result"), "{rendered}");
+        assert!(!rendered.contains("head"), "{rendered}");
+    }
+}
+
+#[test]
+fn adaptive_evidence_receipt_is_calm_path_free_and_width_bounded() {
+    use std::path::Path;
+
+    let secret_path = Path::new("/Users/private/.codewhale/sessions/session-a/artifacts/hash.txt");
+    for width in [18_u16, 40, 80, 120] {
+        let rendered = line_to_plain(&render_spillover_annotation(secret_path, width));
+        assert!(
+            text_display_width(&rendered) <= usize::from(width),
+            "receipt exceeds width {width}: {rendered:?}"
+        );
+        assert!(!rendered.contains("/Users"));
+        assert!(!rendered.contains("hash.txt"));
+        assert!(!rendered.contains("Option+V"));
+        if width >= 32 {
+            assert_eq!(rendered, "  Exact evidence retained");
+        }
+    }
 }
 
 #[test]
@@ -887,6 +944,52 @@ fn tool_history_repair_receipt_renders_as_system_history() {
 }
 
 #[test]
+fn user_history_hides_only_the_trailing_turn_metadata_block() {
+    let visible = "Explain this literal: <turn_meta>example</turn_meta>";
+    let turn_meta = concat!(
+        "<turn_meta>\n",
+        "Current local date: 2026-07-22\n",
+        "Input provenance: external_user\n",
+        "Input authority: external_current_turn\n",
+        "</turn_meta>",
+    );
+    let msg = Message {
+        role: "user".to_string(),
+        content: vec![
+            ContentBlock::Text {
+                text: visible.to_string(),
+                cache_control: None,
+            },
+            ContentBlock::Text {
+                text: turn_meta.to_string(),
+                cache_control: None,
+            },
+        ],
+    };
+
+    let cells = super::history_cells_from_message(&msg);
+
+    assert!(matches!(
+        cells.as_slice(),
+        [HistoryCell::User { content }] if content == visible
+    ));
+
+    let literal_only = Message {
+        role: "user".to_string(),
+        content: vec![ContentBlock::Text {
+            text: "<turn_meta>user-authored example</turn_meta>".to_string(),
+            cache_control: None,
+        }],
+    };
+    let literal_cells = super::history_cells_from_message(&literal_only);
+    assert!(matches!(
+        literal_cells.as_slice(),
+        [HistoryCell::User { content }]
+            if content == "<turn_meta>user-authored example</turn_meta>"
+    ));
+}
+
+#[test]
 fn history_replays_update_plan_tool_use_as_plan_card() {
     let msg = Message {
         role: "assistant".to_string(),
@@ -934,7 +1037,7 @@ fn render_thinking_collapsed_shows_details_affordance() {
         .iter()
         .flat_map(|line| line.spans.iter().map(|span| span.content.as_ref()))
         .collect::<String>();
-    assert!(text.contains("Full reasoning in Ctrl+O"));
+    assert!(text.contains("Ctrl+O: full reasoning"));
     // Pin the actual header shape ("… reasoning done") — a bare
     // `contains("reasoning")` is already satisfied by the Ctrl+O
     // affordance line above and would never fail on its own.
@@ -1008,6 +1111,15 @@ fn render_hidden_streaming_thinking_shows_activity_without_content() {
         text.contains("reasoning hidden"),
         "hidden live thinking should still show progress: {text}"
     );
+    assert_eq!(
+        lines.len(),
+        1,
+        "hidden reasoning should have one compact status treatment: {text}"
+    );
+    assert!(
+        !text.contains("reasoning live") && !text.contains("model is still working"),
+        "hidden reasoning should not stack duplicate live-state copy: {text}"
+    );
     assert!(
         !text.contains("private chain of thought"),
         "hidden live thinking must not reveal content: {text}"
@@ -1041,7 +1153,7 @@ fn render_thinking_streaming_truncated_shows_continues_affordance() {
     // #861 RC4: when a streaming thinking block exceeds the line cap,
     // surface a live affordance pointing at Ctrl+O. The earlier code
     // suppressed the affordance unless `!streaming`.
-    let long = (1..=12)
+    let long = (1..=16)
         .map(|i| format!("Reasoning line {i}"))
         .collect::<Vec<_>>()
         .join("\n");
@@ -1056,7 +1168,7 @@ fn render_thinking_streaming_truncated_shows_continues_affordance() {
     );
     // The most recent line must be the visible tail (head dropped).
     assert!(
-        text.contains("Reasoning line 12"),
+        text.contains("Reasoning line 16"),
         "tail line missing, got: {text}"
     );
     assert!(
@@ -1098,6 +1210,15 @@ fn tool_lines_with_options_respects_low_motion_in_default_path() {
         80,
         TranscriptRenderOptions {
             low_motion: true,
+            motion_mode: MotionMode::Reduced,
+            ..TranscriptRenderOptions::default()
+        },
+    );
+    let still = cell.lines_with_options(
+        80,
+        TranscriptRenderOptions {
+            low_motion: true,
+            motion_mode: MotionMode::Still,
             ..TranscriptRenderOptions::default()
         },
     );
@@ -1105,12 +1226,94 @@ fn tool_lines_with_options_respects_low_motion_in_default_path() {
     // Index 0 is card-rail glyph (╭); the animated symbol is at index 1.
     let animated_symbol = animated[0].spans[1].content.trim();
     let low_motion_symbol = low_motion[0].spans[1].content.trim();
+    let still_symbol = still[0].spans[1].content.trim();
 
     // Reduced motion freezes at a filled, legible bubble rather than an
     // invisible blank braille cell.
     assert_eq!(low_motion_symbol, "⣤");
+    assert_eq!(still_symbol, "›");
     // The animated path should be on a different frame (index 2).
     assert_ne!(animated_symbol, TOOL_RUNNING_SYMBOLS[0]);
+}
+
+#[test]
+fn reduced_verify_marker_uses_the_shared_calm_glyph() {
+    let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: "run_verifiers".to_string(),
+        status: ToolStatus::Running,
+        input_summary: None,
+        output: None,
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    }));
+    let lines = cell.lines_with_options(
+        80,
+        TranscriptRenderOptions {
+            low_motion: true,
+            motion_mode: MotionMode::Reduced,
+            ..TranscriptRenderOptions::default()
+        },
+    );
+
+    assert_eq!(lines[0].spans[1].content.trim(), "⣤");
+}
+
+#[test]
+fn still_fanout_marker_uses_the_shared_chevron() {
+    let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: "workflow".to_string(),
+        status: ToolStatus::Running,
+        input_summary: Some("action: run".to_string()),
+        output: None,
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    }));
+    let lines = cell.lines_with_options(
+        80,
+        TranscriptRenderOptions {
+            low_motion: true,
+            motion_mode: MotionMode::Still,
+            ..TranscriptRenderOptions::default()
+        },
+    );
+
+    assert_eq!(lines[0].spans[1].content.trim(), "›");
+    assert_eq!(lines[0].spans[2].content.trim(), "⋮⋮");
+}
+
+#[test]
+fn still_marker_rewrite_never_consumes_braille_tool_output() {
+    let cell = HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: "read_file".to_string(),
+        status: ToolStatus::Running,
+        input_summary: None,
+        output: Some("⣿".to_string()),
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    }));
+    let lines = cell.lines_with_options(
+        80,
+        TranscriptRenderOptions {
+            low_motion: true,
+            motion_mode: MotionMode::Still,
+            ..TranscriptRenderOptions::default()
+        },
+    );
+
+    assert_eq!(lines[0].spans[1].content.trim(), "›");
+    assert!(
+        lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .any(|span| span.content.as_ref() == "⣿"),
+        "tool output must survive the typed-header marker pass: {lines:?}"
+    );
 }
 
 // === Speaker glyph tests (v0.6.6 UI redesign) ===
@@ -2127,7 +2330,9 @@ fn long_thinking_display_is_shorter_than_transcript() {
                 Third paragraph: even more reasoning.\n\
                 With another line.\n\n\
                 Fourth paragraph: the conclusion.\n\
-                And one more line for good measure.";
+                And one more line for good measure.\n\n\
+                Fifth paragraph: final verification.\n\
+                One last supporting detail.";
     let cell = HistoryCell::Thinking {
         content: body.to_string(),
         streaming: false,
@@ -2162,19 +2367,19 @@ fn long_thinking_display_is_shorter_than_transcript() {
         "live thinking should preview completed reasoning: {live_text}"
     );
     assert!(
-        transcript_text.contains("Fourth paragraph"),
+        transcript_text.contains("Fifth paragraph"),
         "transcript thinking must keep the full body"
     );
     assert!(
-        !live_text.contains("Fourth paragraph"),
+        !live_text.contains("Fifth paragraph"),
         "live thinking must drop the tail when collapsed"
     );
     assert!(
-        live_text.contains("Full reasoning in Ctrl+O"),
+        live_text.contains("Ctrl+O: full reasoning"),
         "live thinking must offer the pager affordance"
     );
     assert!(
-        !transcript_text.contains("Full reasoning in Ctrl+O"),
+        !transcript_text.contains("Ctrl+O: full reasoning"),
         "transcript thinking must not include the live affordance"
     );
 }
@@ -2211,7 +2416,7 @@ fn completed_short_thinking_without_summary_stays_visible_in_live_view() {
         "transcript thinking must keep the full reasoning body"
     );
     assert!(
-        !live_text.contains("Full reasoning in Ctrl+O"),
+        !live_text.contains("Ctrl+O: full reasoning"),
         "complete short reasoning should not need the detail affordance: {live_text}"
     );
 }
@@ -2246,7 +2451,7 @@ fn completed_reasoning_receipt_hides_internal_function_names_until_expanded() {
         "surrounding prose must still read: {collapsed_text}"
     );
     assert!(
-        collapsed_text.contains("Full reasoning in Ctrl+O"),
+        collapsed_text.contains("Ctrl+O: full reasoning"),
         "collapsed receipt must offer the expand affordance: {collapsed_text}"
     );
 

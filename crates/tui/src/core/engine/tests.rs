@@ -7,8 +7,11 @@ use super::turn_loop::{
 };
 use crate::config::ApiProvider;
 use crate::models::{SystemBlock, Usage};
+use crate::prompts::{
+    PromptSessionContext, system_prompt_flat_text,
+    system_prompt_for_mode_with_context_skills_and_session,
+};
 use crate::test_support::{EnvVarGuard, lock_test_env};
-use crate::tools::plan::{PlanItemArg, PlanSnapshot, StepStatus};
 use crate::tools::spec::ToolCapability;
 use crate::tools::todo::{TodoItem, TodoListSnapshot, TodoStatus};
 use serde_json::json;
@@ -1172,10 +1175,13 @@ async fn queued_interrupted_turn_cancels_older_goal_continuation_without_third_c
         "the stale synthetic token must not make a third provider call"
     );
     let goal = goal_state.lock().expect("goal lock").snapshot();
-    assert_eq!(goal.status, "paused");
+    // Interrupted ordinary turns cancel stale auto-continuation only; the goal
+    // stays Active so the next user message continues without /goal resume.
+    assert_eq!(goal.status, "active");
     assert_eq!(goal.blocker, None);
-    let prompt = system_prompt_text(session.system_prompt.expect("paused system prompt"));
-    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+    assert_eq!(goal.pause_reason, None);
+    let prompt = system_prompt_text(session.system_prompt.expect("active system prompt"));
+    assert!(prompt.contains("<session_goal>"), "{prompt}");
 
     handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
@@ -1233,8 +1239,8 @@ async fn initial_goal_failure_projects_blocked_state() {
 }
 
 #[tokio::test]
-async fn initial_goal_interruption_projects_paused_state() {
-    let objective = "pause the initial interrupted goal turn";
+async fn initial_goal_interruption_keeps_goal_active() {
+    let objective = "keep goal active after interrupted turn";
     let request_entered = std::sync::Arc::new(tokio::sync::Notify::new());
     let release_request = std::sync::Arc::new(tokio::sync::Notify::new());
     let model = std::sync::Arc::new(FirstRequestGatedGoalModelClient {
@@ -1278,10 +1284,13 @@ async fn initial_goal_interruption_projects_paused_state() {
     assert_eq!(model.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     let goal = goal_state.lock().expect("goal lock").snapshot();
     assert_eq!(goal.objective.as_deref(), Some(objective));
-    assert_eq!(goal.status, "paused");
+    assert_eq!(goal.status, "active");
     assert_eq!(goal.blocker, None);
-    let prompt = system_prompt_text(session.system_prompt.expect("paused system prompt"));
-    assert!(!prompt.contains("<session_goal>"), "{prompt}");
+    assert_eq!(goal.pause_reason, None);
+    let prompt = system_prompt_text(session.system_prompt.expect("active system prompt"));
+    // Durable goals stay in the prompt after interrupt so the next turn continues.
+    assert!(prompt.contains("<session_goal>"), "{prompt}");
+    assert!(prompt.contains(objective), "{prompt}");
 
     handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
@@ -1481,7 +1490,7 @@ async fn unsaturated_goal_control_runs_before_ready_idle_child_completion() {
 }
 
 #[tokio::test]
-async fn cross_turn_token_budget_exhaustion_blocks_goal_and_refreshes_prompt() {
+async fn cross_turn_token_budget_exhaustion_pauses_goal_and_refreshes_prompt() {
     use crate::llm_client::mock::{MockLlmClient, canned};
 
     let budget_turn = vec![
@@ -1574,26 +1583,24 @@ async fn cross_turn_token_budget_exhaustion_blocks_goal_and_refreshes_prompt() {
                 };
                 assert!(
                     !prompt.contains("<session_goal>"),
-                    "blocked budget goal must leave the active system prompt: {prompt}"
+                    "paused budget goal must leave the active system prompt: {prompt}"
                 );
                 saw_prompt_refresh = true;
             }
-            Event::GoalUpdated { snapshot } if snapshot.status == "blocked" => {
+            Event::GoalUpdated { snapshot } if snapshot.status == "paused" => {
                 assert_eq!(snapshot.objective.as_deref(), Some("finish within budget"));
                 assert_eq!(snapshot.token_budget, Some(10));
                 assert_eq!(snapshot.tokens_used, 11);
-                assert!(
-                    snapshot
-                        .blocker
-                        .as_deref()
-                        .is_some_and(|blocker| blocker.contains("token budget reached")),
-                    "{snapshot:?}"
+                assert_eq!(
+                    snapshot.pause_reason,
+                    Some(crate::tools::goal::GoalPauseReason::BudgetLimit)
                 );
+                assert!(snapshot.blocker.is_none(), "{snapshot:?}");
                 saw_terminal_goal = true;
             }
-            Event::Status { message } if message.contains("automatic continuation stopped") => {
+            Event::Status { message } if message.contains("automatic continuation paused") => {
                 assert!(message.contains("11 / 10 tokens"), "{message}");
-                assert!(message.contains("goal is blocked"), "{message}");
+                assert!(message.contains("Raise the budget"), "{message}");
                 saw_budget_status = true;
             }
             _ => {}
@@ -1614,7 +1621,11 @@ async fn cross_turn_token_budget_exhaustion_blocks_goal_and_refreshes_prompt() {
     };
     assert!(!prompt.contains("<session_goal>"), "{prompt}");
     let snapshot = goal_state.lock().expect("goal lock").snapshot();
-    assert_eq!(snapshot.status, "blocked");
+    assert_eq!(snapshot.status, "paused");
+    assert_eq!(
+        snapshot.pause_reason,
+        Some(crate::tools::goal::GoalPauseReason::BudgetLimit)
+    );
     assert_eq!(starts, 1, "budget stop must not start another turn");
     assert_eq!(
         model.call_count(),
@@ -1683,7 +1694,7 @@ async fn current_turn_usage_stops_budgeted_goal_after_one_provider_call() {
         .expect("current-turn budget stop did not settle")
         .expect("current-turn budget event");
         if let Event::GoalUpdated { snapshot } = event
-            && snapshot.status == "blocked"
+            && snapshot.status == "paused"
         {
             saw_terminal_goal = true;
         }
@@ -1700,16 +1711,14 @@ async fn current_turn_usage_stops_budgeted_goal_after_one_provider_call() {
     );
     assert_eq!(model.remaining_turns(), 0);
     let goal = goal_state.lock().expect("goal lock").snapshot();
-    assert_eq!(goal.status, "blocked");
+    assert_eq!(goal.status, "paused");
     assert_eq!(goal.tokens_used, 11);
     assert_eq!(goal.token_budget, Some(10));
-    assert!(
-        goal.blocker
-            .as_deref()
-            .is_some_and(|blocker| blocker.contains("11 / 10 tokens")),
-        "{goal:?}"
+    assert_eq!(
+        goal.pause_reason,
+        Some(crate::tools::goal::GoalPauseReason::BudgetLimit)
     );
-    let prompt = system_prompt_text(session.system_prompt.expect("blocked system prompt"));
+    let prompt = system_prompt_text(session.system_prompt.expect("paused system prompt"));
     assert!(!prompt.contains("<session_goal>"), "{prompt}");
 
     handle.send(Op::Shutdown).await.expect("shutdown engine");
@@ -1782,7 +1791,7 @@ async fn tool_response_crossing_goal_budget_does_not_issue_second_provider_reque
                 assert!(result.expect("get_goal result").success);
                 saw_get_goal = true;
             }
-            Event::GoalUpdated { snapshot } if snapshot.status == "blocked" => {
+            Event::GoalUpdated { snapshot } if snapshot.status == "paused" => {
                 saw_terminal_goal = true;
             }
             _ => {}
@@ -1801,20 +1810,18 @@ async fn tool_response_crossing_goal_budget_does_not_issue_second_provider_reque
         "the second canned response must remain unused"
     );
     let goal = goal_state.lock().expect("goal lock").snapshot();
-    assert_eq!(goal.status, "blocked");
+    assert_eq!(goal.status, "paused");
     assert_eq!(goal.tokens_used, 11, "usage must be durably recorded once");
     assert_eq!(goal.token_budget, Some(10));
-    assert!(
-        goal.blocker
-            .as_deref()
-            .is_some_and(|blocker| blocker.contains("11 / 10 tokens")),
-        "{goal:?}"
+    assert_eq!(
+        goal.pause_reason,
+        Some(crate::tools::goal::GoalPauseReason::BudgetLimit)
     );
     let session = handle
         .get_session_snapshot()
         .await
         .expect("post-budget tool session snapshot");
-    let prompt = system_prompt_text(session.system_prompt.expect("blocked system prompt"));
+    let prompt = system_prompt_text(session.system_prompt.expect("paused system prompt"));
     assert!(!prompt.contains("<session_goal>"), "{prompt}");
 
     handle.send(Op::Shutdown).await.expect("shutdown engine");
@@ -1954,7 +1961,7 @@ fn without_named_custom_route(mut config: Config) -> Config {
 }
 
 #[tokio::test]
-async fn exhausted_goal_terminalizes_before_invalid_route_resolution() {
+async fn exhausted_goal_pauses_before_invalid_route_resolution() {
     let config = goal_custom_route_config();
     let engine_config = EngineConfig {
         model: "local-model".to_string(),
@@ -1985,9 +1992,9 @@ async fn exhausted_goal_terminalizes_before_invalid_route_resolution() {
         .await
         .expect("queue exhausted continuation");
 
-    let mut saw_blocked_goal = false;
+    let mut saw_paused_goal = false;
     let mut saw_budget_status = false;
-    while !(saw_blocked_goal && saw_budget_status) {
+    while !(saw_paused_goal && saw_budget_status) {
         let event = tokio::time::timeout(model_turn_event_timeout(), async {
             handle.rx_event.write().await.recv().await
         })
@@ -2001,10 +2008,14 @@ async fn exhausted_goal_terminalizes_before_invalid_route_resolution() {
             Event::Error { envelope, .. } => {
                 panic!("budget decision must precede route failure: {envelope:?}")
             }
-            Event::GoalUpdated { snapshot } if snapshot.status == "blocked" => {
+            Event::GoalUpdated { snapshot } if snapshot.status == "paused" => {
                 assert_eq!(snapshot.tokens_used, 11);
                 assert_eq!(snapshot.token_budget, Some(10));
-                saw_blocked_goal = true;
+                assert_eq!(
+                    snapshot.pause_reason,
+                    Some(crate::tools::goal::GoalPauseReason::BudgetLimit)
+                );
+                saw_paused_goal = true;
             }
             Event::Status { message } if message.contains("Goal token budget reached") => {
                 assert!(message.contains("11 / 10 tokens"), "{message}");
@@ -2029,8 +2040,70 @@ async fn exhausted_goal_terminalizes_before_invalid_route_resolution() {
     assert!(!prompt.contains("<session_goal>"), "{prompt}");
     assert_eq!(
         goal_state.lock().expect("goal lock").snapshot().status,
-        "blocked"
+        "paused"
     );
+
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run_task.await.expect("engine task");
+}
+
+#[tokio::test]
+async fn continuation_circuit_breaker_pauses_with_run_limit_reason() {
+    let config = Config::default();
+    let (engine, handle) = Engine::new(
+        EngineConfig {
+            snapshots_enabled: false,
+            terminal_chrome_enabled: false,
+            goal_objective: Some("stop a runaway continuation loop".to_string()),
+            ..EngineConfig::default()
+        },
+        &config,
+    );
+    let goal_state = engine.config.goal_state.clone();
+    {
+        let mut goal = goal_state.lock().expect("goal lock");
+        for _ in 0..crate::goal_loop::MAX_GOAL_CONTINUATIONS {
+            goal.record_continuation();
+        }
+    }
+    let run_task = tokio::spawn(engine.run());
+
+    handle
+        .send(Op::ContinueGoal {
+            dynamic_tools: Vec::new(),
+            engine_schedule_id: None,
+        })
+        .await
+        .expect("queue capped continuation");
+
+    let mut saw_pause = false;
+    let mut saw_reason = false;
+    while !(saw_pause && saw_reason) {
+        let event = tokio::time::timeout(model_turn_event_timeout(), async {
+            handle.rx_event.write().await.recv().await
+        })
+        .await
+        .expect("continuation cap event timeout")
+        .expect("continuation cap event");
+        match event {
+            Event::TurnStarted { .. } => panic!("capped goal must not start another turn"),
+            Event::GoalUpdated { snapshot } if snapshot.status == "paused" => {
+                assert_eq!(
+                    snapshot.pause_reason,
+                    Some(crate::tools::goal::GoalPauseReason::Backoff)
+                );
+                saw_pause = true;
+            }
+            Event::Status { message } if message.contains("automatic continuations") => {
+                assert!(
+                    message.contains(&crate::goal_loop::MAX_GOAL_CONTINUATIONS.to_string()),
+                    "{message}"
+                );
+                saw_reason = true;
+            }
+            _ => {}
+        }
+    }
 
     handle.send(Op::Shutdown).await.expect("shutdown engine");
     run_task.await.expect("engine task");
@@ -2676,7 +2749,7 @@ fn subagent_mailbox_keeps_lifecycle_events_reliable() {
     ));
 
     assert!(!subagent_mailbox_message_is_best_effort(
-        &MailboxMessage::started("agent_a", crate::tools::subagent::SubAgentType::Explore)
+        &MailboxMessage::started("agent_a", crate::tools::subagent::FleetRole::Scout)
     ));
     assert!(!subagent_mailbox_message_is_best_effort(
         &MailboxMessage::Completed {
@@ -2758,14 +2831,14 @@ fn subagent_mailbox_samples_best_effort_events_per_agent() {
 #[test]
 fn subagent_mailbox_never_samples_lifecycle_or_usage_events() {
     use crate::models::Usage;
-    use crate::tools::subagent::{MailboxMessage, SubAgentType};
+    use crate::tools::subagent::{FleetRole, MailboxMessage};
 
     let mut last_sent_at = HashMap::new();
     let start = Instant::now();
 
     assert!(subagent_mailbox_best_effort_send_permitted(
         &mut last_sent_at,
-        &MailboxMessage::started("agent_a", SubAgentType::Explore),
+        &MailboxMessage::started("agent_a", FleetRole::Scout),
         start,
     ));
     assert!(subagent_mailbox_best_effort_send_permitted(
@@ -2884,45 +2957,6 @@ fn tool_catalog_filter_is_inert_without_gates() {
 }
 
 #[test]
-fn structured_state_block_includes_rich_plan_artifact() {
-    let state = StructuredState {
-        mode_label: "Plan".to_string(),
-        workspace: PathBuf::from("/workspace/codewhale"),
-        cwd: None,
-        working_set_summary: None,
-        todo_snapshot: None,
-        plan_snapshot: Some(PlanSnapshot {
-            objective: Some("Make Plan mode reviewable".to_string()),
-            context_summary: Some("Grounded in issue #2691".to_string()),
-            sources_used: vec!["gh issue view 2691".to_string()],
-            critical_files: vec!["crates/tui/src/tools/plan.rs".to_string()],
-            constraints: vec!["Preserve legacy payloads".to_string()],
-            recommended_approach: Some("Enrich update_plan".to_string()),
-            verification_plan: Some("Run focused tests".to_string()),
-            risks_and_unknowns: Some("Replay may drift".to_string()),
-            handoff_packet: Some("Next agent should inspect replay".to_string()),
-            items: vec![PlanItemArg {
-                step: "Render rich artifact".to_string(),
-                status: StepStatus::InProgress,
-            }],
-            ..PlanSnapshot::default()
-        }),
-        subagent_snapshots: Vec::new(),
-    };
-
-    let block = state.to_system_block().expect("fork state block");
-
-    assert!(block.contains("Objective: Make Plan mode reviewable"));
-    assert!(block.contains("Context: Grounded in issue #2691"));
-    assert!(block.contains("Source: gh issue view 2691"));
-    assert!(block.contains("Critical file: crates/tui/src/tools/plan.rs"));
-    assert!(block.contains("Constraint: Preserve legacy payloads"));
-    assert!(block.contains("Verification plan: Run focused tests"));
-    assert!(block.contains("Handoff packet: Next agent should inspect replay"));
-    assert!(block.contains("- [~] Render rich artifact"));
-}
-
-#[test]
 fn structured_state_block_uses_checklist_as_work_surface() {
     let state = StructuredState {
         mode_label: "Agent".to_string(),
@@ -2945,21 +2979,15 @@ fn structured_state_block_uses_checklist_as_work_surface() {
             completion_pct: 0,
             in_progress_id: Some(1),
         }),
-        plan_snapshot: Some(PlanSnapshot {
-            objective: Some("Keep strategy separate".to_string()),
-            ..PlanSnapshot::default()
-        }),
         subagent_snapshots: Vec::new(),
     };
 
     let block = state.to_system_block().expect("fork state block");
 
     assert!(block.contains("### Work"));
-    assert!(block.contains("Checklist (0% complete)"));
-    assert!(block.contains("- [~] Wire Fleet progress projection"));
-    assert!(block.contains("Strategy metadata"));
-    assert!(block.contains("Objective: Keep strategy separate"));
-    assert!(!block.contains("Todo list"));
+    assert!(block.contains("To-do (0% settled)"));
+    assert!(block.contains("- [~] #1 Wire Fleet progress projection"));
+    assert!(!block.contains("Strategy"));
 }
 
 #[test]
@@ -3417,56 +3445,68 @@ async fn injected_model_duplicate_reads_execute_once_and_close_both_tool_ids() {
 async fn coalesced_raw_read_error_touches_working_set_once() {
     use crate::llm_client::mock::{MockLlmClient, canned};
 
-    let workspace = tempdir().expect("tempdir");
-    let duplicate_read_turn = vec![
-        canned::message_start("mock_msg_duplicate_missing_read"),
-        canned::tool_use_block_start(0, "call-missing-1", "read_file"),
-        canned::tool_input_delta(0, r#"{"path":"missing.rs"}"#),
-        canned::block_stop(0),
-        canned::tool_use_block_start(1, "call-missing-2", "read_file"),
-        canned::tool_input_delta(1, r#"{"path":"missing.rs"}"#),
-        canned::block_stop(1),
-        canned::message_delta("tool_use", None),
-        canned::message_stop(),
-    ];
-    let mock = std::sync::Arc::new(MockLlmClient::new(vec![
-        duplicate_read_turn,
-        canned::simple_text_turn("Missing read handled."),
-    ]));
-    let client: crate::core::model_client::SharedModelClient = mock;
-    let (mut engine, _handle) = Engine::new_with_model_client(
-        deterministic_engine_config(workspace.path()),
-        &Config::default(),
-        client,
+    async fn missing_read_touches(read_count: usize) -> u32 {
+        let workspace = tempdir().expect("tempdir");
+        let mut read_turn = vec![canned::message_start("mock_msg_missing_read")];
+        for index in 0..read_count {
+            let block_index = u32::try_from(index).expect("test read count fits u32");
+            let tool_id = format!("call-missing-{}", index + 1);
+            read_turn.push(canned::tool_use_block_start(
+                block_index,
+                &tool_id,
+                "read_file",
+            ));
+            read_turn.push(canned::tool_input_delta(
+                block_index,
+                r#"{"path":"missing.rs"}"#,
+            ));
+            read_turn.push(canned::block_stop(block_index));
+        }
+        read_turn.push(canned::message_delta("tool_use", None));
+        read_turn.push(canned::message_stop());
+
+        let mock = std::sync::Arc::new(MockLlmClient::new(vec![
+            read_turn,
+            canned::simple_text_turn("Missing read handled."),
+        ]));
+        let client: crate::core::model_client::SharedModelClient = mock;
+        let (mut engine, _handle) = Engine::new_with_model_client(
+            deterministic_engine_config(workspace.path()),
+            &Config::default(),
+            client,
+        );
+        let context = crate::tools::ToolContext::new(workspace.path().to_path_buf());
+        let mut registry = crate::tools::ToolRegistry::new(context);
+        registry.register(std::sync::Arc::new(crate::tools::file::ReadFileTool));
+        let tools = Some(registry.to_api_tools_with_cache(true));
+        let mut turn = crate::core::turn::TurnContext::new(8);
+
+        let (status, error) = engine
+            .handle_deepseek_turn(
+                &mut turn,
+                Some(&registry),
+                tools,
+                AppMode::Agent,
+                Vec::new(),
+            )
+            .await;
+
+        assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
+        engine
+            .session
+            .working_set
+            .entries
+            .get("missing.rs")
+            .expect("leader error should record the attempted path")
+            .touches
+    }
+
+    let baseline_touches = missing_read_touches(1).await;
+    let coalesced_touches = missing_read_touches(2).await;
+    assert_eq!(
+        coalesced_touches, baseline_touches,
+        "the coalesced follower must not add a physical working-set observation"
     );
-    let context = crate::tools::ToolContext::new(workspace.path().to_path_buf());
-    let mut registry = crate::tools::ToolRegistry::new(context);
-    registry.register(std::sync::Arc::new(crate::tools::file::ReadFileTool));
-    let tools = Some(registry.to_api_tools_with_cache(true));
-    let mut turn = crate::core::turn::TurnContext::new(8);
-
-    let (status, error) = engine
-        .handle_deepseek_turn(
-            &mut turn,
-            Some(&registry),
-            tools,
-            AppMode::Agent,
-            false,
-            Vec::new(),
-        )
-        .await;
-
-    assert_eq!(status, TurnOutcomeStatus::Completed, "{error:?}");
-    let entry = engine
-        .session
-        .working_set
-        .entries
-        .get("missing.rs")
-        .expect("leader error should record the attempted path");
-    // The generic extractor records this path-shaped value once from its
-    // extension and once from the explicit `path` key. One physical tool
-    // observation is therefore two touches; the old follower bug made four.
-    assert_eq!(entry.touches, 2, "the follower must not add another touch");
 }
 
 #[tokio::test]
@@ -3979,6 +4019,29 @@ fn exec_shell_ask_rule_decision_prompts_for_matching_auto_command() {
 }
 
 #[test]
+fn canonical_bash_run_honors_legacy_typed_ask_rules() {
+    let config = EngineConfig {
+        exec_policy_engine: ask_rule_engine("cargo test"),
+        ..EngineConfig::default()
+    };
+
+    let decision = exec_shell_ask_rule_decision(
+        &config,
+        "Bash",
+        &json!({"action": "run", "command": "cargo test --workspace"}),
+        Path::new("/repo"),
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+
+    assert_eq!(
+        decision,
+        Some(ToolAskRuleDecision::Prompt(
+            "Typed ask rule 'tool=exec_shell command=cargo test' requires approval.".to_string()
+        ))
+    );
+}
+
+#[test]
 fn exec_shell_ask_rule_decision_blocks_matching_never_command() {
     let config = EngineConfig {
         exec_policy_engine: ask_rule_engine("cargo test"),
@@ -4039,6 +4102,29 @@ fn file_ask_rule_decision_prompts_for_matching_read_path() {
         Some(ToolAskRuleDecision::Prompt(
             "Typed ask rule 'tool=read_file path=secrets/api_key.txt' requires approval."
                 .to_string()
+        ))
+    );
+}
+
+#[test]
+fn canonical_file_action_honors_legacy_path_ask_rules() {
+    let config = EngineConfig {
+        exec_policy_engine: file_ask_rule_engine("write_file", "src/lib.rs"),
+        ..EngineConfig::default()
+    };
+
+    let decision = file_tool_ask_rule_decision(
+        &config,
+        "File",
+        &json!({"action": "write", "path": "src/lib.rs", "content": "new\n"}),
+        Path::new("/repo"),
+        crate::tui::approval::ApprovalMode::Auto,
+    );
+
+    assert_eq!(
+        decision,
+        Some(ToolAskRuleDecision::Prompt(
+            "Typed ask rule 'tool=write_file path=src/lib.rs' requires approval.".to_string()
         ))
     );
 }
@@ -4231,6 +4317,7 @@ async fn runtime_goal_updates_emit_ui_snapshot() {
                 check: "cargo test -p codewhale-tui runtime_goal_updates_emit_ui_snapshot"
                     .to_string(),
                 summary: "focused runtime goal snapshot test passed".to_string(),
+                ..Default::default()
             },
         )
         .expect("mark complete");
@@ -4576,94 +4663,6 @@ fn globally_exclusive_agent_start_splits_neighboring_readonly_tools() {
 }
 
 #[test]
-fn successful_update_plan_ends_plan_mode_turn_immediately() {
-    assert!(should_stop_after_plan_tool(
-        AppMode::Plan,
-        "update_plan",
-        &Ok(ToolResult::success("planned"))
-    ));
-    assert!(!should_stop_after_plan_tool(
-        AppMode::Agent,
-        "update_plan",
-        &Ok(ToolResult::success("planned"))
-    ));
-    assert!(!should_stop_after_plan_tool(
-        AppMode::Plan,
-        "request_user_input",
-        &Ok(ToolResult::success("input"))
-    ));
-    assert!(!should_stop_after_plan_tool(
-        AppMode::Plan,
-        "update_plan",
-        &Err(ToolError::execution_failed("failed".to_string()))
-    ));
-}
-
-#[test]
-fn quick_plan_requests_force_update_plan_on_first_step() {
-    assert!(should_force_update_plan_first(
-        AppMode::Plan,
-        "Give me a quick 3-step plan to verify the UI changes."
-    ));
-    assert!(should_force_update_plan_first(
-        AppMode::Plan,
-        "Make a high-level plan for the footer work."
-    ));
-    assert!(!should_force_update_plan_first(
-        AppMode::Plan,
-        "Can you make a plan to get ver 0.8.61 fully built and benchmark it with our api server?"
-    ));
-    assert!(!should_force_update_plan_first(
-        AppMode::Plan,
-        "Make a high-level plan for benchmarking https://github.com/sierra-research/tau2-bench."
-    ));
-    assert!(!should_force_update_plan_first(
-        AppMode::Plan,
-        "Inspect the repo and then give me a quick plan."
-    ));
-    assert!(!should_force_update_plan_first(
-        AppMode::Agent,
-        "Give me a quick 3-step plan."
-    ));
-}
-
-#[test]
-fn quick_plan_turn_can_narrow_first_step_tools_to_update_plan() {
-    let catalog = vec![
-        Tool {
-            tool_type: Some("function".to_string()),
-            name: "read_file".to_string(),
-            description: "Read a file".to_string(),
-            input_schema: json!({"type": "object"}),
-            allowed_callers: Some(vec!["direct".to_string()]),
-            defer_loading: Some(false),
-            input_examples: None,
-            strict: None,
-            cache_control: None,
-        },
-        Tool {
-            tool_type: Some("function".to_string()),
-            name: "update_plan".to_string(),
-            description: "Publish a plan".to_string(),
-            input_schema: json!({"type": "object"}),
-            allowed_callers: Some(vec!["direct".to_string()]),
-            defer_loading: Some(false),
-            input_examples: None,
-            strict: None,
-            cache_control: None,
-        },
-    ];
-    let active = initial_active_tools(&catalog);
-
-    let forced = active_tools_for_step(&catalog, &active, true);
-    assert_eq!(forced.len(), 1);
-    assert_eq!(forced[0].name, "update_plan");
-
-    let default = active_tools_for_step(&catalog, &active, false);
-    assert_eq!(default.len(), 2);
-}
-
-#[test]
 fn tool_error_messages_include_actionable_hints() {
     let path_error = ToolError::path_escape(PathBuf::from("../escape.txt"));
     let formatted = format_tool_error(&path_error, "read_file");
@@ -4871,40 +4870,81 @@ fn approval_stamp_preserves_existing_metadata() {
 #[test]
 fn core_native_tools_stay_loaded_in_yolo_mode() {
     let always_load = HashSet::new();
-    assert!(!should_default_defer_tool("exec_shell", &always_load));
-    // git_blame remains deferred (read-only git history beyond log/show/diff).
+    // #4625: `Bash` is the model-facing shell tool; legacy exec_shell names
+    // are hidden compat aliases whose defer state no longer matters.
+    assert!(!should_default_defer_tool("Bash", &always_load));
+    for canonical in ["File", "Git", "Run"] {
+        assert!(!should_default_defer_tool(canonical, &always_load));
+    }
+    // Legacy spellings remain registered for replay but are no longer eager.
     assert!(should_default_defer_tool("git_blame", &always_load));
+}
+
+#[test]
+fn default_active_contract_keeps_remember_and_synthetic_tool_search_eager() {
+    const EXPECTED_NATIVE: [&str; 8] = [
+        "Bash",
+        "File",
+        "Git",
+        "Run",
+        "agent",
+        "remember",
+        "tasks",
+        "work_update",
+    ];
+    assert_eq!(
+        default_active_native_tool_names(),
+        EXPECTED_NATIVE.as_slice()
+    );
+
+    let always_load = HashSet::new();
+    let mut catalog = build_model_tool_catalog(
+        EXPECTED_NATIVE.into_iter().map(api_tool).collect(),
+        Vec::new(),
+        AppMode::Agent,
+        &always_load,
+    );
+    ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
+    let active = initial_active_tools(&catalog);
+    let expected = EXPECTED_NATIVE
+        .into_iter()
+        .chain([TOOL_SEARCH_NAME])
+        .map(str::to_string)
+        .collect::<HashSet<_>>();
+
+    assert_eq!(active, expected);
+    assert_eq!(
+        catalog
+            .iter()
+            .find(|tool| tool.name == TOOL_SEARCH_NAME)
+            .and_then(|tool| tool.defer_loading),
+        Some(false)
+    );
 }
 
 #[test]
 fn non_yolo_mode_retains_default_defer_policy() {
     let always_load = HashSet::new();
-    assert!(!should_default_defer_tool("exec_shell", &always_load));
-    assert!(!should_default_defer_tool("edit_file", &always_load));
-    assert!(!should_default_defer_tool("apply_patch", &always_load));
-    assert!(!should_default_defer_tool("fetch_url", &always_load));
-    assert!(!should_default_defer_tool("git_diff", &always_load));
-    // #2654: read-only git history joins the active set.
-    assert!(!should_default_defer_tool("git_log", &always_load));
-    assert!(!should_default_defer_tool("git_show", &always_load));
-    assert!(!should_default_defer_tool("git_status", &always_load));
-    assert!(!should_default_defer_tool("run_tests", &always_load));
+    for canonical in ["Bash", "File", "Git", "Run"] {
+        assert!(!should_default_defer_tool(canonical, &always_load));
+    }
     assert!(!should_default_defer_tool("agent", &always_load));
-    assert!(!should_default_defer_tool("read_file", &always_load));
     assert!(!should_default_defer_tool("remember", &always_load));
-    assert!(!should_default_defer_tool(
-        "wait_for_dev_server",
-        &always_load
-    ));
-    assert!(!should_default_defer_tool("web_search", &always_load));
-    assert!(!should_default_defer_tool("write_file", &always_load));
     assert!(should_default_defer_tool(
         REQUEST_USER_INPUT_NAME,
         &always_load
     ));
-    assert!(should_default_defer_tool("task_shell_start", &always_load));
-    assert!(should_default_defer_tool("task_shell_wait", &always_load));
-    assert!(should_default_defer_tool("git_blame", &always_load));
+    for legacy in [
+        "read_file",
+        "edit_file",
+        "apply_patch",
+        "git_status",
+        "git_blame",
+        "run_tests",
+        "web_search",
+    ] {
+        assert!(should_default_defer_tool(legacy, &always_load));
+    }
 }
 
 #[test]
@@ -4947,10 +4987,10 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
     let always_load = HashSet::new();
     let catalog = build_model_tool_catalog(
         vec![
-            api_tool("read_file"),
-            api_tool("write_file"),
-            api_tool("exec_shell"),
-            api_tool("edit_file"),
+            api_tool("File"),
+            api_tool("Bash"),
+            api_tool("Git"),
+            api_tool("Run"),
             api_tool("remember"),
             api_tool("project_map"),
         ],
@@ -4966,10 +5006,10 @@ fn model_tool_catalog_applies_native_and_mcp_deferral() {
             .and_then(|tool| tool.defer_loading)
     };
 
-    assert_eq!(defer_loading("read_file"), Some(false));
-    assert_eq!(defer_loading("write_file"), Some(false));
-    assert_eq!(defer_loading("exec_shell"), Some(false));
-    assert_eq!(defer_loading("edit_file"), Some(false));
+    assert_eq!(defer_loading("File"), Some(false));
+    assert_eq!(defer_loading("Bash"), Some(false));
+    assert_eq!(defer_loading("Git"), Some(false));
+    assert_eq!(defer_loading("Run"), Some(false));
     assert_eq!(defer_loading("remember"), Some(false));
     assert_eq!(defer_loading("project_map"), Some(true));
     assert_eq!(defer_loading("list_mcp_resources"), Some(false));
@@ -4982,13 +5022,12 @@ fn capability_compact_surface_defers_nonessential_core_tools() {
     let catalog = build_model_tool_catalog_with_surface(
         vec![
             api_tool("agent"),
-            api_tool("grep_files"),
-            api_tool("read_file"),
-            api_tool("run_tests"),
+            api_tool("File"),
+            api_tool("Git"),
+            api_tool("Run"),
             api_tool(TOOL_SEARCH_NAME),
             api_tool("update_plan"),
-            api_tool("web_search"),
-            api_tool("write_file"),
+            api_tool("Web"),
         ],
         vec![api_tool("list_mcp_resources"), api_tool("mcp_server_write")],
         AppMode::Agent,
@@ -5003,15 +5042,14 @@ fn capability_compact_surface_defers_nonessential_core_tools() {
             .and_then(|tool| tool.defer_loading)
     };
 
-    assert_eq!(defer_loading("read_file"), Some(false));
-    assert_eq!(defer_loading("grep_files"), Some(false));
-    assert_eq!(defer_loading("update_plan"), Some(false));
-    assert_eq!(defer_loading("write_file"), Some(false));
+    assert_eq!(defer_loading("File"), Some(false));
+    assert_eq!(defer_loading("Git"), Some(false));
+    assert_eq!(defer_loading("update_plan"), Some(true));
     assert_eq!(defer_loading(TOOL_SEARCH_NAME), Some(false));
     assert_eq!(defer_loading("list_mcp_resources"), Some(false));
     assert_eq!(defer_loading("agent"), Some(true));
-    assert_eq!(defer_loading("run_tests"), Some(true));
-    assert_eq!(defer_loading("web_search"), Some(true));
+    assert_eq!(defer_loading("Run"), Some(true));
+    assert_eq!(defer_loading("Web"), Some(true));
     assert_eq!(defer_loading("mcp_server_write"), Some(true));
 }
 
@@ -5019,18 +5057,14 @@ fn capability_compact_surface_defers_nonessential_core_tools() {
 fn capability_full_surface_preserves_default_core_tools() {
     let always_load = HashSet::new();
     let catalog = build_model_tool_catalog_with_surface(
-        vec![
-            api_tool("agent"),
-            api_tool("read_file"),
-            api_tool("run_tests"),
-        ],
+        vec![api_tool("agent"), api_tool("File"), api_tool("Run")],
         Vec::new(),
         AppMode::Agent,
         &always_load,
         crate::model_profile::ToolSurfaceBudget::Full,
     );
 
-    for name in ["agent", "read_file", "run_tests"] {
+    for name in ["agent", "File", "Run"] {
         assert_eq!(
             catalog
                 .iter()
@@ -5046,7 +5080,7 @@ fn capability_full_surface_preserves_default_core_tools() {
 fn plugin_or_benchmark_tools_marked_loaded_stay_active() {
     let always_load = HashSet::new();
     let mut catalog = build_model_tool_catalog(
-        vec![api_tool("KB_search"), api_tool("read_file")],
+        vec![api_tool("KB_search"), api_tool("File")],
         Vec::new(),
         AppMode::Agent,
         &always_load,
@@ -5067,11 +5101,11 @@ fn plugin_or_benchmark_tools_marked_loaded_stay_active() {
         active.contains("KB_search"),
         "plugin/benchmark tools marked loaded must be callable on turn 1"
     );
-    assert!(active.contains("read_file"));
+    assert!(active.contains("File"));
 }
 
 #[test]
-fn agent_catalog_keeps_edit_file_loaded_when_fuzz_is_omitted() {
+fn agent_catalog_keeps_canonical_file_tool_loaded() {
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
     let registry = engine
         .build_turn_tool_registry_builder(
@@ -5087,39 +5121,34 @@ fn agent_catalog_keeps_edit_file_loaded_when_fuzz_is_omitted() {
         AppMode::Agent,
         &always_load,
     );
-    let edit = catalog
+    let file = catalog
         .iter()
-        .find(|tool| tool.name == "edit_file")
-        .expect("edit_file registered");
+        .find(|tool| tool.name == "File")
+        .expect("File registered");
 
-    assert_eq!(edit.defer_loading, Some(false));
-    let required = edit.input_schema["required"]
+    assert_eq!(file.defer_loading, Some(false));
+    let required = file.input_schema["required"]
         .as_array()
-        .expect("edit_file schema should include required fields");
-    assert!(required.iter().any(|field| field.as_str() == Some("path")));
+        .expect("File schema should include required fields");
     assert!(
         required
             .iter()
-            .any(|field| field.as_str() == Some("search"))
-    );
-    assert!(
-        required
-            .iter()
-            .any(|field| field.as_str() == Some("replace"))
+            .any(|field| field.as_str() == Some("action"))
     );
     assert!(!required.iter().any(|field| field.as_str() == Some("fuzz")));
     assert_eq!(
-        edit.input_schema["properties"]["fuzz"]["type"].as_str(),
-        Some("boolean")
+        file.input_schema["properties"]["fuzz"]["oneOf"][0]["type"].as_str(),
+        Some("boolean"),
     );
 
     let active_at_batch_start = initial_active_tools(&catalog);
-    assert!(active_at_batch_start.contains("edit_file"));
+    assert!(active_at_batch_start.contains("File"));
     let mut hydrated_this_batch = HashSet::new();
     assert!(
         maybe_hydrate_requested_deferred_tool(
-            "edit_file",
+            "File",
             &json!({
+                "action": "edit",
                 "path": "src/foo.rs",
                 "search": "before",
                 "replace": "after"
@@ -5129,7 +5158,7 @@ fn agent_catalog_keeps_edit_file_loaded_when_fuzz_is_omitted() {
             &mut hydrated_this_batch,
         )
         .is_none(),
-        "loaded edit_file calls without fuzz should execute instead of hydrating the schema"
+        "loaded File calls without fuzz should execute instead of hydrating the schema"
     );
     assert!(hydrated_this_batch.is_empty());
 }
@@ -5163,7 +5192,7 @@ fn agent_catalog_advertises_and_searches_core_action_tools() {
         .iter()
         .map(|tool| tool.name.as_str())
         .collect::<HashSet<_>>();
-    for tool_name in ["exec_shell", "write_file", "edit_file", "apply_patch"] {
+    for tool_name in ["Bash", "File", "Git", "Run"] {
         assert!(
             names.contains(tool_name),
             "{tool_name} must be advertised in Agent mode"
@@ -5210,43 +5239,59 @@ fn catalog_consistency_self_check_flags_registered_core_tool_missing_from_catalo
         AppMode::Agent,
         &always_load,
     );
-    catalog.retain(|tool| tool.name != "exec_shell");
+    catalog.retain(|tool| tool.name != "Bash");
 
     let issues = tool_catalog_consistency_issues(&catalog, &registry);
     assert!(
         issues
             .iter()
-            .any(|issue| issue.contains("registered core tool 'exec_shell'")),
-        "missing registered exec_shell should be reported: {issues:?}"
+            .any(|issue| issue.contains("registered core tool 'Bash'")),
+        "missing registered Bash should be reported: {issues:?}"
     );
 }
 
-#[test]
-fn tool_search_reports_known_core_action_tool_when_current_catalog_omits_it() {
+fn assert_exec_shell_is_not_discoverable(match_kind: &str) {
     let catalog = vec![api_tool("read_file")];
     let mut active = initial_active_tools(&catalog);
 
     let result = execute_tool_search(
         TOOL_SEARCH_NAME,
-        &json!({ "query": "exec_shell" }),
+        &json!({ "query": "exec_shell", "match": match_kind }),
         &catalog,
         &mut active,
     )
     .expect("tool search succeeds");
 
     assert!(!active.contains("exec_shell"));
-    let unavailable = result.metadata.as_ref().unwrap()["unavailable_tool_references"]
+    let metadata = result.metadata.as_ref().expect("search metadata");
+    let references = metadata["tool_references"]
+        .as_array()
+        .expect("tool references are an array");
+    assert!(
+        references
+            .iter()
+            .all(|reference| reference.as_str() != Some("exec_shell")),
+        "legacy shell alias must not surface via {match_kind}: {references:?}"
+    );
+    let unavailable = metadata["unavailable_tool_references"]
         .as_array()
         .expect("unavailable references are an array");
     assert!(
-        unavailable.iter().any(|reference| {
-            reference["tool_name"].as_str() == Some("exec_shell")
-                && reference["reason"]
-                    .as_str()
-                    .is_some_and(|reason| reason.contains("allow_shell = true"))
-        }),
-        "known-but-omitted core action tool should surface with a reason: {unavailable:?}"
+        unavailable
+            .iter()
+            .all(|reference| reference["tool_name"].as_str() != Some("exec_shell")),
+        "legacy shell alias must not surface as an unavailable fallback via {match_kind}: {unavailable:?}"
     );
+}
+
+#[test]
+fn regex_tool_search_does_not_discover_hidden_exec_shell_alias() {
+    assert_exec_shell_is_not_discoverable("regex");
+}
+
+#[test]
+fn bm25_tool_search_does_not_discover_hidden_exec_shell_alias() {
+    assert_exec_shell_is_not_discoverable("bm25");
 }
 
 #[test]
@@ -5293,6 +5338,9 @@ fn print_agent_tool_catalog_metrics() {
     );
     let registry = crate::tools::ToolRegistryBuilder::new()
         .with_agent_tools(true)
+        // Exercise the complete default-active policy. Production registers
+        // this opt-in tool only when user memory is enabled.
+        .with_remember_tool()
         .with_todo_tool(new_shared_todo_list())
         .with_plan_tool(new_shared_plan_state())
         .with_review_tool(None, DEFAULT_TEXT_MODEL.to_string())
@@ -5312,7 +5360,7 @@ fn print_agent_tool_catalog_metrics() {
     );
     ensure_advanced_tooling(&mut catalog, AppMode::Agent, &always_load);
     let active = initial_active_tools(&catalog);
-    let active_catalog = active_tools_for_step(&catalog, &active, false);
+    let active_catalog = active_tools_for_step(&catalog, &active);
     let active_json = serde_json::to_vec(&active_catalog).expect("serialize active");
     let reduction_percent = if baseline_json.is_empty() {
         0.0
@@ -5332,6 +5380,44 @@ fn print_agent_tool_catalog_metrics() {
             "active_tokens_est": active_json.len().div_ceil(4),
             "reduction_percent": reduction_percent,
             "active_tool_names": active_catalog.iter().map(|tool| tool.name.as_str()).collect::<Vec<_>>(),
+        })
+    );
+}
+
+#[test]
+#[ignore = "one-shot metric for scripts/measure-runtime-contract.py"]
+#[allow(clippy::print_stdout)]
+fn print_agent_runtime_contract_metrics() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().to_path_buf();
+    let session_context = PromptSessionContext::default();
+    let prompt = system_prompt_for_mode_with_context_skills_and_session(
+        &workspace,
+        None,
+        None,
+        None,
+        session_context,
+    );
+    let flat_prompt = system_prompt_flat_text(&prompt);
+    let prompt_bytes = flat_prompt.len();
+    let prompt_tokens_est = prompt_bytes.div_ceil(4);
+
+    // Mode runtime instructions are delivered as per-turn metadata; measure
+    // them separately so prompt-size work does not forget the volatile surface.
+    let mode_bytes = crate::prompts::AGENT_MODE.len();
+    let mode_tokens_est = mode_bytes.div_ceil(4);
+
+    println!(
+        "RUNTIME_CONTRACT_METRICS {}",
+        serde_json::json!({
+            "system_prompt_bytes": prompt_bytes,
+            "system_prompt_tokens_est": prompt_tokens_est,
+            "system_prompt_blocks": match prompt {
+                crate::models::SystemPrompt::Blocks(blocks) => blocks.len(),
+                _ => 1,
+            },
+            "agent_mode_instructions_bytes": mode_bytes,
+            "agent_mode_instructions_tokens_est": mode_tokens_est,
         })
     );
 }
@@ -5454,7 +5540,7 @@ fn deferred_edit_file_first_use_hydrates_schema_without_execution() {
 fn model_tool_catalog_defers_non_core_native_tools_in_yolo_mode() {
     let always_load = HashSet::new();
     let catalog = build_model_tool_catalog(
-        vec![api_tool("read_file"), api_tool("project_map")],
+        vec![api_tool("File"), api_tool("project_map")],
         vec![api_tool("mcp_server_write")],
         AppMode::Yolo,
         &always_load,
@@ -5467,7 +5553,7 @@ fn model_tool_catalog_defers_non_core_native_tools_in_yolo_mode() {
             .and_then(|tool| tool.defer_loading)
     };
 
-    assert_eq!(defer_loading("read_file"), Some(false));
+    assert_eq!(defer_loading("File"), Some(false));
     assert_eq!(defer_loading("project_map"), Some(true));
     assert_eq!(defer_loading("mcp_server_write"), Some(false));
 }
@@ -5494,7 +5580,7 @@ fn request_user_input_stays_deferred_but_can_be_dynamically_activated() {
     assert!(!active.contains(REQUEST_USER_INPUT_NAME));
     active.insert(REQUEST_USER_INPUT_NAME.to_string());
 
-    let active_tools = active_tools_for_step(&catalog, &active, false);
+    let active_tools = active_tools_for_step(&catalog, &active);
     assert!(
         active_tools
             .iter()
@@ -5602,7 +5688,7 @@ fn active_tool_list_pushes_deferred_activations_to_the_tail() {
         .map(String::from)
         .collect();
 
-    let listed = active_tools_for_step(&catalog, &active, false);
+    let listed = active_tools_for_step(&catalog, &active);
     let names: Vec<&str> = listed.iter().map(|t| t.name.as_str()).collect();
     assert_eq!(
         names,
@@ -5612,7 +5698,7 @@ fn active_tool_list_pushes_deferred_activations_to_the_tail() {
 }
 
 #[test]
-fn deferred_tool_preflight_loads_edit_schema_without_executing_bad_aliases() {
+fn hidden_edit_alias_bypasses_deferred_model_catalog_preflight() {
     let (engine, _handle) = Engine::new(EngineConfig::default(), &Config::default());
     let registry = engine
         .build_turn_tool_registry_builder(
@@ -5630,11 +5716,11 @@ fn deferred_tool_preflight_loads_edit_schema_without_executing_bad_aliases() {
     );
     catalog
         .iter_mut()
-        .find(|tool| tool.name == "edit_file")
-        .expect("edit_file registered")
+        .find(|tool| tool.name == "File")
+        .expect("File registered")
         .defer_loading = Some(true);
     let mut active = initial_active_tools(&catalog);
-    assert!(!active.contains("edit_file"));
+    assert!(!active.contains("File"));
 
     let result = preflight_requested_deferred_tool(
         "edit_file",
@@ -5645,22 +5731,10 @@ fn deferred_tool_preflight_loads_edit_schema_without_executing_bad_aliases() {
         }),
         &catalog,
         &mut active,
-    )
-    .expect("deferred edit_file should preflight");
-
-    assert!(active.contains("edit_file"));
-    assert!(result.success);
-    assert!(result.content.contains("Tool `edit_file` was deferred"));
-    assert!(result.content.contains("The tool was not executed"));
-    assert!(result.content.contains("path: string required"));
-    assert!(result.content.contains("search: string required"));
-    assert!(result.content.contains("replace: string required"));
-    assert!(result.content.contains("old_string -> search"));
-    assert!(result.content.contains("new_string -> replace"));
-    assert_eq!(
-        result.metadata.as_ref().unwrap()["deferred_tool_loaded"],
-        json!(true)
     );
+
+    assert!(result.is_none());
+    assert!(!active.contains("File"));
 }
 
 #[test]
@@ -5680,17 +5754,24 @@ fn deferred_tool_preflight_guides_rlm_open_misnamed_source_fields() {
         AppMode::Agent,
         &always_load,
     );
+    // Piagent phase B: the model-facing tool is the unified `rlm`; legacy
+    // `rlm_open` is a hidden compat alias and must not appear in the catalog.
+    assert!(
+        !catalog.iter().any(|tool| tool.name == "rlm_open"),
+        "rlm_open must stay a hidden alias outside the model catalog"
+    );
     catalog
         .iter_mut()
-        .find(|tool| tool.name == "rlm_open")
-        .expect("rlm_open registered")
+        .find(|tool| tool.name == "rlm")
+        .expect("rlm registered")
         .defer_loading = Some(true);
     let mut active = initial_active_tools(&catalog);
-    assert!(!active.contains("rlm_open"));
+    assert!(!active.contains("rlm"));
 
     let result = preflight_requested_deferred_tool(
-        "rlm_open",
+        "rlm",
         &json!({
+            "action": "open",
             "name": "active_prompt",
             "prompt": "inspect this",
             "path": "src/lib.rs"
@@ -5698,11 +5779,11 @@ fn deferred_tool_preflight_guides_rlm_open_misnamed_source_fields() {
         &catalog,
         &mut active,
     )
-    .expect("deferred rlm_open should preflight");
+    .expect("deferred rlm should preflight");
 
-    assert!(active.contains("rlm_open"));
+    assert!(active.contains("rlm"));
     assert!(result.success);
-    assert!(result.content.contains("Tool `rlm_open` was deferred"));
+    assert!(result.content.contains("Tool `rlm` was deferred"));
     assert!(result.content.contains("The tool was not executed"));
     assert!(result.content.contains("session_object: string"));
     assert!(
@@ -5757,8 +5838,8 @@ fn model_catalog_exposes_work_update_as_sole_progress_surface() {
         "work_update should load with the default active native set"
     );
     assert!(
-        catalog_names.contains("update_plan"),
-        "update_plan remains Strategy metadata, not a second checklist"
+        !catalog_names.contains("update_plan"),
+        "retired Strategy/Plan must stay replay-only"
     );
     for hidden in [
         "checklist_write",
@@ -7418,6 +7499,7 @@ fn turn_tool_registry_builder_keeps_plan_mode_read_only_for_files() {
 
     assert!(registry.contains("read_file"));
     assert!(registry.contains("list_dir"));
+    assert!(registry.contains("File"));
     assert!(!registry.contains("write_file"));
     assert!(!registry.contains("edit_file"));
     assert!(!registry.contains("exec_shell"));
@@ -7572,7 +7654,7 @@ fn plan_mode_toggle_preserves_catalog_byte_stability() {
         .collect();
     active.insert("deferred_search".to_string());
 
-    let listed = active_tools_for_step(&catalog_with_deferred, &active, false);
+    let listed = active_tools_for_step(&catalog_with_deferred, &active);
     let listed_names: Vec<&str> = listed.iter().map(|t| t.name.as_str()).collect();
 
     // The head (non-deferred tools) must still be in their original order.
@@ -7643,7 +7725,7 @@ fn plan_mode_registry_can_expose_agent_launcher_without_shell_tools() {
     .with_agent_tool_surface_options(
         engine.agent_tool_surface_options(shell_policy_for_mode(AppMode::Plan, false)),
     );
-    runtime.worker_profile = WorkerRuntimeProfile::for_role(SubAgentType::Plan);
+    runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Planner);
 
     let registry = engine
         .build_turn_tool_registry_builder(
@@ -7846,8 +7928,8 @@ fn mode_invariant_matrix_covers_context_catalog_subagents_and_prompt_metadata() 
             engine.agent_tool_surface_options(shell_policy_for_mode(case.mode, true)),
         );
         runtime.worker_profile = WorkerRuntimeProfile::for_role(match case.mode {
-            AppMode::Plan => SubAgentType::Plan,
-            _ => SubAgentType::General,
+            AppMode::Plan => FleetRole::Planner,
+            _ => FleetRole::Worker,
         });
 
         let registry = engine
@@ -8599,14 +8681,48 @@ async fn session_snapshot_omits_id_for_legacy_root_custom_route() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)]
 async fn edit_last_turn_preserves_current_mode() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // EditLastTurn dispatches a real replacement turn. Pin that turn to a
+    // local, completing SSE response instead of depending on whichever
+    // provider configuration or network state the parallel test process has.
+    let _lock = lock_test_env();
     let tmp = tempdir().expect("tempdir");
+    let server = MockServer::start().await;
+    let done_sse = concat!(
+        "data: {\"id\":\"chatcmpl-edit-mode\",\"choices\":[{\"index\":0,",
+        "\"delta\":{\"content\":\"Revised plan.\"},\"finish_reason\":null}]}\n\n",
+        "data: {\"id\":\"chatcmpl-edit-mode\",\"choices\":[{\"index\":0,",
+        "\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+        "data: [DONE]\n\n",
+    );
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(done_sse),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let api_config = Config {
+        api_key: Some("test-key".to_string()),
+        base_url: Some(server.uri()),
+        ..Config::default()
+    };
     let config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
         model: "deepseek-v4-pro".to_string(),
+        snapshots_enabled: false,
+        subagents_enabled: false,
         ..Default::default()
     };
-    let (engine, handle) = Engine::new(config, &Config::default());
+    let (engine, handle) = Engine::new(config, &api_config);
 
     let run = tokio::spawn(engine.run());
     let seeded_messages = vec![
@@ -8661,14 +8777,24 @@ async fn edit_last_turn_preserves_current_mode() {
         })
         .await
         .expect("request snapshot");
-    let snapshot = tokio::time::timeout(Duration::from_secs(2), rx)
+    let snapshot = tokio::time::timeout(model_turn_event_timeout(), rx)
         .await
         .expect("snapshot response")
         .expect("snapshot");
 
     assert_eq!(snapshot.mode, "plan");
 
-    run.abort();
+    let requests = server
+        .received_requests()
+        .await
+        .expect("recorded replacement request");
+    assert_eq!(
+        requests.len(),
+        1,
+        "edit must dispatch exactly one replacement turn"
+    );
+    handle.send(Op::Shutdown).await.expect("shutdown engine");
+    run.await.expect("engine task");
 }
 
 #[tokio::test]
@@ -9091,7 +9217,8 @@ fn subagent_results_are_summarized_before_parent_context_insertion() {
     assert!(context.len() < output.content.len());
     assert!(context.contains("self-report"));
     assert!(context.contains("verify side effects"));
-    assert!(context.contains("read_file") && context.contains("list_dir"));
+    assert!(context.contains("`File` actions like `read` or `list`"));
+    assert!(!context.contains("read_file") && !context.contains("list_dir"));
     assert!(context.contains("handle_read"));
 }
 
@@ -9784,11 +9911,8 @@ fn turn_metadata_includes_plan_mode_policy() {
     );
     assert!(text.contains("##### Mode: Plan"), "got: {text}");
     assert!(
-        text.contains("All writes and patches are blocked"),
-        "got: {text}"
-    );
-    assert!(
-        text.contains("Shell and code execution are unavailable"),
+        text.contains("All writes, patches, shell commands,")
+            && text.contains("and code execution are blocked"),
         "got: {text}"
     );
 }
@@ -10320,7 +10444,20 @@ async fn slop_gate_survives_mid_turn_compaction_without_reinjection() {
         token_threshold: 1,
         ..CompactionConfig::default()
     };
-    let mock = MockLlmClient::new(vec![canned::simple_text_turn("bounded history summary")]);
+    // Structured successor brief so the post-compact failure ladder does not
+    // treat a one-line mock string as degenerate and issue a second sample.
+    let successor_brief = "\
+1. Primary request and intent — keep the active slop gate across compaction.\n\
+2. Key technical concepts — mid-turn pin of the gate message.\n\
+3. Files and code sections — none.\n\
+4. Errors and fixes — none.\n\
+5. Problem solving — pin active turn before summarize.\n\
+6. User messages — exercise active-turn pin specifically.\n\
+7. Pending tasks — assert gate text survives compact.\n\
+8. Current work — compact_messages_safe mid-turn with pins.\n\
+9. Next step — verify marker still present in retained messages.\n\
+Extra padding so non-whitespace seed length clears the degenerate floor.";
+    let mock = MockLlmClient::new(vec![canned::simple_text_turn(successor_brief)]);
     assert!(should_compact(
         &engine.session.messages,
         &compaction,
@@ -11640,6 +11777,40 @@ async fn post_edit_hook_skips_unknown_tool_names() {
 // ── #3802: non-blocking send for ListSubAgents refresh events ─────────────
 
 #[test]
+fn agent_list_event_carries_the_typed_coordination_projection() {
+    use crate::tools::subagent::coord::{DecisionRecord, DecisionStatus};
+
+    let mut manager = SubAgentManager::new(PathBuf::from("."), 1);
+    manager
+        .record_coordination_decision(DecisionRecord {
+            decision_id: "decision-event".to_string(),
+            subject: "typed event".to_string(),
+            status: DecisionStatus::Accepted,
+            owner: "root".to_string(),
+            scope: Vec::new(),
+            constraints: Vec::new(),
+            evidence_handles: Vec::new(),
+            version: 1,
+            sequence: 0,
+        })
+        .expect("record decision");
+
+    let Event::AgentList {
+        agents,
+        coordination,
+    } = agent_list_event(&manager)
+    else {
+        panic!("expected AgentList event");
+    };
+    assert!(agents.is_empty());
+    assert_eq!(coordination.decisions.len(), 1);
+    assert_eq!(coordination.decisions[0].decision_id, "decision-event");
+    assert_eq!(coordination.decisions[0].status, DecisionStatus::Accepted);
+    assert!(coordination.bounded);
+    assert_eq!(coordination.limit, 24);
+}
+
+#[test]
 fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
     use tokio::sync::mpsc;
 
@@ -11744,7 +11915,11 @@ async fn list_subagents_event_try_send_does_not_block_when_event_channel_full() 
     // Reproduce the handler pattern: try_send an AgentList event.
     // This must return Err immediately — the handler should never hang.
     let agents = vec![];
-    let result = tx_event.try_send(Event::AgentList { agents });
+    let result = tx_event.try_send(Event::AgentList {
+        agents,
+        coordination: crate::tools::subagent::SubAgentManager::new(PathBuf::from("."), 1)
+            .coordination_detail_projection(None, 24),
+    });
     assert!(
         result.is_err(),
         "try_send should fail when event channel is full (backpressure avoided)"

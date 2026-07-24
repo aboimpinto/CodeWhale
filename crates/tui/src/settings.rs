@@ -12,11 +12,44 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{ApiProvider, expand_path, normalize_model_name};
 use crate::localization::normalize_configured_locale;
-use crate::palette::{normalize_hex_rgb_color, normalize_theme_name};
+use crate::palette::{normalize_hex_rgb_color, normalize_theme_setting};
 use crate::tui::app::ReasoningEffort;
 
 const SETTINGS_FILE_NAME: &str = "settings.toml";
 const TUI_PREFS_FILE_NAME: &str = "tui.toml";
+
+/// How successful structured file mutations are represented in the live
+/// transcript. Exact evidence is retained for inspection in every mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum InlineDiffMode {
+    /// Show a bounded red/green unified diff plus semantic change statistics.
+    #[default]
+    Full,
+    /// Show only bounded semantic change statistics.
+    Summary,
+    /// Keep the calm File outcome row without any inline diff detail.
+    Off,
+}
+
+impl InlineDiffMode {
+    #[must_use]
+    pub fn parse(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "summary" => Self::Summary,
+            "off" => Self::Off,
+            _ => Self::Full,
+        }
+    }
+
+    #[must_use]
+    pub const fn as_setting(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Summary => "summary",
+            Self::Off => "off",
+        }
+    }
+}
 
 // ============================================================================
 // TuiPrefs — ~/.codewhale/tui.toml
@@ -174,14 +207,7 @@ impl TuiPrefs {
     /// Returns `Err` if an unrecognised `theme` value is found so callers can
     /// surface a helpful message rather than silently ignoring a typo.
     pub fn validate(&mut self) -> Result<()> {
-        let theme = self.theme.trim().to_ascii_lowercase();
-        let Some(theme) = normalize_theme_name(&theme) else {
-            anyhow::bail!(
-                "Invalid tui.toml theme '{}': expected system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, or solarized-light.",
-                self.theme
-            );
-        };
-        self.theme = theme.to_string();
+        self.theme = normalize_theme_setting(&self.theme).map_err(anyhow::Error::msg)?;
         Ok(())
     }
 }
@@ -232,6 +258,10 @@ pub struct Settings {
     /// Ocean Tasks / To-do / Workers rail placement: top, left, or right.
     /// The lower edge remains owned by the composer and phase footer.
     pub work_surface_placement: String,
+    /// Remembered total height (content plus divider) for top Work placement.
+    pub work_surface_top_height: u16,
+    /// Remembered total width (content plus divider) for side Work placement.
+    pub work_surface_side_width: u16,
     /// Runtime-only 30 FPS cap for terminals that flicker at high redraw
     /// rates. Separate from accessibility motion and text delivery.
     #[serde(skip)]
@@ -257,6 +287,10 @@ pub struct Settings {
     pub show_thinking: bool,
     /// Show detailed tool output
     pub show_tool_details: bool,
+    /// Successful structured File mutation evidence: full, summary, or off.
+    /// This affects inline presentation only; exact evidence remains available
+    /// through the tool-details route in every mode.
+    pub inline_diffs: String,
     /// UI locale: auto, en, ja, zh-Hans, pt-BR, es-419
     pub locale: String,
     /// Named UI theme. Accepts `"system"` (follow terminal background),
@@ -309,11 +343,24 @@ pub struct Settings {
     /// TUI-only Shift+Tab posture: ask, auto-review, or full-access.
     /// An explicit/managed `config.toml` approval policy always takes
     /// precedence, so this preference cannot loosen project requirements.
+    /// This is **tool-approval posture**, not filesystem scope — see
+    /// [`Self::sandbox_mode`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub permission_posture: Option<String>,
+    /// Filesystem sandbox scope, independent of approval posture:
+    /// `read-only | workspace-write | danger-full-access | external-sandbox`.
+    /// Surfaced in Settings and the shell so "Full Access" (approval) is
+    /// never confused with unrestricted filesystem writes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox_mode: Option<String>,
     /// Per-provider model overrides. Key is provider name (e.g. "openai"),
     /// value is the model id. Takes precedence over `default_model`.
     pub provider_models: Option<std::collections::HashMap<String, String>>,
+    /// Provider-scoped model IDs intentionally enabled for the ordinary model
+    /// picker. Missing on older files; current and saved provider choices are
+    /// seeded at load time so the migration is additive and non-breaking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_models: Option<std::collections::HashMap<String, Vec<String>>>,
     /// Header status indicator next to the effort chip. Cycles through a
     /// per-turn animation keyed off `App::turn_started_at`:
     /// - `"cw"` (default): static typographic Codewhale mark.
@@ -401,6 +448,10 @@ impl Default for Settings {
             fancy_animations: true,
             ocean_treatment: "ombre".to_string(),
             work_surface_placement: "top".to_string(),
+            // Cap, not fixed height: the top strip auto-fits its rows and
+            // only grows to this many lines (user request, 2026-07-23).
+            work_surface_top_height: 8,
+            work_surface_side_width: 30,
             constrained_frame_rate: false,
             bracketed_paste: true,
             paste_burst_detection: true,
@@ -411,6 +462,7 @@ impl Default for Settings {
             // never displace the actual conversation in the default TUI.
             show_thinking: false,
             show_tool_details: false,
+            inline_diffs: "full".to_string(),
             locale: "auto".to_string(),
             theme: "system".to_string(),
             background_color: None,
@@ -430,7 +482,12 @@ impl Default for Settings {
             default_model: None,
             reasoning_effort: None,
             permission_posture: None,
+            sandbox_mode: None,
             provider_models: None,
+            enabled_models: None,
+            // The whale lives in the terminal window title (OSC 0). The in-app
+            // header defaults to the static typographic `cw` mark so the two
+            // surfaces do not compete with a second spinner.
             status_indicator: "cw".to_string(),
             synchronized_output: "auto".to_string(),
             prefer_external_pdftotext: false,
@@ -472,6 +529,10 @@ fn normalize_work_surface_placement(value: &str) -> &'static str {
         "right" => "right",
         _ => "top",
     }
+}
+
+fn normalize_inline_diffs(value: &str) -> &'static str {
+    InlineDiffMode::parse(value).as_setting()
 }
 
 /// The `(key, value)` fields a named preset applies, or `None` for an unknown
@@ -609,13 +670,16 @@ impl Settings {
             s.ocean_treatment = normalize_ocean_treatment(&s.ocean_treatment).to_string();
             s.work_surface_placement =
                 normalize_work_surface_placement(&s.work_surface_placement).to_string();
+            s.work_surface_top_height = s.work_surface_top_height.clamp(2, 16);
+            s.work_surface_side_width = s.work_surface_side_width.clamp(26, 80);
+            s.inline_diffs = normalize_inline_diffs(&s.inline_diffs).to_string();
             s.synchronized_output =
                 normalize_synchronized_output(&s.synchronized_output).to_string();
             s.locale = normalize_configured_locale(&s.locale)
                 .unwrap_or("en")
                 .to_string();
             s.background_color = normalize_optional_background_color(s.background_color.as_deref());
-            s.theme = normalize_settings_theme(&s.theme).to_string();
+            s.theme = normalize_settings_theme(&s.theme);
             s.default_model = s.default_model.as_deref().and_then(normalize_default_model);
             s.reasoning_effort = s
                 .reasoning_effort
@@ -628,6 +692,7 @@ impl Settings {
             if legacy_yolo_default && s.permission_posture.is_none() {
                 s.permission_posture = Some("full-access".to_string());
             }
+            s.sandbox_mode = s.sandbox_mode.as_deref().and_then(normalize_sandbox_mode);
             s
         };
         if migrate_legacy_file {
@@ -836,6 +901,14 @@ impl Settings {
                 }
                 self.work_surface_placement = normalized;
             }
+            "work_surface_top_height" | "work_top_height" => {
+                self.work_surface_top_height =
+                    parse_u16_range("work_surface_top_height", value, 2, 16)?;
+            }
+            "work_surface_side_width" | "work_side_width" => {
+                self.work_surface_side_width =
+                    parse_u16_range("work_surface_side_width", value, 26, 80)?;
+            }
             "bracketed_paste" | "paste" => {
                 self.bracketed_paste = parse_bool(value)?;
             }
@@ -857,6 +930,15 @@ impl Settings {
             "show_tool_details" | "tool_details" => {
                 self.show_tool_details = parse_bool(value)?;
             }
+            "inline_diffs" | "inline_diff" | "diffs" => {
+                let normalized = value.trim().to_ascii_lowercase();
+                if !matches!(normalized.as_str(), "full" | "summary" | "off") {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid inline diff mode '{value}'. Expected: full, summary, or off."
+                    );
+                }
+                self.inline_diffs = normalized;
+            }
             "locale" | "language" => {
                 let Some(locale) = normalize_configured_locale(value) else {
                     anyhow::bail!(
@@ -867,20 +949,10 @@ impl Settings {
                 self.locale = locale.to_string();
             }
             "theme" => {
-                let Some(id) = crate::palette::ThemeId::from_name(value) else {
-                    anyhow::bail!(
-                        "Failed to update setting: invalid theme '{value}'. Expected: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, solarized-light."
-                    );
-                };
-                self.theme = id.name().to_string();
+                self.theme = normalize_theme_setting(value).map_err(anyhow::Error::msg)?;
             }
             "ui_theme" => {
-                let Some(id) = crate::palette::ThemeId::from_name(value) else {
-                    anyhow::bail!(
-                        "Failed to update setting: invalid theme '{value}'. Expected: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, solarized-light."
-                    );
-                };
-                self.theme = id.name().to_string();
+                self.theme = normalize_theme_setting(value).map_err(anyhow::Error::msg)?;
             }
             "background_color" | "background" | "bg" => {
                 self.background_color = normalize_background_color_setting(value)?;
@@ -943,14 +1015,14 @@ impl Settings {
                 self.workspace_follow_symlinks = parse_bool(value)?;
             }
             "default_mode" | "mode" => {
-                // Loading remains deliberately liberal so old `operate` and
-                // `yolo` files migrate safely. New writes are strict: these
-                // are session actions/permission aliases, not startup modes.
+                // Act (wire: agent), Plan, and Operate are valid startup modes.
+                // yolo remains a permission-migration alias, not a mode write.
                 self.default_mode = match value.trim().to_ascii_lowercase().as_str() {
-                    "agent" | "normal" => "agent".to_string(),
+                    "agent" | "normal" | "act" | "edit" => "agent".to_string(),
                     "plan" => "plan".to_string(),
+                    "operate" | "operation" | "ops" => "operate".to_string(),
                     _ => anyhow::bail!(
-                        "Failed to update setting: invalid mode '{value}'. Expected: agent or plan."
+                        "Failed to update setting: invalid mode '{value}'. Expected: act (agent), plan, or operate."
                     ),
                 };
             }
@@ -1040,6 +1112,14 @@ impl Settings {
                     );
                 }
             }
+            "sandbox_mode" | "sandbox" | "filesystem_sandbox" => {
+                self.sandbox_mode = normalize_sandbox_mode(value);
+                if self.sandbox_mode.is_none() {
+                    anyhow::bail!(
+                        "Failed to update setting: invalid sandbox_mode '{value}'. Expected: read-only, workspace-write, danger-full-access, or external-sandbox."
+                    );
+                }
+            }
             _ => {
                 anyhow::bail!("Failed to update setting: unknown setting '{key}'.");
             }
@@ -1091,6 +1171,14 @@ impl Settings {
             "  work_surface:       {}",
             self.work_surface_placement
         ));
+        lines.push(format!(
+            "  work_top_height:    {}",
+            self.work_surface_top_height
+        ));
+        lines.push(format!(
+            "  work_side_width:    {}",
+            self.work_surface_side_width
+        ));
         lines.push(format!("  bracketed_paste:    {}", self.bracketed_paste));
         lines.push(format!(
             "  paste_burst_detect: {}",
@@ -1104,6 +1192,7 @@ impl Settings {
         ));
         lines.push(format!("  show_thinking:      {}", self.show_thinking));
         lines.push(format!("  show_tool_details:  {}", self.show_tool_details));
+        lines.push(format!("  inline_diffs:      {}", self.inline_diffs));
         lines.push(format!("  locale:            {}", self.locale));
         lines.push(format!("  theme:              {}", self.theme));
         lines.push(format!(
@@ -1173,6 +1262,10 @@ impl Settings {
                 .as_deref()
                 .unwrap_or("(config/default)")
         ));
+        lines.push(format!(
+            "  sandbox_mode:       {}  # filesystem scope (not approval)",
+            self.sandbox_mode.as_deref().unwrap_or("(config/default)")
+        ));
         lines.push(String::new());
         lines.push(format!(
             "{} {}",
@@ -1213,6 +1306,14 @@ impl Settings {
                 "Ocean Tasks/To-do/Workers rail placement: top/left/right",
             ),
             (
+                "work_surface_top_height",
+                "Resizable To-do/Sub-agent top bar height: 2-16 rows",
+            ),
+            (
+                "work_surface_side_width",
+                "Resizable To-do/Sub-agent side bar width: 26-80 columns",
+            ),
+            (
                 "bracketed_paste",
                 "Terminal bracketed-paste mode: on/off (rare to disable)",
             ),
@@ -1235,6 +1336,10 @@ impl Settings {
             ("show_thinking", "Show model thinking: on/off"),
             ("show_tool_details", "Show detailed tool output: on/off"),
             (
+                "inline_diffs",
+                "Successful File mutation evidence: full/summary/off (exact detail is always retained)",
+            ),
+            (
                 "base_url",
                 "HTTP base URL for DeepSeek-compatible endpoints.",
             ),
@@ -1244,7 +1349,7 @@ impl Settings {
             ),
             (
                 "theme",
-                "UI theme: system, dark, light, grayscale, catppuccin-mocha, tokyo-night, dracula, gruvbox-dark, solarized-light",
+                "UI theme: a compiled name or custom:<name> from the Codewhale themes directory",
             ),
             (
                 "background_color",
@@ -1283,7 +1388,10 @@ impl Settings {
                 "workspace_follow_symlinks",
                 "Follow symbolic links during workspace file discovery walks: on/off (default off). Enable for symlink-based multi-project workspaces. Has built-in cycle detection but may increase latency on large symlinked trees.",
             ),
-            ("default_mode", "Default mode: agent or plan"),
+            (
+                "default_mode",
+                "Default mode: act (agent), plan, or operate",
+            ),
             ("sidebar_width", "Sidebar width percentage: 10-50"),
             (
                 "sidebar_focus",
@@ -1311,6 +1419,29 @@ impl Settings {
         self.provider_models
             .get_or_insert_with(std::collections::HashMap::new)
             .insert(provider.to_string(), model.to_string());
+        self.enable_model_for_provider(provider, model);
+    }
+
+    /// Add a model to a provider's enabled chooser set without removing prior
+    /// choices. IDs are compared case-insensitively but preserve their wire
+    /// spelling on disk.
+    pub fn enable_model_for_provider(&mut self, provider: &str, model: &str) {
+        let provider = provider.trim();
+        let model = model.trim();
+        if provider.is_empty() || model.is_empty() || model.eq_ignore_ascii_case("auto") {
+            return;
+        }
+        let models = self
+            .enabled_models
+            .get_or_insert_with(std::collections::HashMap::new)
+            .entry(provider.to_string())
+            .or_default();
+        if !models
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(model))
+        {
+            models.push(model.to_string());
+        }
     }
 
     /// Persist a provider's model selection.
@@ -1508,6 +1639,22 @@ fn normalize_permission_posture(value: &str) -> Option<String> {
     }
 }
 
+/// Normalize filesystem sandbox mode. Distinct from permission posture.
+fn normalize_sandbox_mode(value: &str) -> Option<String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "read-only" | "readonly" | "read_only" | "ro" => Some("read-only".to_string()),
+        "workspace-write" | "workspace_write" | "workspace" | "workspace-only" => {
+            Some("workspace-write".to_string())
+        }
+        "danger-full-access" | "danger_full_access" | "full-fs" | "full_filesystem"
+        | "filesystem-full" => Some("danger-full-access".to_string()),
+        "external-sandbox" | "external_sandbox" | "opensandbox" | "external" => {
+            Some("external-sandbox".to_string())
+        }
+        _ => None,
+    }
+}
+
 fn normalize_reasoning_effort_setting(value: &str) -> Result<Option<String>> {
     let trimmed = value.trim();
     if trimmed.is_empty()
@@ -1543,6 +1690,17 @@ fn parse_usize_setting(key: &str, value: &str) -> Result<usize> {
     })
 }
 
+fn parse_u16_range(key: &str, value: &str, min: u16, max: u16) -> Result<u16> {
+    let parsed = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| anyhow::anyhow!("Invalid {key} '{value}': expected {min}-{max}"))?;
+    if !(min..=max).contains(&parsed) {
+        anyhow::bail!("Invalid {key} '{value}': expected {min}-{max}");
+    }
+    Ok(parsed)
+}
+
 fn parse_percent_setting(key: &str, value: &str) -> Result<f64> {
     let trimmed = value.trim().trim_end_matches('%').trim();
     let percent = trimmed.parse::<f64>().map_err(|_| {
@@ -1574,13 +1732,11 @@ fn normalize_mode(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
         "edit" => "agent",
         "normal" => "agent",
-        "agent" => "agent",
+        "agent" | "act" => "agent",
         "plan" => "plan",
-        // Operate is a session action, not a startup personality. Old saved
-        // values fall back to the safe general-purpose Agent startup mode.
-        "operate" | "operation" | "ops" => "agent",
-        // Kept as a migration input in `load_persisted`; new settings never
-        // advertise it as a mode because permission posture is separate.
+        // Operate is a first-class startup mode (Hunter 2026-07-24).
+        "operate" | "operation" | "ops" => "operate",
+        // yolo was mode+permission; keep mode as Act and migrate posture on load.
         "yolo" => "agent",
         _ => value,
     }
@@ -1620,7 +1776,9 @@ fn normalize_tool_collapse_mode(value: &str) -> &str {
 fn normalize_status_indicator(value: &str) -> &str {
     match value.trim().to_ascii_lowercase().as_str() {
         "cw" | "mark" | "text" => "cw",
-        "whale" | "🐳" | "🐋" => "whale",
+        // The whale emoji header chip is retired (2026-07-23): persisted
+        // opt-ins migrate to the typographic mark on load.
+        "whale" | "🐳" | "🐋" => "cw",
         "dots" | "dot" => "dots",
         "off" | "none" | "hidden" | "false" => "off",
         _ => value,
@@ -1640,8 +1798,8 @@ fn normalize_synchronized_output(value: &str) -> &str {
     }
 }
 
-fn normalize_settings_theme(value: &str) -> &'static str {
-    normalize_theme_name(value).unwrap_or("system")
+fn normalize_settings_theme(value: &str) -> String {
+    normalize_theme_setting(value).unwrap_or_else(|_| "system".to_string())
 }
 
 /// Returns `true` when the active terminal is Ptyxis (the new default
@@ -1784,6 +1942,43 @@ mod tests {
             .expect_err("bottom is owned by composer/footer");
         assert!(err.to_string().contains("top, left, or right"));
         assert_eq!(settings.work_surface_placement, "top");
+    }
+
+    #[test]
+    fn work_surface_drag_sizes_round_trip_with_bounded_values() {
+        let mut settings = Settings::default();
+        settings.set("work_surface_top_height", "9").unwrap();
+        settings.set("work_surface_side_width", "54").unwrap();
+        let body = toml::to_string(&settings).expect("serialize settings");
+        let restored: Settings = toml::from_str(&body).expect("restore settings");
+        assert_eq!(restored.work_surface_top_height, 9);
+        assert_eq!(restored.work_surface_side_width, 54);
+        assert!(settings.set("work_surface_top_height", "17").is_err());
+        assert!(settings.set("work_surface_side_width", "25").is_err());
+    }
+
+    #[test]
+    fn inline_diffs_default_full_and_persist_exactly_one_mode() {
+        let mut settings = Settings::default();
+        assert_eq!(settings.inline_diffs, "full");
+        assert_eq!(
+            InlineDiffMode::parse(&settings.inline_diffs),
+            InlineDiffMode::Full
+        );
+
+        for mode in ["summary", "off", "full"] {
+            settings.set("inline_diffs", mode).expect("valid mode");
+            assert_eq!(settings.inline_diffs, mode);
+            let body = toml::to_string(&settings).expect("serialize settings");
+            let restored: Settings = toml::from_str(&body).expect("restore settings");
+            assert_eq!(restored.inline_diffs, mode);
+        }
+
+        let error = settings
+            .set("inline_diffs", "compact")
+            .expect_err("unknown mode must not be guessed");
+        assert!(error.to_string().contains("full, summary, or off"));
+        assert_eq!(settings.inline_diffs, "full");
     }
 
     /// Explicit animated baseline for env-force tests (#4095 flipped defaults to calm).
@@ -2041,6 +2236,11 @@ mod tests {
             .expect("set solarized alias");
         assert_eq!(settings.theme, "solarized-light");
 
+        settings
+            .set("theme", "custom:Ocean_1")
+            .expect("custom selector validation must not depend on the file system");
+        assert_eq!(settings.theme, "custom:ocean_1");
+
         let err = settings
             .set("theme", "nord")
             .expect_err("unknown theme should fail");
@@ -2226,6 +2426,38 @@ mod tests {
         assert!(display.contains("    zai: GLM-5.2"));
         assert!(display.contains("    deepseek: deepseek-v4-flash"));
         assert!(!display.contains("  default_model:"));
+    }
+
+    #[test]
+    fn provider_model_selection_additively_enables_models() {
+        let mut settings = Settings::default();
+
+        settings.set_model_for_provider("openrouter", "anthropic/claude-sonnet-4");
+        settings.enable_model_for_provider("openrouter", "qwen/qwen3.7-plus");
+        settings.enable_model_for_provider("openrouter", "QWEN/QWEN3.7-PLUS");
+        settings.enable_model_for_provider("openrouter", "auto");
+
+        assert_eq!(
+            settings
+                .provider_models
+                .as_ref()
+                .and_then(|models| models.get("openrouter")),
+            Some(&"anthropic/claude-sonnet-4".to_string())
+        );
+        assert_eq!(
+            settings
+                .enabled_models
+                .as_ref()
+                .and_then(|models| models.get("openrouter")),
+            Some(&vec![
+                "anthropic/claude-sonnet-4".to_string(),
+                "qwen/qwen3.7-plus".to_string(),
+            ])
+        );
+
+        let encoded = toml::to_string(&settings).expect("serialize enabled models");
+        let decoded: Settings = toml::from_str(&encoded).expect("deserialize enabled models");
+        assert_eq!(decoded.enabled_models, settings.enabled_models);
     }
 
     /// Tests that mutate process-global `NO_ANIMATIONS` serialise
@@ -3097,7 +3329,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_mode_writes_only_accept_agent_or_plan() {
+    fn startup_mode_writes_accept_act_plan_operate() {
         let mut settings = Settings::default();
 
         settings.set("default_mode", "plan").expect("plan mode");
@@ -3106,13 +3338,22 @@ mod tests {
             .set("default_mode", "normal")
             .expect("legacy normal alias remains harmless");
         assert_eq!(settings.default_mode, "agent");
+        settings
+            .set("default_mode", "operate")
+            .expect("operate is a valid startup mode");
+        assert_eq!(settings.default_mode, "operate");
+        settings
+            .set("default_mode", "act")
+            .expect("act alias maps to agent wire value");
+        assert_eq!(settings.default_mode, "agent");
 
-        for removed in ["operate", "ops", "yolo"] {
-            let err = settings
-                .set("default_mode", removed)
-                .expect_err("session actions must not become saved startup modes");
-            assert!(err.to_string().contains("agent or plan"), "{err}");
-        }
+        let err = settings
+            .set("default_mode", "yolo")
+            .expect_err("yolo remains a permission migration alias, not a mode write");
+        assert!(
+            err.to_string().contains("act (agent), plan, or operate"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -3139,9 +3380,9 @@ mod tests {
             codewhale_home.join("settings.toml"),
             "default_mode = \"operate\"\n",
         )
-        .expect("legacy operate settings");
-        let loaded = Settings::load_persisted().expect("load legacy operate settings");
-        assert_eq!(loaded.default_mode, "agent");
+        .expect("operate startup settings");
+        let loaded = Settings::load_persisted().expect("load operate settings");
+        assert_eq!(loaded.default_mode, "operate");
         assert_eq!(loaded.permission_posture, None);
     }
 
@@ -3444,12 +3685,20 @@ mod tests {
             ..TuiPrefs::default()
         };
         let err = prefs.validate().expect_err("nord is not a valid theme");
-        assert!(err.to_string().contains("Invalid tui.toml theme"));
-        assert!(
-            err.to_string()
-                .contains("expected system, dark, light, grayscale")
-        );
-        assert!(err.to_string().contains("solarized-light"));
+        assert!(err.to_string().contains("invalid theme 'nord'"));
+        assert!(err.to_string().contains("custom:<name>"));
+    }
+
+    #[test]
+    fn tui_prefs_validate_custom_selector_without_loading_file() {
+        let mut prefs = TuiPrefs {
+            theme: "custom:Ocean_1".to_string(),
+            ..TuiPrefs::default()
+        };
+        prefs
+            .validate()
+            .expect("selector validation must not depend on the file system");
+        assert_eq!(prefs.theme, "custom:ocean_1");
     }
 
     #[test]

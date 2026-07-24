@@ -10,19 +10,12 @@
 //! would blow the prompt budget the moment a user has half a dozen
 //! skills installed.
 //!
-//! Two paths exist for the model to actually read a native skill:
-//!
-//! 1. The existing progressive-disclosure pattern: model spots a
-//!    skill in the catalogue, calls `read_file <path>` from the
-//!    listing.
-//! 2. (this tool) `load_skill name=<id>` — single call, name-based
-//!    lookup, also enumerates the sibling files in the skill's
-//!    directory so the model sees the companion resources without
-//!    a separate `list_dir`.
-//!
-//! Both are valid for native skills. Reviewed plugin skills are exposed only
-//! through this tool's content-bound in-memory snapshot; their mutable source
-//! paths and companion files are deliberately not returned.
+//! `load_skill name=<id>` is the canonical progressive-disclosure path. It
+//! performs a name-based host lookup, so native global skills work without
+//! widening the model's workspace file authority, and it enumerates companion
+//! files without a separate `list_dir`. Reviewed plugin skills are exposed
+//! only through this tool's content-bound in-memory snapshot; their mutable
+//! source paths and companion files are deliberately not returned.
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -56,10 +49,9 @@ impl ToolSpec for LoadSkillTool {
             "properties": {
                 "name": {
                     "type": "string",
-                    "description": "Skill id (the `name` field from the SKILL.md frontmatter, also shown in the `## Skills` listing)."
+                    "description": "Skill id to load. Omit or pass \"list\" to see all available skills."
                 }
             },
-            "required": ["name"],
             "additionalProperties": false
         })
     }
@@ -80,13 +72,8 @@ impl ToolSpec for LoadSkillTool {
         let name = input
             .get("name")
             .and_then(Value::as_str)
-            .ok_or_else(|| ToolError::missing_field("name"))?
+            .unwrap_or("")
             .trim();
-        if name.is_empty() {
-            return Err(ToolError::invalid_input(
-                "`name` must be a non-empty string",
-            ));
-        }
 
         // #432: walk every candidate skill directory (workspace
         // .agents/skills, skills, .opencode/skills, .claude/skills,
@@ -112,6 +99,24 @@ impl ToolSpec for LoadSkillTool {
             )
         }
         .into_enabled();
+
+        // Listing mode: empty name, "*", or "list" returns the full registry (#4651).
+        if name.is_empty() || name == "*" || name == "list" {
+            let skills = registry.list();
+            if skills.is_empty() {
+                return Ok(ToolResult::success("No skills installed."));
+            }
+            let mut listing = format!("Available skills ({}):\n", skills.len());
+            for skill in skills {
+                if skill.description.trim().is_empty() {
+                    listing.push_str(&format!("  - {}\n", skill.name));
+                } else {
+                    listing.push_str(&format!("  - {} — {}\n", skill.name, skill.description));
+                }
+            }
+            return Ok(ToolResult::success(listing));
+        }
+
         let Some(skill) = registry.get(name) else {
             let available: Vec<&str> = registry.list().iter().map(|s| s.name.as_str()).collect();
             let hint = if available.is_empty() {
@@ -462,6 +467,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn execute_lists_available_skills_for_empty_star_and_list_names() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempdir().unwrap();
+        // Pin home-based global skill roots to the tempdir so host skills
+        // never leak into the listing count.
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path().join("home"));
+        let _cw_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cw-home"));
+        let workspace = tmp.path().to_path_buf();
+        let skills_dir = workspace.join(".codewhale").join("skills");
+        write_skill(&skills_dir, "alpha-skill", "First demo skill", "Body A.");
+        write_skill(&skills_dir, "beta-skill", "", "Body B.");
+
+        let context = ToolContext::new(workspace);
+        let tool = LoadSkillTool;
+
+        // #4651: listing is an action inside the single load_skill tool —
+        // empty name, "*", and "list" all enumerate the reviewed registry.
+        for listing_name in [json!({}), json!({"name": "*"}), json!({"name": "list"})] {
+            let result = tool
+                .execute(listing_name.clone(), &context)
+                .await
+                .expect("listing should succeed");
+            assert!(result.success);
+            assert!(
+                result.content.contains("Available skills (2)"),
+                "listing for {listing_name} should count skills: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains("alpha-skill — First demo skill"),
+                "listing should include name and description: {}",
+                result.content
+            );
+            assert!(
+                result.content.contains("- beta-skill"),
+                "listing should include description-less skills: {}",
+                result.content
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_listing_reports_empty_registry_plainly() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempdir().unwrap();
+        let _home = crate::test_support::EnvVarGuard::set("HOME", tmp.path().join("home"));
+        let _cw_home =
+            crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", tmp.path().join("cw-home"));
+        let context = ToolContext::new(tmp.path().to_path_buf());
+        let result = LoadSkillTool
+            .execute(json!({"name": "list"}), &context)
+            .await
+            .expect("empty listing should still succeed");
+        assert!(result.success);
+        assert!(
+            result.content.contains("No skills installed."),
+            "{}",
+            result.content
+        );
+    }
+
+    #[tokio::test]
     async fn execute_finds_skills_in_opencode_dir_via_workspace_discovery() {
         let tmp = tempdir().unwrap();
         let workspace = tmp.path().to_path_buf();
@@ -547,6 +615,46 @@ mod tests {
             msg.contains("claude-only") && msg.contains("codewhale-only"),
             "error should name the missing skill and available strict catalog: {msg}"
         );
+    }
+
+    #[tokio::test]
+    async fn execute_loads_configured_external_skill_without_workspace_trust() {
+        let tmp = tempdir().unwrap();
+        let workspace = tmp.path().join("workspace");
+        let home = tmp.path().join("home");
+        let global_skills = home.join(".codewhale/skills");
+        fs::create_dir_all(&workspace).unwrap();
+        write_skill(
+            &global_skills,
+            "global-helper",
+            "Global helper",
+            "Global body marker.",
+        );
+
+        // Keep this test independent of the process-native home directory:
+        // `dirs::home_dir()` cannot be redirected reliably after process start
+        // on Windows. The injected-home discovery test in `skills::tests`
+        // separately proves that ~/.codewhale/skills enters the default catalog.
+        let context = ToolContext::new(&workspace).with_skills_config(global_skills.clone(), false);
+        assert!(!context.trust_mode);
+        assert!(
+            context
+                .resolve_path(
+                    global_skills
+                        .join("global-helper/SKILL.md")
+                        .to_str()
+                        .unwrap()
+                )
+                .is_err(),
+            "ordinary file tools must retain the workspace boundary"
+        );
+
+        let result = LoadSkillTool
+            .execute(json!({"name": "global-helper"}), &context)
+            .await
+            .expect("load_skill host lookup should open a configured external skill root");
+        assert!(result.success);
+        assert!(result.content.contains("Global body marker."));
     }
 
     #[tokio::test]

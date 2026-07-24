@@ -334,6 +334,16 @@ pub struct ProvidersToml {
         alias = "grok"
     )]
     pub xai: ProviderConfigToml,
+    /// Jiangsu Telecom TokenHub — OpenAI-compatible AI gateway.
+    #[serde(
+        default,
+        skip_serializing_if = "ProviderConfigToml::is_empty",
+        alias = "telecom-js",
+        alias = "telecom_js",
+        alias = "telecomjs-cn",
+        alias = "tokenhub"
+    )]
+    pub telecomjs: ProviderConfigToml,
     /// Catch-all table for the dynamic OpenAI-compatible custom provider
     /// identity (#1519). Arbitrary `[providers.<name>]` tables are handled by
     /// the tui-side flatten map; this named slot keeps the canonical
@@ -449,6 +459,7 @@ impl ProvidersToml {
             ProviderKind::OpencodeGo => &self.opencode_go,
             ProviderKind::Meta => &self.meta,
             ProviderKind::Xai => &self.xai,
+            ProviderKind::Telecomjs => &self.telecomjs,
             ProviderKind::Custom => &self.custom,
         }
     }
@@ -489,9 +500,19 @@ impl ProvidersToml {
             ProviderKind::OpencodeGo => &mut self.opencode_go,
             ProviderKind::Meta => &mut self.meta,
             ProviderKind::Xai => &mut self.xai,
+            ProviderKind::Telecomjs => &mut self.telecomjs,
             ProviderKind::Custom => &mut self.custom,
         }
     }
+}
+
+fn deserialize_root_provider<'de, D>(deserializer: D) -> std::result::Result<ProviderKind, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    let strict = serde::de::value::StringDeserializer::<D::Error>::new(value);
+    Ok(ProviderKind::deserialize(strict).unwrap_or(ProviderKind::Custom))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -506,8 +527,17 @@ pub struct ConfigToml {
     pub http_headers: BTreeMap<String, String>,
     /// TUI-compatible default DeepSeek model.
     pub default_text_model: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_root_provider")]
     pub provider: ProviderKind,
+    /// Exact id for a dynamically named root provider.
+    ///
+    /// This is runtime parse state rather than a second on-disk key. The
+    /// serialized `provider` value is restored by [`ConfigStore`] so a typed
+    /// dispatcher read/write cannot collapse `[providers.<name>]` back to the
+    /// legacy literal `custom` route.
+    #[doc(hidden)]
+    #[serde(skip)]
+    pub selected_provider_id: Option<String>,
     pub model: Option<String>,
     pub auth_mode: Option<String>,
     pub output_mode: Option<String>,
@@ -1945,6 +1975,73 @@ pub struct LspConfigToml {
 }
 
 impl ConfigToml {
+    /// Exact configured provider id, including a dynamically named custom
+    /// provider selected by the TUI.
+    #[must_use]
+    pub fn provider_id(&self) -> &str {
+        self.named_custom_provider_id()
+            .unwrap_or_else(|| self.provider.as_str())
+    }
+
+    /// Return the exact id only when the root selection names a dynamic custom
+    /// provider rather than the legacy literal `custom` route.
+    #[must_use]
+    pub fn named_custom_provider_id(&self) -> Option<&str> {
+        (self.provider == ProviderKind::Custom)
+            .then_some(self.selected_provider_id.as_deref())
+            .flatten()
+    }
+
+    fn named_custom_provider_table(&self, provider_id: &str) -> Result<&toml::value::Table> {
+        let table = self
+            .providers
+            .extras
+            .get(provider_id)
+            .and_then(toml::Value::as_table)
+            .with_context(|| {
+                format!(
+                    "custom provider '{provider_id}' requires a matching [providers.{provider_id}] table"
+                )
+            })?;
+        let compatible = table
+            .get("kind")
+            .and_then(toml::Value::as_str)
+            .is_some_and(|kind| {
+                kind.trim()
+                    .to_ascii_lowercase()
+                    .replace('_', "-")
+                    .eq("openai-compatible")
+            });
+        if !compatible {
+            bail!(
+                "custom provider '{provider_id}' must set [providers.{provider_id}].kind = \"openai-compatible\""
+            );
+        }
+        Ok(table)
+    }
+
+    fn named_custom_provider_config(&self) -> Option<ProviderConfigToml> {
+        let provider_id = self.named_custom_provider_id()?;
+        self.named_custom_provider_table(provider_id).ok()?;
+        self.providers
+            .extras
+            .get(provider_id)
+            .cloned()?
+            .try_into()
+            .ok()
+    }
+
+    fn bind_persisted_provider_id(&mut self, provider_id: &str) -> Result<()> {
+        self.selected_provider_id = None;
+        if self.provider != ProviderKind::Custom || provider_id == ProviderKind::Custom.as_str() {
+            return Ok(());
+        }
+
+        self.named_custom_provider_table(provider_id)?;
+        self.selected_provider_id = Some(provider_id.to_string());
+        Ok(())
+    }
+
     /// Merge safe project-level overrides from `$WORKSPACE/.codewhale/config.toml`
     /// or legacy `$WORKSPACE/.deepseek/config.toml`.
     ///
@@ -1997,7 +2094,7 @@ impl ConfigToml {
         }
 
         match key {
-            "provider" => Some(self.provider.as_str().to_string()),
+            "provider" => Some(self.provider_id().to_string()),
             "stream_chunk_timeout_secs" | "tui.stream_chunk_timeout_secs" => {
                 Some(self.stream_chunk_timeout_secs().to_string())
             }
@@ -2079,12 +2176,21 @@ impl ConfigToml {
 
         match key {
             "provider" => {
-                self.provider = ProviderKind::parse(value).with_context(|| {
-                    format!(
-                        "unknown provider '{value}': expected {}",
-                        ProviderKind::names_hint()
-                    )
-                })?;
+                if let Some(provider) = ProviderKind::parse(value) {
+                    self.provider = provider;
+                    self.selected_provider_id = None;
+                } else {
+                    let provider_id = value.trim();
+                    self.named_custom_provider_table(provider_id)
+                        .with_context(|| {
+                            format!(
+                                "unknown provider '{value}': expected {} or a configured custom provider",
+                                ProviderKind::names_hint()
+                            )
+                        })?;
+                    self.provider = ProviderKind::Custom;
+                    self.selected_provider_id = Some(provider_id.to_string());
+                }
             }
             "api_key" => self.api_key = Some(value.to_string()),
             "base_url" => self.base_url = Some(value.to_string()),
@@ -2120,7 +2226,10 @@ impl ConfigToml {
         }
 
         match key {
-            "provider" => self.provider = ProviderKind::Deepseek,
+            "provider" => {
+                self.provider = ProviderKind::Deepseek;
+                self.selected_provider_id = None;
+            }
             "api_key" => self.api_key = None,
             "base_url" => self.base_url = None,
             "http_headers" => self.http_headers.clear(),
@@ -2148,7 +2257,7 @@ impl ConfigToml {
     #[must_use]
     pub fn list_values(&self) -> BTreeMap<String, String> {
         let mut out = BTreeMap::new();
-        out.insert("provider".to_string(), self.provider.as_str().to_string());
+        out.insert("provider".to_string(), self.provider_id().to_string());
 
         if let Some(v) = self.api_key.as_ref() {
             out.insert("api_key".to_string(), redact_secret(v));
@@ -2246,7 +2355,14 @@ impl ConfigToml {
             (self.provider, ProviderSource::Config)
         };
 
-        let mut provider_cfg = self.providers.for_provider(provider).clone();
+        let mut provider_cfg = if provider == ProviderKind::Custom
+            && matches!(provider_source, ProviderSource::Config)
+        {
+            self.named_custom_provider_config()
+                .unwrap_or_else(|| self.providers.for_provider(provider).clone())
+        } else {
+            self.providers.for_provider(provider).clone()
+        };
         if provider == ProviderKind::SiliconflowCN {
             let fb = &self.providers.siliconflow;
             if provider_cfg.api_key.is_none() {
@@ -2352,6 +2468,7 @@ impl ConfigToml {
                 ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_BASE_URL.to_string(),
                 ProviderKind::Meta => DEFAULT_META_BASE_URL.to_string(),
                 ProviderKind::Xai => DEFAULT_XAI_BASE_URL.to_string(),
+                ProviderKind::Telecomjs => DEFAULT_TELECOMJS_BASE_URL.to_string(),
                 // The custom provider has no built-in endpoint; fall back to its
                 // descriptor placeholder so the lookup is total. Real custom
                 // routes always supply a configured base_url before this point.
@@ -2582,8 +2699,23 @@ pub fn load_project_config(workspace: &Path) -> Option<ConfigToml> {
                 return None;
             }
         };
-        match toml::from_str(&raw) {
-            Ok(config) => return Some(config),
+        match toml::from_str::<ConfigToml>(&raw) {
+            Ok(config) => {
+                let raw_provider = toml::from_str::<toml::Value>(&raw)
+                    .ok()
+                    .and_then(|document| document.get("provider").cloned())
+                    .and_then(|provider| provider.as_str().map(str::to_string));
+                if config.provider == ProviderKind::Custom
+                    && raw_provider.as_deref() != Some(ProviderKind::Custom.as_str())
+                {
+                    tracing::warn!(
+                        "Failed to parse project config {}; file contents were omitted",
+                        quote_os_path(&path)
+                    );
+                    return None;
+                }
+                return Some(config);
+            }
             Err(_) => {
                 tracing::warn!(
                     "Failed to parse project config {}; file contents were omitted",
@@ -3021,6 +3153,7 @@ fn default_model_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_MODEL,
         ProviderKind::Meta => DEFAULT_META_MODEL,
         ProviderKind::Xai => DEFAULT_XAI_MODEL,
+        ProviderKind::Telecomjs => DEFAULT_TELECOMJS_MODEL,
         // No built-in default model; the registry placeholder keeps this total.
         ProviderKind::Custom => provider.provider().default_model(),
     }
@@ -3062,6 +3195,7 @@ fn default_base_url_for_provider(provider: ProviderKind) -> &'static str {
         ProviderKind::OpencodeGo => DEFAULT_OPENCODE_GO_BASE_URL,
         ProviderKind::Meta => DEFAULT_META_BASE_URL,
         ProviderKind::Xai => DEFAULT_XAI_BASE_URL,
+        ProviderKind::Telecomjs => DEFAULT_TELECOMJS_BASE_URL,
         // No built-in default base URL; the registry placeholder keeps this total.
         ProviderKind::Custom => provider.provider().default_base_url(),
     }
@@ -3442,12 +3576,25 @@ impl ConfigStore {
         let path = resolve_config_path(path)?;
         let (config, original_raw) = if checked_path_exists(&path)? {
             let raw = read_checked_config_file(&path)?;
-            let parsed: ConfigToml = toml::from_str(&raw).map_err(|_| {
+            let mut parsed: ConfigToml = toml::from_str(&raw).map_err(|_| {
                 anyhow::anyhow!(
                     "failed to parse config at {}; file contents were omitted",
                     quote_os_path(&path)
                 )
             })?;
+            let raw_document: toml::Value = toml::from_str(&raw).map_err(|_| {
+                anyhow::anyhow!(
+                    "failed to parse config at {}; file contents were omitted",
+                    quote_os_path(&path)
+                )
+            })?;
+            if let Some(provider_id) = raw_document.get("provider").and_then(toml::Value::as_str) {
+                parsed
+                    .bind_persisted_provider_id(provider_id)
+                    .with_context(|| {
+                        format!("failed to parse config at {}", quote_os_path(&path))
+                    })?;
+            }
             (parsed, Some(raw))
         } else {
             (ConfigToml::default(), None)
@@ -3468,8 +3615,15 @@ impl ConfigStore {
     /// [`persistence::SetupTransaction`] alongside sibling files and keep the
     /// comment-preserving write atomic with the rest of the transaction.
     pub fn rendered_body(&self) -> Result<String> {
-        let serialized =
+        let mut serialized =
             toml::to_string_pretty(&self.config).context("failed to serialize config")?;
+        if let Some(provider_id) = self.config.named_custom_provider_id() {
+            let mut document = serialized
+                .parse::<toml_edit::DocumentMut>()
+                .context("failed to edit serialized config")?;
+            document["provider"] = toml_edit::value(provider_id);
+            serialized = document.to_string();
+        }
         if let Some(ref original_raw) = self.original_raw {
             merge_and_preserve_comments(&serialized, original_raw).with_context(|| {
                 format!(
@@ -4719,6 +4873,8 @@ struct EnvRuntimeOverrides {
     meta_model: Option<String>,
     xai_base_url: Option<String>,
     xai_model: Option<String>,
+    telecomjs_base_url: Option<String>,
+    telecomjs_model: Option<String>,
 }
 
 impl EnvRuntimeOverrides {
@@ -5007,6 +5163,12 @@ impl EnvRuntimeOverrides {
             xai_model: std::env::var("XAI_MODEL")
                 .ok()
                 .filter(|v| !v.trim().is_empty()),
+            telecomjs_base_url: std::env::var("TELECOMJS_BASE_URL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
+            telecomjs_model: std::env::var("TELECOMJS_MODEL")
+                .ok()
+                .filter(|v| !v.trim().is_empty()),
         }
     }
 
@@ -5063,6 +5225,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::OpencodeGo => self.opencode_go_base_url.clone(),
             ProviderKind::Meta => self.meta_base_url.clone(),
             ProviderKind::Xai => self.xai_base_url.clone(),
+            ProviderKind::Telecomjs => self.telecomjs_base_url.clone(),
             // No dedicated CODEWHALE_CUSTOM_BASE_URL env override: a custom
             // provider's base URL comes from its `[providers.<name>]` table.
             ProviderKind::Custom => None,
@@ -5097,6 +5260,7 @@ impl EnvRuntimeOverrides {
             ProviderKind::OpencodeGo => self.opencode_go_model.clone(),
             ProviderKind::Meta => self.meta_model.clone(),
             ProviderKind::Xai => self.xai_model.clone(),
+            ProviderKind::Telecomjs => self.telecomjs_model.clone(),
             _ => None,
         }?;
 

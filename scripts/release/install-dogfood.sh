@@ -64,10 +64,25 @@ install_binary() {
   trap 'rm -f -- "${tmp}"' RETURN
   cp "${src}" "${tmp}"
   chmod 0755 "${tmp}"
+  # macOS AMFI kills ad-hoc linker-signed binaries after `cp` into a new
+  # path (SIGKILL on exec, no output). Re-sign in place with a proper
+  # ad-hoc signature so self-built dogfood installs run after install.
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+    codesign --force --sign - "${tmp}" >/dev/null 2>&1 || {
+      echo "WARN: codesign failed for ${tmp}; binary may be killed by AMFI after install" >&2
+    }
+  fi
   mv -f "${tmp}" "${dst}"
+  # Re-sign the final path as well — some macOS versions re-evaluate on rename.
+  if [[ "$(uname -s)" == "Darwin" ]] && command -v codesign >/dev/null 2>&1; then
+    codesign --force --sign - "${dst}" >/dev/null 2>&1 || true
+  fi
   cmp -s "${src}" "${dst}" || {
-    echo "ERROR: installed binary differs from source: ${dst}" >&2
-    return 1
+    # cmp can fail after codesign rewrote the code signature; verify exec instead.
+    if [[ ! -x "${dst}" ]]; then
+      echo "ERROR: installed binary not executable: ${dst}" >&2
+      return 1
+    fi
   }
   trap - RETURN
 }
@@ -83,19 +98,24 @@ done
 
 verify_fresh_shell_binary() {
   local command_name="$1"
-  local expected_sha="$2"
   local command_path
-  local command_sha
   local command_version
+  local dest
+  local is_installed=0
 
   command_path="$(zsh -lc "command -v ${command_name}" 2>/dev/null || true)"
   if [[ -z "${command_path}" || ! -x "${command_path}" ]]; then
     echo "ERROR: fresh login shell cannot resolve ${command_name}" >&2
     return 1
   fi
-  command_sha="$(shasum -a 256 "${command_path}" | awk '{print $1}')"
-  if [[ "${command_sha}" != "${expected_sha}" ]]; then
-    echo "ERROR: fresh-shell ${command_name} is not the installed build: ${command_path}" >&2
+  for dest in "${dest_dirs[@]}"; do
+    if [[ "${command_path}" == "${dest}/${command_name}" ]]; then
+      is_installed=1
+      break
+    fi
+  done
+  if [[ "${is_installed}" != "1" ]]; then
+    echo "ERROR: fresh-shell ${command_name} resolves outside the installed destinations: ${command_path}" >&2
     return 1
   fi
   command_version="$(zsh -lc "${command_name} --version" 2>/dev/null || true)"
@@ -106,9 +126,12 @@ verify_fresh_shell_binary() {
   printf '%s\n' "${command_path}"
 }
 
-path_cli="$(verify_fresh_shell_binary codewhale "${cli_sha}")"
-path_shim="$(verify_fresh_shell_binary codew "${shim_sha}")"
-path_tui="$(verify_fresh_shell_binary codewhale-tui "${tui_sha}")"
+path_cli="$(verify_fresh_shell_binary codewhale)"
+path_shim="$(verify_fresh_shell_binary codew)"
+path_tui="$(verify_fresh_shell_binary codewhale-tui)"
+installed_cli_sha="$(shasum -a 256 "${path_cli}" | awk '{print $1}')"
+installed_shim_sha="$(shasum -a 256 "${path_shim}" | awk '{print $1}')"
+installed_tui_sha="$(shasum -a 256 "${path_tui}" | awk '{print $1}')"
 
 default_receipt_root="${HOME}/.codewhale/dogfood-receipts"
 if [[ -d "/Volumes/VIXinSSD/CW/backups" ]]; then
@@ -125,10 +148,13 @@ receipt="${receipt_root}/${timestamp}-${source_sha:0:12}.txt"
   echo "source_dir=${src_dir}"
   echo "codewhale_version=${cli_version}"
   echo "codewhale_sha256=${cli_sha}"
+  echo "installed_codewhale_sha256=${installed_cli_sha}"
   echo "codew_version=${shim_version}"
   echo "codew_sha256=${shim_sha}"
+  echo "installed_codew_sha256=${installed_shim_sha}"
   echo "codewhale_tui_version=${tui_version}"
   echo "codewhale_tui_sha256=${tui_sha}"
+  echo "installed_codewhale_tui_sha256=${installed_tui_sha}"
   echo "fresh_shell_codewhale=${path_cli}"
   echo "fresh_shell_codew=${path_shim}"
   echo "fresh_shell_codewhale_tui=${path_tui}"

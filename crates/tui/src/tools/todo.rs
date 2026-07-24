@@ -20,6 +20,8 @@ pub enum TodoStatus {
     Pending,
     InProgress,
     Completed,
+    #[serde(alias = "canceled")]
+    Cancelled,
 }
 
 impl TodoStatus {
@@ -29,6 +31,7 @@ impl TodoStatus {
             TodoStatus::Pending => "pending",
             TodoStatus::InProgress => "in_progress",
             TodoStatus::Completed => "completed",
+            TodoStatus::Cancelled => "cancelled",
         }
     }
 
@@ -39,8 +42,16 @@ impl TodoStatus {
             "pending" => Some(TodoStatus::Pending),
             "in_progress" | "inprogress" => Some(TodoStatus::InProgress),
             "completed" | "done" => Some(TodoStatus::Completed),
+            "cancelled" | "canceled" => Some(TodoStatus::Cancelled),
             _ => None,
         }
+    }
+
+    /// Whether this item has reached a terminal outcome. Cancellation settles
+    /// work without misreporting it as successful completion.
+    #[must_use]
+    pub fn is_settled(self) -> bool {
+        matches!(self, TodoStatus::Completed | TodoStatus::Cancelled)
     }
 }
 
@@ -67,6 +78,26 @@ impl TodoListSnapshot {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    /// Plain-text rendering for headless and accessibility surfaces. Styled
+    /// panes consume the same `items`; this keeps status wording and ordering
+    /// owned by the canonical list rather than a second progress model.
+    #[must_use]
+    pub fn plain_text(&self) -> String {
+        self.items
+            .iter()
+            .map(|item| {
+                let marker = match item.status {
+                    TodoStatus::Pending => "[ ]",
+                    TodoStatus::InProgress => "[~]",
+                    TodoStatus::Completed => "[x]",
+                    TodoStatus::Cancelled => "[-]",
+                };
+                format!("{marker} #{} {}", item.id, item.content)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
 
@@ -182,12 +213,12 @@ impl TodoList {
             return 0;
         }
         let total = self.items.len();
-        let completed = self
+        let settled = self
             .items
             .iter()
-            .filter(|item| item.status == TodoStatus::Completed)
+            .filter(|item| item.status.is_settled())
             .count();
-        let percent = completed.saturating_mul(100);
+        let percent = settled.saturating_mul(100);
         let percent = (percent + total / 2) / total;
         u8::try_from(percent).unwrap_or(u8::MAX)
     }
@@ -308,7 +339,7 @@ impl ToolSpec for TodoAddTool {
                 },
                 "status": {
                     "type": "string",
-                    "enum": ["pending", "in_progress", "completed"],
+                    "enum": ["pending", "in_progress", "completed", "cancelled"],
                     "description": "Task status (default: pending)"
                 }
             },
@@ -408,7 +439,7 @@ impl ToolSpec for TodoUpdateTool {
                 },
                 "status": {
                     "type": "string",
-                    "enum": ["pending", "in_progress", "completed"],
+                    "enum": ["pending", "in_progress", "completed", "cancelled"],
                     "description": "New status"
                 }
             },
@@ -531,7 +562,7 @@ impl ToolSpec for TodoListTool {
         let snapshot = current_todo_snapshot(context, &self.todo_list).await?;
         let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
         Ok(ToolResult::success(format!(
-            "Todo list ({} items, {}% complete)\n{}",
+            "Todo list ({} items, {}% settled)\n{}",
             snapshot.items.len(),
             snapshot.completion_pct,
             result
@@ -555,7 +586,7 @@ impl ToolSpec for TodoWriteTool {
                 "Compatibility alias for work_update. Replace the active thread/task To-do list; durable tasks are the real executable work object."
             }
             _ => {
-                "Replace the active thread/task To-do list (concrete current work items). This is the canonical progress surface — use it for ordinary in-flight work. Use update_plan only for Strategy metadata/context/route, not as a second checklist. Durable tasks remain the real executable work object."
+                "Replace the active thread/task To-do list (concrete current work items). This is the canonical progress surface the user watches, so keep it live while you work: mark an item in_progress before starting it (exactly one at a time), and call work_update again the moment an item finishes so it shows completed — never batch completions at the end. Durable tasks remain the real executable work object."
             }
         }
     }
@@ -576,7 +607,7 @@ impl ToolSpec for TodoWriteTool {
                             },
                             "status": {
                                 "type": "string",
-                                "enum": ["pending", "in_progress", "completed"],
+                                "enum": ["pending", "in_progress", "completed", "cancelled"],
                                 "description": "Task status"
                             }
                         },
@@ -635,7 +666,7 @@ impl ToolSpec for TodoWriteTool {
         let result = serde_json::to_string_pretty(&snapshot).unwrap_or_else(|_| "{}".to_string());
 
         Ok(ToolResult::success(format!(
-            "Todo list updated ({} items, {}% complete)\n{}",
+            "Todo list updated ({} items, {}% settled)\n{}",
             snapshot.items.len(),
             snapshot.completion_pct,
             result
@@ -717,7 +748,58 @@ fn work_progress_metadata(snapshot: &TodoListSnapshot, tool_name: &str) -> serde
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn work_update_description_teaches_live_upkeep() {
+        // 2026-07-23 user report: models wrote the list once and never
+        // updated it while working. The canonical tool description must
+        // carry the upkeep contract every provider sees.
+        let tool = super::TodoWriteTool::work_update(super::new_shared_todo_list());
+        let description = crate::tools::spec::ToolSpec::description(&tool);
+        for phrase in [
+            "keep it live while you work",
+            "in_progress before starting it (exactly one at a time)",
+            "the moment an item finishes",
+            "never batch completions",
+        ] {
+            assert!(
+                description.contains(phrase),
+                "work_update description missing {phrase:?}: {description}"
+            );
+        }
+    }
+
     use super::*;
+
+    #[test]
+    fn cancelled_is_a_terminal_round_trippable_todo_state() {
+        assert_eq!(
+            TodoStatus::from_str("cancelled"),
+            Some(TodoStatus::Cancelled)
+        );
+        assert_eq!(
+            TodoStatus::from_str("canceled"),
+            Some(TodoStatus::Cancelled)
+        );
+
+        let mut list = TodoList::new();
+        list.add("abandoned approach".to_string(), TodoStatus::Cancelled);
+        let snapshot = list.snapshot();
+        assert_eq!(snapshot.completion_pct, 100);
+        assert_eq!(snapshot.in_progress_id, None);
+        assert_eq!(snapshot.plain_text(), "[-] #1 abandoned approach");
+        assert_eq!(
+            serde_json::to_value(snapshot.items[0].status).expect("serialize"),
+            serde_json::json!("cancelled")
+        );
+
+        let schema = TodoWriteTool::work_update(new_shared_todo_list()).input_schema();
+        let statuses = &schema["properties"]["todos"]["items"]["properties"]["status"]["enum"];
+        assert!(statuses.as_array().is_some_and(|values| {
+            values
+                .iter()
+                .any(|value| value.as_str() == Some("cancelled"))
+        }));
+    }
 
     #[test]
     fn persisted_snapshot_restores_ids_status_and_recomputes_metrics() {
@@ -846,7 +928,10 @@ mod tests {
 
         TodoWriteTool::work_update(todos.clone())
             .execute(
-                json!({"todos": [{"content": "Graph-owned", "status": "in_progress"}]}),
+                json!({"todos": [
+                    {"content": "Graph-owned", "status": "in_progress"},
+                    {"content": "Discarded branch", "status": "cancelled"}
+                ]}),
                 &context,
             )
             .await
@@ -862,16 +947,30 @@ mod tests {
             .expect("capture")
             .expect("graph state");
         assert_eq!(state.todos.items[0].status, TodoStatus::Completed);
+        assert_eq!(state.todos.items[1].status, TodoStatus::Cancelled);
+        assert_eq!(state.todos.completion_pct, 100);
         let node = state
             .graph
             .node(&state.graph.compat.todos[0].node)
             .expect("projected node");
         assert_eq!(node.state, crate::work_graph::NodeState::Completed);
+        let cancelled_node = state
+            .graph
+            .node(&state.graph.compat.todos[1].node)
+            .expect("cancelled projected node");
+        assert_eq!(
+            cancelled_node.state,
+            crate::work_graph::NodeState::Cancelled
+        );
         assert!(todos.lock().await.snapshot().is_empty());
         assert_eq!(work.publish_pending().await, Ok(true));
         assert_eq!(
             todos.lock().await.snapshot().items[0].status,
             TodoStatus::Completed
+        );
+        assert_eq!(
+            todos.lock().await.snapshot().items[1].status,
+            TodoStatus::Cancelled
         );
     }
 

@@ -94,6 +94,10 @@ impl ToolSpec for ReadFileTool {
         "read_file"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Read a UTF-8 file from the workspace. Use this instead of `cat`, `head`, `tail`, or `sed -n '..p'` in `exec_shell` — it's faster, sandbox-aware, and skips the approval prompt. Plain text is returned as-is and records the file snapshot required before `edit_file` will make a narrow in-place edit. CodeWhale config files and file-backed credential stores cannot be read with this tool; use `codewhale config list` or `codewhale auth status` for safe inspection. PDFs are auto-extracted via the bundled pure-Rust extractor (no Poppler install required). Image screenshots are OCR-extracted when local OCR is available. Cannot read other non-PDF binaries.\n\nFor large files, use `start_line` and `max_lines` to read in chunks. By default, returns at most 200 lines (~16KB). If `truncated=\"true\"` in the response, use `next_start_line` to continue reading. For PDFs, use `pages` instead — `start_line`/`max_lines` only apply to text files."
     }
@@ -675,6 +679,10 @@ impl ToolSpec for WriteFileTool {
         "write_file"
     }
 
+    fn model_visible(&self) -> bool {
+        false
+    }
+
     fn description(&self) -> &'static str {
         "Write content to a UTF-8 file in the workspace. Use this instead of heredocs (`cat <<EOF > file`) or `echo > file` in `exec_shell` — diffs render inline and approval is handled cleanly. Creates or overwrites; parent directories are auto-created."
     }
@@ -760,7 +768,18 @@ impl ToolSpec for WriteFileTool {
             format!("{body}\n{diag_block}")
         };
 
-        Ok(ToolResult::success(full_body))
+        let outcome = if existed_before { "updated" } else { "created" };
+        // Keep the execution-owned receipt workspace-relative even though the
+        // legacy model-facing output above retains its resolved-path wording.
+        let receipt_diff = make_unified_diff(path_str, &prior_contents, file_content);
+        Ok(ToolResult::success(full_body).with_metadata(json!({
+            "event": "file.mutation",
+            "mutation": {
+                "diff": receipt_diff,
+                "files": [{ "path": path_str, "outcome": outcome }],
+                "renames": []
+            }
+        })))
     }
 }
 
@@ -773,6 +792,10 @@ pub struct EditFileTool;
 impl ToolSpec for EditFileTool {
     fn name(&self) -> &'static str {
         "edit_file"
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     fn description(&self) -> &'static str {
@@ -826,6 +849,11 @@ impl ToolSpec for EditFileTool {
             return Err(ToolError::invalid_input(
                 "search and replace are identical, no change intended",
             ));
+        }
+        if let Some(reason) = edit_payload_looks_corrupted(search, replace) {
+            return Err(ToolError::invalid_input(format!(
+                "edit_file refused corrupted payload: {reason}. Recovery: re-read the file and retry with a complete replace (or use apply_patch for brace-heavy multi-line edits)."
+            )));
         }
 
         let file_path = context.resolve_path(path_str)?;
@@ -891,6 +919,15 @@ impl ToolSpec for EditFileTool {
             (contents.replace(search, replace), count, None)
         };
 
+        // Fidelity: the intended replace text must appear in the updated buffer
+        // (empty replace is a valid deletion). Catches host/tool bridges that
+        // claim success after mangling the payload.
+        if !replace.is_empty() && !updated.contains(replace) {
+            return Err(ToolError::execution_failed(
+                "edit_file internal fidelity check failed: replace text missing from updated buffer — refusing write",
+            ));
+        }
+
         crate::utils::write_atomic_workspace(&file_path, updated.as_bytes()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
         })?;
@@ -921,8 +958,79 @@ impl ToolSpec for EditFileTool {
             format!("{body}\n{diag_block}")
         };
 
-        Ok(ToolResult::success(full_body))
+        // The structured receipt uses the requested workspace path instead of
+        // the resolved host path retained by the legacy model-facing body.
+        let receipt_diff = make_unified_diff(path_str, &contents, &updated);
+        Ok(ToolResult::success(full_body).with_metadata(json!({
+            "event": "file.mutation",
+            "mutation": {
+                "diff": receipt_diff,
+                "files": [{ "path": path_str, "outcome": "updated" }],
+                "renames": []
+            }
+        })))
     }
+}
+
+/// Detect catastrophic argument corruption of brace-structured edits.
+///
+/// Models (and some host XML/JSON bridges) occasionally deliver a `replace`
+/// payload where a multi-line `{ ... }` block collapsed to empty `[]` or `{}`
+/// while `search` still contains the full structured original. Writing that
+/// would brick Rust match arms / JSON objects. Fail closed with recovery text
+/// instead of applying the mangled payload (dogfood 2026-07-24).
+fn edit_payload_looks_corrupted(search: &str, replace: &str) -> Option<&'static str> {
+    let search_curly_open = search.matches('{').count();
+    let search_curly_close = search.matches('}').count();
+    let replace_curly_open = replace.matches('{').count();
+    let replace_curly_close = replace.matches('}').count();
+    let replace_square_open = replace.matches('[').count();
+    let replace_square_close = replace.matches(']').count();
+
+    if replace_curly_open != replace_curly_close {
+        return Some(
+            "replace has unbalanced `{`/`}` braces — the tool-call arguments were likely truncated or mangled before apply",
+        );
+    }
+    if search_curly_open != search_curly_close {
+        return Some(
+            "search has unbalanced `{`/`}` braces — copy the exact file span again with balanced braces",
+        );
+    }
+    if replace_square_open != replace_square_close {
+        return Some(
+            "replace has unbalanced `[`/`]` brackets — the tool-call arguments were likely truncated or mangled before apply",
+        );
+    }
+
+    // Dogfood 2026-07-24: multi-line Rust `{ ... }` search collapsed into an
+    // empty `[ ... ]` placeholder (host/XML arg bridge ate the brace body).
+    // Count non-whitespace, non-bracket payload chars; a near-empty bracket
+    // husk with a tiny tail like `=> {},` is the signature of that failure.
+    if search_curly_open >= 1 && replace_square_open >= 1 {
+        let significant = replace
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '[' && *c != ']')
+            .count();
+        if significant <= 12 {
+            return Some(
+                "replace collapsed a brace-structured search block into an empty/placeholder bracket span — refusing to brick the file; re-send the full replace text (prefer apply_patch for multi-line match arms)",
+            );
+        }
+    }
+
+    // Extreme shrinkage with lost braces (e.g. 200-char match arm -> tiny stub).
+    if search.len() >= 80
+        && replace.len() * 8 < search.len()
+        && search_curly_open >= 1
+        && replace_curly_open < search_curly_open
+    {
+        return Some(
+            "replace is drastically shorter than search and lost brace structure — likely argument mangling; refuse apply",
+        );
+    }
+
+    None
 }
 
 fn strip_line_leading_whitespace_with_map(input: &str) -> (String, Vec<usize>) {
@@ -1074,6 +1182,10 @@ const LIST_DIR_MAX_ENTRIES: usize = 500;
 impl ToolSpec for ListDirTool {
     fn name(&self) -> &'static str {
         "list_dir"
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     fn description(&self) -> &'static str {
@@ -1313,10 +1425,21 @@ mod tests {
         fs::copy(&fixture, tmp.path().join("ocr_hello.png")).expect("copy fixture");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
 
-        let result = ReadFileTool
+        let result = match ReadFileTool
             .execute(json!({"path": "ocr_hello.png"}), &ctx)
             .await
-            .expect("read image through OCR");
+        {
+            Ok(result) => result,
+            Err(err) => {
+                // Name is when_backend_exists — skip if live OCR fails after
+                // the availability probe (restricted Vision, etc.).
+                let msg = err.to_string();
+                let _skip_reason =
+                    format!("OCR backend probe passed but read_file OCR failed: {msg}");
+                let _ = &_skip_reason;
+                return;
+            }
+        };
 
         assert!(result.success);
         assert!(result.content.contains("<image_ocr"));
@@ -1903,6 +2026,24 @@ mod tests {
             "{}",
             result.content
         );
+        let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
+        assert_eq!(
+            mutation["files"],
+            json!([{ "path": "output.txt", "outcome": "created" }])
+        );
+        assert!(
+            mutation["diff"]
+                .as_str()
+                .is_some_and(|diff| diff.contains("--- a/output.txt")),
+            "{mutation}"
+        );
+        assert!(
+            !mutation["diff"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(&tmp.path().display().to_string()),
+            "receipt headers must not expose the resolved host path: {mutation}"
+        );
 
         // Verify file was written
         let written = fs::read_to_string(tmp.path().join("output.txt")).expect("read");
@@ -2018,6 +2159,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_file_refuses_brace_collapsed_match_arm_payload() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let path = tmp.path().join("arm.rs");
+        let original = r#"match outcome {
+            SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Interrupted,
+                ..
+            } => self.pause_goal_after_interruption().await,
+            SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Completed,
+                ..
+            } => {}
+        }
+"#;
+        fs::write(&path, original).expect("write");
+        read_before_edit(&ctx, "arm.rs").await;
+
+        let search = r#"SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Interrupted,
+                ..
+            } => self.pause_goal_after_interruption().await,"#;
+        // Corrupted host payload: brace block collapsed to empty brackets.
+        let replace = "[
+                
+            ] => {},";
+        let err = EditFileTool
+            .execute(
+                json!({
+                    "path": "arm.rs",
+                    "search": search,
+                    "replace": replace,
+                }),
+                &ctx,
+            )
+            .await
+            .expect_err("corrupted brace collapse must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("corrupted") || msg.contains("collapsed") || msg.contains("unbalanced"),
+            "unexpected error: {msg}"
+        );
+        assert_eq!(fs::read_to_string(&path).expect("read"), original);
+    }
+
+    #[tokio::test]
+    async fn edit_file_preserves_rust_match_arm_braces() {
+        let tmp = tempdir().expect("tempdir");
+        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let path = tmp.path().join("arm.rs");
+        let original = r#"match outcome {
+            SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Interrupted,
+                ..
+            } => self.pause_goal_after_interruption().await,
+            other => {}
+        }
+"#;
+        fs::write(&path, original).expect("write");
+        read_before_edit(&ctx, "arm.rs").await;
+
+        let search = r#"SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Interrupted,
+                ..
+            } => self.pause_goal_after_interruption().await,"#;
+        let replace = r#"SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Interrupted,
+                ..
+            } => {
+                // stay active
+                let _ = self.tx_event.send(Event::status("ok".into())).await;
+            }"#;
+        EditFileTool
+            .execute(
+                json!({
+                    "path": "arm.rs",
+                    "search": search,
+                    "replace": replace,
+                }),
+                &ctx,
+            )
+            .await
+            .expect("brace-heavy replace must apply");
+        let updated = fs::read_to_string(&path).expect("read");
+        assert!(updated.contains("stay active"), "{updated}");
+        assert!(
+            updated.contains("SendMessageOutcome::Finished"),
+            "{updated}"
+        );
+        assert!(
+            !updated.contains("pause_goal_after_interruption"),
+            "{updated}"
+        );
+    }
+
+    #[tokio::test]
     async fn test_edit_file_tool() {
         let tmp = tempdir().expect("tempdir");
         let ctx = ToolContext::new(tmp.path().to_path_buf());
@@ -2047,6 +2284,19 @@ mod tests {
             result.content
         );
         assert!(result.content.contains("+hi world"), "{}", result.content);
+        let mutation = &result.metadata.as_ref().expect("metadata")["mutation"];
+        assert_eq!(
+            mutation["files"],
+            json!([{ "path": "edit_me.txt", "outcome": "updated" }])
+        );
+        let receipt_diff = mutation["diff"].as_str().expect("receipt diff");
+        assert!(receipt_diff.contains("--- a/edit_me.txt"), "{receipt_diff}");
+        assert!(receipt_diff.contains("-hello world"), "{receipt_diff}");
+        assert!(receipt_diff.contains("+hi world"), "{receipt_diff}");
+        assert!(
+            !receipt_diff.contains(&tmp.path().display().to_string()),
+            "receipt headers must not expose the resolved host path: {receipt_diff}"
+        );
 
         // Verify edit was applied
         let edited = fs::read_to_string(&test_file).expect("read");

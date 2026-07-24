@@ -14,12 +14,14 @@ use crate::tools::plan::PlanSnapshot;
 use crate::tools::review::ReviewOutput;
 use crate::tui::app::TranscriptSpacing;
 use crate::tui::diff_render;
+use crate::tui::motion::MotionMode;
 use crate::tui::ui_text::CopyLineSeparator;
 
 mod agent_activity;
 mod archived_context;
 mod checklist;
 mod constants;
+mod file_mutation;
 mod message;
 mod plan;
 mod thinking;
@@ -43,14 +45,15 @@ use constants::{
 use constants::{TOOL_RUNNING_SYMBOLS, TOOL_STATUS_SYMBOL_MS};
 use message::{
     RenderedTranscriptLine, assistant_label_style_for, hard_break_copy_lines, message_body_style,
-    render_message, render_message_with_copy_metadata, render_plain_message, render_user_message,
-    system_body_style, system_label_style, user_body_style, user_label_style,
+    render_message, render_message_with_copy_metadata_for_palette, render_plain_message,
+    render_user_message, system_body_style, system_label_style, user_body_style, user_label_style,
 };
 use thinking::{render_hidden_thinking_activity, render_thinking};
 use tool_output::{render_exec_output_mode, render_tool_output_mode, wrap_plain_line, wrap_text};
 
 #[cfg(test)]
 use agent_activity::extract_agent_id;
+pub use file_mutation::FileMutationReceipt;
 pub use plan::PlanUpdateCell;
 #[cfg(test)]
 use thinking::extract_reasoning_summary;
@@ -137,6 +140,7 @@ pub enum HistoryCell {
 
 /// In-transcript sub-agent cell — either a single delegate or a fanout.
 /// State mutates over the turn as mailbox envelopes are drained.
+/// `Shelf` is a synthetic collapsed projector for concurrent live agents.
 #[derive(Debug, Clone)]
 pub enum SubAgentCell {
     Delegate(crate::tui::widgets::agent_card::DelegateCard),
@@ -157,9 +161,14 @@ pub struct TranscriptRenderOptions {
     pub show_thinking: bool,
     pub verbose: bool,
     pub show_tool_details: bool,
+    pub inline_diff_mode: crate::settings::InlineDiffMode,
     pub calm_mode: bool,
     pub low_motion: bool,
+    pub motion_mode: MotionMode,
     pub spacing: TranscriptSpacing,
+    /// Resolved application theme mode. This keeps cached markdown syntax
+    /// colors aligned with an explicit theme selection.
+    pub palette_mode: palette::PaletteMode,
 }
 
 impl Default for TranscriptRenderOptions {
@@ -168,14 +177,36 @@ impl Default for TranscriptRenderOptions {
             show_thinking: true,
             verbose: false,
             show_tool_details: true,
+            inline_diff_mode: crate::settings::InlineDiffMode::Full,
             calm_mode: false,
             low_motion: false,
+            motion_mode: MotionMode::Full,
             spacing: TranscriptSpacing::Comfortable,
+            palette_mode: palette::PaletteMode::detect(),
         }
     }
 }
 
 impl HistoryCell {
+    #[must_use]
+    pub(crate) fn has_live_motion(&self) -> bool {
+        match self {
+            HistoryCell::Assistant { streaming, .. } => *streaming,
+            HistoryCell::Tool(ToolCell::Generic(tool))
+                if tool.name == "agent" && !agent_activity::is_agent_inspection(tool) =>
+            {
+                false
+            }
+            HistoryCell::Tool(tool) => tool.is_running(),
+            HistoryCell::User { .. }
+            | HistoryCell::System { .. }
+            | HistoryCell::Error { .. }
+            | HistoryCell::Thinking { .. }
+            | HistoryCell::ArchivedContext { .. }
+            | HistoryCell::SubAgent(_) => false,
+        }
+    }
+
     /// Render the cell into a set of terminal lines.
     ///
     /// This is the live-display path used by widgets that don't already pass
@@ -263,7 +294,7 @@ impl HistoryCell {
         options: TranscriptRenderOptions,
         folded: bool,
     ) -> Vec<Line<'static>> {
-        match self {
+        let mut lines = match self {
             HistoryCell::Thinking {
                 streaming,
                 duration_secs,
@@ -286,6 +317,12 @@ impl HistoryCell {
                 *duration_secs,
                 folded ^ !options.verbose,
                 options.low_motion,
+            ),
+            HistoryCell::Tool(ToolCell::PatchSummary(cell)) => cell.render(
+                width,
+                options.low_motion,
+                RenderMode::Live,
+                options.inline_diff_mode,
             ),
             HistoryCell::Tool(cell) if !options.show_tool_details && !cell.is_failed() => {
                 let mut lines = cell.lines_with_motion(width, options.low_motion);
@@ -311,19 +348,42 @@ impl HistoryCell {
             }
             HistoryCell::Tool(cell) => cell.lines_with_motion(width, options.low_motion),
             HistoryCell::User { content } => render_user_message(content, width),
-            HistoryCell::Assistant { content, streaming } => render_message(
-                ASSISTANT_GLYPH,
-                assistant_label_style_for(*streaming, options.low_motion),
-                message_body_style(),
-                content,
-                width,
-            ),
+            HistoryCell::Assistant { content, streaming } => {
+                let mut lines: Vec<Line<'static>> = render_message_with_copy_metadata_for_palette(
+                    ASSISTANT_GLYPH,
+                    assistant_label_style_for(*streaming, options.low_motion),
+                    message_body_style(),
+                    content,
+                    width,
+                    options.palette_mode,
+                )
+                .into_iter()
+                .map(|rendered| rendered.line)
+                .collect();
+                if *streaming {
+                    apply_hot_tail_to_last_line(&mut lines, options.low_motion);
+                }
+                lines
+            }
             HistoryCell::System { .. } | HistoryCell::Error { .. } => self.lines(width),
             HistoryCell::SubAgent(cell) => cell.lines(width),
             HistoryCell::ArchivedContext { .. } => {
                 render_archived_context(self, width, options.low_motion)
             }
+        };
+        if matches!(self, HistoryCell::Tool(_)) {
+            match options.motion_mode {
+                MotionMode::Reduced => apply_static_tool_markers(
+                    &mut lines,
+                    crate::tui::spinner::BRAILLE_SPINNER_STILL_FRAME,
+                ),
+                MotionMode::Still => {
+                    apply_static_tool_markers(&mut lines, crate::tui::spinner::LIVE_STATIC_MARKER)
+                }
+                MotionMode::Full => {}
+            }
         }
+        lines
     }
 
     #[allow(dead_code)]
@@ -345,20 +405,28 @@ impl HistoryCell {
             HistoryCell::User { content } => {
                 hard_break_copy_lines(render_user_message(content, width))
             }
-            HistoryCell::Assistant { content, streaming } => render_message_with_copy_metadata(
-                ASSISTANT_GLYPH,
-                assistant_label_style_for(*streaming, options.low_motion),
-                message_body_style(),
-                content,
-                width,
-            ),
+            HistoryCell::Assistant { content, streaming } => {
+                let mut rendered = render_message_with_copy_metadata_for_palette(
+                    ASSISTANT_GLYPH,
+                    assistant_label_style_for(*streaming, options.low_motion),
+                    message_body_style(),
+                    content,
+                    width,
+                    options.palette_mode,
+                );
+                if *streaming && let Some(last) = rendered.last_mut() {
+                    apply_hot_tail_to_line(&mut last.line, options.low_motion);
+                }
+                rendered
+            }
             HistoryCell::System { content } if !is_cycle_boundary(content) => {
-                render_message_with_copy_metadata(
+                render_message_with_copy_metadata_for_palette(
                     "Note",
                     system_label_style(),
                     system_body_style(),
                     content,
                     width,
+                    options.palette_mode,
                 )
             }
             HistoryCell::Tool(_) => self
@@ -422,26 +490,6 @@ impl HistoryCell {
             HistoryCell::ArchivedContext { .. } => render_archived_context(self, width, true),
         }
     }
-
-    /// Whether this cell is the continuation of a streaming assistant message.
-    #[must_use]
-    pub fn is_stream_continuation(&self) -> bool {
-        matches!(
-            self,
-            HistoryCell::Assistant {
-                streaming: true,
-                ..
-            }
-        )
-    }
-
-    #[must_use]
-    pub fn is_conversational(&self) -> bool {
-        matches!(
-            self,
-            HistoryCell::User { .. } | HistoryCell::Assistant { .. } | HistoryCell::Thinking { .. }
-        )
-    }
 }
 
 /// Convert a message into history cells for rendering.
@@ -455,9 +503,12 @@ pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
 
     let mut cells = Vec::new();
 
-    for block in &msg.content {
+    for (block_index, block) in msg.content.iter().enumerate() {
         match block {
             ContentBlock::Text { text, .. } => {
+                if is_trailing_turn_metadata_block(msg, block_index, text) {
+                    continue;
+                }
                 if text.starts_with("[tool_history_repair]") {
                     cells.push(HistoryCell::System {
                         content: text.clone(),
@@ -539,6 +590,18 @@ pub fn history_cells_from_message(msg: &Message) -> Vec<HistoryCell> {
     cells
 }
 
+fn is_trailing_turn_metadata_block(msg: &Message, block_index: usize, text: &str) -> bool {
+    if msg.role != "user" || block_index == 0 || block_index + 1 != msg.content.len() {
+        return false;
+    }
+
+    let trimmed = text.trim();
+    trimmed
+        .strip_prefix("<turn_meta>")
+        .and_then(|body| body.strip_suffix("</turn_meta>"))
+        .is_some()
+}
+
 // === Tool Cells ===
 
 /// Variants describing a tool result cell.
@@ -549,6 +612,10 @@ pub enum ToolCell {
     PlanUpdate(PlanUpdateCell),
     PatchSummary(PatchSummaryCell),
     Review(ReviewCell),
+    /// Standalone preview compatibility cell. Approval previews now live in
+    /// the modal and successful mutations use `PatchSummary`, but keeping this
+    /// renderer avoids discarding the older transcript shape outright.
+    #[allow(dead_code)]
     DiffPreview(DiffPreviewCell),
     Mcp(McpToolCell),
     ViewImage(ViewImageCell),
@@ -557,6 +624,20 @@ pub enum ToolCell {
 }
 
 impl ToolCell {
+    /// Whether this tool cell projects durable Work state rather than a
+    /// transient action receipt. Transcript rhythm uses this semantic split
+    /// to keep plans, checklists, and workflows legible without teaching the
+    /// renderer about individual tool payloads.
+    #[must_use]
+    pub(crate) fn is_durable_work_receipt(&self) -> bool {
+        matches!(self, ToolCell::PlanUpdate(_))
+            || matches!(
+                self,
+                ToolCell::Generic(cell)
+                    if cell.name == "workflow" || is_checklist_tool_name(&cell.name)
+            )
+    }
+
     /// Status for cells that have a concrete lifecycle state.
     pub fn status(&self) -> Option<ToolStatus> {
         match self {
@@ -640,7 +721,12 @@ impl ToolCell {
             ToolCell::Exec(cell) => cell.render(width, low_motion, mode),
             ToolCell::Exploring(cell) => cell.lines_with_motion(width, low_motion),
             ToolCell::PlanUpdate(cell) => cell.lines_with_motion(width, low_motion),
-            ToolCell::PatchSummary(cell) => cell.render(width, low_motion, mode),
+            ToolCell::PatchSummary(cell) => cell.render(
+                width,
+                low_motion,
+                mode,
+                crate::settings::InlineDiffMode::Full,
+            ),
             ToolCell::Review(cell) => cell.render(width, low_motion, mode),
             ToolCell::DiffPreview(cell) => cell.lines_with_motion(width, low_motion),
             ToolCell::Mcp(cell) => cell.render(width, low_motion, mode),
@@ -729,14 +815,22 @@ impl ExecCell {
         // to the single header line in live mode. The bottom shell strip owns
         // live/background detail, failures stay fully verbose so errors remain
         // visible, and Transcript mode keeps everything for the pager/clipboard.
+        if mode == RenderMode::Live
+            && self
+                .output
+                .as_deref()
+                .is_some_and(is_exact_evidence_receipt)
+        {
+            lines.push(render_spillover_annotation(std::path::Path::new(""), width));
+            return wrap_card_rail(lines);
+        }
         if mode == RenderMode::Live && self.status == ToolStatus::Success {
             if let Some(duration_ms) = self.duration_ms
                 && duration_ms >= 1000
             {
-                let seconds = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX)) / 1000.0;
                 lines.extend(render_compact_kv(
                     "time",
-                    &format!("{seconds:.2}s"),
+                    &crate::elapsed::format_elapsed_ms(duration_ms),
                     Style::default().fg(palette::TEXT_DIM),
                     width,
                 ));
@@ -803,12 +897,11 @@ impl ExecCell {
 
         if let Some(duration_ms) = self.duration_ms {
             // #3031: Suppress sub-second timing in compact mode.
-            // Transcript mode always shows exact timing.
+            // Transcript mode always shows timing.
             if mode == RenderMode::Transcript || duration_ms >= 1000 {
-                let seconds = f64::from(u32::try_from(duration_ms).unwrap_or(u32::MAX)) / 1000.0;
                 lines.extend(render_compact_kv(
                     "time",
-                    &format!("{seconds:.2}s"),
+                    &crate::elapsed::format_elapsed_ms(duration_ms),
                     Style::default().fg(palette::TEXT_DIM),
                     width,
                 ));
@@ -951,13 +1044,14 @@ pub struct ExploringEntry {
     pub status: ToolStatus,
 }
 
-/// Cell for patch summaries emitted by the patch tool.
+/// Calm outcome and exact evidence for a structured File mutation.
 #[derive(Debug, Clone)]
 pub struct PatchSummaryCell {
     pub path: String,
     pub summary: String,
     pub status: ToolStatus,
     pub error: Option<String>,
+    pub receipt: Option<FileMutationReceipt>,
 }
 
 impl PatchSummaryCell {
@@ -966,28 +1060,40 @@ impl PatchSummaryCell {
         width: u16,
         low_motion: bool,
         mode: RenderMode,
+        inline_diff_mode: crate::settings::InlineDiffMode,
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
+        let header_summary = self
+            .receipt
+            .as_ref()
+            .map(FileMutationReceipt::outcome_label)
+            .unwrap_or_else(|| self.path.clone());
         lines.push(render_tool_header_with_summary(
-            "Patch",
-            Some(&self.path),
+            "File",
+            Some(&header_summary),
             tool_status_label(self.status),
             self.status,
             None,
             low_motion,
         ));
-        lines.extend(render_compact_kv(
-            "file",
-            &self.path,
-            tool_value_style(),
-            width,
-        ));
-        lines.extend(render_tool_output_mode(
-            &self.summary,
-            width,
-            TOOL_COMMAND_LINE_LIMIT,
-            mode,
-        ));
+        if self.status == ToolStatus::Success
+            && let Some(receipt) = self.receipt.as_ref()
+        {
+            lines.extend(receipt.render_inline(width, inline_diff_mode));
+        } else {
+            lines.extend(render_compact_kv(
+                "file",
+                &self.path,
+                tool_value_style(),
+                width,
+            ));
+            lines.extend(render_tool_output_mode(
+                &self.summary,
+                width,
+                TOOL_COMMAND_LINE_LIMIT,
+                mode,
+            ));
+        }
         if let Some(error) = self.error.as_ref() {
             lines.extend(render_tool_output_mode(
                 error,
@@ -1208,6 +1314,10 @@ impl McpToolCell {
         }
 
         if let Some(content) = self.content.as_ref() {
+            if mode == RenderMode::Live && is_exact_evidence_receipt(content) {
+                lines.push(render_spillover_annotation(std::path::Path::new(""), width));
+                return lines;
+            }
             lines.extend(render_tool_output_mode(
                 content,
                 width,
@@ -1416,19 +1526,23 @@ impl GenericToolCell {
             );
             let should_collapse = self.status == ToolStatus::Success
                 || (self.status != ToolStatus::Failed && !is_read_family);
-            if should_collapse {
+            if should_collapse || self.spillover_path.is_some() {
                 let header_summary = crate::tui::widgets::tool_card::tool_header_summary_for_name(
                     &self.name,
                     self.input_summary.as_deref(),
                 );
-                return wrap_card_rail(vec![render_tool_header_with_family_and_summary(
+                let mut collapsed = vec![render_tool_header_with_family_and_summary(
                     family,
                     header_summary.as_deref(),
                     tool_status_label(self.status),
                     self.status,
                     None,
                     low_motion,
-                )]);
+                )];
+                if let Some(path) = self.spillover_path.as_ref() {
+                    collapsed.push(render_spillover_annotation(path, width));
+                }
+                return wrap_card_rail(collapsed);
             }
         }
 
@@ -1707,26 +1821,21 @@ impl GenericToolCell {
 }
 
 /// Render the inline annotation for a tool cell whose full output was
-/// spilled to disk (#422 + #423). Produces a one-line muted hint:
-///
-/// ```text
-///   full output: /Users/you/.deepseek/tool_outputs/call-abc12.txt
-/// ```
-///
-/// Path is plain text on this branch; the OSC 8 hyperlink-wrap that
-/// makes it Cmd+click-openable lives on the OSC 8 branch (PR #515)
-/// and merges in once both PRs land on `main`. The clipboard /
-/// selection path already strips OSC 8 there, so a future enhancement
-/// stays backward-compatible.
-fn render_spillover_annotation(path: &std::path::Path, width: u16) -> Line<'static> {
-    let display = path.display().to_string();
-    let prefix = "  full output: ";
-    let budget = usize::from(width).saturating_sub(prefix.len()).max(8);
-    let truncated = truncate_text(&display, budget);
-    Line::from(vec![
-        Span::styled(prefix, Style::default().fg(palette::TEXT_MUTED)),
-        Span::styled(truncated, Style::default().fg(palette::TEXT_MUTED).italic()),
-    ])
+/// retained as exact evidence. The receipt stays calm and path-free; the
+/// activity-detail shortcut opens the verified retained file.
+fn render_spillover_annotation(_path: &std::path::Path, width: u16) -> Line<'static> {
+    // Keep the per-card receipt path-free and short. The Option+V / details
+    // shortcut is a global chrome affordance — stamping it under every tool
+    // card made transcript density too high (#4718).
+    let receipt = "  Exact evidence retained";
+    Line::from(Span::styled(
+        truncate_text(receipt, usize::from(width).max(8)),
+        Style::default().fg(palette::TEXT_MUTED).italic(),
+    ))
+}
+
+fn is_exact_evidence_receipt(content: &str) -> bool {
+    content.trim_start().starts_with("[Exact evidence retained")
 }
 
 fn render_command_mode(command: &str, width: u16, mode: RenderMode) -> Vec<Line<'static>> {
@@ -1821,6 +1930,40 @@ fn wrap_card_rail(mut lines: Vec<Line<'static>>) -> Vec<Line<'static>> {
     lines
 }
 
+/// The legacy tool renderers accept only a low-motion boolean, which gives
+/// both Reduced and Still a mix of legacy static frames. Preserve that stable
+/// rendering path, then apply the central mode's exact fallback at the typed
+/// header span (never by rewriting user/tool output text).
+fn apply_static_tool_markers(lines: &mut [Line<'static>], marker: &'static str) {
+    for line in lines {
+        let mut index = 0;
+        if line
+            .spans
+            .first()
+            .is_some_and(|span| matches!(span.content.as_ref(), "─ " | "╭ " | "│ " | "╰ "))
+        {
+            index = 1;
+        }
+        let Some(status) = line.spans.get(index).map(|span| span.content.as_ref()) else {
+            continue;
+        };
+        let Some(family) = line.spans.get(index + 1).map(|span| span.content.as_ref()) else {
+            continue;
+        };
+        if !status.ends_with(' ')
+            || !is_tool_status_glyph(status.trim_end())
+            || !family.ends_with(' ')
+            || !is_tool_family_glyph(family.trim_end())
+        {
+            continue;
+        }
+        let mut chars = status.trim_end().chars();
+        if matches!(chars.next(), Some('\u{2800}'..='\u{28FF}')) && chars.next().is_none() {
+            line.spans[index].content = format!("{marker} ").into();
+        }
+    }
+}
+
 /// Return the width of tool-cell chrome that remains after the transcript
 /// cache removes the cell-local card rail. Tool headers have two additional
 /// visual tokens (`✓`/spinner and the family glyph); detail rows have the
@@ -1861,7 +2004,7 @@ fn tool_copy_prefix_width(line: &Line<'static>) -> usize {
     if !status.ends_with(' ')
         || !is_tool_status_glyph(status.trim_end())
         || !family.ends_with(' ')
-        || UnicodeWidthStr::width(family.trim_end()) != 1
+        || !is_tool_family_glyph(family.trim_end())
     {
         return 0;
     }
@@ -1880,8 +2023,28 @@ fn is_tool_status_glyph(text: &str) -> bool {
             '\u{2713}' // ✓
                 | '\u{2715}' // ✕
                 | '\u{00B7}' // ·
+                | '\u{203A}' // › static still-mode marker
                 | '\u{2800}'..='\u{28FF}' // braille spinner frames
         )
+}
+
+fn is_tool_family_glyph(text: &str) -> bool {
+    use crate::tui::widgets::tool_card::{ToolFamily, family_glyph};
+
+    [
+        ToolFamily::Read,
+        ToolFamily::Patch,
+        ToolFamily::Run,
+        ToolFamily::Find,
+        ToolFamily::Delegate,
+        ToolFamily::Fanout,
+        ToolFamily::Rlm,
+        ToolFamily::Verify,
+        ToolFamily::Think,
+        ToolFamily::Generic,
+    ]
+    .into_iter()
+    .any(|family| family_glyph(family) == text)
 }
 
 fn review_severity_color(severity: &str) -> Color {
@@ -2326,6 +2489,133 @@ fn looks_like_file_path(s: &str) -> bool {
     } else {
         false
     }
+}
+
+/// Aggregated file activity for compact Work panel display (#4636).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FileActivitySummary {
+    pub files_read: u32,
+    pub dirs_listed: u32,
+    pub patterns_searched: u32,
+    pub files_written: u32,
+}
+
+impl FileActivitySummary {
+    pub fn is_empty(&self) -> bool {
+        self.files_read == 0
+            && self.dirs_listed == 0
+            && self.patterns_searched == 0
+            && self.files_written == 0
+    }
+
+    pub fn compact_display(&self) -> Vec<String> {
+        let mut parts = Vec::new();
+        if self.files_read > 0 {
+            parts.push(format!("Read {} files", self.files_read));
+        }
+        if self.dirs_listed > 0 {
+            parts.push(format!("Listed {} directories", self.dirs_listed));
+        }
+        if self.patterns_searched > 0 {
+            parts.push(format!("Searched {} patterns", self.patterns_searched));
+        }
+        if self.files_written > 0 {
+            parts.push(format!("Wrote {} files", self.files_written));
+        }
+        parts
+    }
+
+    pub fn from_tool_name(name: &str) -> Option<FileActivityKind> {
+        match name {
+            "read_file" | "Read" | "read" => Some(FileActivityKind::Read),
+            "list_dir" | "list_directory" | "Glob" | "glob" => Some(FileActivityKind::List),
+            "search" | "grep" | "Grep" | "grep_files" | "file_search" | "codebase_search" => {
+                Some(FileActivityKind::Search)
+            }
+            "write_file" | "Write" | "apply_patch" | "Edit" | "edit_file" | "fim_edit" => {
+                Some(FileActivityKind::Write)
+            }
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileActivityKind {
+    Read,
+    List,
+    Search,
+    Write,
+}
+
+impl FileActivitySummary {
+    pub fn record(&mut self, kind: FileActivityKind) {
+        match kind {
+            FileActivityKind::Read => self.files_read += 1,
+            FileActivityKind::List => self.dirs_listed += 1,
+            FileActivityKind::Search => self.patterns_searched += 1,
+            FileActivityKind::Write => self.files_written += 1,
+        }
+    }
+}
+
+/// Illuminate the newest graphemes of an actively streaming assistant line.
+fn apply_hot_tail_to_last_line(lines: &mut [Line<'static>], low_motion: bool) {
+    if let Some(last) = lines.last_mut() {
+        apply_hot_tail_to_line(last, low_motion);
+    }
+}
+
+fn apply_hot_tail_to_line(line: &mut Line<'static>, low_motion: bool) {
+    if line.spans.is_empty() {
+        return;
+    }
+    // Reconstruct plain text from spans, split hot tail, re-style.
+    let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    if plain.trim().is_empty() {
+        return;
+    }
+    let (_settled, hot) = crate::tui::hot_tail::split_hot_tail(
+        &plain,
+        true,
+        crate::tui::hot_tail::HOT_TAIL_GRAPHEMES,
+    );
+    if hot.is_empty() {
+        return;
+    }
+    let hot_start = plain.len().saturating_sub(hot.len());
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let base_fg = palette::TEXT_PRIMARY;
+    let hot_style = crate::tui::hot_tail::hot_tail_style(base_fg, elapsed, low_motion);
+
+    // Walk spans and re-style the trailing hot graphemes.
+    let mut cursor = 0usize;
+    let mut new_spans = Vec::with_capacity(line.spans.len() + 2);
+    for span in line.spans.drain(..) {
+        let content = span.content.to_string();
+        let len = content.len();
+        let span_end = cursor + len;
+        if span_end <= hot_start {
+            new_spans.push(span);
+        } else if cursor >= hot_start {
+            new_spans.push(Span::styled(content, hot_style));
+        } else {
+            // Split this span across the boundary.
+            let local = hot_start - cursor;
+            let (left, right) = content.split_at(local.min(content.len()));
+            if !left.is_empty() {
+                new_spans.push(Span::styled(left.to_string(), span.style));
+            }
+            if !right.is_empty() {
+                new_spans.push(Span::styled(right.to_string(), hot_style));
+            }
+        }
+        cursor = span_end;
+    }
+    line.spans = new_spans;
 }
 
 #[cfg(test)]

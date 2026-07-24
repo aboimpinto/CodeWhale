@@ -11,7 +11,7 @@
 //!
 //! Set `[search]` in config.toml to switch providers:
 //!   provider = "duckduckgo"  # or tavily/bocha/metaso/searxng/baidu/volcengine/sofya
-//!   base_url = "https://search.example/"  # DDG-compatible URL or SearXNG instance
+//!   base_url = `"https://search.example/"`  # DDG-compatible URL or SearXNG instance
 //!   api_key = "tvly-..."
 
 use super::spec::{
@@ -97,6 +97,10 @@ pub struct WebSearchTool;
 impl ToolSpec for WebSearchTool {
     fn name(&self) -> &'static str {
         "web_search"
+    }
+
+    fn model_visible(&self) -> bool {
+        false
     }
 
     fn description(&self) -> &'static str {

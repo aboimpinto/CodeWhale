@@ -6,6 +6,7 @@ use crate::tools::plan::{PlanItemArg, StepStatus, UpdatePlanArgs};
 use crate::tools::todo::TodoStatus;
 use crate::tui::clipboard::{ClipboardHandler, PastedImage};
 use crate::tui::history::{GenericToolCell, HistoryCell, ToolCell, ToolStatus};
+use crate::tui::motion::MotionMode;
 
 fn test_options(yolo: bool) -> TuiOptions {
     TuiOptions {
@@ -30,6 +31,29 @@ fn test_options(yolo: bool) -> TuiOptions {
         yolo,
         resume_session_id: None,
         initial_input: None,
+    }
+}
+
+#[test]
+fn app_motion_policy_and_transcript_bridge_cover_every_settings_mode() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.constrained_frame_rate = false;
+
+    for (low_motion, fancy_animations, expected_mode, static_status) in [
+        (false, true, MotionMode::Full, false),
+        (true, true, MotionMode::Reduced, true),
+        (false, false, MotionMode::Still, true),
+        // The explicit accessibility preference wins when both switches are off.
+        (true, false, MotionMode::Reduced, true),
+    ] {
+        app.low_motion = low_motion;
+        app.fancy_animations = fancy_animations;
+
+        assert_eq!(app.motion_policy().mode(), expected_mode);
+        assert_eq!(app.effective_low_motion_for_status(), static_status);
+        let options = app.transcript_render_options();
+        assert_eq!(options.low_motion, static_status);
+        assert_eq!(options.motion_mode, expected_mode);
     }
 }
 
@@ -1638,6 +1662,46 @@ fn paste_under_threshold_does_not_consolidate() {
 }
 
 #[test]
+fn large_multiline_paste_preserves_exact_bytes_through_submit() {
+    // #4719: large multi-line pastes must not byte-corrupt before submission.
+    // Real dogfood saw paths like `codewhale-v091-exact-88a158-ci` arrive as
+    // `work-88a158-ci` — assert exact fidelity for a representative payload.
+    let tmp = tempfile::TempDir::new().expect("tempdir");
+    let mut opts = test_options(false);
+    opts.workspace = tmp.path().to_path_buf();
+    let mut app = App::new(opts, &Config::default());
+
+    let payload = format!(
+        "Mission path: /Volumes/VIXinSSD/CW/worktrees/codewhale-v091-exact-88a158-ci\n\
+         SHA: 0dfe9170a10e081fe48b23239f22d33260f4fa24\n\
+         Branch: codex/v091-local-candidate-20260722\n\
+         Paths that must not truncate: codewhale-v091-exact-88a158-ci worktrees/codewhale-v091-exact-88a158-ci\n\
+         Mixed punctuation: a;b:c[m]<n> digits 0123456789 and hyphens-ok\n\
+         Unicode: 你好世界 café — keep every codepoint.\n\
+         {}",
+        "line-body-".repeat(200)
+    );
+    // Stay under MAX_SUBMITTED_INPUT_CHARS so submit returns the inline text
+    // (no @paste consolidation) and we can compare exact bytes.
+    assert!(
+        payload.chars().count() < MAX_SUBMITTED_INPUT_CHARS,
+        "fixture must stay under submit consolidation threshold"
+    );
+
+    app.insert_paste_text(&payload);
+    assert_eq!(
+        app.input, payload,
+        "composer input must equal pasted payload exactly"
+    );
+
+    let submitted = app.submit_input().expect("submit");
+    assert_eq!(
+        submitted, payload,
+        "submitted bytes must equal pasted payload exactly"
+    );
+}
+
+#[test]
 fn submit_input_consolidates_oversized_input_into_paste_file() {
     let tmp = tempfile::TempDir::new().expect("tempdir");
     let mut opts = test_options(false);
@@ -1733,7 +1797,7 @@ fn clear_todos_resets_plan_state() {
             }],
             ..UpdatePlanArgs::default()
         });
-        assert!(!plan.is_empty());
+        assert!(!plan.snapshot().is_empty());
     }
 
     assert!(app.clear_todos());
@@ -1742,7 +1806,7 @@ fn clear_todos_resets_plan_state() {
         .plan_state
         .try_lock()
         .expect("plan lock should be available");
-    assert!(plan.is_empty());
+    assert!(plan.snapshot().is_empty());
 }
 
 #[test]
@@ -2417,10 +2481,12 @@ fn permission_postures_persist_across_restart() {
             assert!(app.cycle_approval_posture());
         }
         assert_eq!(app.approval_mode, expected);
+        assert_eq!(app.trust_mode, expected == ApprovalMode::Bypass);
 
         let restarted = App::new(options, &Config::default());
         assert_eq!(restarted.approval_mode, expected);
         assert_eq!(restarted.mode_prefs.agent_approval_mode, expected);
+        assert_eq!(restarted.trust_mode, expected == ApprovalMode::Bypass);
         drop(config_env);
     }
 }
@@ -2685,6 +2751,9 @@ fn set_mode_captures_agent_edits_as_the_durable_baseline() {
 
 #[test]
 fn yolo_start_with_default_config_restores_interactive_agent_shell_baseline() {
+    // Isolate from the developer's live settings.toml — a saved
+    // `permission_posture` (e.g. full-access) must not leak into the
+    // durable baseline these assertions depend on.
     let _env_lock = lock_test_env();
     let tmp = tempfile::tempdir().expect("tempdir");
     let config_path = tmp.path().join("config.toml");
@@ -2710,6 +2779,9 @@ fn yolo_start_with_default_config_restores_interactive_agent_shell_baseline() {
 
 #[test]
 fn leaving_yolo_after_startup_restores_baseline_policies() {
+    // Isolate from the developer's live settings.toml — a saved
+    // `permission_posture` (e.g. full-access) must not leak into the
+    // durable baseline these assertions depend on.
     let _env_lock = lock_test_env();
     let tmp = tempfile::tempdir().expect("tempdir");
     let config_path = tmp.path().join("config.toml");
@@ -2756,6 +2828,96 @@ fn test_mark_history_updated() {
     let initial_version = app.history_version;
     app.mark_history_updated();
     assert!(app.history_version > initial_version);
+}
+
+#[test]
+fn live_motion_invalidation_only_bumps_live_transcript_rows() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.history = vec![
+        HistoryCell::Assistant {
+            content: "settled".to_string(),
+            streaming: false,
+        },
+        HistoryCell::Assistant {
+            content: "streaming".to_string(),
+            streaming: true,
+        },
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "read_file".to_string(),
+            status: ToolStatus::Running,
+            input_summary: None,
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })),
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "agent".to_string(),
+            status: ToolStatus::Running,
+            input_summary: Some("action: spawn".to_string()),
+            output: None,
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })),
+        HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+            name: "read_file".to_string(),
+            status: ToolStatus::Success,
+            input_summary: None,
+            output: Some("done".to_string()),
+            prompts: None,
+            spillover_path: None,
+            output_summary: None,
+            is_diff: false,
+        })),
+    ];
+    app.resync_history_revisions();
+    let history_before = app.history_revisions.clone();
+
+    let active = app.active_cell.get_or_insert_with(ActiveCell::new);
+    active.push_untracked(HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
+        name: "web_search".to_string(),
+        status: ToolStatus::Running,
+        input_summary: None,
+        output: None,
+        prompts: None,
+        spillover_path: None,
+        output_summary: None,
+        is_diff: false,
+    })));
+    let app_active_before = app.active_cell_revision;
+    let cell_active_before = app.active_cell.as_ref().expect("active cell").revision();
+
+    app.mark_live_motion_updated();
+
+    assert_eq!(app.history_revisions[0], history_before[0]);
+    assert_ne!(app.history_revisions[1], history_before[1]);
+    assert_ne!(app.history_revisions[2], history_before[2]);
+    assert_eq!(app.history_revisions[3], history_before[3]);
+    assert_eq!(app.history_revisions[4], history_before[4]);
+    assert_ne!(app.active_cell_revision, app_active_before);
+    assert_ne!(
+        app.active_cell.as_ref().expect("active cell").revision(),
+        cell_active_before
+    );
+
+    let history_after_all_live = app.history_revisions.clone();
+    let app_active_after_all_live = app.active_cell_revision;
+    let cell_active_after_all_live = app.active_cell.as_ref().expect("active cell").revision();
+    app.mark_live_history_motion_updated();
+
+    assert_eq!(app.history_revisions[0], history_after_all_live[0]);
+    assert_ne!(app.history_revisions[1], history_after_all_live[1]);
+    assert_ne!(app.history_revisions[2], history_after_all_live[2]);
+    assert_eq!(app.history_revisions[3], history_after_all_live[3]);
+    assert_eq!(app.history_revisions[4], history_after_all_live[4]);
+    assert_eq!(app.active_cell_revision, app_active_after_all_live);
+    assert_eq!(
+        app.active_cell.as_ref().expect("active cell").revision(),
+        cell_active_after_all_live
+    );
 }
 
 #[test]
@@ -3639,6 +3801,37 @@ fn double_enter_detects_steering() {
     // Second Enter within 500ms → Steer (double-tap detected)
     let second = app.enter_with_double_tap();
     assert_eq!(second, Some(SubmitDisposition::Steer));
+}
+
+#[test]
+fn empty_composer_double_enter_takes_last_queued_for_steer() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.is_loading = true;
+    app.streaming_message_index = Some(0);
+    // Mirror the live path: first Enter queues + clears the composer.
+    assert_eq!(app.enter_with_double_tap(), Some(SubmitDisposition::Queue));
+    app.queue_message(QueuedMessage::new("older queued".to_string(), None));
+    app.queue_message(QueuedMessage::new("just typed follow-up".to_string(), None));
+    assert!(app.input.is_empty());
+
+    let taken = app
+        .take_queued_for_double_tap_steer()
+        .expect("second bare Enter must escalate the just-queued message");
+    assert_eq!(taken.display, "just typed follow-up");
+    assert_eq!(app.queued_message_count(), 1);
+    assert!(app.last_enter_instant.is_none());
+    // Window consumed: a third Enter does not keep popping.
+    assert!(app.take_queued_for_double_tap_steer().is_none());
+}
+
+#[test]
+fn sticky_error_ttl_is_capped_and_clears_on_composer_activity() {
+    let mut app = App::new(test_options(false), &Config::default());
+    app.set_sticky_status("workflow failed", StatusToastLevel::Error, None);
+    let sticky = app.sticky_status.as_ref().expect("sticky error");
+    assert_eq!(sticky.ttl_ms, Some(App::STICKY_ERROR_TTL_MS));
+    app.insert_char('a');
+    assert!(app.sticky_status.is_none());
 }
 
 #[test]
@@ -4609,6 +4802,40 @@ fn onboarding_provider_copy_is_provider_neutral_in_en() {
     assert!(
         !api_title.to_ascii_lowercase().contains("deepseek"),
         "{api_title}"
+    );
+}
+
+#[test]
+fn agent_current_activity_bounds_redacts_and_strips_control_sequences() {
+    let secret = "sk-activity-secret-1234567890";
+    let raw = format!(
+        "\u{1b}[31mrunning\u{1b}[0m\napi_key={secret}\n\u{1b}]8;;https://example.invalid\u{7}details\u{1b}]8;;\u{7}\u{1}"
+    );
+    let activity = AgentCurrentActivity::bounded(
+        AgentCurrentActivityStatus::Running,
+        Some(raw.clone()),
+        Some(format!("\u{1b}[33mFile.read\u{1b}[0m {secret}")),
+        Some(4),
+    );
+
+    let detail = activity.detail.expect("bounded detail");
+    let tool = activity.current_tool.expect("bounded tool");
+    assert!(detail.contains("running"), "{detail:?}");
+    assert!(detail.contains("api_key=[redacted]"), "{detail:?}");
+    assert!(detail.contains("details"), "{detail:?}");
+    assert!(tool.contains("File.read"), "{tool:?}");
+    assert!(tool.contains("[redacted]"), "{tool:?}");
+    for safe in [&detail, &tool] {
+        assert!(!safe.contains(secret), "{safe:?}");
+        assert!(!safe.contains('\u{1b}'), "{safe:?}");
+        assert!(!safe.contains('\u{1}'), "{safe:?}");
+        assert!(!safe.contains("example.invalid"), "{safe:?}");
+    }
+    assert_eq!(activity.step, Some(4));
+    assert_eq!(
+        raw.matches(secret).count(),
+        1,
+        "source text stays untouched"
     );
 }
 

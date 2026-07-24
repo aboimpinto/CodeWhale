@@ -18,8 +18,8 @@ use windows::Win32::UI::WindowsAndMessaging::MESSAGEBOX_STYLE;
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU8, AtomicU64};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -272,6 +272,84 @@ pub fn clear_taskbar_progress() {
 /// Shared flag controlling the title activity marker. Set to `true` by
 /// `start_title_animation()`, cleared by `stop_title_animation()`.
 static TITLE_ANIMATION_RUNNING: AtomicBool = AtomicBool::new(false);
+/// Focus reporting starts enabled before the event loop begins, so treating
+/// the terminal as focused is the safe default: never flood window chrome
+/// unless the terminal has explicitly reported `FocusLost` or motion is on.
+static TERMINAL_FOCUSED: AtomicBool = AtomicBool::new(true);
+/// When false, the title keeps a static whale + state (reduced motion /
+/// status animation off) instead of cycling frames.
+static TITLE_MOTION_ENABLED: AtomicBool = AtomicBool::new(true);
+/// Invalidates a previous animation worker when a new turn starts or ends.
+static TITLE_ANIMATION_GENERATION: AtomicU64 = AtomicU64::new(0);
+static TITLE_ANIMATION_BASE: OnceLock<Mutex<String>> = OnceLock::new();
+static TITLE_ACTIVITY_VERB: OnceLock<Mutex<String>> = OnceLock::new();
+/// Whale frames restored from #1871 (`cd357de0c`). Cycle slowly so the
+/// terminal title communicates life without competing with in-app spinners.
+const TITLE_FRAME_HOLD: Duration = Duration::from_millis(800);
+const TITLE_WHALE_FRAMES: &[&str] = &["🐳", "🐋", "🐳", "🐋"];
+
+fn title_animation_base() -> &'static Mutex<String> {
+    TITLE_ANIMATION_BASE.get_or_init(|| Mutex::new("Codewhale".to_string()))
+}
+
+fn title_activity_verb() -> &'static Mutex<String> {
+    TITLE_ACTIVITY_VERB.get_or_init(|| Mutex::new("working…".to_string()))
+}
+
+/// Configure whether the title whale cycles frames.
+///
+/// Call once at startup (and whenever motion settings change). Reduced motion
+/// and `status_indicator = "off"` both freeze the title to a single whale.
+pub fn set_title_motion_enabled(enabled: bool) {
+    TITLE_MOTION_ENABLED.store(enabled, Ordering::SeqCst);
+}
+
+/// Update the truthful activity verb shown next to the title whale
+/// (`working…`, `reasoning…`, `using tool…`, `verifying…`, `waiting on you…`).
+pub fn set_title_activity_verb(verb: &str) {
+    let verb = verb.trim();
+    if verb.is_empty() {
+        return;
+    }
+    if let Ok(mut slot) = title_activity_verb().lock() {
+        if slot.as_str() == verb {
+            return;
+        }
+        verb.clone_into(&mut *slot);
+    }
+    if !TITLE_ANIMATION_RUNNING.load(Ordering::SeqCst) {
+        return;
+    }
+    let base = title_animation_base()
+        .lock()
+        .map_or_else(|_| "Codewhale".to_string(), |base| base.clone());
+    set_terminal_title(&title_activity_label(
+        &base,
+        Duration::ZERO,
+        TERMINAL_FOCUSED.load(Ordering::SeqCst),
+        TITLE_MOTION_ENABLED.load(Ordering::SeqCst),
+    ));
+}
+
+#[must_use]
+fn title_activity_label(base: &str, elapsed: Duration, focused: bool, motion: bool) -> String {
+    let verb = title_activity_verb()
+        .lock()
+        .map_or_else(|_| "working…".to_string(), |v| v.clone());
+    let body = if verb.is_empty() {
+        base.to_string()
+    } else {
+        verb
+    };
+    // Static title when motion is off or the window is focused: one whale +
+    // state, no competing spinner in the focused app chrome.
+    if !motion || focused {
+        return format!("🐳 {body}");
+    }
+    let frame = TITLE_WHALE_FRAMES
+        [(elapsed.as_millis() / TITLE_FRAME_HOLD.as_millis()) as usize % TITLE_WHALE_FRAMES.len()];
+    format!("{frame} {body}")
+}
 
 /// Write OSC 0 (set window title) sequence.
 fn set_terminal_title(title: &str) {
@@ -285,27 +363,94 @@ fn set_terminal_title(title: &str) {
 /// `reset_title_on_interaction()` can skip redundant writes.
 static COMPLETION_MARKER_SHOWN: AtomicBool = AtomicBool::new(false);
 
-/// Mark the terminal title as active. Window chrome stays static so an
-/// alt-tabbed session communicates state without another competing spinner.
+/// Mark the terminal title as active with the animated whale + state verb.
+///
+/// While focused (or under reduced motion), the title stays a static whale
+/// with the current verb. After `FocusLost` with motion enabled, the whale
+/// frames cycle so alt-tabbed sessions still communicate progress.
 pub fn start_title_animation(original: &str) {
+    if let Ok(mut base) = title_animation_base().lock() {
+        original.clone_into(&mut base);
+    }
+    if let Ok(mut verb) = title_activity_verb().lock() {
+        if verb.is_empty() {
+            "working…".clone_into(&mut *verb);
+        }
+    }
+    COMPLETION_MARKER_SHOWN.store(false, Ordering::SeqCst);
     TITLE_ANIMATION_RUNNING.store(true, Ordering::SeqCst);
-    set_terminal_title(&format!("› {original}"));
+    let generation = TITLE_ANIMATION_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    let focused = TERMINAL_FOCUSED.load(Ordering::SeqCst);
+    let motion = TITLE_MOTION_ENABLED.load(Ordering::SeqCst);
+    set_terminal_title(&title_activity_label(
+        original,
+        Duration::ZERO,
+        focused,
+        motion,
+    ));
+
+    let base = original.to_string();
+    std::thread::spawn(move || {
+        let started_at = std::time::Instant::now();
+        loop {
+            std::thread::sleep(TITLE_FRAME_HOLD);
+            if !TITLE_ANIMATION_RUNNING.load(Ordering::SeqCst)
+                || TITLE_ANIMATION_GENERATION.load(Ordering::SeqCst) != generation
+            {
+                break;
+            }
+            let motion = TITLE_MOTION_ENABLED.load(Ordering::SeqCst);
+            // Only advance frames when unfocused + motion is on. Focused
+            // windows keep the static whale so the title is not a second
+            // spinner competing with in-app activity chrome.
+            if motion && !TERMINAL_FOCUSED.load(Ordering::SeqCst) {
+                set_terminal_title(&title_activity_label(
+                    &base,
+                    started_at.elapsed(),
+                    false,
+                    true,
+                ));
+            }
+        }
+    });
+}
+
+/// Update the focus gate used by the title activity signal.
+///
+/// Focus gain immediately restores the steady whale + verb. Focus loss emits
+/// the first animation frame immediately, then the worker advances it at the
+/// debounced whale cadence.
+pub fn set_terminal_focused(focused: bool) {
+    TERMINAL_FOCUSED.store(focused, Ordering::SeqCst);
+    if !TITLE_ANIMATION_RUNNING.load(Ordering::SeqCst) {
+        return;
+    }
+    let base = title_animation_base()
+        .lock()
+        .map_or_else(|_| "Codewhale".to_string(), |base| base.clone());
+    let motion = TITLE_MOTION_ENABLED.load(Ordering::SeqCst);
+    set_terminal_title(&title_activity_label(
+        &base,
+        Duration::ZERO,
+        focused,
+        motion,
+    ));
 }
 
 /// Stop the title animation and show a completion marker.
 ///
-/// Sets the title to `✓ <base>` so alt-tabbed users see at a glance
-/// that processing finished. The marker is overwritten on the next turn
-/// by [`start_title_animation`].
+/// Sets the title to `✓ done` so alt-tabbed users see at a glance that
+/// processing finished. The marker is overwritten on the next turn by
+/// [`start_title_animation`].
 pub fn stop_title_animation() {
     TITLE_ANIMATION_RUNNING.store(false, Ordering::SeqCst);
-    COMPLETION_MARKER_SHOWN.store(false, Ordering::SeqCst);
-    // Show a completion marker only for beep mode. Bell mode already has its own
-    // terminal-level visual indicator (flash/icon).
-    let mode = COMPLETION_SOUND_MODE.load(Ordering::SeqCst);
-    if mode == 1 {
-        set_terminal_title("✓ Codewhale");
-    }
+    TITLE_ANIMATION_GENERATION.fetch_add(1, Ordering::SeqCst);
+    // Always show the completion marker so quiet-sound modes still communicate
+    // finish state in the window title; interaction clears it.
+    COMPLETION_MARKER_SHOWN.store(true, Ordering::SeqCst);
+    set_terminal_title("✓ done");
     play_completion_sound();
 }
 
@@ -315,6 +460,7 @@ pub fn stop_title_animation() {
 /// without presenting them as completed work.
 pub fn stop_title_animation_quietly() {
     TITLE_ANIMATION_RUNNING.store(false, Ordering::SeqCst);
+    TITLE_ANIMATION_GENERATION.fetch_add(1, Ordering::SeqCst);
     COMPLETION_MARKER_SHOWN.store(false, Ordering::SeqCst);
     set_terminal_title("Codewhale");
 }
@@ -548,69 +694,6 @@ fn truncate_notification_text(text: &str, max_chars: usize) -> String {
     out
 }
 
-/// Return a human-readable duration string, capped at two units so
-/// it stays compact in headers and notifications.
-///
-/// Examples:
-/// * `"45s"`, `"1m"`, `"1m 12s"`
-/// * `"1h"`, `"3h 12m"` (#447 — was previously `"192m"` form)
-/// * `"1d"`, `"2d 5h"` (#447 — multi-day sessions)
-/// * `"1w"`, `"3w 2d"` (#447 — long-running automations)
-///
-/// The output drops the secondary unit when it's zero, so `"1h"`
-/// rather than `"1h 0m"`. Sub-minute precision is dropped at the
-/// hour mark and above; the goal is "is this a couple of hours or
-/// a couple of days," not stopwatch accuracy.
-#[must_use]
-pub fn humanize_duration(d: Duration) -> String {
-    const MINUTE: u64 = 60;
-    const HOUR: u64 = 60 * MINUTE;
-    const DAY: u64 = 24 * HOUR;
-    const WEEK: u64 = 7 * DAY;
-
-    let total = d.as_secs();
-    if total == 0 {
-        return "0s".to_string();
-    }
-    if total >= WEEK {
-        let w = total / WEEK;
-        let days = (total % WEEK) / DAY;
-        return if days == 0 {
-            format!("{w}w")
-        } else {
-            format!("{w}w {days}d")
-        };
-    }
-    if total >= DAY {
-        let days = total / DAY;
-        let h = (total % DAY) / HOUR;
-        return if h == 0 {
-            format!("{days}d")
-        } else {
-            format!("{days}d {h}h")
-        };
-    }
-    if total >= HOUR {
-        let h = total / HOUR;
-        let m = (total % HOUR) / MINUTE;
-        return if m == 0 {
-            format!("{h}h")
-        } else {
-            format!("{h}h {m}m")
-        };
-    }
-    if total >= MINUTE {
-        let m = total / MINUTE;
-        let s = total % MINUTE;
-        return if s == 0 {
-            format!("{m}m")
-        } else {
-            format!("{m}m {s}s")
-        };
-    }
-    format!("{total}s")
-}
-
 // ── Per-turn notification composition ────────────────────────────────
 //
 // The helpers below decide *whether* to notify on a completed turn and
@@ -738,7 +821,7 @@ fn completion_status(
         return label.to_string();
     }
 
-    let human = humanize_duration(elapsed);
+    let human = crate::elapsed::format_elapsed_secs(elapsed.as_secs());
     match cost {
         Some(cost) => format!("{label} ({human}, {cost})"),
         None => format!("{label} ({human})"),
@@ -807,6 +890,35 @@ mod tests {
     use std::sync::{Mutex, OnceLock};
 
     use super::*;
+
+    #[test]
+    fn title_whale_is_static_when_focused_or_motion_disabled() {
+        if let Ok(mut verb) = title_activity_verb().lock() {
+            "working…".clone_into(&mut *verb);
+        }
+        assert_eq!(
+            title_activity_label("Codewhale", Duration::ZERO, true, true),
+            "🐳 working…"
+        );
+        assert_eq!(
+            title_activity_label("Codewhale", Duration::ZERO, false, false),
+            "🐳 working…"
+        );
+        assert_eq!(
+            title_activity_label("Codewhale", Duration::ZERO, false, true),
+            "🐳 working…"
+        );
+        assert_eq!(
+            title_activity_label("Codewhale", Duration::from_millis(800), false, true),
+            "🐋 working…"
+        );
+    }
+
+    #[test]
+    fn title_whale_frames_are_the_restored_emoji_pair() {
+        assert_eq!(TITLE_WHALE_FRAMES, &["🐳", "🐋", "🐳", "🐋"]);
+        assert_eq!(TITLE_FRAME_HOLD, Duration::from_millis(800));
+    }
 
     /// Serialise tests that mutate process-global environment or notification
     /// sound state while the test harness runs them in parallel threads.
@@ -1226,55 +1338,6 @@ mod tests {
             }
         }
         assert_eq!(resolved, Method::Bel);
-    }
-
-    #[test]
-    fn humanize_duration_seconds_and_minutes() {
-        assert_eq!(humanize_duration(Duration::from_secs(0)), "0s");
-        assert_eq!(humanize_duration(Duration::from_secs(45)), "45s");
-        assert_eq!(humanize_duration(Duration::from_secs(60)), "1m");
-        assert_eq!(humanize_duration(Duration::from_secs(72)), "1m 12s");
-        // 59m 59s — still under the hour boundary.
-        assert_eq!(humanize_duration(Duration::from_secs(3599)), "59m 59s");
-    }
-
-    #[test]
-    fn humanize_duration_promotes_to_hours_at_one_hour() {
-        // 3661s = 1h 1m 1s — under the new format the seconds fall
-        // off; we keep just the top two units at the hour mark.
-        assert_eq!(humanize_duration(Duration::from_secs(3661)), "1h 1m");
-        assert_eq!(humanize_duration(Duration::from_secs(3600)), "1h");
-        assert_eq!(humanize_duration(Duration::from_secs(7200)), "2h");
-        assert_eq!(humanize_duration(Duration::from_secs(7320)), "2h 2m");
-        // 3h 12m — the previous "192m 30s" case that motivated #447.
-        assert_eq!(humanize_duration(Duration::from_secs(11_550)), "3h 12m");
-    }
-
-    #[test]
-    fn humanize_duration_handles_multi_day_sessions() {
-        // Exactly one day.
-        assert_eq!(humanize_duration(Duration::from_secs(86_400)), "1d");
-        // 1d 1h.
-        assert_eq!(humanize_duration(Duration::from_secs(90_000)), "1d 1h");
-        // 2d 5h — the two-tier rule drops minutes/seconds.
-        assert_eq!(
-            humanize_duration(Duration::from_secs(2 * 86_400 + 5 * 3600 + 17 * 60)),
-            "2d 5h"
-        );
-    }
-
-    #[test]
-    fn humanize_duration_promotes_to_weeks_after_seven_days() {
-        assert_eq!(humanize_duration(Duration::from_secs(604_800)), "1w");
-        assert_eq!(
-            humanize_duration(Duration::from_secs(604_800 + 86_400)),
-            "1w 1d"
-        );
-        // 3w 2d — long-running automation case.
-        assert_eq!(
-            humanize_duration(Duration::from_secs(3 * 604_800 + 2 * 86_400 + 17 * 3600)),
-            "3w 2d"
-        );
     }
 
     #[test]

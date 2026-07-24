@@ -745,7 +745,7 @@ mod tests {
             ContextWindowSource::StaticKimiCodeSafeFloor
         );
 
-        let generic = resolve_route_candidate_with_context_metadata(
+        let generic_err = resolve_route_candidate_with_context_metadata(
             ApiProvider::Moonshot,
             Some("k3"),
             None,
@@ -756,11 +756,10 @@ mod tests {
                 observed_at: Utc::now(),
             }),
         )
-        .expect("generic Moonshot route");
-        assert_ne!(
-            generic.context_window.source,
-            ContextWindowSource::ProviderReported,
-            "Moonshot metadata may not promote bare K3 outside the exact Kimi Code route"
+        .expect_err("bare k3 is rejected on the direct Moonshot endpoint (#4687)");
+        assert!(
+            generic_err.contains("kimi-k3"),
+            "error should guide the user to kimi-k3: {generic_err}"
         );
     }
 
@@ -808,6 +807,91 @@ mod tests {
     }
 
     #[test]
+    fn k3_route_rejects_cross_paired_model_ids_and_allows_canonical_pairs() {
+        use crate::config::{
+            DEFAULT_KIMI_CODE_BASE_URL, DEFAULT_MOONSHOT_BASE_URL, KIMI_CODE_K3_MODEL,
+            MOONSHOT_KIMI_K3_MODEL, moonshot_k3_route_display_name,
+            validate_kimi_code_api_model_id,
+        };
+
+        // Canonical pairs succeed.
+        validate_kimi_code_api_model_id(
+            ApiProvider::Moonshot,
+            DEFAULT_KIMI_CODE_BASE_URL,
+            KIMI_CODE_K3_MODEL,
+        )
+        .expect("kimi code + k3");
+        validate_kimi_code_api_model_id(
+            ApiProvider::Moonshot,
+            DEFAULT_MOONSHOT_BASE_URL,
+            MOONSHOT_KIMI_K3_MODEL,
+        )
+        .expect("direct + kimi-k3");
+
+        // Trailing slash normalization still enforces.
+        let err = validate_kimi_code_api_model_id(
+            ApiProvider::Moonshot,
+            "https://api.kimi.com/coding/v1/",
+            "kimi-k3",
+        )
+        .expect_err("kimi code + kimi-k3");
+        assert!(err.contains("k3"), "{err}");
+        assert!(err.contains("kimi-k3"), "{err}");
+
+        let err = validate_kimi_code_api_model_id(
+            ApiProvider::Moonshot,
+            "https://api.moonshot.ai/v1/",
+            "k3",
+        )
+        .expect_err("direct + k3");
+        assert!(err.contains("kimi-k3"), "{err}");
+
+        // Custom gateway is not rejected for either model id.
+        validate_kimi_code_api_model_id(
+            ApiProvider::Moonshot,
+            "https://gateway.example.com/v1",
+            "k3",
+        )
+        .expect("custom + k3");
+        validate_kimi_code_api_model_id(
+            ApiProvider::Moonshot,
+            "https://gateway.example.com/v1",
+            "kimi-k3",
+        )
+        .expect("custom + kimi-k3");
+
+        // Runtime resolve fails closed the same way.
+        let err = resolve_route_candidate(
+            ApiProvider::Moonshot,
+            Some("kimi-k3"),
+            None,
+            Some(DEFAULT_KIMI_CODE_BASE_URL.to_string()),
+            None,
+        )
+        .expect_err("resolve kimi code + kimi-k3");
+        assert!(err.contains("k3"), "{err}");
+
+        let err = resolve_route_candidate(
+            ApiProvider::Moonshot,
+            Some("k3"),
+            None,
+            Some(DEFAULT_MOONSHOT_BASE_URL.to_string()),
+            None,
+        )
+        .expect_err("resolve direct + k3");
+        assert!(err.contains("kimi-k3"), "{err}");
+
+        assert_eq!(
+            moonshot_k3_route_display_name(DEFAULT_KIMI_CODE_BASE_URL, "k3"),
+            Some("Kimi Code membership / k3")
+        );
+        assert_eq!(
+            moonshot_k3_route_display_name(DEFAULT_MOONSHOT_BASE_URL, "kimi-k3"),
+            Some("Moonshot direct / kimi-k3")
+        );
+    }
+
+    #[test]
     fn kimi_code_k3_baseline_does_not_leak_to_other_moonshot_routes() {
         let kimi_code_endpoint = Some(crate::config::DEFAULT_KIMI_CODE_BASE_URL.to_string());
         let direct_moonshot = resolve_route_candidate(
@@ -820,9 +904,21 @@ mod tests {
         .expect("direct Moonshot K3 route");
         assert_eq!(direct_moonshot.limits().context_tokens, Some(1_048_576));
 
-        let generic_moonshot = resolve_route_candidate(
+        // Bare k3 on the direct platform endpoint is fail-closed (#4687).
+        let generic_err = resolve_route_candidate(
             ApiProvider::Moonshot,
             Some("k3"),
+            None,
+            Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
+            None,
+        )
+        .expect_err("bare k3 on direct Moonshot must fail closed");
+        assert!(generic_err.contains("kimi-k3"), "{generic_err}");
+
+        // A non-K3 direct model must not inherit the Kimi Code 262k floor.
+        let generic_moonshot = resolve_route_candidate(
+            ApiProvider::Moonshot,
+            Some("moonshot-v1-128k"),
             None,
             Some(crate::config::DEFAULT_MOONSHOT_BASE_URL.to_string()),
             None,

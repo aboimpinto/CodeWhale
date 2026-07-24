@@ -1212,9 +1212,101 @@ async fn run_workflow_vm(
     } else {
         state.mark_owner_missing(&run_id);
     }
+    write_run_report_artifact(&context.workspace, &snapshot);
     if let Ok(mut controllers_guard) = state.controllers.lock() {
         controllers_guard.remove(&run_id);
     }
+}
+
+/// Persist a durable per-run report under `.codewhale/reports/<run_id>.md`
+/// so a settled background run leaves one synthesized artifact even after
+/// the session ends. Best-effort: report IO never affects the run outcome.
+fn write_run_report_artifact(workspace: &Path, record: &WorkflowRunRecord) {
+    if !matches!(
+        record.status,
+        WorkflowRunStatus::Completed | WorkflowRunStatus::Failed | WorkflowRunStatus::Cancelled
+    ) {
+        return;
+    }
+    // Run ids are generated slugs, but never trust one as a path segment.
+    let safe_id: String = record
+        .run_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+        .collect();
+    if safe_id.is_empty() {
+        return;
+    }
+    let dir = workspace.join(".codewhale").join("reports");
+    if let Err(err) = std::fs::create_dir_all(&dir) {
+        crate::logging::warn(format!(
+            "workflow report dir {} not created: {err}",
+            dir.display()
+        ));
+        return;
+    }
+    let path = dir.join(format!("{safe_id}.md"));
+    if let Err(err) = std::fs::write(&path, render_run_report(record)) {
+        crate::logging::warn(format!(
+            "workflow report {} not written: {err}",
+            path.display()
+        ));
+    }
+}
+
+fn render_run_report(record: &WorkflowRunRecord) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("# Workflow run {}\n\n", record.run_id));
+    out.push_str(&format!("- status: {:?}\n", record.status));
+    if let Some(goal) = record.workflow_goal.as_deref() {
+        out.push_str(&format!("- goal: {goal}\n"));
+    }
+    if let Some(source) = record.source_path.as_deref() {
+        out.push_str(&format!("- source: {}\n", source.display()));
+    }
+    out.push_str(&format!("- started_at_ms: {}\n", record.started_at_ms));
+    if let Some(completed) = record.completed_at_ms {
+        out.push_str(&format!("- completed_at_ms: {completed}\n"));
+    }
+    if let Some(budget) = record.token_budget {
+        out.push_str(&format!("- token_budget: {budget}\n"));
+    }
+    out.push_str(&format!("- child_agents: {}\n", record.child_ids.len()));
+    if let Some(error) = record.error.as_deref() {
+        out.push_str(&format!("- error: {error}\n"));
+    }
+    if !record.gate_status.is_empty() {
+        out.push_str("\n## Gates\n\n");
+        for line in &record.gate_status {
+            out.push_str(&format!("- {line:?}\n"));
+        }
+    }
+    if !record.progress.is_empty() {
+        out.push_str("\n## Progress\n\n");
+        for line in &record.progress {
+            out.push_str(&format!("- {line}\n"));
+        }
+    }
+    if !record.schema_errors.is_empty() {
+        out.push_str(&format!(
+            "\n## Schema errors ({})\n\n",
+            record.schema_errors.len()
+        ));
+    }
+    if let Some(result) = record.result.as_ref() {
+        out.push_str("\n## Result\n\n```json\n");
+        out.push_str(&serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()));
+        out.push_str("\n```\n");
+    }
+    if let Some(verification) = record.verification.as_ref() {
+        out.push_str("\n## Verification\n\n```json\n");
+        out.push_str(
+            &serde_json::to_string_pretty(verification)
+                .unwrap_or_else(|_| verification.to_string()),
+        );
+        out.push_str("\n```\n");
+    }
+    out
 }
 
 fn workflow_result_for(
@@ -1354,6 +1446,8 @@ struct StructuredPlanChild {
     profile: Option<String>,
     #[serde(default)]
     mode: Option<String>,
+    #[serde(default)]
+    file_scope: Vec<String>,
 }
 
 fn structured_plan_to_workflow_spec(plan_value: &Value) -> Result<WorkflowSpec, ToolError> {
@@ -1578,7 +1672,7 @@ fn plan_children_to_leaves(
             profile,
             mode,
             isolation: Default::default(),
-            file_scope: Vec::new(),
+            file_scope: child.file_scope.clone(),
             depends_on_results: Vec::new(),
             budget: BudgetSpec {
                 max_tokens: token_budget,
@@ -1641,9 +1735,19 @@ fn read_workflow_source_path(
             .workspace
             .canonicalize()
             .unwrap_or_else(|_| context.workspace.clone());
-        if !canonical.starts_with(&workspace) {
+        // The user-global saved-workflow store is a first-class source
+        // alongside the workspace: `~/.codewhale/workflows/*.workflow.js`
+        // definitions surface as slash commands and must launch from any
+        // workspace without trust_mode.
+        let home_store = crate::config::effective_home_dir()
+            .map(|home| home.join(".codewhale").join("workflows"))
+            .and_then(|dir| dir.canonicalize().ok());
+        let inside_home_store = home_store
+            .as_deref()
+            .is_some_and(|dir| canonical.starts_with(dir));
+        if !canonical.starts_with(&workspace) && !inside_home_store {
             return Err(ToolError::permission_denied(format!(
-                "workflow source_path must stay inside the workspace: {}",
+                "workflow source_path must stay inside the workspace or ~/.codewhale/workflows: {}",
                 canonical.display()
             )));
         }
@@ -1844,13 +1948,15 @@ impl DeclarativeWorkflowLowerer {
                     "{} + \"\\n\\nInputs:\\n\" + {inputs}",
                     js_string(&spec.prompt)
                 ),
-                Some("general"),
+                Some("plan"),
                 None,
                 None,
                 false,
                 None,
                 None,
                 None,
+                Some("read_only"),
+                &[],
                 &spec.id,
                 Some("reduce"),
                 None,
@@ -1915,6 +2021,20 @@ fn leaf_task_options_expression(
     parallel: bool,
 ) -> Result<String, ToolError> {
     validate_leaf_runtime_contract(spec)?;
+    let worktree = leaf_wants_worktree(spec, parallel);
+    let write_authority = match spec.mode {
+        TaskMode::ReadOnly => "read_only",
+        TaskMode::ReadWrite if worktree => "worktree_write",
+        TaskMode::ReadWrite => "workspace_write",
+    };
+    let write_roots = if spec.mode == TaskMode::ReadWrite {
+        spec.file_scope
+            .iter()
+            .map(|scope| codewhale_workflow::normalize_file_scope_root(scope))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     Ok(task_options_expression(
         leaf_description_expression(spec),
         leaf_subagent_type(spec),
@@ -1922,10 +2042,12 @@ fn leaf_task_options_expression(
         spec.profile.as_deref(),
         // Parallel write-capable children default to worktree isolation (#4120).
         // Explicit isolation: shared is the approved same-worktree override.
-        leaf_wants_worktree(spec, parallel),
+        worktree,
         spec.budget.max_tokens,
         spec.budget.max_steps,
         spec.budget.timeout_secs,
+        Some(write_authority),
+        &write_roots,
         &spec.id,
         phase,
         leaf_allowed_tools(spec)?,
@@ -1938,6 +2060,21 @@ fn validate_leaf_runtime_contract(spec: &LeafSpec) -> Result<(), ToolError> {
             "Workflow leaf '{}' is read_only but requests allow_write permissions",
             spec.id
         )));
+    }
+    if spec.mode == TaskMode::ReadWrite && spec.file_scope.is_empty() {
+        return Err(ToolError::invalid_input(format!(
+            "Workflow leaf '{}' is read_write but declares no file_scope for its bounded write claim",
+            spec.id
+        )));
+    }
+    for scope in &spec.file_scope {
+        let normalized = codewhale_workflow::normalize_file_scope_root(scope);
+        if normalized.is_empty() || normalized.contains('*') {
+            return Err(ToolError::invalid_input(format!(
+                "Workflow leaf '{}' has unsupported file_scope '{}'; use a concrete path or a trailing /* or /** directory scope",
+                spec.id, scope
+            )));
+        }
     }
     // A Fleet role and its authority posture are independent. In particular,
     // acceptance workflows must be able to resolve the `implementer` role to
@@ -2063,6 +2200,8 @@ fn task_options_expression(
     token_budget: Option<u64>,
     max_steps: Option<u32>,
     wall_time_secs: Option<u64>,
+    write_authority: Option<&str>,
+    write_roots: &[String],
     label: &str,
     phase: Option<&str>,
     allowed_tools: Option<Vec<String>>,
@@ -2092,6 +2231,15 @@ fn task_options_expression(
     }
     if let Some(wall_time_secs) = wall_time_secs {
         fields.push(format!("wallTimeSecs: {wall_time_secs}"));
+    }
+    if let Some(write_authority) = write_authority {
+        fields.push(format!("writeAuthority: {}", js_string(write_authority)));
+    }
+    if !write_roots.is_empty() {
+        fields.push(format!(
+            "writeRoots: {}",
+            serde_json::to_string(write_roots).expect("serializing write roots cannot fail")
+        ));
     }
     if let Some(allowed_tools) = allowed_tools {
         fields.push(format!(
@@ -3797,6 +3945,73 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn settled_runs_leave_a_report_artifact_under_codewhale_reports() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut record = WorkflowRunRecord::new("workflow_report_1".to_string(), None, None, None);
+        record.status = WorkflowRunStatus::Completed;
+        record.workflow_goal = Some("prove the report artifact".to_string());
+        record.progress.push("phase: scan".to_string());
+        record.result = Some(serde_json::json!({"confirmed": 2}));
+
+        write_run_report_artifact(tmp.path(), &record);
+
+        let path = tmp
+            .path()
+            .join(".codewhale")
+            .join("reports")
+            .join("workflow_report_1.md");
+        let body = std::fs::read_to_string(&path).expect("report written");
+        assert!(body.contains("# Workflow run workflow_report_1"), "{body}");
+        assert!(body.contains("status: Completed"), "{body}");
+        assert!(body.contains("prove the report artifact"), "{body}");
+        assert!(body.contains("phase: scan"), "{body}");
+        assert!(body.contains("\"confirmed\": 2"), "{body}");
+    }
+
+    #[test]
+    fn running_runs_write_no_report_artifact() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let record = WorkflowRunRecord::new("workflow_report_2".to_string(), None, None, None);
+        write_run_report_artifact(tmp.path(), &record);
+        assert!(
+            !tmp.path().join(".codewhale").join("reports").exists(),
+            "running runs must not leave report files"
+        );
+    }
+
+    #[test]
+    fn source_path_accepts_the_home_workflow_store_and_rejects_elsewhere() {
+        let _lock = crate::test_support::lock_test_env();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let home = tmp.path().join("home");
+        let store = home.join(".codewhale").join("workflows");
+        std::fs::create_dir_all(&store).expect("store");
+        let _home_guard = crate::test_support::EnvVarGuard::set("HOME", &home);
+        let _userprofile_guard = crate::test_support::EnvVarGuard::set("USERPROFILE", &home);
+
+        let saved = store.join("triage.workflow.js");
+        std::fs::write(&saved, "phase('scan');\n").expect("write saved workflow");
+        let elsewhere = tmp.path().join("outside.workflow.js");
+        std::fs::write(&elsewhere, "phase('scan');\n").expect("write outside workflow");
+
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).expect("workspace");
+        let context = ToolContext::new(workspace);
+
+        let resolved = read_workflow_source_path(saved.to_str().expect("utf8 path"), &context)
+            .expect("home workflow store is a first-class source");
+        assert!(resolved.source.contains("phase('scan')"));
+
+        let err = read_workflow_source_path(elsewhere.to_str().expect("utf8 path"), &context)
+            .expect_err("arbitrary outside paths stay denied");
+        assert!(
+            err.to_string()
+                .contains("workspace or ~/.codewhale/workflows"),
+            "{err}"
+        );
+    }
+
+    #[test]
     fn restored_workflow_binding_consumes_journal_recovery() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let state = WorkflowWorkspaceState::open(tmp.path());
@@ -4029,6 +4244,12 @@ mod tests {
             model_strength: None,
             thinking: None,
             worktree: true,
+            write_authority: Some("worktree_write".to_string()),
+            write_roots: vec!["src".to_string()],
+            exact_files: Vec::new(),
+            coordination_contracts: vec!["test-contract".to_string()],
+            dependencies: Vec::new(),
+            acceptance: Vec::new(),
             allowed_tools: None,
             max_depth: None,
             token_budget: None,
@@ -4057,6 +4278,12 @@ mod tests {
             model_strength: None,
             thinking: None,
             worktree: false,
+            write_authority: Some("read_only".to_string()),
+            write_roots: Vec::new(),
+            exact_files: Vec::new(),
+            coordination_contracts: Vec::new(),
+            dependencies: Vec::new(),
+            acceptance: Vec::new(),
             allowed_tools: None,
             max_depth: None,
             token_budget: None,
@@ -4320,7 +4547,8 @@ workflow({
         assert!(
             conflicting_payload["error"]
                 .as_str()
-                .is_some_and(|error| error.contains("conflicting explicit type")),
+                .is_some_and(|error| error
+                    .contains("Fleet role conflicts with the explicit legacy agent type")),
             "{conflicting_payload}"
         );
         assert_eq!(
@@ -4396,6 +4624,17 @@ export default workflow({
             "each parallel write child should get worktree: true:\n{}",
             adapted.source
         );
+        assert_eq!(
+            adapted
+                .source
+                .matches("writeAuthority: \"worktree_write\"")
+                .count(),
+            2,
+            "each isolated writer should carry enforced worktree authority:\n{}",
+            adapted.source
+        );
+        assert!(adapted.source.contains("writeRoots: [\"src/left.rs\"]"));
+        assert!(adapted.source.contains("writeRoots: [\"src/right.rs\"]"));
     }
 
     #[test]
@@ -4470,6 +4709,16 @@ export default workflow({
             "both children should still be lowered:\n{}",
             adapted.source
         );
+        assert!(
+            adapted
+                .source
+                .contains("writeAuthority: \"workspace_write\"")
+        );
+        assert!(
+            adapted
+                .source
+                .contains("writeAuthority: \"worktree_write\"")
+        );
     }
 
     #[test]
@@ -4511,6 +4760,15 @@ export default workflow({
             "read-only parallel children should not get worktree isolation:\n{}",
             adapted.source
         );
+        assert_eq!(
+            adapted
+                .source
+                .matches("writeAuthority: \"read_only\"")
+                .count(),
+            2,
+            "read-only mode must reach the task authority contract:\n{}",
+            adapted.source
+        );
     }
 
     #[test]
@@ -4544,6 +4802,78 @@ export default workflow({
             "sequential writes should not default to worktree:\n{}",
             adapted.source
         );
+        assert!(
+            adapted
+                .source
+                .contains("writeAuthority: \"workspace_write\"")
+        );
+        assert!(adapted.source.contains("writeRoots: [\"src/main.rs\"]"));
+    }
+
+    #[test]
+    fn write_scope_suffix_globs_lower_to_enforceable_roots() {
+        let source = r#"workflow({
+          "goal": "bounded auth patch",
+          "nodes": [{ "agent": {
+            "id": "writer",
+            "prompt": "Patch auth",
+            "agent_type": "implementer",
+            "mode": "read_write",
+            "file_scope": ["./src/auth/**"]
+          }}]
+        });"#;
+        let adapted = adapt_workflow_source(source, None).expect("lower trailing glob scope");
+        assert!(
+            adapted.source.contains("writeRoots: [\"src/auth\"]"),
+            "runtime claim must contain src/auth/login.rs:\n{}",
+            adapted.source
+        );
+
+        let unsupported = r#"workflow({
+          "goal": "reject ambiguous glob",
+          "nodes": [{ "agent": {
+            "id": "writer",
+            "prompt": "Patch auth",
+            "agent_type": "implementer",
+            "mode": "read_write",
+            "file_scope": ["src/*/auth"]
+          }}]
+        });"#;
+        let error = match adapt_workflow_source(unsupported, None) {
+            Ok(_) => panic!("internal globs cannot become literal runtime roots"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("unsupported file_scope"), "{error}");
+    }
+
+    #[test]
+    fn write_leaves_require_scope_and_reduce_stays_read_only() {
+        let unscoped_writer = r#"workflow({
+          "goal": "reject an unbounded writer",
+          "nodes": [{ "agent": {
+            "id": "writer",
+            "prompt": "Patch it",
+            "agent_type": "implementer",
+            "mode": "read_write"
+          }}]
+        });"#;
+        let error = match adapt_workflow_source(unscoped_writer, None) {
+            Ok(_) => panic!("write-capable leaves must declare file_scope"),
+            Err(error) => error.to_string(),
+        };
+        assert!(error.contains("declares no file_scope"), "{error}");
+
+        let reduce = r#"workflow({
+          "goal": "reduce read-only evidence",
+          "nodes": [{ "reduce": {
+            "id": "summary",
+            "inputs": [],
+            "prompt": "Summarize the evidence"
+          }}]
+        });"#;
+        let adapted = adapt_workflow_source(reduce, None).expect("lower reduce");
+        assert!(adapted.source.contains("type: \"plan\""));
+        assert!(adapted.source.contains("writeAuthority: \"read_only\""));
     }
 
     #[test]
@@ -5235,6 +5565,12 @@ reviewer = "reviewer"
             model_strength: None,
             thinking: None,
             worktree: false,
+            write_authority: Some("workspace_write".to_string()),
+            write_roots: vec!["src".to_string()],
+            exact_files: Vec::new(),
+            coordination_contracts: vec!["test-contract".to_string()],
+            dependencies: Vec::new(),
+            acceptance: Vec::new(),
             allowed_tools: Some(Vec::new()),
             max_depth: None,
             token_budget: None,
@@ -5393,6 +5729,12 @@ reviewer = "reviewer"
             model_strength: None,
             thinking: None,
             worktree: false,
+            write_authority: Some("workspace_write".to_string()),
+            write_roots: vec!["src".to_string()],
+            exact_files: Vec::new(),
+            coordination_contracts: vec!["test-contract".to_string()],
+            dependencies: Vec::new(),
+            acceptance: Vec::new(),
             allowed_tools: Some(Vec::new()),
             max_depth: None,
             token_budget: None,
@@ -5511,6 +5853,12 @@ reviewer = "reviewer"
             model_strength: None,
             thinking: None,
             worktree: false,
+            write_authority: Some("workspace_write".to_string()),
+            write_roots: vec!["src".to_string()],
+            exact_files: Vec::new(),
+            coordination_contracts: vec!["test-contract".to_string()],
+            dependencies: Vec::new(),
+            acceptance: Vec::new(),
             allowed_tools: Some(Vec::new()),
             max_depth: None,
             token_budget: None,
@@ -5807,6 +6155,12 @@ reviewer = "reviewer"
             model_strength: None,
             thinking: None,
             worktree: false,
+            write_authority: Some("read_only".to_string()),
+            write_roots: Vec::new(),
+            exact_files: Vec::new(),
+            coordination_contracts: Vec::new(),
+            dependencies: Vec::new(),
+            acceptance: Vec::new(),
             allowed_tools: Some(Vec::new()),
             max_depth: None,
             token_budget: None,
@@ -6071,7 +6425,11 @@ reviewer = "reviewer"
         std::fs::write(workflow_dir.join("issue_audit.workflow.js"), fixture)
             .expect("write fixture into workspace");
 
-        let ctx = ToolContext::new(tmp.path().to_path_buf());
+        let mut ctx = ToolContext::new(tmp.path().to_path_buf());
+        ctx.runtime.work = Some(crate::work_graph::new_shared_work_runtime(
+            crate::tools::todo::new_shared_todo_list(),
+            crate::tools::plan::new_shared_plan_state(),
+        ));
         let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
         let (client, calls) = fake_chat_client("audited").await;
         let runtime = SubAgentRuntime::new(
@@ -6131,6 +6489,53 @@ reviewer = "reviewer"
                 .iter()
                 .any(|message| message == "phase: parallel-audit")
         );
+
+        // Operate projects Workflow fan-out/fan-in and its children through
+        // the same canonical Work Graph. The Workflow remains the accountable
+        // operation identity while the worker bindings stay inspectable; no
+        // second plan/strategy lifecycle is created for the reduce step.
+        let work = ctx.runtime.work.as_ref().expect("work runtime");
+        let graph = work
+            .capture(Some(&ctx.state_namespace))
+            .expect("capture workflow work")
+            .expect("workflow graph")
+            .graph;
+        let workflow_external = format!(
+            "workflow:{}",
+            payload["run_id"].as_str().expect("workflow run id")
+        );
+        let workflow_operations = graph
+            .nodes
+            .iter()
+            .filter(|node| {
+                node.binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.external == workflow_external)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            workflow_operations.len(),
+            1,
+            "one accountable Workflow operation: {graph:#?}"
+        );
+        assert_eq!(
+            workflow_operations[0].state,
+            crate::work_graph::NodeState::Completed
+        );
+        for child_id in payload["child_ids"].as_array().expect("workflow child ids") {
+            let worker_external = format!(
+                "worker:{}",
+                child_id.as_str().expect("workflow child id string")
+            );
+            assert!(
+                graph.nodes.iter().any(|node| {
+                    node.binding
+                        .as_ref()
+                        .is_some_and(|binding| binding.external == worker_external)
+                }),
+                "Workflow worker {worker_external} must remain inspectable in the same graph: {graph:#?}"
+            );
+        }
     }
 
     #[tokio::test]

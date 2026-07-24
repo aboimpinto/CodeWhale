@@ -83,14 +83,11 @@ pub fn project_todos(snapshot: &WorkGraphSnapshot) -> TodoProjection {
             })
         })
         .collect::<Vec<_>>();
-    let completed = items
-        .iter()
-        .filter(|item| item.status == TodoStatus::Completed)
-        .count();
+    let settled = items.iter().filter(|item| item.status.is_settled()).count();
     let completion_pct = if items.is_empty() {
         0
     } else {
-        let rounded = (completed.saturating_mul(100) + items.len() / 2) / items.len();
+        let rounded = (settled.saturating_mul(100) + items.len() / 2) / items.len();
         u8::try_from(rounded).unwrap_or(u8::MAX)
     };
     let in_progress_id = items
@@ -116,6 +113,7 @@ fn todo_status(node: &WorkNode) -> TodoStatus {
     match node.state {
         NodeState::Initializing | NodeState::Active => TodoStatus::InProgress,
         NodeState::Completed | NodeState::Verified => TodoStatus::Completed,
+        NodeState::Cancelled | NodeState::Superseded => TodoStatus::Cancelled,
         _ => TodoStatus::Pending,
     }
 }

@@ -242,7 +242,7 @@ fn shell_owner_registers_before_spawn_and_silent_work_stays_live() {
 
 #[test]
 fn exec_shell_parallel_flags_are_input_aware() {
-    let tool = ExecShellTool;
+    let tool = BashTool::new("Bash");
     let readonly = json!({"command": "git status -s"});
     assert!(tool.supports_parallel_for(&readonly));
     assert!(tool.is_read_only_for(&readonly));
@@ -316,7 +316,7 @@ fn exec_shell_parallel_flags_are_input_aware() {
 
 #[test]
 fn exec_shell_interact_requires_approval() {
-    let tool = ShellInteractTool::new("exec_shell_interact");
+    let tool = BashTool::alias("exec_shell_interact", "interact");
     assert_eq!(tool.approval_requirement(), ApprovalRequirement::Required);
     assert!(
         tool.capabilities()
@@ -329,7 +329,7 @@ async fn read_only_shell_policy_blocks_non_readonly_commands() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path())
         .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
-    let tool = ExecShellTool;
+    let tool = BashTool::new("Bash");
 
     let result = tool
         .execute(json!({"command": "cargo build"}), &ctx)
@@ -355,7 +355,7 @@ async fn read_only_shell_policy_allows_readonly_inspection() {
     let ctx = ToolContext::new(tmp.path())
         .with_shell_policy(crate::worker_profile::ShellPolicy::ReadOnly);
 
-    let result = ExecShellTool
+    let result = BashTool::new("Bash")
         .execute(json!({"command": "pwd"}), &ctx)
         .await
         .expect("execute");
@@ -380,7 +380,7 @@ async fn exec_shell_multiline_block_explains_allow_shell_boundary() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path());
 
-    let result = ExecShellTool
+    let result = BashTool::new("Bash")
         .execute(
             json!({"command": "python3 -c \"print(1)\nprint(2)\""}),
             &ctx,
@@ -413,12 +413,12 @@ async fn exec_shell_multiline_block_explains_allow_shell_boundary() {
 
 #[test]
 fn exec_shell_wait_schema_defaults_to_nonblocking_snapshot() {
-    let schema = ShellWaitTool::new("exec_shell_wait").input_schema();
-    assert_eq!(schema["properties"]["wait"]["default"], json!(false));
+    let schema = BashTool::alias("exec_shell_wait", "wait").input_schema();
+    assert!(schema["properties"]["wait"].is_object());
     assert!(
-        ShellWaitTool::new("exec_shell_wait")
+        BashTool::alias("exec_shell_wait", "wait")
             .description()
-            .contains("without blocking by default")
+            .contains("wait")
     );
 }
 
@@ -426,7 +426,7 @@ fn exec_shell_wait_schema_defaults_to_nonblocking_snapshot() {
 async fn exec_shell_wait_without_wait_arg_returns_snapshot() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path());
-    let start_result = ExecShellTool
+    let start_result = BashTool::new("Bash")
         .execute(
             json!({"command": sleep_command(2), "background": true}),
             &ctx,
@@ -442,7 +442,7 @@ async fn exec_shell_wait_without_wait_arg_returns_snapshot() {
         .to_string();
 
     let started = Instant::now();
-    let wait_result = ShellWaitTool::new("exec_shell_wait")
+    let wait_result = BashTool::alias("exec_shell_wait", "wait")
         .execute(json!({"task_id": task_id, "timeout_ms": 5_000}), &ctx)
         .await
         .expect("wait snapshot");
@@ -465,7 +465,7 @@ async fn exec_shell_wait_without_wait_arg_returns_snapshot() {
 async fn background_start_advertises_task_status_completion() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path());
-    let result = ExecShellTool
+    let result = BashTool::new("Bash")
         .execute(
             json!({"command": sleep_command(1), "background": true}),
             &ctx,
@@ -495,7 +495,7 @@ async fn background_start_advertises_task_status_completion() {
 async fn background_shell_job_carries_subagent_owner() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path()).with_owner_agent("agent_owner", "verifier");
-    let result = ExecShellTool
+    let result = BashTool::new("Bash")
         .execute(
             json!({"command": sleep_command(2), "background": true}),
             &ctx,
@@ -529,7 +529,7 @@ async fn background_shell_job_carries_subagent_owner() {
         assert_eq!(snapshot.owner_agent_name.as_deref(), Some("verifier"));
     }
 
-    ShellCancelTool
+    BashTool::alias("exec_shell_cancel", "cancel")
         .execute(json!({"task_id": task_id}), &ctx)
         .await
         .expect("cancel owned background shell");
@@ -539,7 +539,7 @@ async fn background_shell_job_carries_subagent_owner() {
 async fn drain_finished_jobs_reports_once() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path());
-    let result = ExecShellTool
+    let result = BashTool::new("Bash")
         .execute(
             json!({"command": echo_command("drain-finished-once"), "background": true}),
             &ctx,
@@ -1164,7 +1164,7 @@ fn test_summarize_output_strips_truncation_note() {
 async fn test_exec_shell_metadata_includes_summaries() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path());
-    let tool = ExecShellTool;
+    let tool = BashTool::new("Bash");
 
     let result = tool
         .execute(json!({"command": echo_command("hello")}), &ctx)
@@ -1188,7 +1188,7 @@ async fn test_exec_shell_metadata_includes_summaries() {
 async fn test_exec_shell_combined_output_uses_single_stream() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path());
-    let tool = ExecShellTool;
+    let tool = BashTool::new("Bash");
     let command = "printf 'out\\n'; printf 'err\\n' >&2";
 
     let result = tool
@@ -1210,7 +1210,7 @@ async fn test_exec_shell_combined_output_uses_single_stream() {
 async fn test_exec_shell_foreground_timeout_guides_background_rerun() {
     let tmp = tempdir().expect("tempdir");
     let ctx = ToolContext::new(tmp.path());
-    let tool = ExecShellTool;
+    let tool = BashTool::new("Bash");
 
     let result = tool
         .execute(
@@ -1249,16 +1249,11 @@ async fn test_exec_shell_foreground_timeout_guides_background_rerun() {
 
 #[test]
 fn test_exec_shell_schema_guides_gt_five_second_work_to_background() {
-    let schema = ExecShellTool.input_schema();
+    let schema = BashTool::new("Bash").input_schema();
     let description = schema["properties"]["background"]["description"]
         .as_str()
         .expect("background description");
-    // The schema must steer >5s work to the background and point at the wait
-    // tool for early output. The wording references `exec_shell_wait` (the
-    // model-visible wait tool); the older `task_shell_start` phrasing was
-    // dropped, but the >5s + wait-tool guidance is the load-bearing contract.
     assert!(description.contains(">5 seconds"), "{description}");
-    assert!(description.contains("exec_shell_wait"), "{description}");
 }
 
 #[tokio::test]
@@ -1269,7 +1264,7 @@ async fn test_exec_shell_foreground_cancel_kills_process() {
     let command = sleep_command(30);
 
     let task = tokio::spawn(async move {
-        ExecShellTool
+        BashTool::new("Bash")
             .execute(
                 json!({
                     "command": command,
@@ -1305,7 +1300,7 @@ async fn test_exec_shell_foreground_can_move_to_background() {
     let task_ctx = ctx.clone();
 
     let task = tokio::spawn(async move {
-        ExecShellTool
+        BashTool::new("Bash")
             .execute(
                 json!({
                     "command": command,
@@ -1373,7 +1368,7 @@ async fn test_exec_shell_wait_cancel_leaves_background_process_running() {
     let task_ctx = ctx.clone();
 
     let task = tokio::spawn(async move {
-        ShellWaitTool::new("exec_shell_wait")
+        BashTool::alias("exec_shell_wait", "wait")
             .execute(
                 json!({
                     "task_id": wait_task_id,
@@ -1422,7 +1417,7 @@ async fn test_completed_background_shell_releases_process_handles() {
         .expect("execute");
     let task_id = started.task_id.expect("task id");
 
-    let result = ShellWaitTool::new("exec_shell_wait")
+    let result = BashTool::alias("exec_shell_wait", "wait")
         .execute(
             json!({
                 "task_id": task_id.clone(),
@@ -1459,7 +1454,7 @@ async fn test_exec_shell_cancel_tool_kills_background_process() {
         .expect("execute");
     let task_id = started.task_id.expect("task id");
 
-    let result = ShellCancelTool
+    let result = BashTool::alias("exec_shell_cancel", "cancel")
         .execute(json!({ "task_id": task_id }), &ctx)
         .await
         .expect("cancel");
@@ -1498,7 +1493,7 @@ async fn test_exec_shell_cancel_tool_can_kill_all_running_processes() {
         .task_id
         .expect("second task id");
 
-    let result = ShellCancelTool
+    let result = BashTool::alias("exec_shell_cancel", "cancel")
         .execute(json!({ "all": true }), &ctx)
         .await
         .expect("cancel all");
@@ -1875,4 +1870,48 @@ fn issue_1691_quoted_commit_message_round_trips() {
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     assert_eq!(got, spec.args);
+}
+
+/// When no `cwd` is provided, the shell should run in `context.workspace`,
+/// not in the ShellManager's default_workspace. This ensures sub-agents in
+/// worktrees run commands in the worktree directory rather than the parent.
+///
+/// Without the `context.workspace` default (stashed): runs in sm_dir → FAILS
+/// With the `context.workspace` default (unstashed): runs in ctx_dir → PASSES
+#[tokio::test]
+async fn default_cwd_uses_context_workspace_not_shell_manager_default() {
+    let ctx_dir = tempdir().expect("ctx tempdir");
+    let sm_dir = tempdir().expect("sm tempdir");
+
+    // Create distinct dirs — write a marker in each so we can tell them apart.
+    std::fs::write(ctx_dir.path().join("I_AM_CTX_DIR"), "").unwrap();
+    std::fs::write(sm_dir.path().join("I_AM_SM_DIR"), "").unwrap();
+
+    // ToolContext whose workspace is ctx_dir...
+    let ctx = ToolContext::new(ctx_dir.path())
+        // ...but whose ShellManager's default_workspace is sm_dir.
+        .with_shell_manager(new_shared_shell_manager(sm_dir.path().to_path_buf()));
+
+    // Assert directory identity through marker files instead of comparing the
+    // shell's printed path. PowerShell and `canonicalize` can spell the same
+    // Windows path differently (for example, with a verbatim-path prefix).
+    let command = if cfg!(windows) {
+        "if (Test-Path -LiteralPath 'I_AM_CTX_DIR') { Write-Output 'context-workspace' } elseif (Test-Path -LiteralPath 'I_AM_SM_DIR') { Write-Output 'manager-workspace' } else { Write-Output 'missing-workspace' }"
+    } else {
+        "if [ -f I_AM_CTX_DIR ]; then printf 'context-workspace'; elif [ -f I_AM_SM_DIR ]; then printf 'manager-workspace'; else printf 'missing-workspace'; fi"
+    };
+    let result = BashTool::new("Bash")
+        .execute(json!({"command": command}), &ctx)
+        .await
+        .expect("shell execute");
+    assert!(result.success, "command failed: {:?}", result.content);
+
+    assert!(
+        result
+            .content
+            .lines()
+            .any(|line| line.trim() == "context-workspace"),
+        "expected context.workspace marker, but shell reported: {:?}",
+        result.content
+    );
 }

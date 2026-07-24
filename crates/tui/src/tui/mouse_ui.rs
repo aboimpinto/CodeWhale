@@ -35,19 +35,17 @@ pub(crate) fn should_drop_loading_mouse_motion(app: &App, mouse: MouseEvent) -> 
     }
 
     match mouse.kind {
-        MouseEventKind::Moved => {
-            let over_sidebar = mouse_hits_rect(mouse, app.viewport.last_sidebar_area);
-            let was_over_sidebar = app.last_mouse_pos.is_some_and(|(column, row)| {
-                point_hits_rect(column, row, app.viewport.last_sidebar_area)
-            });
-            !(over_sidebar || was_over_sidebar || app.sidebar_hover_tooltip.is_some())
-        }
+        // v0.9.1: keep a cheap hover hit-test alive while streaming. Motion
+        // events are no longer dropped wholesale — the frame limiter bounds
+        // redraw cost. Only expensive transcript reflow stays deferred.
+        MouseEventKind::Moved => false,
         MouseEventKind::Drag(_) => {
-            // Sidebar drag-to-resize must stay live during active turns —
-            // dropping these events wedges the resize state mid-drag (#3063).
+            // Divider drags must stay live during active turns — dropping
+            // these events wedges the resize state mid-drag (#3063).
             !app.viewport.transcript_selection.dragging
                 && !app.viewport.transcript_scrollbar_dragging
                 && !app.sidebar_resizing
+                && !app.work_surface.is_resizing()
         }
         _ => false,
     }
@@ -80,8 +78,16 @@ fn handle_sidebar_resize_mouse(app: &mut App, mouse: MouseEvent) -> bool {
         && mouse.row < handle.y.saturating_add(handle.height);
 
     match mouse.kind {
+        MouseEventKind::Moved => {
+            if app.sidebar_resize_hovered != hit {
+                app.sidebar_resize_hovered = hit;
+                app.needs_redraw = true;
+            }
+            false
+        }
         MouseEventKind::Down(MouseButton::Left) if hit => {
             app.sidebar_resizing = true;
+            app.sidebar_resize_hovered = true;
             app.sidebar_resize_anchor_x = mouse.column;
             app.sidebar_resize_anchor_width = app.last_sidebar_area.map(|a| a.width).unwrap_or(28);
             app.needs_redraw = true;
@@ -100,6 +106,7 @@ fn handle_sidebar_resize_mouse(app: &mut App, mouse: MouseEvent) -> bool {
         }
         MouseEventKind::Up(MouseButton::Left) if app.sidebar_resizing => {
             app.sidebar_resizing = false;
+            app.sidebar_resize_hovered = hit;
             app.sidebar_width_dirty = true;
             app.needs_redraw = true;
             true
@@ -452,8 +459,9 @@ pub(crate) fn handle_mouse_event(app: &mut App, mouse: MouseEvent) -> Vec<ViewEv
 
     match mouse.kind {
         MouseEventKind::Moved => {
-            // Update last mouse position for tooltip rendering.
+            // Update last mouse position for tooltip rendering + hover layer.
             app.last_mouse_pos = Some((mouse.column, mouse.row));
+            crate::tui::hover_layer::set_pointer(mouse.column, mouse.row);
 
             // Check sidebar sections for hover popovers. Only surface a
             // popover when the hovered row lost information in the compact
@@ -710,38 +718,16 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
             Vec::new()
         }
         SidebarRowAction::OpenAgentDetail { agent_id } => {
-            // Prefer the worker's actual message transcript over the compact
-            // status card. The card intentionally keeps only a few activity
-            // lines; Open must show the conversation the worker had.
-            if open_agent_chat_pager(app, &agent_id) {
-                app.needs_redraw = true;
-                return Vec::new();
+            if !crate::tui::agent_details::open_agent_details(app, &agent_id) {
+                crate::tui::work_surface::agent_details_closed(app, &agent_id);
+                app.status_message = Some("Agent details are unavailable".to_string());
             }
-            let cell_index = app.history.iter().position(|cell| {
-                matches!(
-                    cell,
-                    HistoryCell::SubAgent(crate::tui::history::SubAgentCell::Delegate(card))
-                        if card.agent_id == agent_id
-                )
-            });
-            match cell_index {
-                Some(cell_index) => {
-                    open_details_pager_for_cell(app, cell_index);
-                }
-                None => {
-                    // Open failed — do not leave a stale detail-open owner.
-                    if app
-                        .work_surface
-                        .opened
-                        .as_ref()
-                        .is_some_and(|id| id.0 == format!("worker:{agent_id}"))
-                    {
-                        app.work_surface.opened = None;
-                    }
-                    app.status_message = Some(format!(
-                        "No transcript card for {agent_id} yet — use handle_read agent:{agent_id}/full_transcript"
-                    ));
-                }
+            app.needs_redraw = true;
+            Vec::new()
+        }
+        SidebarRowAction::OpenAgentTranscript { agent_id } => {
+            if !open_agent_chat_pager(app, &agent_id) {
+                app.status_message = Some("Exact agent transcript is unavailable".to_string());
             }
             app.needs_redraw = true;
             Vec::new()
@@ -789,7 +775,15 @@ pub(crate) fn apply_sidebar_row_action(app: &mut App, action: SidebarRowAction) 
     }
 }
 
-fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
+pub(crate) fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
+    let Some(text) = resolve_agent_transcript_text(app, agent_id) else {
+        return false;
+    };
+    push_agent_chat_pager(app, agent_id, &text);
+    true
+}
+
+fn resolve_agent_transcript_text(app: &App, agent_id: &str) -> Option<String> {
     use crate::tools::handle::{HandleValue, VarHandle};
 
     let lookup = VarHandle {
@@ -809,7 +803,7 @@ fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
             },
             None => None,
         },
-        Err(_) => return false,
+        Err(_) => return None,
     };
 
     // The handle is a deliberately bounded live projection. Prefer the private
@@ -837,21 +831,45 @@ fn open_agent_chat_pager(app: &mut App, agent_id: &str) -> bool {
         if matches_resident_count {
             let text = agent_messages_text(&messages);
             if !text.trim().is_empty() {
-                push_agent_chat_pager(app, agent_id, &text);
-                return true;
+                return Some(text);
             }
         }
     }
 
-    let Some(payload) = payload else {
-        return false;
-    };
+    let payload = payload?;
     let text = agent_transcript_text(&payload);
     if text.trim().is_empty() {
-        return false;
+        return None;
     }
-    push_agent_chat_pager(app, agent_id, &text);
-    true
+    Some(text)
+}
+
+pub(crate) fn resident_agent_transcript_available(app: &App, agent_id: &str) -> bool {
+    use crate::tools::handle::{HandleValue, VarHandle};
+
+    let lookup = VarHandle {
+        kind: "var_handle".to_string(),
+        session_id: format!("agent:{agent_id}"),
+        name: "full_transcript".to_string(),
+        type_name: String::new(),
+        length: 0,
+        repr_preview: String::new(),
+        sha256: String::new(),
+    };
+    let Ok(store) = app.runtime_services.handle_store.try_lock() else {
+        return false;
+    };
+    let Some(record) = store.get(&lookup) else {
+        return false;
+    };
+    match &record.value {
+        HandleValue::Json(payload) => !agent_transcript_text(payload).trim().is_empty(),
+        HandleValue::Text(_) => false,
+    }
+}
+
+pub(crate) fn agent_transcript_evidence_available(app: &App, agent_id: &str) -> bool {
+    resolve_agent_transcript_text(app, agent_id).is_some()
 }
 
 fn push_agent_chat_pager(app: &mut App, agent_id: &str, text: &str) {
@@ -860,8 +878,9 @@ fn push_agent_chat_pager(app: &mut App, agent_id: &str, text: &str) {
         .last_transcript_area
         .map(|area| area.width)
         .unwrap_or(80);
+    let display_name = crate::tui::agent_details::safe_agent_display_name(app, agent_id);
     app.view_stack.push(PagerView::from_text(
-        format!("Agent chat — {agent_id}"),
+        format!("Agent transcript — {display_name}"),
         text,
         width.saturating_sub(2),
     ));
@@ -1130,100 +1149,145 @@ pub(crate) fn open_context_menu(app: &mut App, mouse: MouseEvent) {
         return;
     }
     let title = app.tr(MessageId::CtxMenuTitle).to_string();
-    app.view_stack.push(ContextMenuView::new(
+    let reduced = app.motion_policy().as_low_motion();
+    app.view_stack.push(ContextMenuView::new_with_motion(
         entries,
         mouse.column,
         mouse.row,
         title,
+        reduced,
     ));
     app.needs_redraw = true;
 }
 
 pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<ContextMenuEntry> {
     let mut entries = Vec::new();
+    let mut git_path = None;
     let on_sidebar = mouse_hits_rect(mouse, app.viewport.last_sidebar_area);
 
     if on_sidebar {
         if let Some(command) = sidebar_click_action(app, mouse)
             .and_then(|action| action.as_command().map(str::to_string))
         {
-            entries.push(ContextMenuEntry {
-                label: "Run".to_string(),
-                description: command.clone(),
-                action: ContextMenuAction::ExecuteCommand { command },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    "Run",
+                    command.clone(),
+                    ContextMenuAction::ExecuteCommand { command },
+                )
+                .with_glyph("▶")
+                .primary(),
+            );
         }
         // Copy the hovered row's full text (sidebar rows can't be
         // mouse-selected, so the menu is the only copy path).
         if let Some(text) = sidebar_row_copy_text(app, mouse) {
-            entries.push(ContextMenuEntry {
-                label: "Copy".to_string(),
-                description: truncate_line_to_width(first_line(&text), 28),
-                action: ContextMenuAction::CopyText { text },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    "Copy",
+                    truncate_line_to_width(first_line(&text), 28),
+                    ContextMenuAction::CopyText { text },
+                )
+                .with_glyph("⎘")
+                .with_hint("y"),
+            );
         }
     } else {
         // Paste first — the most common action when right-clicking in the
         // composer or transcript after copying text from the output area.
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuPaste).to_string(),
-            description: app.tr(MessageId::CtxMenuPasteDesc).to_string(),
-            action: ContextMenuAction::Paste,
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuPaste),
+                app.tr(MessageId::CtxMenuPasteDesc),
+                ContextMenuAction::Paste,
+            )
+            .with_glyph("📋")
+            .with_hint("p")
+            .primary(),
+        );
     }
 
     if selection_has_content(app) {
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuCopySelection).to_string(),
-            description: app.tr(MessageId::CtxMenuCopySelectionDesc).to_string(),
-            action: ContextMenuAction::CopySelection,
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuOpenSelection).to_string(),
-            description: app.tr(MessageId::CtxMenuOpenSelectionDesc).to_string(),
-            action: ContextMenuAction::OpenSelection,
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuClearSelection).to_string(),
-            description: String::new(),
-            action: ContextMenuAction::ClearSelection,
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuCopySelection),
+                app.tr(MessageId::CtxMenuCopySelectionDesc),
+                ContextMenuAction::CopySelection,
+            )
+            .with_glyph("⎘")
+            .with_hint("y")
+            .section_start(),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuOpenSelection),
+                app.tr(MessageId::CtxMenuOpenSelectionDesc),
+                ContextMenuAction::OpenSelection,
+            )
+            .with_glyph("↗"),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuClearSelection),
+                "",
+                ContextMenuAction::ClearSelection,
+            )
+            .with_glyph("×"),
+        );
     }
 
     if !on_sidebar && let Some(filtered_cell_index) = transcript_cell_index_from_mouse(app, mouse) {
         let cell_index = app.original_cell_index_for_rendered(filtered_cell_index);
+        git_path = context_menu_git_path(app, cell_index);
 
         let target = detail_target_label(app, cell_index)
             .map(|label| truncate_line_to_width(label.as_str(), 28))
             .unwrap_or_else(|| "message".to_string());
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuOpenDetails).to_string(),
-            description: target,
-            action: ContextMenuAction::OpenDetails { cell_index },
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuCopyMessage).to_string(),
-            description: app.tr(MessageId::CtxMenuCopyMessageDesc).to_string(),
-            action: ContextMenuAction::CopyCell { cell_index },
-        });
-        entries.push(ContextMenuEntry {
-            label: app.tr(MessageId::CtxMenuOpenInEditor).to_string(),
-            description: app.tr(MessageId::CtxMenuOpenInEditorDesc).to_string(),
-            action: ContextMenuAction::OpenFileAtLine { cell_index },
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuOpenDetails),
+                target,
+                ContextMenuAction::OpenDetails { cell_index },
+            )
+            .with_glyph("▣")
+            .section_start(),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuCopyMessage),
+                app.tr(MessageId::CtxMenuCopyMessageDesc),
+                ContextMenuAction::CopyCell { cell_index },
+            )
+            .with_glyph("⎘"),
+        );
+        entries.push(
+            ContextMenuEntry::new(
+                app.tr(MessageId::CtxMenuOpenInEditor),
+                app.tr(MessageId::CtxMenuOpenInEditorDesc),
+                ContextMenuAction::OpenFileAtLine { cell_index },
+            )
+            .with_glyph("↗")
+            .with_hint("e"),
+        );
         // Hide/show cell toggle.
         if app.collapsed_cells.contains(&cell_index) {
-            entries.push(ContextMenuEntry {
-                label: app.tr(MessageId::CtxMenuShowCell).to_string(),
-                description: app.tr(MessageId::CtxMenuShowCellDesc).to_string(),
-                action: ContextMenuAction::ShowCell { cell_index },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    app.tr(MessageId::CtxMenuShowCell),
+                    app.tr(MessageId::CtxMenuShowCellDesc),
+                    ContextMenuAction::ShowCell { cell_index },
+                )
+                .with_glyph("◇"),
+            );
         } else {
-            entries.push(ContextMenuEntry {
-                label: app.tr(MessageId::CtxMenuHideCell).to_string(),
-                description: app.tr(MessageId::CtxMenuHideCellDesc).to_string(),
-                action: ContextMenuAction::HideCell { cell_index },
-            });
+            entries.push(
+                ContextMenuEntry::new(
+                    app.tr(MessageId::CtxMenuHideCell),
+                    app.tr(MessageId::CtxMenuHideCellDesc),
+                    ContextMenuAction::HideCell { cell_index },
+                )
+                .with_glyph("○"),
+            );
         }
     }
 
@@ -1231,30 +1295,59 @@ pub(crate) fn build_context_menu_entries(app: &App, mouse: MouseEvent) -> Vec<Co
     if !app.collapsed_cells.is_empty() {
         let count = app.collapsed_cells.len();
         let label = app.tr(MessageId::CtxMenuShowHidden).to_string();
-        entries.push(ContextMenuEntry {
-            label: format!("{label} ({count})"),
-            description: app.tr(MessageId::CtxMenuShowHiddenDesc).to_string(),
-            action: ContextMenuAction::ShowAllHidden,
-        });
+        entries.push(
+            ContextMenuEntry::new(
+                format!("{label} ({count})"),
+                app.tr(MessageId::CtxMenuShowHiddenDesc),
+                ContextMenuAction::ShowAllHidden,
+            )
+            .with_glyph("◇")
+            .section_start(),
+        );
     }
 
-    entries.push(ContextMenuEntry {
-        label: app.tr(MessageId::CtxMenuCmdPalette).to_string(),
-        description: app.tr(MessageId::CtxMenuCmdPaletteDesc).to_string(),
-        action: ContextMenuAction::OpenCommandPalette,
-    });
-    entries.push(ContextMenuEntry {
-        label: app.tr(MessageId::CtxMenuContextInspector).to_string(),
-        description: app.tr(MessageId::CtxMenuContextInspectorDesc).to_string(),
-        action: ContextMenuAction::OpenContextInspector,
-    });
-    entries.push(ContextMenuEntry {
-        label: app.tr(MessageId::CtxMenuHelp).to_string(),
-        description: app.tr(MessageId::CtxMenuHelpDesc).to_string(),
-        action: ContextMenuAction::OpenHelp,
-    });
+    entries.push(
+        ContextMenuEntry::new(
+            app.tr(MessageId::CtxMenuCmdPalette),
+            app.tr(MessageId::CtxMenuCmdPaletteDesc),
+            ContextMenuAction::OpenCommandPalette,
+        )
+        .with_glyph("⌘")
+        .section_start(),
+    );
+    entries.push(
+        ContextMenuEntry::new(
+            app.tr(MessageId::CtxMenuContextInspector),
+            app.tr(MessageId::CtxMenuContextInspectorDesc),
+            ContextMenuAction::OpenContextInspector,
+        )
+        .with_glyph("ⓘ"),
+    );
+    entries.push(
+        ContextMenuEntry::new(
+            app.tr(MessageId::CtxMenuHelp),
+            app.tr(MessageId::CtxMenuHelpDesc),
+            ContextMenuAction::OpenHelp,
+        )
+        .with_glyph("?"),
+    );
 
-    entries
+    let branch = git_path
+        .as_deref()
+        .and_then(|_| crate::tui::workspace_context::branch(&app.workspace));
+    crate::tui::context_menu::with_git_actions(entries, git_path.as_deref(), branch.as_deref())
+}
+
+fn context_menu_git_path(app: &App, cell_index: usize) -> Option<String> {
+    use crate::tui::history::ToolCell;
+
+    match app.cell_at_virtual_index(cell_index)? {
+        HistoryCell::Tool(ToolCell::PatchSummary(patch)) => Some(patch.path.clone()),
+        HistoryCell::Tool(ToolCell::ViewImage(image)) => {
+            Some(image.path.to_string_lossy().into_owned())
+        }
+        _ => None,
+    }
 }
 
 pub(crate) fn transcript_cell_index_from_mouse(app: &App, mouse: MouseEvent) -> Option<usize> {
@@ -1321,7 +1414,8 @@ pub(crate) fn handle_context_menu_action(app: &mut App, action: ContextMenuActio
             open_context_inspector(app);
         }
         ContextMenuAction::OpenHelp => {
-            app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
+            let help = HelpView::new_for_workspace(app.ui_locale, &app.workspace);
+            app.view_stack.push(help);
         }
         ContextMenuAction::OpenFileAtLine { cell_index } => {
             let width = app

@@ -824,6 +824,46 @@ mod tests {
     }
 
     #[test]
+    fn streaming_render_stays_within_per_frame_cell_diff_budget() {
+        let mut view = LiveTranscriptOverlay::new();
+        let mut cells = (0..30)
+            .map(|index| user(&format!("stable transcript row {index}")))
+            .collect::<Vec<_>>();
+        cells.push(assistant("streaming answer", true));
+        install_snapshots(&mut view, cells);
+
+        let area = Rect::new(0, 0, 89, 24);
+        let mut before = Buffer::empty(area);
+        view.render(area, &mut before);
+
+        let tail = view.snapshots.last_mut().expect("streaming tail");
+        let HistoryCell::Assistant { content, .. } = &mut tail.cell else {
+            panic!("fixture tail must be an assistant cell");
+        };
+        content.push_str(" + one delta");
+        tail.revision = tail.revision.saturating_add(1);
+
+        let mut after = Buffer::empty(area);
+        view.render(area, &mut after);
+        let changed_cells = before
+            .content()
+            .iter()
+            .zip(after.content())
+            .filter(|(left, right)| left != right)
+            .count();
+
+        // A short stream delta may change its text row and a wrap boundary,
+        // but it must not invalidate the viewport. Four rows is a generous
+        // ceiling that still catches a full-frame repaint regression.
+        let max_changed_cells = area.width as usize * 4;
+        assert!(changed_cells > 0, "stream delta did not reach the frame");
+        assert!(
+            changed_cells <= max_changed_cells,
+            "stream delta changed {changed_cells} cells; budget is {max_changed_cells}"
+        );
+    }
+
+    #[test]
     fn cache_invalidates_on_revision_bump() {
         let mut v = LiveTranscriptOverlay::new();
         install_snapshots(&mut v, vec![user("a"), assistant("b", true)]);

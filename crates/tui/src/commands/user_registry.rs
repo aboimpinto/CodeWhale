@@ -43,11 +43,43 @@ pub struct UserCommandMetadata {
     pub name: String,
     pub body: String,
     pub description: Option<String>,
+    pub usage: Option<String>,
+    pub arguments: Option<String>,
     pub argument_hint: Option<String>,
     pub allowed_tools: Option<Vec<String>>,
     pub pausable: bool,
     pub aliases: Vec<String>,
     pub hidden: bool,
+}
+
+impl UserCommandMetadata {
+    /// User-facing invocation syntax. `argument-hint` remains the legacy
+    /// fallback for existing command files; `arguments` is the final fallback
+    /// when no complete `usage` string is supplied.
+    pub(crate) fn display_usage(&self) -> Option<&str> {
+        [&self.usage, &self.argument_hint, &self.arguments]
+            .into_iter()
+            .filter_map(Option::as_deref)
+            .find(|value| !value.trim().is_empty())
+            .map(str::trim)
+    }
+
+    /// Whether selecting this command should leave the composer open for
+    /// arguments. These fields describe presentation only; dispatch keeps the
+    /// existing permissive `$ARGUMENTS`/`$1` template semantics.
+    pub(crate) fn takes_arguments(&self) -> bool {
+        self.arguments
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+            // Preserve the legacy contract exactly: the presence of
+            // `argument-hint`, including an explicitly empty value, made the
+            // palette insert rather than immediately execute the command.
+            || self.argument_hint.is_some()
+            || self
+                .usage
+                .as_deref()
+                .is_some_and(|usage| usage_describes_arguments(&self.name, usage))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -73,7 +105,32 @@ impl UserCommandRegistry {
         // The user_commands module is the permanent lower-level file scanning
         // and parsing boundary; this registry owns metadata, shadowing, and
         // dispatch. See docs/architecture/command-dispatch.md.
-        Self::load_from_paths(&user_commands::commands_dirs(workspace))
+        Self::load_with_sources(
+            &user_commands::commands_dirs(workspace),
+            &user_commands::workflow_dirs(workspace),
+        )
+    }
+
+    pub(crate) fn load_with_sources(md_dirs: &[PathBuf], workflow_dirs: &[PathBuf]) -> Self {
+        let mut registry = Self::load_from_paths(md_dirs);
+
+        // Saved workflows become slash commands after explicit .md commands,
+        // so a hand-written command with the same name always wins without a
+        // noisy duplicate-definition warning.
+        let mut workflow_entries: Vec<(String, String, PathBuf)> = Vec::new();
+        for dir in workflow_dirs {
+            for (name, content, path) in user_commands::load_workflow_commands_from_dir(dir) {
+                if registry.get(&name).is_none()
+                    && !workflow_entries
+                        .iter()
+                        .any(|(existing, _, _)| *existing == name)
+                {
+                    workflow_entries.push((name, content, path));
+                }
+            }
+        }
+        registry.load_from_entries(workflow_entries);
+        registry
     }
 
     pub(crate) fn load_from_paths(paths: &[PathBuf]) -> Self {
@@ -82,7 +139,9 @@ impl UserCommandRegistry {
         let mut registry = Self::new();
 
         for dir in paths {
-            for (name, content) in user_commands::load_commands_from_dir(dir) {
+            let mut directory_commands = user_commands::load_commands_from_dir(dir);
+            directory_commands.sort_by(|a, b| a.0.cmp(&b.0));
+            for (name, content) in directory_commands {
                 let canonical = normalize_name(&name);
                 if seen.insert(canonical.clone()) {
                     loaded.push((name, content, dir.join(format!("{canonical}.md"))));
@@ -96,7 +155,6 @@ impl UserCommandRegistry {
                 }
             }
         }
-        loaded.sort_by(|a, b| a.0.cmp(&b.0));
         registry.load_from_entries(loaded);
         registry
     }
@@ -116,18 +174,21 @@ impl UserCommandRegistry {
     }
 
     fn load_from_entries(&mut self, commands: Vec<(String, String, PathBuf)>) {
-        let canonical_names = commands
+        let parsed_commands = commands
+            .into_iter()
+            .map(|(name, content, path)| {
+                let (metadata, errors) = parse_metadata(name, &content, &path);
+                (metadata, errors, path)
+            })
+            .collect::<Vec<_>>();
+        let canonical_names = parsed_commands
             .iter()
-            .map(|(name, _, _)| normalize_name(name))
+            .map(|(metadata, _, _)| metadata.name.clone())
             .collect::<HashSet<_>>();
 
-        for (name, content, path) in commands {
-            let (metadata, errors) = parse_metadata(name, &content, &path);
-            for error in errors {
+        for (mut metadata, errors, path) in parsed_commands {
+            for error in &errors {
                 self.record_load_error(error.path.clone(), error.message.clone());
-                self.invalid_commands
-                    .entry(metadata.name.clone())
-                    .or_insert(error.message);
             }
 
             if self.commands.contains_key(&metadata.name) {
@@ -141,6 +202,16 @@ impl UserCommandRegistry {
                 continue;
             }
 
+            // A malformed losing duplicate must not poison the valid command
+            // that already won precedence. Only the selected definition owns
+            // the dispatch-time error for its canonical name and aliases.
+            for error in errors {
+                self.invalid_commands
+                    .entry(metadata.name.clone())
+                    .or_insert(error.message);
+            }
+
+            let mut accepted_aliases = Vec::with_capacity(metadata.aliases.len());
             for alias in &metadata.aliases {
                 let alias = alias.to_ascii_lowercase();
                 if canonical_names.contains(&alias) {
@@ -163,8 +234,13 @@ impl UserCommandRegistry {
                     );
                     continue;
                 }
-                self.aliases.insert(alias, metadata.name.clone());
+                self.aliases.insert(alias.clone(), metadata.name.clone());
+                accepted_aliases.push(alias);
             }
+            // Discovery surfaces consume metadata directly. Keep it aligned
+            // with the dispatch map so a rejected alias is never advertised
+            // by help, command palettes, or slash completion.
+            metadata.aliases = accepted_aliases;
 
             self.commands.insert(metadata.name.clone(), metadata);
         }
@@ -228,23 +304,28 @@ fn parse_metadata(
     content: &str,
     path: &Path,
 ) -> (UserCommandMetadata, Vec<LoadError>) {
-    let canonical = normalize_name(&name);
+    let filename_name = normalize_name(&name);
     let (metadata, body) = user_commands::parse_frontmatter(content);
-    let errors = validate_command_content(&canonical, content, path);
     let mut command = UserCommandMetadata {
-        name: canonical,
+        name: filename_name.clone(),
         body: body.to_string(),
         description: None,
+        usage: None,
+        arguments: None,
         argument_hint: None,
         allowed_tools: None,
         pausable: false,
         aliases: Vec::new(),
         hidden: false,
     };
+    let mut configured_name = None;
 
     for (key, value) in metadata {
         match key.as_str() {
+            "name" => configured_name = Some(value),
             "description" => command.description = Some(value),
+            "usage" => command.usage = Some(value),
+            "arguments" => command.arguments = Some(value),
             "argument-hint" => command.argument_hint = Some(value),
             "allowed-tools" => {
                 command.allowed_tools = Some(user_commands::parse_allowed_tools(&value));
@@ -261,6 +342,21 @@ fn parse_metadata(
             _ => {}
         }
     }
+
+    let mut errors = Vec::new();
+    if let Some(configured_name) = configured_name {
+        if let Some(normalized) = normalize_configured_name(&configured_name) {
+            command.name = normalized;
+        } else {
+            errors.push(LoadError {
+                path: path.to_path_buf(),
+                message: format!(
+                    "User command '/{filename_name}' has invalid frontmatter name {configured_name:?}; expected one slash-command token"
+                ),
+            });
+        }
+    }
+    errors.extend(validate_command_content(&command.name, content, path));
 
     (command, errors)
 }
@@ -333,6 +429,22 @@ fn normalize_name(name: &str) -> String {
     name.trim().trim_start_matches('/').to_ascii_lowercase()
 }
 
+fn normalize_configured_name(name: &str) -> Option<String> {
+    let name = name.trim();
+    let name = name.strip_prefix('/').unwrap_or(name);
+    (!name.is_empty() && !name.contains('/') && !name.contains(char::is_whitespace))
+        .then(|| name.to_ascii_lowercase())
+}
+
+fn usage_describes_arguments(name: &str, usage: &str) -> bool {
+    let usage = usage.trim();
+    if usage.is_empty() {
+        return false;
+    }
+    let bare_usage = usage.trim_start_matches('/');
+    !bare_usage.eq_ignore_ascii_case(name)
+}
+
 fn normalize_workspace(workspace: Option<&Path>) -> Option<PathBuf> {
     workspace.map(Path::to_path_buf)
 }
@@ -340,35 +452,49 @@ fn normalize_workspace(workspace: Option<&Path>) -> Option<PathBuf> {
 fn command_dirs_snapshot(workspace: Option<&Path>) -> Vec<CommandDirSnapshot> {
     user_commands::commands_dirs(workspace)
         .into_iter()
-        .map(|path| {
-            let modified = std::fs::metadata(&path)
-                .and_then(|metadata| metadata.modified())
-                .ok();
-            let mut files = Vec::new();
-            if let Ok(entries) = std::fs::read_dir(&path) {
-                for entry in entries.flatten() {
-                    let file_path = entry.path();
-                    if file_path.extension().and_then(|ext| ext.to_str()) != Some("md") {
-                        continue;
-                    }
-                    let Ok(metadata) = entry.metadata() else {
-                        continue;
-                    };
-                    files.push(CommandFileSnapshot {
-                        path: file_path,
-                        modified: metadata.modified().ok(),
-                        len: metadata.len(),
-                    });
-                }
-            }
-            files.sort_by(|a, b| a.path.cmp(&b.path));
-            CommandDirSnapshot {
-                path,
-                modified,
-                files,
-            }
-        })
+        .map(|path| snapshot_dir(path, |name| name.ends_with(".md")))
+        .chain(
+            user_commands::workflow_dirs(workspace)
+                .into_iter()
+                .map(|path| {
+                    snapshot_dir(path, |name| {
+                        name.ends_with(user_commands::WORKFLOW_SOURCE_SUFFIX)
+                    })
+                }),
+        )
         .collect()
+}
+
+fn snapshot_dir(path: PathBuf, matches: impl Fn(&str) -> bool) -> CommandDirSnapshot {
+    let modified = std::fs::metadata(&path)
+        .and_then(|metadata| metadata.modified())
+        .ok();
+    let mut files = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&path) {
+        for entry in entries.flatten() {
+            let file_path = entry.path();
+            let Some(file_name) = file_path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !matches(file_name) {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            files.push(CommandFileSnapshot {
+                path: file_path,
+                modified: metadata.modified().ok(),
+                len: metadata.len(),
+            });
+        }
+    }
+    files.sort_by(|a, b| a.path.cmp(&b.path));
+    CommandDirSnapshot {
+        path,
+        modified,
+        files,
+    }
 }
 
 fn registry_lock() -> &'static RwLock<UserCommandRegistryState> {
@@ -515,21 +641,115 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
+    fn saved_workflows_become_arg_taking_slash_commands() {
+        let tmp = TempDir::new().expect("tempdir");
+        let workflow_dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        std::fs::write(
+            workflow_dir.join("pr-review.workflow.js"),
+            "// Review a PR across dimensions and verify findings\nphase('scan');\n",
+        )
+        .expect("write workflow");
+
+        let registry =
+            UserCommandRegistry::load_with_sources(&[], std::slice::from_ref(&workflow_dir));
+        let command = registry.get("pr-review").expect("workflow command");
+        assert_eq!(
+            command.description.as_deref(),
+            Some("Review a PR across dimensions and verify findings")
+        );
+        assert!(command.takes_arguments(), "workflows accept custom args");
+        assert!(
+            command.body.contains("source_path=")
+                && command.body.contains(
+                    &workflow_dir
+                        .join("pr-review.workflow.js")
+                        .display()
+                        .to_string()
+                ),
+            "body must point the workflow tool at the saved source: {}",
+            command.body
+        );
+        assert!(
+            command.body.contains("$ARGUMENTS"),
+            "slash arguments must forward into the run: {}",
+            command.body
+        );
+    }
+
+    #[test]
+    fn explicit_md_commands_shadow_same_named_workflows_quietly() {
+        let tmp = TempDir::new().expect("tempdir");
+        let md_dir = tmp.path().join("commands");
+        let workflow_dir = tmp.path().join("workflows");
+        std::fs::create_dir_all(&md_dir).expect("md dir");
+        std::fs::create_dir_all(&workflow_dir).expect("workflow dir");
+        std::fs::write(md_dir.join("triage.md"), "hand-written triage $ARGUMENTS")
+            .expect("write md command");
+        std::fs::write(workflow_dir.join("triage.workflow.js"), "phase('x');\n")
+            .expect("write workflow");
+
+        let registry = UserCommandRegistry::load_with_sources(&[md_dir], &[workflow_dir]);
+        let command = registry.get("triage").expect("command");
+        assert_eq!(command.body, "hand-written triage $ARGUMENTS");
+        assert!(
+            registry.load_errors().is_empty(),
+            "shadowing a workflow is silent, not a duplicate-definition warning: {:?}",
+            registry.load_errors()
+        );
+    }
+
+    #[test]
     fn registry_loads_markdown_metadata() {
         let registry = UserCommandRegistry::from_loaded(vec![(
             "review".to_string(),
-            "---\ndescription: Review code\nargument-hint: <file>\nallowed-tools: read, grep\npausable: true\n---\nReview $ARGUMENTS".to_string(),
+            "---\ndescription: Review code\nusage: /review <file>\narguments: <file>\nargument-hint: <legacy-file>\nallowed-tools: read, grep\npausable: true\n---\nReview $ARGUMENTS".to_string(),
         )]);
 
         let command = registry.get("review").expect("command loaded");
         assert_eq!(command.description.as_deref(), Some("Review code"));
-        assert_eq!(command.argument_hint.as_deref(), Some("<file>"));
+        assert_eq!(command.usage.as_deref(), Some("/review <file>"));
+        assert_eq!(command.arguments.as_deref(), Some("<file>"));
+        assert_eq!(command.argument_hint.as_deref(), Some("<legacy-file>"));
+        assert_eq!(command.display_usage(), Some("/review <file>"));
+        assert!(command.takes_arguments());
         assert_eq!(
             command.allowed_tools,
             Some(vec!["read".to_string(), "grep".to_string()])
         );
         assert!(command.pausable);
         assert_eq!(command.body, "Review $ARGUMENTS");
+    }
+
+    #[test]
+    fn frontmatter_name_replaces_filename_canonical_name() {
+        let registry = UserCommandRegistry::from_loaded(vec![(
+            "workflow-file".to_string(),
+            "---\nname: /Review-Target\ndescription: Review target\n---\nreview $ARGUMENTS"
+                .to_string(),
+        )]);
+
+        let command = registry.get("review-target").expect("renamed command");
+        assert_eq!(command.name, "review-target");
+        assert_eq!(command.body, "review $ARGUMENTS");
+        assert!(
+            registry.get("workflow-file").is_none(),
+            "the filename is only a default; retaining it requires an explicit alias"
+        );
+    }
+
+    #[test]
+    fn filename_remains_the_default_name_without_frontmatter_override() {
+        let registry = UserCommandRegistry::from_loaded(vec![(
+            "Filename-Default".to_string(),
+            "plain body".to_string(),
+        )]);
+
+        assert_eq!(registry.names(), vec!["filename-default"]);
+        assert_eq!(
+            registry.get("/filename-default").unwrap().body,
+            "plain body"
+        );
     }
 
     #[test]
@@ -554,6 +774,33 @@ mod tests {
         ]);
 
         assert_eq!(registry.get("shadow").unwrap().body, "first");
+    }
+
+    #[test]
+    fn frontmatter_name_collision_uses_directory_then_filename_precedence() {
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        std::fs::write(
+            first.path().join("z-workspace.md"),
+            "---\nname: shared\n---\nworkspace body",
+        )
+        .unwrap();
+        std::fs::write(
+            second.path().join("a-global.md"),
+            "---\nname: shared\n---\nglobal body",
+        )
+        .unwrap();
+
+        let registry = UserCommandRegistry::load_from_paths(&[
+            first.path().to_path_buf(),
+            second.path().to_path_buf(),
+        ]);
+
+        assert_eq!(registry.get("shared").unwrap().body, "workspace body");
+        assert!(registry.load_errors().iter().any(|error| {
+            error.message.contains("User command '/shared'")
+                && error.message.contains("defined more than once")
+        }));
     }
 
     #[test]
@@ -644,8 +891,8 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_workspace_command(
             tmp.path(),
-            "secret",
-            "---\nhidden: true\ndescription: Internal workflow\n---\nsecret $ARGUMENTS",
+            "internal-workflow",
+            "---\nname: secret\nhidden: true\ndescription: Internal workflow\n---\nsecret $ARGUMENTS",
         );
         let mut app = test_app(tmp.path().to_path_buf());
 
@@ -654,6 +901,30 @@ mod tests {
         assert!(!result.is_error);
         assert_eq!(sent_message(result), "secret now");
         assert_eq!(app.hunt.quarry.as_deref(), Some("Internal workflow"));
+    }
+
+    #[test]
+    fn dispatch_uses_frontmatter_name_arguments_and_allowed_tools() {
+        let tmp = TempDir::new().unwrap();
+        write_workspace_command(
+            tmp.path(),
+            "deploy-workflow",
+            "---\nname: ship\nusage: /ship <target>\narguments: <target>\nallowed-tools: Read_File, Grep_Files\n---\nship $1 with $ARGUMENTS",
+        );
+        let mut app = test_app(tmp.path().to_path_buf());
+
+        let result = crate::commands::execute("/ship moon base", &mut app);
+
+        assert!(!result.is_error, "{:?}", result.message);
+        assert_eq!(sent_message(result), "ship moon with moon base");
+        assert_eq!(
+            app.active_allowed_tools,
+            Some(vec!["read_file".to_string(), "grep_files".to_string()])
+        );
+        assert!(
+            try_dispatch(&mut app, "/deploy-workflow").is_none(),
+            "the source filename must not remain an implicit dispatch alias"
+        );
     }
 
     #[test]
@@ -732,6 +1003,7 @@ mod tests {
             app.plan_state
                 .try_lock()
                 .expect("plan_state lock")
+                .snapshot()
                 .is_empty(),
             "previous command's plan must be cleared on new command dispatch"
         );
@@ -753,6 +1025,11 @@ mod tests {
         let command = registry.get("shared").expect("alias resolves");
         assert_eq!(command.name, "first");
         assert_eq!(command.body, "first body");
+        assert_eq!(command.aliases, ["shared"]);
+        assert!(
+            registry.get("second").unwrap().aliases.is_empty(),
+            "the losing command must not advertise an alias it does not own"
+        );
         assert!(
             registry.load_errors().iter().any(|error| error
                 .message
@@ -770,12 +1047,19 @@ mod tests {
                 "alpha".to_string(),
                 "---\nalias: beta\n---\nalpha body".to_string(),
             ),
-            ("beta".to_string(), "beta body".to_string()),
+            (
+                "renamed-beta".to_string(),
+                "---\nname: beta\n---\nbeta body".to_string(),
+            ),
         ]);
 
         let command = registry.get("beta").expect("canonical command resolves");
         assert_eq!(command.name, "beta");
         assert_eq!(command.body, "beta body");
+        assert!(
+            registry.get("alpha").unwrap().aliases.is_empty(),
+            "a canonical-name collision must be absent from alias metadata"
+        );
         assert!(
             registry.load_errors().iter().any(|error| error
                 .message
@@ -808,6 +1092,30 @@ mod tests {
     }
 
     #[test]
+    fn malformed_losing_name_override_does_not_poison_valid_winner() {
+        let registry = UserCommandRegistry::from_loaded(vec![
+            (
+                "first-file".to_string(),
+                "---\nname: shared\n---\nfirst body".to_string(),
+            ),
+            (
+                "second-file".to_string(),
+                "---\nname: shared\nnot valid frontmatter\n---\nsecond body".to_string(),
+            ),
+        ]);
+
+        assert_eq!(registry.get("shared").unwrap().body, "first body");
+        assert_eq!(registry.dispatch_error("shared"), None);
+        assert!(registry.load_errors().iter().any(|error| {
+            error.message.contains("invalid frontmatter") && error.path.ends_with("second-file.md")
+        }));
+        assert!(registry.load_errors().iter().any(|error| {
+            error.message.contains("defined more than once")
+                && error.path.ends_with("second-file.md")
+        }));
+    }
+
+    #[test]
     fn invalid_frontmatter_dispatch_returns_user_command_error_without_builtin_fallback() {
         let tmp = TempDir::new().unwrap();
         write_workspace_command(
@@ -823,6 +1131,51 @@ mod tests {
         let message = result.message.expect("error message");
         assert!(message.contains("User command '/help'"), "{message}");
         assert!(message.contains("invalid frontmatter"), "{message}");
+    }
+
+    #[test]
+    fn malformed_file_is_recoverable_and_valid_sibling_still_dispatches() {
+        let tmp = TempDir::new().unwrap();
+        write_workspace_command(
+            tmp.path(),
+            "broken",
+            "---\ndescription: Broken\nnot valid frontmatter\n---\nbroken body",
+        );
+        write_workspace_command(
+            tmp.path(),
+            "healthy",
+            "---\ndescription: Healthy\n---\nhealthy $ARGUMENTS",
+        );
+        let mut app = test_app(tmp.path().to_path_buf());
+
+        let healthy = crate::commands::execute("/healthy now", &mut app);
+        assert!(!healthy.is_error, "{:?}", healthy.message);
+        assert_eq!(sent_message(healthy), "healthy now");
+
+        let broken = crate::commands::execute("/broken", &mut app);
+        assert!(broken.is_error);
+        assert!(
+            broken
+                .message
+                .as_deref()
+                .is_some_and(|message| message.contains("invalid frontmatter"))
+        );
+    }
+
+    #[test]
+    fn invalid_frontmatter_name_is_recoverable_under_filename_default() {
+        let registry = UserCommandRegistry::from_loaded(vec![(
+            "recoverable".to_string(),
+            "---\nname: two words\n---\nbody".to_string(),
+        )]);
+
+        assert!(registry.get("recoverable").is_some());
+        assert!(registry.dispatch_error("recoverable").is_some());
+        assert!(registry.load_errors().iter().any(|error| {
+            error
+                .message
+                .contains("invalid frontmatter name \"two words\"")
+        }));
     }
 
     #[test]

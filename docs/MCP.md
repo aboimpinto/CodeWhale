@@ -3,8 +3,10 @@
 codewhale can load additional tools via MCP (Model Context Protocol). MCP servers can be local stdio processes that the TUI starts, or remote URL-based servers that speak Streamable HTTP with legacy SSE fallback.
 
 Browsing note:
-- `web.run` is the canonical built-in browsing tool.
-- `web_search` remains available as a compatibility alias for older prompts and integrations.
+- `Web` is the canonical, deferred built-in browsing tool; it provides
+  `search`, `fetch`, and `wait` actions when network policy permits.
+- `web_search`, `fetch_url`, and `wait_for_dev_server` are hidden replay-only
+  aliases. New prompts and integrations should use `Web`.
 
 Server mode note:
 - `codewhale-tui serve --mcp` runs the MCP stdio server.
@@ -398,7 +400,10 @@ Per-server settings:
 
 ## Safety Notes
 
-MCP tools now flow through the same tool-approval framework as built-in tools. Read-only MCP helpers (resource/prompt listing and reads) can run without prompts in suggestive approval modes, while side-effectful MCP tools require approval.
+MCP tools flow through the same approval framework as built-in tools. Read-only
+MCP helpers (resource/prompt listing and reads) can run without prompts in Ask
+and Auto-Review when policy permits, while side-effectful MCP tools require
+approval. Full Access does not bypass hard policy holds.
 
 You should still only configure MCP servers you trust, and treat MCP server configuration as equivalent to running code on your machine.
 Avoid committing literal `Authorization` headers. Prefer `env_headers`,

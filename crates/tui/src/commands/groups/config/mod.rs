@@ -56,7 +56,7 @@ static SIDEBAR_INFO: CommandInfo = CommandInfo {
 static SETTINGS_INFO: CommandInfo = CommandInfo {
     name: "settings",
     aliases: &[],
-    usage: "/settings",
+    usage: "/settings [text]",
     description_id: MessageId::CmdSettingsDescription,
 };
 static STATUS_INFO: CommandInfo = CommandInfo {
@@ -80,7 +80,7 @@ static MODE_INFO: CommandInfo = CommandInfo {
 static THEME_INFO: CommandInfo = CommandInfo {
     name: "theme",
     aliases: &[],
-    usage: "/theme [name]",
+    usage: "/theme [name|custom:<name>|schema|path]",
     description_id: MessageId::CmdThemeDescription,
 };
 static VERBOSE_INFO: CommandInfo = CommandInfo {
@@ -103,9 +103,9 @@ static LOGOUT_INFO: CommandInfo = CommandInfo {
 };
 static DEBT_INFO: CommandInfo = CommandInfo {
     name: "debt",
-    aliases: &["cleanup"],
+    aliases: &["cleanup", "slop", "canzha"],
     usage: "/debt [query|export]",
-    description_id: MessageId::CmdSlopDescription,
+    description_id: MessageId::CmdDebtDescription,
 };
 
 fn run_registered(app: &mut App, name: &str, arg: Option<&str>) -> CommandResult {
@@ -163,7 +163,7 @@ pub(in crate::commands) fn dispatch(
             _ => CommandResult::error("Usage: /auth xai-device"),
         },
         "sidebar" => config::sidebar(app, arg),
-        "settings" => config::show_settings(app),
+        "settings" => config::settings_command(app, arg),
         "status" => status::status(app),
         "statusline" => config::status_line(app),
         "mode" => config::mode(app, arg),

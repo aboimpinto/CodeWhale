@@ -149,7 +149,7 @@ fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
         fork_context: false,
         workspace: None,
         git_branch: None,
-        agent_type: SubAgentType::General,
+        agent_type: FleetRole::Worker,
         assignment: make_assignment(),
         model: "deepseek-v4-flash".to_string(),
         nickname: None,
@@ -169,7 +169,7 @@ fn make_snapshot(status: SubAgentStatus) -> SubAgentResult {
 fn make_worker_spec(worker_id: &str, workspace: PathBuf) -> AgentWorkerSpec {
     let tool_profile =
         AgentWorkerToolProfile::Explicit(vec!["read_file".to_string(), "grep_files".to_string()]);
-    let mut runtime_profile = WorkerRuntimeProfile::for_role(SubAgentType::Explore);
+    let mut runtime_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
     runtime_profile.tools =
         ToolScope::Explicit(vec!["read_file".to_string(), "grep_files".to_string()]);
     runtime_profile.model = ModelRoute::Fixed("deepseek-v4-flash".to_string());
@@ -181,7 +181,7 @@ fn make_worker_spec(worker_id: &str, workspace: PathBuf) -> AgentWorkerSpec {
         session_name: Some(worker_id.to_string()),
         objective: "inspect the repo".to_string(),
         role: Some("explorer".to_string()),
-        agent_type: SubAgentType::Explore,
+        agent_type: FleetRole::Scout,
         model: "deepseek-v4-flash".to_string(),
         workspace,
         git_branch: None,
@@ -192,7 +192,55 @@ fn make_worker_spec(worker_id: &str, workspace: PathBuf) -> AgentWorkerSpec {
         max_steps: 8,
         spawn_depth: 1,
         max_spawn_depth: DEFAULT_MAX_SPAWN_DEPTH,
+        launch_manifest: None,
     }
+}
+
+fn make_write_worker_spec(worker_id: &str, workspace: PathBuf, root: &str) -> AgentWorkerSpec {
+    let mut spec = make_worker_spec(worker_id, workspace.clone());
+    spec.agent_type = FleetRole::Builder;
+    spec.role = Some("implementer".to_string());
+    spec.runtime_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
+    spec.launch_manifest = Some(ChildLaunchManifest {
+        owner_session: "root".to_string(),
+        child_id: worker_id.to_string(),
+        profile: spec.runtime_profile.clone(),
+        prompt: spec.objective.clone(),
+        cwd: Some(workspace.display().to_string()),
+        worktree: false,
+        writable_roots: vec![root.to_string()],
+        writable_files: Vec::new(),
+        coordination_contracts: Vec::new(),
+        expected_artifact: Some("tested patch".to_string()),
+        token_budget: None,
+        resume_identity: Some(worker_id.to_string()),
+        generation: 1,
+    });
+    spec
+}
+
+#[test]
+fn active_worker_records_are_never_pruned_by_history_retention() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
+    for index in 0..=MAX_AGENT_WORKER_RECORDS {
+        manager.register_worker(make_worker_spec(
+            &format!("active-worker-{index:03}"),
+            tmp.path().to_path_buf(),
+        ));
+    }
+
+    assert_eq!(
+        manager.list_worker_records().len(),
+        MAX_AGENT_WORKER_RECORDS + 1
+    );
+    assert!(manager.get_worker_record("active-worker-000").is_some());
+    assert!(
+        manager
+            .list_worker_records()
+            .iter()
+            .all(|record| !record.status.is_terminal())
+    );
 }
 
 #[test]
@@ -211,13 +259,19 @@ fn headless_worker_record_tracks_lifecycle_without_tui_projection() {
         None,
         None,
     );
-    manager.record_worker_progress(
+    manager.record_worker_event(
         "agent_worker_contract",
-        "step 1: requesting model response".to_string(),
+        AgentWorkerStatus::ModelWait,
+        Some("step 1: requesting model response".to_string()),
+        Some(1),
+        None,
     );
-    manager.record_worker_progress(
+    manager.record_worker_event(
         "agent_worker_contract",
-        "step 1: running tool 'read_file'".to_string(),
+        AgentWorkerStatus::RunningTool,
+        Some("step 1: running tool 'read_file'".to_string()),
+        Some(1),
+        Some("read_file".to_string()),
     );
 
     let mut result = make_snapshot(SubAgentStatus::Completed);
@@ -233,12 +287,12 @@ fn headless_worker_record_tracks_lifecycle_without_tui_projection() {
     assert_eq!(record.status, AgentWorkerStatus::Completed);
     assert_eq!(record.spec.run_id, "agent_worker_contract");
     assert_eq!(record.actor_kind, "subagent");
-    assert_eq!(record.spec.agent_type, SubAgentType::Explore);
+    assert_eq!(record.spec.agent_type, FleetRole::Scout);
     assert_eq!(
         record.spec.tool_profile,
         AgentWorkerToolProfile::Explicit(vec!["read_file".to_string(), "grep_files".to_string()])
     );
-    assert_eq!(record.spec.runtime_profile.role, SubAgentType::Explore);
+    assert_eq!(record.spec.runtime_profile.role, FleetRole::Scout);
     assert!(!record.spec.runtime_profile.permissions.write);
     assert_eq!(
         record.spec.runtime_profile.tools,
@@ -404,7 +458,7 @@ fn token_budget_scope_is_shared_across_nested_workers_and_blocks_when_spent() {
 #[test]
 fn agent_worker_profile_derives_from_parent_without_escalation() {
     let mut runtime = stub_runtime();
-    runtime.worker_profile = WorkerRuntimeProfile::for_role(SubAgentType::Explore);
+    runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
     runtime.spawn_depth = 1;
     runtime.max_spawn_depth = DEFAULT_MAX_SPAWN_DEPTH;
     let tool_profile =
@@ -412,13 +466,14 @@ fn agent_worker_profile_derives_from_parent_without_escalation() {
 
     let profile = worker_profile_for_spawn(
         &runtime,
-        &SubAgentType::Implementer,
+        &FleetRole::Builder,
         &tool_profile,
         "deepseek-v4-pro",
         Some(ModelRoute::Fixed("deepseek-v4-pro".to_string())),
+        false,
     );
 
-    assert_eq!(profile.role, SubAgentType::Implementer);
+    assert_eq!(profile.role, FleetRole::Builder);
     assert!(
         !profile.permissions.write,
         "child cannot gain write permission from a read-only parent profile"
@@ -436,9 +491,79 @@ fn agent_worker_profile_derives_from_parent_without_escalation() {
 }
 
 #[test]
+fn declared_read_only_write_roles_derive_without_mutating_shell() {
+    for input in [
+        json!({"prompt": "inspect only"}),
+        json!({
+            "prompt": "implementation review",
+            "type": "implementer",
+            "write_authority": "read_only"
+        }),
+    ] {
+        let request = parse_spawn_request(&input).expect("read-only spawn parses");
+        let mut runtime = stub_runtime().background_runtime();
+        apply_spawn_write_authority(&mut runtime, &request);
+        let profile = worker_profile_for_spawn(
+            &runtime,
+            &request.agent_type,
+            &AgentWorkerToolProfile::Inherited,
+            "deepseek-v4-pro",
+            None,
+            false,
+        );
+        assert!(!profile.permissions.write, "{request:?}");
+        assert_eq!(profile.shell, ShellPolicy::None, "{request:?}");
+    }
+}
+
+#[test]
+fn custom_runtime_opens_only_for_explicit_bounded_write_authority() {
+    let runtime = stub_runtime().background_runtime();
+    let tools = AgentWorkerToolProfile::Explicit(vec!["write_file".to_string()]);
+    let locked = worker_profile_for_spawn(
+        &runtime,
+        &FleetRole::Custom,
+        &tools,
+        "deepseek-v4-pro",
+        None,
+        false,
+    );
+    assert!(!locked.permissions.write);
+    assert_eq!(locked.shell, ShellPolicy::None);
+
+    let opened = worker_profile_for_spawn(
+        &runtime,
+        &FleetRole::Custom,
+        &tools,
+        "deepseek-v4-pro",
+        None,
+        true,
+    );
+    assert!(opened.permissions.write);
+    assert_eq!(opened.shell, ShellPolicy::Full);
+
+    let mut read_only_parent = runtime;
+    read_only_parent.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Scout);
+    let intersected = worker_profile_for_spawn(
+        &read_only_parent,
+        &FleetRole::Custom,
+        &tools,
+        "deepseek-v4-pro",
+        None,
+        true,
+    );
+    assert!(!intersected.permissions.write);
+    assert_eq!(intersected.shell, ShellPolicy::ReadOnly);
+}
+
+#[test]
 fn subagent_progress_displays_shell_tools_as_bash() {
     assert_eq!(subagent_progress_tool_display_name("exec_shell"), "Bash");
     assert_eq!(subagent_progress_tool_display_name("exec_wait"), "Bash");
+    assert_eq!(
+        subagent_progress_tool_display_name("exec_shell_cancel"),
+        "Bash"
+    );
     assert_eq!(
         subagent_progress_tool_display_name("task_shell_wait"),
         "Bash"
@@ -461,6 +586,7 @@ fn agent_progress_preserves_event_channel_headroom_under_load() {
         Some(&tx),
         "agent_busy",
         "step 1: requesting model response".to_string(),
+        AgentProgressEventMeta::new(AgentWorkerStatus::ModelWait).with_step(1),
         None,
         1,
     );
@@ -474,6 +600,7 @@ fn agent_progress_preserves_event_channel_headroom_under_load() {
         Some(&tx),
         "agent_waiting",
         "waiting for user input".to_string(),
+        AgentProgressEventMeta::new(AgentWorkerStatus::WaitingForUser),
         None,
         1,
     );
@@ -488,8 +615,10 @@ fn agent_progress_preserves_event_channel_headroom_under_load() {
     }
     assert!(matches!(
         rx.try_recv(),
-        Ok(Event::AgentProgress { id, status, .. })
-            if id == "agent_waiting" && status == "waiting for user input"
+        Ok(Event::AgentProgress { id, status, activity, .. })
+            if id == "agent_waiting"
+                && status == "waiting for user input"
+                && activity.worker_status == AgentWorkerStatus::WaitingForUser
     ));
     assert!(rx.try_recv().is_err());
 }
@@ -502,6 +631,7 @@ fn agent_progress_uses_small_event_channels_without_headroom_reservation() {
         Some(&tx),
         "agent_small_channel",
         "step 1: requesting model response".to_string(),
+        AgentProgressEventMeta::new(AgentWorkerStatus::ModelWait).with_step(1),
         None,
         1,
     );
@@ -509,8 +639,11 @@ fn agent_progress_uses_small_event_channels_without_headroom_reservation() {
     assert_eq!(tx.capacity(), 7);
     assert!(matches!(
         rx.try_recv(),
-        Ok(Event::AgentProgress { id, status, .. })
-            if id == "agent_small_channel" && status == "step 1: requesting model response"
+        Ok(Event::AgentProgress { id, status, activity, .. })
+            if id == "agent_small_channel"
+                && status == "step 1: requesting model response"
+                && activity.worker_status == AgentWorkerStatus::ModelWait
+                && activity.step == Some(1)
     ));
 }
 
@@ -551,6 +684,644 @@ fn headless_worker_records_persist_with_subagent_state() {
             .events
             .iter()
             .any(|event| event.status == AgentWorkerStatus::Failed)
+    );
+}
+
+#[test]
+fn coordination_ledger_persists_and_replays_bounded_contracts() {
+    let tmp = tempdir().expect("tempdir");
+    let state_path = tmp.path().join("subagents.v1.json");
+    let mut manager =
+        SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path.clone());
+    manager
+        .coordination
+        .register_claim(
+            WriteScopeClaim {
+                owner: "agent_writer".into(),
+                roots: vec!["src".into()],
+                exact_files: vec!["Cargo.toml".into()],
+                contracts: vec!["public-api".into()],
+            },
+            false,
+            |_| false,
+        )
+        .expect("claim");
+    manager
+        .record_coordination_decision(DecisionRecord {
+            decision_id: "decision_storage".into(),
+            subject: "storage".into(),
+            status: DecisionStatus::Accepted,
+            owner: "agent_writer".into(),
+            scope: vec!["router".into()],
+            constraints: vec!["bounded".into()],
+            evidence_handles: vec!["test:coordination".into()],
+            version: 1,
+            sequence: 0,
+        })
+        .expect("decision");
+    manager.persist_state().unwrap().join().unwrap();
+
+    let mut loaded = SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path);
+    loaded.load_state().expect("reload coordination");
+    assert!(
+        loaded
+            .validate_write_scope("agent_writer", &["src/lib.rs".into()])
+            .is_ok()
+    );
+    let err = loaded
+        .validate_write_scope("agent_writer", &["docs/readme.md".into()])
+        .unwrap_err();
+    assert!(err.contains("outside") && err.contains("expand"), "{err}");
+    let inspect = loaded.inspect_coordination(Some("storage"), 4);
+    assert_eq!(inspect["decisions"][0]["decision_id"], "decision_storage");
+    assert_eq!(inspect["write_claims"][0]["claim"]["owner"], "agent_writer");
+}
+
+#[test]
+fn invalid_decision_and_reconciliation_inputs_cannot_poison_persisted_replay() {
+    let tmp = tempdir().expect("tempdir");
+    let state_path = tmp.path().join("subagents.v1.json");
+    let mut manager =
+        SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path.clone());
+
+    for bad_id in ["bad\ndecision".to_string(), "x".repeat(513)] {
+        let error = manager
+            .record_coordination_decision(DecisionRecord {
+                decision_id: bad_id,
+                subject: "safe-subject".into(),
+                status: DecisionStatus::Proposed,
+                owner: "agent-a".into(),
+                scope: vec!["path:src".into()],
+                constraints: vec!["bounded".into()],
+                evidence_handles: vec!["receipt:test".into()],
+                version: 1,
+                sequence: 0,
+            })
+            .expect_err("invalid decision id must fail before mutation");
+        assert!(error.contains("decision id"), "{error}");
+        assert!(manager.coordination.decisions.is_empty());
+    }
+
+    for (id, owner) in [("candidate-a", "agent-a"), ("candidate-b", "agent-b")] {
+        manager
+            .record_coordination_decision(DecisionRecord {
+                decision_id: id.into(),
+                subject: "safe-subject".into(),
+                status: DecisionStatus::Proposed,
+                owner: owner.into(),
+                scope: vec!["path:src".into()],
+                constraints: vec!["bounded".into()],
+                evidence_handles: vec![format!("receipt:{id}")],
+                version: 1,
+                sequence: 0,
+            })
+            .expect("valid candidate decision");
+    }
+    let duplicate_candidate = manager
+        .coordination
+        .reconcile(
+            "safe-subject".into(),
+            "root".into(),
+            vec!["candidate-a".into(), "candidate-b".into()],
+            "preserve both".into(),
+            vec!["receipt:fan-in".into()],
+            vec!["branch:a".into(), " branch:a ".into()],
+            0,
+            3,
+            vec!["review:independent".into()],
+            vec!["verify:locked".into()],
+            "verified".into(),
+        )
+        .expect_err("whitespace aliases must not satisfy two-candidate fan-in");
+    assert!(
+        duplicate_candidate.contains("distinct normalized candidate"),
+        "{duplicate_candidate}"
+    );
+    let duplicate_input = manager
+        .coordination
+        .reconcile(
+            "safe-subject".into(),
+            "root".into(),
+            vec!["candidate-a".into(), " candidate-a ".into()],
+            "preserve both".into(),
+            vec!["receipt:fan-in".into()],
+            vec!["branch:a".into(), "branch:b".into()],
+            0,
+            3,
+            vec!["review:independent".into()],
+            vec!["verify:locked".into()],
+            "verified".into(),
+        )
+        .expect_err("whitespace aliases must not satisfy two-decision fan-in");
+    assert!(
+        duplicate_input.contains("distinct normalized input decisions"),
+        "{duplicate_input}"
+    );
+    assert!(manager.coordination.reconciliations.is_empty());
+
+    manager.persist_state().unwrap().join().unwrap();
+    let mut replayed =
+        SubAgentManager::new(tmp.path().to_path_buf(), 4).with_state_path(state_path);
+    replayed
+        .load_state()
+        .expect("valid state survives restart after rejected poison inputs");
+    assert_eq!(replayed.coordination.decisions.len(), 2);
+    assert!(replayed.coordination.reconciliations.is_empty());
+}
+
+#[test]
+fn coordination_hot_paths_count_only_active_authoritative_owners() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 4);
+    manager.register_worker(make_worker_spec("agent-live", tmp.path().to_path_buf()));
+    manager.register_worker(make_worker_spec("agent-done", tmp.path().to_path_buf()));
+    manager
+        .worker_records
+        .get_mut("agent-done")
+        .expect("terminal worker")
+        .status = AgentWorkerStatus::Completed;
+    for (owner, root) in [("agent-live", "src/live"), ("agent-done", "src/history")] {
+        manager
+            .coordination
+            .register_claim(
+                WriteScopeClaim {
+                    owner: owner.into(),
+                    roots: vec![root.into()],
+                    exact_files: Vec::new(),
+                    contracts: Vec::new(),
+                },
+                false,
+                |_| false,
+            )
+            .expect("bounded non-overlapping claim");
+    }
+
+    let projection = manager.coordination_detail_projection(None, 24);
+    assert_eq!(
+        projection.metrics.hottest_paths,
+        vec![CoordinationHotPath {
+            path: "src/live".into(),
+            active_claims: 1,
+        }]
+    );
+}
+
+#[test]
+fn headless_worker_registration_enforces_live_claims_and_projects_context() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 8);
+    manager
+        .record_coordination_decision(DecisionRecord {
+            decision_id: "decision-src-a".into(),
+            subject: "src-a-contract".into(),
+            status: DecisionStatus::Accepted,
+            owner: "planner".into(),
+            scope: vec!["path:src/a".into()],
+            constraints: vec!["preserve the public API".into()],
+            evidence_handles: vec!["receipt:planner".into()],
+            version: 1,
+            sequence: 0,
+        })
+        .expect("accepted decision");
+
+    let worker = |id: &str, root: &str| {
+        let mut spec = make_worker_spec(id, tmp.path().to_path_buf());
+        spec.agent_type = FleetRole::Builder;
+        spec.role = Some("worker".into());
+        spec.runtime_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
+        spec.launch_manifest = Some(ChildLaunchManifest {
+            owner_session: "fleet-run".into(),
+            child_id: id.into(),
+            profile: spec.runtime_profile.clone(),
+            prompt: spec.objective.clone(),
+            cwd: Some(tmp.path().display().to_string()),
+            worktree: false,
+            writable_roots: vec![root.into()],
+            writable_files: Vec::new(),
+            coordination_contracts: Vec::new(),
+            expected_artifact: None,
+            token_budget: None,
+            resume_identity: Some(format!("fleet-{id}")),
+            generation: 1,
+        });
+        spec
+    };
+
+    let worker_a = worker("worker-a", "src/a");
+    manager
+        .preflight_worker_coordination(&worker_a)
+        .expect("first worker preflight");
+    manager
+        .register_worker_with_coordination(worker_a)
+        .expect("first worker registration");
+    let record = manager
+        .get_worker_record("worker-a")
+        .expect("worker record");
+    assert!(record.spec.objective.contains("src-a-contract"));
+    assert!(
+        record
+            .spec
+            .launch_manifest
+            .as_ref()
+            .expect("launch manifest")
+            .prompt
+            .contains("src-a-contract")
+    );
+
+    let overlap = manager
+        .preflight_worker_coordination(&worker("worker-b", "src/a/nested"))
+        .expect_err("overlapping live Fleet writer must remain queued");
+    assert!(overlap.contains("worker-a"), "{overlap}");
+    assert_eq!(manager.coordination.contentions.len(), 1);
+    assert!(manager.get_worker_record("worker-b").is_none());
+
+    let worker_c = worker("worker-c", "src/b");
+    manager
+        .preflight_worker_coordination(&worker_c)
+        .expect("non-overlapping worker preflight");
+    manager
+        .register_worker_with_coordination(worker_c)
+        .expect("non-overlapping workers may proceed concurrently");
+    assert_eq!(manager.coordination.write_claims.len(), 2);
+}
+
+#[test]
+fn neutral_reconciliation_requires_the_nearest_common_planner() {
+    let tmp = tempdir().expect("tempdir");
+    let mut manager = SubAgentManager::new(tmp.path().to_path_buf(), 8);
+
+    let mut planner = make_worker_spec("planner", tmp.path().to_path_buf());
+    planner.agent_type = FleetRole::Planner;
+    planner.role = Some("planner".into());
+    manager.register_worker(planner);
+    for worker_id in ["worker-a", "worker-b"] {
+        let mut worker = make_worker_spec(worker_id, tmp.path().to_path_buf());
+        worker.parent_run_id = Some("planner".into());
+        worker.agent_type = FleetRole::Builder;
+        worker.role = Some("worker".into());
+        manager.register_worker(worker);
+        manager
+            .record_coordination_decision(DecisionRecord {
+                decision_id: format!("decision-{worker_id}"),
+                subject: "public-api".into(),
+                status: DecisionStatus::Proposed,
+                owner: worker_id.into(),
+                scope: vec!["contract:public-api".into()],
+                constraints: vec!["preserve candidate".into()],
+                evidence_handles: vec![format!("branch:{worker_id}")],
+                version: 1,
+                sequence: 0,
+            })
+            .expect("record candidate decision");
+    }
+    for (worker_id, agent_type, role) in [
+        ("reviewer", FleetRole::Reviewer, "reviewer"),
+        ("verifier", FleetRole::Verifier, "verifier"),
+    ] {
+        let mut worker = make_worker_spec(worker_id, tmp.path().to_path_buf());
+        worker.parent_run_id = Some("planner".into());
+        worker.agent_type = agent_type;
+        worker.role = Some(role.into());
+        manager.register_worker(worker);
+        manager.record_worker_event(
+            worker_id,
+            AgentWorkerStatus::Completed,
+            Some(format!("{role} evidence complete")),
+            None,
+            None,
+        );
+    }
+
+    let input_decisions = vec!["decision-worker-a".into(), "decision-worker-b".into()];
+    let error = manager
+        .reconcile_coordination(
+            "public-api".into(),
+            "worker-a".into(),
+            input_decisions.clone(),
+            "combine both candidates".into(),
+            vec!["receipt:fanin".into()],
+            vec!["branch:worker-a".into(), "branch:worker-b".into()],
+            1,
+            3,
+            vec!["agent:reviewer:review-pass".into()],
+            vec!["agent:verifier:locked-tests".into()],
+            "verified".into(),
+        )
+        .unwrap_err();
+    assert!(error.contains("'planner'"), "{error}");
+
+    let receipt = manager
+        .reconcile_coordination(
+            "public-api".into(),
+            "planner".into(),
+            input_decisions,
+            "combine both candidates".into(),
+            vec!["receipt:fanin".into()],
+            vec!["branch:worker-a".into(), "branch:worker-b".into()],
+            1,
+            3,
+            vec!["agent:reviewer:review-pass".into()],
+            vec!["agent:verifier:locked-tests".into()],
+            "verified".into(),
+        )
+        .expect("nearest common planner may reconcile");
+    assert_eq!(receipt.owner, "planner");
+    assert_eq!(receipt.retry_limit, 3);
+    assert_eq!(receipt.candidate_handles.len(), 2);
+}
+
+#[test]
+fn coordination_acceptance_preserves_scopes_candidates_and_replay() {
+    let repo = init_subagent_git_repo();
+    let state_path = repo.path().join("coordination-state.json");
+    let base_branch = {
+        let output = Command::new("git")
+            .args(["branch", "--show-current"])
+            .current_dir(repo.path())
+            .output()
+            .expect("current branch");
+        assert!(output.status.success());
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    };
+    std::fs::create_dir_all(repo.path().join("src")).expect("src directory");
+
+    git(repo.path(), &["switch", "-c", "candidate-a"]);
+    std::fs::write(repo.path().join("src/a.rs"), "pub const A: u8 = 1;\n")
+        .expect("candidate A edit");
+    git(repo.path(), &["add", "src/a.rs"]);
+    git(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=codewhale Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "candidate A",
+        ],
+    );
+    let candidate_a = git_stdout(repo.path(), &["rev-parse", "candidate-a"]);
+
+    git(repo.path(), &["switch", &base_branch]);
+    git(repo.path(), &["switch", "-c", "candidate-b"]);
+    std::fs::create_dir_all(repo.path().join("src")).expect("candidate B src directory");
+    std::fs::write(repo.path().join("src/b.rs"), "pub const B: u8 = 2;\n")
+        .expect("candidate B edit");
+    git(repo.path(), &["add", "src/b.rs"]);
+    git(
+        repo.path(),
+        &[
+            "-c",
+            "user.name=codewhale Tests",
+            "-c",
+            "user.email=tests@example.com",
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "candidate B",
+        ],
+    );
+    let candidate_b = git_stdout(repo.path(), &["rev-parse", "candidate-b"]);
+
+    let mut manager =
+        SubAgentManager::new(repo.path().to_path_buf(), 8).with_state_path(state_path.clone());
+    let mut planner = make_worker_spec("parent_session", repo.path().to_path_buf());
+    planner.agent_type = FleetRole::Planner;
+    planner.role = Some("planner".into());
+    manager.register_worker(planner);
+    let agent_a = manager.insert_test_running_agent("a", repo.path());
+    let agent_b = manager.insert_test_running_agent("b", repo.path());
+    let agent_c = manager.insert_test_running_agent("c", repo.path());
+
+    let claim = |owner: &str, path: &str| WriteScopeClaim {
+        owner: owner.into(),
+        roots: vec![],
+        exact_files: vec![path.into()],
+        contracts: vec![],
+    };
+    manager
+        .coordination
+        .register_claim(claim(&agent_a, "src/a.rs"), false, |_| false)
+        .expect("A claim");
+    manager
+        .coordination
+        .register_claim(claim(&agent_b, "src/b.rs"), false, |_| false)
+        .expect("B claim");
+    let contention = manager
+        .coordination
+        .register_claim(claim(&agent_c, "src/a.rs"), false, |owner| {
+            owner == agent_a || owner == agent_b
+        })
+        .expect_err("C cannot collide silently with A");
+    assert!(contention.contains(&agent_a), "{contention}");
+    assert_eq!(manager.coordination.contentions.len(), 1);
+
+    let scope_expansion = manager
+        .expand_write_claim(&agent_a, vec![], vec!["src/b.rs".into()], vec![])
+        .expect_err("A expansion into B must visibly replan");
+    assert!(scope_expansion.contains("contention"), "{scope_expansion}");
+
+    for (id, subject, owner, scope) in [
+        ("accepted-a", "api-a", agent_a.as_str(), "path:src/a.rs"),
+        ("accepted-b", "api-b", agent_b.as_str(), "path:src/b.rs"),
+    ] {
+        manager
+            .record_coordination_decision(DecisionRecord {
+                decision_id: id.into(),
+                subject: subject.into(),
+                status: DecisionStatus::Accepted,
+                owner: owner.into(),
+                scope: vec![scope.into()],
+                constraints: vec!["preserve public behavior".into()],
+                evidence_handles: vec![format!("commit:{id}")],
+                version: 1,
+                sequence: 0,
+            })
+            .expect("accepted scoped decision");
+    }
+    for (id, owner) in [("merge-a", agent_a.as_str()), ("merge-b", agent_b.as_str())] {
+        manager
+            .record_coordination_decision(DecisionRecord {
+                decision_id: id.into(),
+                subject: "merge-strategy".into(),
+                status: DecisionStatus::Proposed,
+                owner: owner.into(),
+                scope: vec!["contract:public-api".into()],
+                constraints: vec!["retain both edits".into()],
+                evidence_handles: vec![format!("commit:{id}")],
+                version: 1,
+                sequence: 0,
+            })
+            .expect("candidate decision");
+    }
+    let merge_a = manager
+        .coordination
+        .decisions
+        .iter()
+        .find(|decision| decision.decision_id == "merge-a")
+        .cloned()
+        .expect("merge A decision");
+    let merge_b = manager
+        .coordination
+        .decisions
+        .iter()
+        .find(|decision| decision.decision_id == "merge-b")
+        .cloned()
+        .expect("merge B decision");
+    assert_eq!(merge_a.version, 1);
+    assert_eq!(merge_b.version, 2);
+    let stale_version = manager
+        .update_coordination_decision(
+            "merge-b",
+            DecisionStatus::Accepted,
+            &agent_b,
+            merge_a.version,
+        )
+        .expect_err("a competing stale version cannot replace either candidate");
+    assert!(stale_version.contains("version changed"), "{stale_version}");
+    assert_eq!(
+        manager
+            .coordination
+            .decisions
+            .iter()
+            .filter(|decision| {
+                decision.subject == "merge-strategy" && decision.status == DecisionStatus::Proposed
+            })
+            .count(),
+        2,
+        "both conflicting candidates remain preserved"
+    );
+    let claim_a = manager
+        .coordination
+        .write_claims
+        .iter()
+        .find(|claim| claim.claim.owner == agent_a)
+        .expect("claim A")
+        .claim
+        .clone();
+    let claim_b = manager
+        .coordination
+        .write_claims
+        .iter()
+        .find(|claim| claim.claim.owner == agent_b)
+        .expect("claim B")
+        .claim
+        .clone();
+    let (projection_a, projection_a_receipt) =
+        manager
+            .coordination
+            .project_relevant_decisions(&agent_a, Some(&claim_a), &["File".into()]);
+    let (projection_b, projection_b_receipt) =
+        manager
+            .coordination
+            .project_relevant_decisions(&agent_b, Some(&claim_b), &["File".into()]);
+    assert!(projection_a.contains("api-a") && !projection_a.contains("api-b"));
+    assert!(projection_b.contains("api-b") && !projection_b.contains("api-a"));
+    for receipt in [&projection_a_receipt, &projection_b_receipt] {
+        assert!(
+            receipt.projected_bytes <= coord::COORDINATION_PROJECTION_BYTE_LIMIT,
+            "projection byte cap is durable"
+        );
+        assert!(
+            receipt.decision_ids.len() <= coord::COORDINATION_PROJECTION_DECISION_LIMIT,
+            "projection decision cap is durable"
+        );
+        assert_eq!(
+            receipt
+                .decision_ids
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            receipt.decision_ids.len(),
+            "projection ids are deduplicated"
+        );
+        assert_eq!(receipt.deduplicated, 0);
+        assert_eq!(receipt.omitted, 0);
+    }
+
+    for (worker_id, agent_type, role) in [
+        ("reviewer-agent", FleetRole::Reviewer, "reviewer"),
+        ("verifier-agent", FleetRole::Verifier, "verifier"),
+    ] {
+        let mut worker = make_worker_spec(worker_id, repo.path().to_path_buf());
+        worker.parent_run_id = Some("parent_session".into());
+        worker.agent_type = agent_type;
+        worker.role = Some(role.into());
+        manager.register_worker(worker);
+        manager.record_worker_event(
+            worker_id,
+            AgentWorkerStatus::Completed,
+            Some(format!("{role} evidence complete")),
+            None,
+            None,
+        );
+    }
+
+    let receipt = manager
+        .reconcile_coordination(
+            "merge-strategy".into(),
+            "parent_session".into(),
+            vec!["merge-a".into(), "merge-b".into()],
+            "retry budget exhausted; preserve both candidates for explicit disposition".into(),
+            vec!["receipt:neutral-fan-in".into()],
+            vec![
+                format!("branch:candidate-a@{candidate_a}"),
+                format!("branch:candidate-b@{candidate_b}"),
+            ],
+            3,
+            3,
+            vec!["agent:reviewer-agent:review-pass".into()],
+            vec!["agent:verifier-agent:locked-tests".into()],
+            "blocked".into(),
+        )
+        .expect("nearest common Planner records terminal retry exhaustion");
+    assert_eq!(receipt.retry_count, receipt.retry_limit);
+    assert_eq!(receipt.candidate_handles.len(), 2);
+
+    manager.persist_state().unwrap().join().unwrap();
+    let mut replayed =
+        SubAgentManager::new(repo.path().to_path_buf(), 8).with_state_path(state_path);
+    replayed.load_state().expect("restart/replay");
+    assert_eq!(
+        replayed.coordination.schema_version,
+        coord::COORDINATION_SCHEMA_VERSION
+    );
+    assert_eq!(replayed.coordination.contentions.len(), 2);
+    assert_eq!(replayed.coordination.projections.len(), 2);
+    assert_eq!(replayed.coordination.reconciliations.len(), 1);
+    assert!(
+        replayed
+            .coordination
+            .write_claims
+            .iter()
+            .any(|claim| claim.claim.owner == agent_a)
+    );
+    let sequences = replayed
+        .coordination
+        .decisions
+        .iter()
+        .map(|decision| decision.sequence)
+        .chain(
+            replayed
+                .coordination
+                .reconciliations
+                .iter()
+                .map(|receipt| receipt.sequence),
+        )
+        .collect::<Vec<_>>();
+    assert!(sequences.windows(2).all(|window| window[0] < window[1]));
+
+    assert_eq!(
+        git_stdout(repo.path(), &["show", "candidate-a:src/a.rs"]),
+        "pub const A: u8 = 1;"
+    );
+    assert_eq!(
+        git_stdout(repo.path(), &["show", "candidate-b:src/b.rs"]),
+        "pub const B: u8 = 2;"
     );
 }
 
@@ -615,6 +1386,20 @@ fn git(repo: &Path, args: &[&str]) {
         "git {args:?} failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn git_stdout(repo: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(repo)
+        .output()
+        .expect("git command should run");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
 fn text_message(role: &str, text: &str) -> Message {
@@ -723,7 +1508,7 @@ async fn tool_free_subagent_omits_chat_tools_and_tool_choice() {
     let result = run_subagent(
         &runtime,
         "agent_no_tools_request".to_string(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "Return a final answer without tools.".to_string(),
         make_assignment(),
         Some(Vec::new()),
@@ -917,51 +1702,33 @@ fn estimate_tool_description_tokens_conservative(text: &str) -> usize {
 
 #[test]
 fn test_agent_type_from_str() {
+    assert_eq!(FleetRole::from_str("general"), Some(FleetRole::Worker));
+    assert_eq!(FleetRole::from_str("explore"), Some(FleetRole::Scout));
+    assert_eq!(FleetRole::from_str("PLAN"), Some(FleetRole::Planner));
     assert_eq!(
-        SubAgentType::from_str("general"),
-        Some(SubAgentType::General)
+        FleetRole::from_str("code-review"),
+        Some(FleetRole::Reviewer)
     );
-    assert_eq!(
-        SubAgentType::from_str("explore"),
-        Some(SubAgentType::Explore)
-    );
-    assert_eq!(SubAgentType::from_str("PLAN"), Some(SubAgentType::Plan));
-    assert_eq!(
-        SubAgentType::from_str("code-review"),
-        Some(SubAgentType::Review)
-    );
-    assert_eq!(
-        SubAgentType::from_str("worker"),
-        Some(SubAgentType::General)
-    );
-    assert_eq!(
-        SubAgentType::from_str("default"),
-        Some(SubAgentType::General)
-    );
-    assert_eq!(
-        SubAgentType::from_str("explorer"),
-        Some(SubAgentType::Explore)
-    );
-    assert_eq!(SubAgentType::from_str("awaiter"), Some(SubAgentType::Plan));
-    assert_eq!(SubAgentType::from_str("invalid"), None);
+    assert_eq!(FleetRole::from_str("worker"), Some(FleetRole::Worker));
+    assert_eq!(FleetRole::from_str("default"), Some(FleetRole::Worker));
+    assert_eq!(FleetRole::from_str("explorer"), Some(FleetRole::Scout));
+    assert_eq!(FleetRole::from_str("awaiter"), Some(FleetRole::Planner));
+    assert_eq!(FleetRole::from_str("invalid"), None);
 }
 
 #[test]
 fn test_agent_type_implementer_aliases() {
-    // #404 — Implementer accepts the obvious aliases the model is
+    // #404 — Builder accepts the obvious legacy aliases the model is
     // likely to reach for when the user says "build this".
     for alias in ["implementer", "implement", "implementation", "builder"] {
         assert_eq!(
-            SubAgentType::from_str(alias),
-            Some(SubAgentType::Implementer),
-            "alias {alias} should resolve to Implementer"
+            FleetRole::from_str(alias),
+            Some(FleetRole::Builder),
+            "alias {alias} should resolve to Builder"
         );
     }
     // Case-insensitive.
-    assert_eq!(
-        SubAgentType::from_str("IMPLEMENTER"),
-        Some(SubAgentType::Implementer)
-    );
+    assert_eq!(FleetRole::from_str("IMPLEMENTER"), Some(FleetRole::Builder));
 }
 
 #[test]
@@ -970,15 +1737,12 @@ fn test_agent_type_verifier_aliases() {
     // Reviewer, which is for *grading* code rather than *running* it.
     for alias in ["verifier", "verify", "verification", "validator", "tester"] {
         assert_eq!(
-            SubAgentType::from_str(alias),
-            Some(SubAgentType::Verifier),
+            FleetRole::from_str(alias),
+            Some(FleetRole::Verifier),
             "alias {alias} should resolve to Verifier"
         );
     }
-    assert_eq!(
-        SubAgentType::from_str("VERIFY"),
-        Some(SubAgentType::Verifier)
-    );
+    assert_eq!(FleetRole::from_str("VERIFY"), Some(FleetRole::Verifier));
 }
 
 #[test]
@@ -987,29 +1751,111 @@ fn test_agent_type_round_trips_via_as_str() {
     // through `from_str`. Catches missed variants when adding a new
     // role.
     for t in [
-        SubAgentType::General,
-        SubAgentType::Explore,
-        SubAgentType::Plan,
-        SubAgentType::Review,
-        SubAgentType::Implementer,
-        SubAgentType::Verifier,
-        SubAgentType::Custom,
+        FleetRole::Worker,
+        FleetRole::Scout,
+        FleetRole::Planner,
+        FleetRole::Reviewer,
+        FleetRole::Builder,
+        FleetRole::Verifier,
+        FleetRole::Custom,
     ] {
         let label = t.as_str();
-        let back = SubAgentType::from_str(label)
+        let back = FleetRole::from_str(label)
             .unwrap_or_else(|| panic!("as_str label {label:?} doesn't round-trip via from_str"));
         assert_eq!(back, t, "round-trip failed for {t:?} via {label:?}");
     }
 }
 
 #[test]
+fn fleet_role_labels_are_canonical_while_legacy_snapshot_wire_stays_readable() {
+    assert_eq!(FleetRole::Scout.as_str(), "scout");
+    assert_eq!(FleetRole::Builder.as_str(), "builder");
+    // Normal serialization writes Fleet role names only.
+    assert_eq!(
+        serde_json::to_string(&FleetRole::Scout).expect("serialize fleet role"),
+        "\"scout\""
+    );
+    assert_eq!(
+        serde_json::to_string(&FleetRole::Builder).expect("serialize fleet role"),
+        "\"builder\""
+    );
+    // Legacy wire is accepted only at the deserialize boundary.
+    assert_eq!(
+        serde_json::from_str::<FleetRole>("\"explore\"").expect("read legacy snapshot"),
+        FleetRole::Scout
+    );
+    assert_eq!(
+        migrate_legacy_role_token("explore"),
+        Some("scout"),
+        "boundary helper maps explore → scout"
+    );
+    // Re-serializing a migrated load never re-emits the legacy token.
+    let migrated: FleetRole = serde_json::from_str("\"explore\"").expect("migrate legacy explore");
+    assert_eq!(
+        serde_json::to_string(&migrated).expect("re-serialize after migration"),
+        "\"scout\""
+    );
+}
+
+#[test]
+fn fleet_role_deserialize_rejects_unknown_values_with_canonical_hint() {
+    // Unknown role tokens fail closed at the serde boundary, and the error
+    // teaches the canonical Fleet vocabulary rather than legacy aliases.
+    let err = serde_json::from_str::<FleetRole>("\"wizard\"")
+        .expect_err("unknown role token must fail closed");
+    let message = err.to_string();
+    assert!(
+        message.contains("wizard"),
+        "error should name the rejected token: {message}"
+    );
+    for canonical in [
+        "worker", "scout", "planner", "reviewer", "builder", "verifier", "custom",
+    ] {
+        assert!(
+            message.contains(canonical),
+            "error should list canonical role {canonical}: {message}"
+        );
+    }
+    assert!(
+        !message.contains("implementer") && !message.contains("explore"),
+        "error must not advertise legacy aliases: {message}"
+    );
+}
+
+#[test]
+fn write_capable_children_get_verify_contract_in_system_prompt() {
+    let implementer = build_subagent_system_prompt(
+        &FleetRole::Builder,
+        &SubAgentAssignment::new("land the fix".into(), None),
+    );
+    assert!(
+        implementer.contains("Verify-before-return")
+            || implementer.contains("VERDICT: PASS | FAIL"),
+        "implementer spawn prompt must require PASS/FAIL evidence: {implementer}"
+    );
+    assert!(
+        implementer.contains("COMMANDS:") || implementer.contains("command evidence"),
+        "implementer spawn prompt must ask for commands: {implementer}"
+    );
+
+    let scout = build_subagent_system_prompt(
+        &FleetRole::Scout,
+        &SubAgentAssignment::new("map the tree".into(), None),
+    );
+    assert!(
+        !scout.contains("Verify-before-return"),
+        "read-only scout must not get write verify contract"
+    );
+}
+
+#[test]
 fn test_implementer_and_verifier_have_distinct_prompts() {
     // The whole point of adding the types is that they carry distinct
     // posture. Defensive guard: catch the easy bug where copy-paste
-    // leaves two new variants with the same prompt as `General`.
-    let implementer = SubAgentType::Implementer.system_prompt();
-    let verifier = SubAgentType::Verifier.system_prompt();
-    let general = SubAgentType::General.system_prompt();
+    // leaves two new variants with the same prompt as `Worker`.
+    let implementer = FleetRole::Builder.system_prompt();
+    let verifier = FleetRole::Verifier.system_prompt();
+    let general = FleetRole::Worker.system_prompt();
     assert_ne!(
         implementer, general,
         "Implementer prompt must differ from General"
@@ -1025,7 +1871,8 @@ fn test_implementer_and_verifier_have_distinct_prompts() {
     // Sanity: each prompt mentions the role's defining verb so the
     // model has clear direction.
     assert!(
-        implementer.to_lowercase().contains("implement")
+        implementer.to_lowercase().contains("builder")
+            || implementer.to_lowercase().contains("implement")
             || implementer.to_lowercase().contains("write the code"),
         "Implementer prompt should reference its role: {implementer}"
     );
@@ -1040,13 +1887,13 @@ fn test_implementer_and_verifier_have_distinct_prompts() {
 #[test]
 fn test_agent_type_prompts_include_shared_output_contract_once() {
     for (agent_type, marker) in [
-        (SubAgentType::General, "general-purpose sub-agent"),
-        (SubAgentType::Explore, "exploration sub-agent"),
-        (SubAgentType::Plan, "planning sub-agent"),
-        (SubAgentType::Review, "code review sub-agent"),
-        (SubAgentType::Implementer, "implementation sub-agent"),
-        (SubAgentType::Verifier, "verification sub-agent"),
-        (SubAgentType::Custom, "custom sub-agent"),
+        (FleetRole::Worker, "Fleet worker"),
+        (FleetRole::Scout, "Fleet scout"),
+        (FleetRole::Planner, "Fleet planner"),
+        (FleetRole::Reviewer, "Fleet reviewer"),
+        (FleetRole::Builder, "Fleet builder"),
+        (FleetRole::Verifier, "Fleet verifier"),
+        (FleetRole::Custom, "custom Fleet worker"),
     ] {
         let prompt = agent_type.system_prompt();
         assert!(prompt.contains(marker));
@@ -1061,8 +1908,8 @@ fn test_agent_type_prompts_include_shared_output_contract_once() {
 
 #[test]
 fn explore_prompt_orients_before_searching() {
-    let prompt = SubAgentType::Explore.system_prompt();
-    assert!(prompt.contains("role: `explore`"));
+    let prompt = FleetRole::Scout.system_prompt();
+    assert!(prompt.contains("role: `scout`"));
     assert!(prompt.contains("AGENTS.md/README"));
     assert!(prompt.contains("workspace/project root"));
     assert!(prompt.contains("compressed reconnaissance"));
@@ -1070,7 +1917,7 @@ fn explore_prompt_orients_before_searching() {
 
 #[test]
 fn explore_prompt_is_quick_bounded_and_read_only() {
-    let prompt = SubAgentType::Explore.system_prompt();
+    let prompt = FleetRole::Scout.system_prompt();
     assert!(prompt.contains("Default to `EFFORT: quick`"));
     assert!(prompt.contains("3-5 tool calls"));
     assert!(prompt.contains("strictly read-only"));
@@ -1081,16 +1928,45 @@ fn explore_prompt_is_quick_bounded_and_read_only() {
 
 #[test]
 fn implementer_prompt_is_not_forced_into_explorer_cap() {
-    let prompt = SubAgentType::Implementer.system_prompt();
-    assert!(prompt.contains("not limited to an explorer-style 3-5 tool-call cap"));
+    let prompt = FleetRole::Builder.system_prompt();
+    assert!(prompt.contains("not limited to a scout-style 3-5 tool-call cap"));
     assert!(prompt.contains("Checkpoint before expanding scope"));
     assert!(!prompt.contains("Default to `EFFORT: quick`"));
 }
 
 #[test]
+fn role_prompts_use_canonical_file_action_contract() {
+    let explore = FleetRole::Scout.system_prompt();
+    assert!(
+        explore.contains("`File` with actions `list`, `search_name`, `search_content`, and `read`")
+    );
+
+    let implementer = FleetRole::Builder.system_prompt();
+    assert!(implementer.contains("`File` action `read`"));
+    assert!(implementer.contains("action `edit`"));
+    assert!(implementer.contains("action `patch`"));
+
+    for prompt in [&explore, &implementer] {
+        for legacy_name in [
+            "list_dir",
+            "file_search",
+            "grep_files",
+            "read_file",
+            "edit_file",
+            "apply_patch",
+        ] {
+            assert!(
+                !prompt.contains(legacy_name),
+                "live role prompt must not teach legacy File alias {legacy_name}: {prompt}"
+            );
+        }
+    }
+}
+
+#[test]
 fn review_and_verifier_prompts_stop_after_decisive_evidence() {
-    let review = SubAgentType::Review.system_prompt();
-    let verifier = SubAgentType::Verifier.system_prompt();
+    let review = FleetRole::Reviewer.system_prompt();
+    let verifier = FleetRole::Verifier.system_prompt();
     assert!(review.contains("stop after decisive evidence"));
     assert!(verifier.contains("stop after decisive pass/fail evidence"));
 }
@@ -1136,7 +2012,7 @@ fn deliberate_spawn_requires_delegation_fields() {
         "write_authority": "read_only",
     }))
     .expect("deliberate spawn with all fields");
-    assert_eq!(ok.agent_type, SubAgentType::Review);
+    assert_eq!(ok.agent_type, FleetRole::Reviewer);
     assert_eq!(ok.token_budget, None);
     assert_eq!(ok.write_authority, Some(SpawnWriteAuthority::ReadOnly));
     assert_eq!(ok.expected_artifact.as_deref(), Some("review findings"));
@@ -1196,9 +2072,303 @@ fn declared_write_authority_parses_and_worktree_write_requires_isolation() {
         "prompt": "write in a worktree",
         "write_authority": "worktree_write",
         "worktree": true,
+        "write_roots": ["."],
     }))
     .expect("worktree_write with isolation parses");
     assert_eq!(ok.write_authority, Some(SpawnWriteAuthority::WorktreeWrite));
+
+    let custom_read_only = parse_spawn_request(&json!({
+        "prompt": "run a narrow reader",
+        "type": "custom",
+        "allowed_tools": ["read_file"]
+    }))
+    .expect("custom without explicit write authority stays read-only");
+    assert_eq!(
+        custom_read_only.write_authority,
+        Some(SpawnWriteAuthority::ReadOnly)
+    );
+
+    let custom_implicit_write = parse_spawn_request(&json!({
+        "prompt": "ambiguous custom writer",
+        "type": "custom",
+        "allowed_tools": ["write_file"],
+        "write_roots": ["src"]
+    }))
+    .expect_err("custom scopes require deliberate write authority")
+    .to_string();
+    assert!(
+        custom_implicit_write.contains("explicit"),
+        "{custom_implicit_write}"
+    );
+
+    let custom_writer = parse_spawn_request(&json!({
+        "prompt": "bounded custom writer",
+        "type": "custom",
+        "allowed_tools": ["write_file"],
+        "write_authority": "workspace_write",
+        "write_roots": ["src"]
+    }))
+    .expect("explicit bounded custom write parses");
+    assert!(spawn_request_is_write_capable(&custom_writer));
+}
+
+#[test]
+fn prompt_only_general_children_default_read_only_instead_of_claiming_the_repo() {
+    let request = parse_spawn_request(&json!({
+        "prompt": "inspect the subsystem",
+    }))
+    .expect("prompt-only child remains ergonomic");
+    assert_eq!(request.write_authority, Some(SpawnWriteAuthority::ReadOnly));
+    assert!(request.write_roots.is_empty());
+
+    let error = parse_spawn_request(&json!({
+        "prompt": "edit without a claim",
+        "write_authority": "workspace_write",
+    }))
+    .expect_err("explicit write authority requires an explicit bounded claim")
+    .to_string();
+    assert!(error.contains("must declare"), "{error}");
+
+    for explicit in [
+        json!({"prompt": "implement", "type": "implementer"}),
+        json!({"prompt": "general but explicit", "type": "general"}),
+    ] {
+        let error = parse_spawn_request(&explicit)
+            .expect_err("explicit write-capable identity must not silently become read-only")
+            .to_string();
+        assert!(error.contains("must declare"), "{error}");
+    }
+
+    // Fleet roles are classified only after the live roster resolves them.
+    // A manager profile still fails closed before spawn when it has no scope.
+    let roster = FleetRoster::built_ins_only();
+    let mut fleet_role =
+        parse_spawn_request(&json!({"prompt": "fleet role", "role": "release_lead"}))
+            .expect("unresolved fleet role should parse");
+    apply_spawn_profile(&mut fleet_role, &roster).expect("release lead should resolve");
+    let error = validate_spawn_write_contract(&mut fleet_role, false)
+        .expect_err("resolved write-capable fleet role must declare a scope")
+        .to_string();
+    assert!(error.contains("must declare"), "{error}");
+}
+
+#[test]
+fn read_only_roles_reject_write_authority_but_implementers_can_be_narrowed() {
+    let reviewer = parse_spawn_request(&json!({
+        "prompt": "review while writing",
+        "type": "review",
+        "write_authority": "workspace_write",
+        "write_roots": ["src"]
+    }))
+    .expect_err("read-only role cannot request writes")
+    .to_string();
+    assert!(reviewer.contains("read-only role"), "{reviewer}");
+
+    let implementer = parse_spawn_request(&json!({
+        "prompt": "implement without writes",
+        "type": "implementer",
+        "write_authority": "read_only"
+    }))
+    .expect("role identity may be narrowed to read-only authority");
+    assert_eq!(implementer.agent_type, FleetRole::Builder);
+    assert_eq!(
+        implementer.write_authority,
+        Some(SpawnWriteAuthority::ReadOnly)
+    );
+}
+
+#[test]
+fn declared_write_scope_is_normalized_and_rejects_traversal() {
+    let request = parse_spawn_request(&json!({
+        "prompt": "edit bounded files",
+        "write_authority": "workspace_write",
+        "write_roots": ["./crates/tui/src/", "docs"],
+        "exact_files": ["Cargo.toml"],
+        "coordination_contracts": ["public-api"],
+        "dependencies": ["#4619", "#4619"],
+        "acceptance": ["locked tests pass"]
+    }))
+    .expect("bounded scope parses");
+    assert_eq!(request.write_roots, vec!["crates/tui/src", "docs"]);
+    assert_eq!(request.exact_files, vec!["Cargo.toml"]);
+    assert_eq!(request.coordination_contracts, vec!["public-api"]);
+    assert_eq!(request.dependencies, vec!["#4619"]);
+    assert_eq!(request.acceptance, vec!["locked tests pass"]);
+
+    let err = parse_spawn_request(&json!({
+        "prompt": "escape",
+        "write_roots": ["../outside"]
+    }))
+    .expect_err("traversal must fail")
+    .to_string();
+    assert!(
+        err.contains("repo-relative") || err.contains("traversal"),
+        "{err}"
+    );
+}
+
+#[test]
+fn shared_child_cwd_claims_use_one_root_namespace_for_collisions_and_mutations() {
+    let repo = tempdir().expect("repo");
+    let package = repo.path().join("pkg");
+    std::fs::create_dir_all(package.join("src")).expect("package tree");
+    std::fs::write(
+        package.join("Cargo.toml"),
+        "[package]\nname='pkg'\nversion='0.1.0'\n",
+    )
+    .expect("package manifest");
+
+    let mut manager = SubAgentManager::new(repo.path().to_path_buf(), 4);
+    let root_owner = manager.insert_test_running_agent("root_writer", repo.path());
+    let child_owner = manager.insert_test_running_agent("child_writer", &package);
+    let root_claim = manager
+        .namespace_write_claim(
+            repo.path(),
+            false,
+            WriteScopeClaim {
+                owner: root_owner.clone(),
+                roots: Vec::new(),
+                exact_files: vec!["pkg/Cargo.toml".into()],
+                contracts: Vec::new(),
+            },
+        )
+        .expect("root claim namespace");
+    manager
+        .coordination
+        .register_claim(root_claim, false, |_| true)
+        .expect("root writer claim");
+    let child_alias = manager
+        .namespace_write_claim(
+            &package,
+            false,
+            WriteScopeClaim {
+                owner: child_owner.clone(),
+                roots: Vec::new(),
+                exact_files: vec!["Cargo.toml".into()],
+                contracts: Vec::new(),
+            },
+        )
+        .expect("child claim namespace");
+    assert_eq!(child_alias.exact_files, vec!["pkg/Cargo.toml"]);
+    let active = manager.active_coordination_owners();
+    let collision = manager
+        .coordination
+        .register_claim(child_alias, false, |owner| active.contains(owner))
+        .expect_err("root and child cwd aliases must collide");
+    assert!(collision.contains(&root_owner), "{collision}");
+
+    let mut scoped = SubAgentManager::new(repo.path().to_path_buf(), 4);
+    let child_owner = scoped.insert_test_running_agent("scoped_child", &package);
+    let claim = scoped
+        .namespace_write_claim(
+            &package,
+            false,
+            WriteScopeClaim {
+                owner: child_owner.clone(),
+                roots: vec!["src".into()],
+                exact_files: Vec::new(),
+                contracts: Vec::new(),
+            },
+        )
+        .expect("scoped child claim namespace");
+    assert_eq!(claim.roots, vec!["pkg/src"]);
+    scoped
+        .coordination
+        .register_claim(claim, false, |_| true)
+        .expect("scoped child claim");
+    scoped
+        .validate_write_scope(&child_owner, &["src/lib.rs".into()])
+        .expect("child-relative mutation resolves inside persisted root scope");
+    let outside = scoped
+        .validate_write_scope(&child_owner, &["../other/lib.rs".into()])
+        .expect_err("child cwd traversal must remain outside authority");
+    assert!(
+        outside.contains("repo-relative") || outside.contains("traversal"),
+        "{outside}"
+    );
+}
+
+#[test]
+fn resident_file_context_is_workspace_relative_bounded_and_exclusive() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("context.txt"), "bounded context").unwrap();
+    let context = ToolContext::new(tmp.path());
+
+    let resident = read_bounded_resident_context(&context, "context.txt")
+        .expect("regular in-workspace resident context");
+    assert_eq!(resident.display_path, "context.txt");
+    assert_eq!(resident.contents, "bounded context");
+    assert_eq!(
+        resident.lease_key,
+        tmp.path()
+            .join("context.txt")
+            .canonicalize()
+            .expect("canonical test resident")
+            .display()
+            .to_string()
+    );
+
+    let absolute = read_bounded_resident_context(
+        &context,
+        &tmp.path().join("context.txt").display().to_string(),
+    )
+    .expect_err("absolute resident paths must fail closed")
+    .to_string();
+    assert!(absolute.contains("repo-relative"), "{absolute}");
+    let traversal = read_bounded_resident_context(&context, "../context.txt")
+        .expect_err("resident traversal must fail closed")
+        .to_string();
+    assert!(
+        traversal.contains("repo-relative") || traversal.contains("parent traversal"),
+        "{traversal}"
+    );
+
+    std::fs::write(
+        tmp.path().join("oversize.txt"),
+        vec![b'x'; usize::try_from(MAX_RESIDENT_CONTEXT_BYTES + 1).unwrap()],
+    )
+    .unwrap();
+    let oversize = read_bounded_resident_context(&context, "oversize.txt")
+        .expect_err("oversize resident context must fail closed")
+        .to_string();
+    assert!(oversize.contains("bounded context limit"), "{oversize}");
+
+    let lease_key = format!("resident-test-{}", uuid::Uuid::new_v4());
+    reserve_resident_lease(&lease_key, "context.txt").expect("first resident owner reserves");
+    let duplicate = reserve_resident_lease(&lease_key, "context.txt")
+        .expect_err("a second resident owner must be rejected")
+        .to_string();
+    assert!(duplicate.contains("already leased"), "{duplicate}");
+    rollback_pending_resident_lease(&lease_key);
+    reserve_resident_lease(&lease_key, "context.txt").expect("rollback releases pending lease");
+    rollback_pending_resident_lease(&lease_key);
+
+    let other_workspace = tempdir().expect("second workspace");
+    std::fs::write(other_workspace.path().join("context.txt"), "other context").unwrap();
+    let other =
+        read_bounded_resident_context(&ToolContext::new(other_workspace.path()), "context.txt")
+            .expect("same relative path in another workspace");
+    assert_ne!(resident.lease_key, other.lease_key);
+    reserve_resident_lease(&resident.lease_key, &resident.display_path)
+        .expect("first workspace lease");
+    reserve_resident_lease(&other.lease_key, &other.display_path)
+        .expect("unrelated workspace must not falsely collide");
+    rollback_pending_resident_lease(&resident.lease_key);
+    rollback_pending_resident_lease(&other.lease_key);
+}
+
+#[cfg(unix)]
+#[test]
+fn resident_file_context_rejects_symlink_aliases() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempdir().expect("tempdir");
+    std::fs::write(tmp.path().join("target.txt"), "secret alias").unwrap();
+    symlink("target.txt", tmp.path().join("alias.txt")).unwrap();
+    let error = read_bounded_resident_context(&ToolContext::new(tmp.path()), "alias.txt")
+        .expect_err("resident context must not traverse symlinks")
+        .to_string();
+    assert!(error.contains("must not traverse symlinks"), "{error}");
 }
 
 #[test]
@@ -1215,8 +2385,8 @@ fn test_parse_spawn_request_accepts_message_and_agent_type_aliases() {
     });
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
     assert_eq!(parsed.prompt, "Find references to Foo");
-    assert_eq!(parsed.agent_type, SubAgentType::Explore);
-    assert_eq!(parsed.assignment.role.as_deref(), Some("explorer"));
+    assert_eq!(parsed.agent_type, FleetRole::Scout);
+    assert_eq!(parsed.assignment.role.as_deref(), Some("scout"));
 }
 
 #[test]
@@ -1227,8 +2397,8 @@ fn test_parse_spawn_request_accepts_objective_and_role_alias() {
     });
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
     assert_eq!(parsed.prompt, "Coordinate and wait");
-    assert_eq!(parsed.agent_type, SubAgentType::Plan);
-    assert_eq!(parsed.assignment.role.as_deref(), Some("awaiter"));
+    assert_eq!(parsed.agent_type, FleetRole::Planner);
+    assert_eq!(parsed.assignment.role.as_deref(), Some("planner"));
 }
 
 #[test]
@@ -1243,7 +2413,7 @@ fn test_parse_spawn_request_accepts_items_payload() {
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
     assert!(parsed.prompt.contains("Analyze module"));
     assert!(parsed.prompt.contains("[mention:$drive](app://drive)"));
-    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.agent_type, FleetRole::Scout);
 }
 
 #[test]
@@ -1276,7 +2446,7 @@ fn test_parse_spawn_request_accepts_model_strength() {
         "model_strength": "faster"
     });
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
-    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.agent_type, FleetRole::Scout);
     assert_eq!(parsed.model_strength, SubAgentModelStrength::Faster);
 
     let input = json!({
@@ -1296,7 +2466,7 @@ fn explore_subagent_inherits_active_model_by_default() {
         "type": "explore"
     });
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
-    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.agent_type, FleetRole::Scout);
     assert_eq!(parsed.model_strength, SubAgentModelStrength::Same);
 
     // Explicit model_strength: "same" wins for explore too.
@@ -1306,7 +2476,7 @@ fn explore_subagent_inherits_active_model_by_default() {
         "model_strength": "same"
     });
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
-    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.agent_type, FleetRole::Scout);
     assert_eq!(parsed.model_strength, SubAgentModelStrength::Same);
 
     // An explicit model pins the child (downstream Fixed route) and disables
@@ -1317,7 +2487,7 @@ fn explore_subagent_inherits_active_model_by_default() {
         "model": "GLM-5.2"
     });
     let parsed = parse_spawn_request(&input).expect("spawn request should parse");
-    assert_eq!(parsed.agent_type, SubAgentType::Explore);
+    assert_eq!(parsed.agent_type, FleetRole::Scout);
     assert_eq!(parsed.model_strength, SubAgentModelStrength::Same);
 }
 
@@ -1325,10 +2495,13 @@ fn explore_subagent_inherits_active_model_by_default() {
 fn non_explore_subagents_keep_default_same_model_strength() {
     // Non-explore roles keep the conservative Same default even with no model.
     for role in ["general", "plan", "review", "implementer"] {
-        let input = json!({
+        let mut input = json!({
             "prompt": "do some work",
             "type": role
         });
+        if matches!(role, "general" | "implementer") {
+            input["write_roots"] = json!(["."]);
+        }
         let parsed = parse_spawn_request(&input).expect("spawn request should parse");
         assert_eq!(
             parsed.model_strength,
@@ -1529,11 +2702,11 @@ fn test_apply_spawn_profile_rejects_conflicting_explicit_type() {
     let err = apply_spawn_profile(&mut request, &roster).expect_err("type conflict should fail");
     let message = err.to_string();
     assert!(
-        message.contains("profile 'reviewer' implies type review"),
+        message.contains("profile 'reviewer' implies type reviewer"),
         "{message}"
     );
     assert!(
-        message.contains("conflicting explicit type 'implementer'"),
+        message.contains("conflicting explicit type 'builder'"),
         "{message}"
     );
 }
@@ -1551,7 +2724,7 @@ fn test_apply_spawn_profile_accepts_agreeing_explicit_type() {
         .expect("agreeing type should pass")
         .expect("member resolved");
     assert_eq!(member.id, "reviewer");
-    assert_eq!(request.agent_type, SubAgentType::Review);
+    assert_eq!(request.agent_type, FleetRole::Reviewer);
     assert_eq!(request.assignment.role.as_deref(), Some("reviewer"));
 }
 
@@ -1563,7 +2736,7 @@ fn test_apply_spawn_profile_scout_yields_explore_type_and_inherits_route() {
     let member = apply_spawn_profile(&mut request, &roster)
         .expect("scout should resolve")
         .expect("member resolved");
-    assert_eq!(request.agent_type, SubAgentType::Explore);
+    assert_eq!(request.agent_type, FleetRole::Scout);
     let selected = resolve_spawn_model_selection(&stub_runtime(), &request, Some(&member))
         .expect("scout model selection");
     assert_eq!(
@@ -1581,7 +2754,7 @@ fn test_apply_spawn_profile_synthesizer_yields_plan_type() {
         parse_spawn_request(&json!({"prompt": "merge findings", "profile": "synthesizer"}))
             .expect("parse");
     apply_spawn_profile(&mut request, &roster).expect("synthesizer should resolve");
-    assert_eq!(request.agent_type, SubAgentType::Plan);
+    assert_eq!(request.agent_type, FleetRole::Planner);
 }
 
 #[test]
@@ -1880,127 +3053,6 @@ fn test_delegate_defaults_to_fork_context() {
 }
 
 #[test]
-fn auto_fork_context_default_forks_only_same_route_read_only_engine_children() {
-    let mut runtime = stub_runtime();
-    let provider = runtime.client.api_provider();
-    let model = runtime.model.clone();
-
-    // No captured parent snapshot: never auto-fork.
-    assert!(!auto_fork_context_default(
-        &SubAgentType::Explore,
-        None,
-        false,
-        false,
-        &runtime,
-        provider,
-        &model
-    ));
-
-    runtime.fork_context = Some(SubAgentForkContext {
-        messages: Vec::new(),
-        structured_state_block: None,
-    });
-
-    // Read-only postures on the parent route in the parent workspace fork.
-    for agent_type in [
-        SubAgentType::Explore,
-        SubAgentType::Plan,
-        SubAgentType::Review,
-        SubAgentType::Verifier,
-    ] {
-        assert!(
-            auto_fork_context_default(&agent_type, None, false, false, &runtime, provider, &model),
-            "{agent_type:?} should auto-fork"
-        );
-    }
-    // Explicit read_only authority upgrades a General child.
-    assert!(auto_fork_context_default(
-        &SubAgentType::General,
-        Some(SpawnWriteAuthority::ReadOnly),
-        false,
-        false,
-        &runtime,
-        provider,
-        &model
-    ));
-    // Write-capable children stay fresh.
-    for agent_type in [SubAgentType::General, SubAgentType::Implementer] {
-        assert!(
-            !auto_fork_context_default(&agent_type, None, false, false, &runtime, provider, &model),
-            "{agent_type:?} must stay fresh"
-        );
-    }
-    // Worktree or cwd isolation stays fresh.
-    assert!(!auto_fork_context_default(
-        &SubAgentType::Explore,
-        None,
-        true,
-        false,
-        &runtime,
-        provider,
-        &model
-    ));
-    assert!(!auto_fork_context_default(
-        &SubAgentType::Explore,
-        None,
-        false,
-        true,
-        &runtime,
-        provider,
-        &model
-    ));
-    // A different model route pays a cold prefill of the parent context.
-    assert!(!auto_fork_context_default(
-        &SubAgentType::Explore,
-        None,
-        false,
-        false,
-        &runtime,
-        provider,
-        "some-other-model"
-    ));
-    // A huge parent prefix stays fresh: cached fork reads on every child
-    // step would cost more than a fresh brief.
-    let huge_text = "token ".repeat(400_000);
-    runtime.fork_context = Some(SubAgentForkContext {
-        messages: vec![crate::models::Message {
-            role: "user".to_string(),
-            content: vec![crate::models::ContentBlock::Text {
-                text: huge_text,
-                cache_control: None,
-            }],
-        }],
-        structured_state_block: None,
-    });
-    assert!(!auto_fork_context_default(
-        &SubAgentType::Explore,
-        None,
-        false,
-        false,
-        &runtime,
-        provider,
-        &model
-    ));
-    runtime.fork_context = Some(SubAgentForkContext {
-        messages: Vec::new(),
-        structured_state_block: None,
-    });
-
-    // Nested spawners stay fresh — their snapshot is the root prefix, not
-    // their own conversation.
-    runtime.parent_agent_id = Some("agent_parent".to_string());
-    assert!(!auto_fork_context_default(
-        &SubAgentType::Explore,
-        None,
-        false,
-        false,
-        &runtime,
-        provider,
-        &model
-    ));
-}
-
-#[test]
 fn spawn_request_parses_token_budget_override() {
     let parsed = parse_spawn_request(&json!({
         "prompt": "fan out safely",
@@ -2045,7 +3097,7 @@ fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
     let messages = build_initial_subagent_messages(
         "inspect parser",
         &assignment,
-        &SubAgentType::General,
+        &FleetRole::Worker,
         Some(&fork_context),
     );
 
@@ -2067,7 +3119,7 @@ fn forked_subagent_messages_preserve_parent_prefix_then_append_task() {
 fn fresh_subagent_messages_keep_existing_single_turn_shape() {
     let assignment = SubAgentAssignment::new("list files".to_string(), None);
     let messages =
-        build_initial_subagent_messages("list files", &assignment, &SubAgentType::Explore, None);
+        build_initial_subagent_messages("list files", &assignment, &FleetRole::Scout, None);
 
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].role, "user");
@@ -2105,7 +3157,7 @@ fn test_parse_spawn_request_accepts_fleet_role_token_for_runtime_resolution() {
         "role": "release_lead"
     });
     let parsed = parse_spawn_request(&input).expect("fleet role token should parse");
-    assert_eq!(parsed.agent_type, SubAgentType::General);
+    assert_eq!(parsed.agent_type, FleetRole::Worker);
     assert!(!parsed.agent_type_explicit);
     assert_eq!(parsed.assignment.role.as_deref(), Some("release_lead"));
     assert_eq!(parsed.profile.as_deref(), Some("release_lead"));
@@ -2118,50 +3170,52 @@ fn test_parse_spawn_request_accepts_fleet_role_token_for_runtime_resolution() {
     assert_eq!(member.id, "manager");
     assert_eq!(parsed.profile.as_deref(), Some("manager"));
 
-    let mut scout =
-        parse_spawn_request(&json!({"prompt": "map it", "role": "scout"})).expect("scout");
-    let member = apply_spawn_profile(&mut scout, &roster)
-        .expect("scout should resolve")
-        .expect("scout should select a roster member");
-    assert_eq!(member.id, "scout");
-    assert_eq!(scout.agent_type, SubAgentType::Explore);
+    let mut scout = parse_spawn_request(&json!({"prompt": "map it", "role": "scout"}))
+        .expect("canonical scout role");
+    let member = apply_spawn_profile(&mut scout, &roster).expect("scout should resolve");
+    assert!(
+        member.is_none(),
+        "a role posture should not silently select a roster profile; use profile=scout"
+    );
+    assert_eq!(scout.agent_type, FleetRole::Scout);
 }
 
 #[test]
 fn test_parse_spawn_request_accepts_full_role_vocabulary() {
-    // Regression for #2649: roles that `SubAgentType::from_str` accepts must
+    // Regression for #2649: roles that `FleetRole::from_str` accepts must
     // also pass the second `normalize_role_alias` validation pass instead of
     // being rejected with a stale hint.
     for (role, expected_type, expected_role) in [
-        ("general", SubAgentType::General, "worker"),
-        ("general-purpose", SubAgentType::General, "worker"),
-        ("general_purpose", SubAgentType::General, "worker"),
-        ("worker", SubAgentType::General, "worker"),
-        ("default", SubAgentType::General, "default"),
-        ("explore", SubAgentType::Explore, "explorer"),
-        ("exploration", SubAgentType::Explore, "explorer"),
-        ("explorer", SubAgentType::Explore, "explorer"),
-        ("plan", SubAgentType::Plan, "awaiter"),
-        ("planning", SubAgentType::Plan, "awaiter"),
-        ("planner", SubAgentType::Plan, "awaiter"),
-        ("awaiter", SubAgentType::Plan, "awaiter"),
-        ("review", SubAgentType::Review, "reviewer"),
-        ("code-review", SubAgentType::Review, "reviewer"),
-        ("code_review", SubAgentType::Review, "reviewer"),
-        ("reviewer", SubAgentType::Review, "reviewer"),
-        ("implementer", SubAgentType::Implementer, "implementer"),
-        ("implement", SubAgentType::Implementer, "implementer"),
-        ("implementation", SubAgentType::Implementer, "implementer"),
-        ("builder", SubAgentType::Implementer, "implementer"),
-        ("verifier", SubAgentType::Verifier, "verifier"),
-        ("verify", SubAgentType::Verifier, "verifier"),
-        ("verification", SubAgentType::Verifier, "verifier"),
-        ("validator", SubAgentType::Verifier, "verifier"),
-        ("tester", SubAgentType::Verifier, "verifier"),
-        ("custom", SubAgentType::Custom, "custom"),
+        ("general", FleetRole::Worker, "worker"),
+        ("general-purpose", FleetRole::Worker, "worker"),
+        ("general_purpose", FleetRole::Worker, "worker"),
+        ("worker", FleetRole::Worker, "worker"),
+        ("default", FleetRole::Worker, "default"),
+        ("scout", FleetRole::Scout, "scout"),
+        ("explore", FleetRole::Scout, "scout"),
+        ("exploration", FleetRole::Scout, "scout"),
+        ("explorer", FleetRole::Scout, "scout"),
+        ("plan", FleetRole::Planner, "planner"),
+        ("planning", FleetRole::Planner, "planner"),
+        ("planner", FleetRole::Planner, "planner"),
+        ("awaiter", FleetRole::Planner, "planner"),
+        ("review", FleetRole::Reviewer, "reviewer"),
+        ("code-review", FleetRole::Reviewer, "reviewer"),
+        ("code_review", FleetRole::Reviewer, "reviewer"),
+        ("reviewer", FleetRole::Reviewer, "reviewer"),
+        ("implementer", FleetRole::Builder, "builder"),
+        ("implement", FleetRole::Builder, "builder"),
+        ("implementation", FleetRole::Builder, "builder"),
+        ("builder", FleetRole::Builder, "builder"),
+        ("verifier", FleetRole::Verifier, "verifier"),
+        ("verify", FleetRole::Verifier, "verifier"),
+        ("verification", FleetRole::Verifier, "verifier"),
+        ("validator", FleetRole::Verifier, "verifier"),
+        ("tester", FleetRole::Verifier, "verifier"),
+        ("custom", FleetRole::Custom, "custom"),
     ] {
         assert_eq!(
-            SubAgentType::from_str(role),
+            FleetRole::from_str(role),
             Some(expected_type.clone()),
             "from_str should accept role alias {role:?}"
         );
@@ -2171,7 +3225,13 @@ fn test_parse_spawn_request_accepts_full_role_vocabulary() {
             "normalize_role_alias should accept role alias {role:?}"
         );
 
-        let input = json!({ "prompt": "do work", "role": role });
+        let mut input = json!({ "prompt": "do work", "role": role });
+        if matches!(&expected_type, FleetRole::Worker | FleetRole::Builder) {
+            input["write_roots"] = json!(["."]);
+        } else if expected_type == FleetRole::Custom {
+            input["write_authority"] = json!("workspace_write");
+            input["write_roots"] = json!(["."]);
+        }
         let mut parsed = parse_spawn_request(&input)
             .unwrap_or_else(|e| panic!("role {role:?} should parse, got {e}"));
         assert_eq!(parsed.agent_type, expected_type, "type for role {role:?}");
@@ -2198,7 +3258,11 @@ fn test_invalid_role_error_lists_real_aliases() {
     // Well-formed fleet role tokens parse and then fail clearly at roster
     // resolution time with both real roster members and type aliases (#4177).
     let roster = FleetRoster::built_ins_only();
-    let input = json!({ "prompt": "do work", "role": "nonsense" });
+    let input = json!({
+        "prompt": "do work",
+        "role": "nonsense",
+        "write_roots": ["."]
+    });
     let mut request = parse_spawn_request(&input).expect("fleet role token should parse");
     let err = apply_spawn_profile(&mut request, &roster)
         .expect_err("unknown fleet role should fail at runtime resolution")
@@ -2211,13 +3275,10 @@ fn test_invalid_role_error_lists_real_aliases() {
     assert!(err.contains("reviewer"), "hint should list reviewer: {err}");
     assert!(err.contains("verifier"), "hint should list verifier: {err}");
     assert!(err.contains("custom"), "hint should list custom: {err}");
+    assert!(err.contains("worker"), "hint should list worker: {err}");
     assert!(
-        err.contains("general-purpose"),
-        "hint should list general-purpose: {err}"
-    );
-    assert!(
-        err.contains("code_review"),
-        "hint should list code_review: {err}"
+        err.contains("legacy aliases remain accepted"),
+        "hint should explain compatibility aliases: {err}"
     );
 }
 
@@ -2235,13 +3296,7 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
 
     let description = schema_property_description(&agent_schema, "type");
     for alias in [
-        "general",
-        "explore",
-        "plan",
-        "review",
-        "implementer",
-        "verifier",
-        "custom",
+        "worker", "scout", "planner", "reviewer", "builder", "verifier", "custom",
     ] {
         assert!(
             description.contains(alias),
@@ -2276,13 +3331,104 @@ fn subagent_tool_schemas_advertise_real_type_and_role_vocabulary() {
 }
 
 #[test]
+fn agent_tool_role_schema_is_a_closed_canonical_enum() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 1);
+    let agent_schema = AgentTool::new(manager, stub_runtime()).input_schema();
+
+    // Exact canonical values, exact order. New models are told the closed
+    // Fleet vocabulary and nothing else.
+    let expected = json!([
+        "worker", "scout", "planner", "reviewer", "builder", "verifier", "custom"
+    ]);
+    assert_eq!(
+        agent_schema["properties"]["type"]["enum"], expected,
+        "model-facing role schema must advertise exactly the canonical Fleet enum"
+    );
+
+    // The description teaches each canonical role and never advertises
+    // legacy aliases; those stay at replay/deserialization boundaries.
+    let description = schema_property_description(&agent_schema, "type");
+    assert!(
+        description.starts_with("Fleet role for this delegated worker."),
+        "type description should lead with the Fleet role contract: {description}"
+    );
+    let lowered = description.to_ascii_lowercase();
+    for legacy in [
+        "general",
+        "explore",
+        "implementer",
+        "awaiter",
+        "legacy",
+        "alias",
+    ] {
+        assert!(
+            !lowered.contains(legacy),
+            "type description must not advertise legacy vocabulary {legacy:?}: {description}"
+        );
+    }
+}
+
+#[test]
+fn provider_schema_sanitizers_preserve_the_closed_fleet_role_enum() {
+    use crate::tools::schema_sanitize;
+
+    let tmp = tempdir().expect("tempdir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 1);
+    let agent_schema = AgentTool::new(manager, stub_runtime()).input_schema();
+    let expected = json!([
+        "worker", "scout", "planner", "reviewer", "builder", "verifier", "custom"
+    ]);
+
+    // Generic Chat Completions sanitize pass.
+    let mut plain = agent_schema.clone();
+    schema_sanitize::sanitize(&mut plain);
+    assert_eq!(
+        plain["properties"]["type"]["enum"], expected,
+        "chat completions sanitize must not erase or widen the role enum"
+    );
+
+    // Strict-mode structured outputs pass.
+    let mut strict = agent_schema.clone();
+    schema_sanitize::sanitize_for_strict(&mut strict);
+    assert_eq!(
+        strict["properties"]["type"]["enum"], expected,
+        "strict-mode sanitize must not erase or widen the role enum"
+    );
+
+    // Anthropic Messages and OpenAI Responses (and xAI, an alias of the
+    // Responses pass) share sanitize_for_responses; it strips root-level
+    // enum keywords only and must keep this nested property enum intact.
+    let mut responses = agent_schema.clone();
+    let note = schema_sanitize::sanitize_for_responses(&mut responses);
+    assert!(
+        note.is_none(),
+        "agent schema has no root composition to drop"
+    );
+    assert_eq!(
+        responses["properties"]["type"]["enum"], expected,
+        "responses/anthropic sanitize must not erase or widen the role enum"
+    );
+
+    // Moonshot/Kimi validating sanitizer must accept the schema unchanged.
+    let mut kimi = agent_schema.clone();
+    schema_sanitize::sanitize_for_kimi_parameters(&mut kimi)
+        .expect("agent schema must stay Kimi-compatible");
+    assert_eq!(
+        kimi["properties"]["type"]["enum"], expected,
+        "kimi sanitize must not erase or widen the role enum"
+    );
+}
+
+#[test]
 fn agent_tool_prompt_schema_keeps_ordinary_starts_message_first() {
     let tmp = tempdir().expect("tempdir");
     let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 1);
     let agent_schema = AgentTool::new(manager, stub_runtime()).input_schema();
     let prompt = schema_property_description(&agent_schema, "prompt");
     assert!(prompt.contains("focused task"));
-    assert!(prompt.contains("only field needed"));
+    assert!(prompt.contains("read-only role needs no write scope"));
+    assert!(prompt.contains("write-capable role must also declare a bounded write scope"));
     for ceremony in [
         "Subagent Brief",
         "QUESTION",
@@ -2320,7 +3466,7 @@ async fn agent_tool_status_returns_running_child_projection() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "probe".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -2335,8 +3481,13 @@ async fn agent_tool_status_returns_running_child_projection() {
         let mut manager_guard = manager.write().await;
         manager_guard.agents.insert(agent_id.clone(), agent);
         manager_guard.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
-        manager_guard
-            .record_worker_progress(&agent_id, "step 1: requesting model response".to_string());
+        manager_guard.record_worker_event(
+            &agent_id,
+            AgentWorkerStatus::ModelWait,
+            Some("step 1: requesting model response".to_string()),
+            Some(1),
+            None,
+        );
     }
 
     let tool = AgentTool::new(Arc::clone(&manager), stub_runtime());
@@ -2363,7 +3514,7 @@ async fn agent_tool_status_reconciles_stale_single_agent_projection() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "probe stale single status".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -2413,7 +3564,7 @@ async fn agent_tool_cancel_stops_running_child() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "cancel".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -2480,7 +3631,7 @@ async fn model_wait_cancel_fans_in_once_and_preserves_checkpoint() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "cancel while waiting on provider".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -2579,7 +3730,7 @@ async fn coordination_interrupt_fans_in_once_and_preserves_checkpoint() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "interrupt with a recoverable checkpoint".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -2606,7 +3757,10 @@ async fn coordination_interrupt_fans_in_once_and_preserves_checkpoint() {
     runtime.event_tx = Some(event_tx);
     agent.terminal_delivery = Some(SubAgentTerminalDeliveryContext::from_runtime(&runtime));
     manager.agents.insert(agent_id.clone(), agent);
-    manager.register_worker(make_worker_spec(&agent_id, tmp.path().to_path_buf()));
+    manager.register_worker(make_worker_spec("agent_parent", tmp.path().to_path_buf()));
+    let mut child_spec = make_worker_spec(&agent_id, tmp.path().to_path_buf());
+    child_spec.parent_run_id = Some("agent_parent".to_string());
+    manager.register_worker(child_spec);
     manager.record_worker_event(
         &agent_id,
         AgentWorkerStatus::RunningTool,
@@ -2695,7 +3849,7 @@ async fn late_completion_does_not_overwrite_cancelled_outcome() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "race".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -2747,7 +3901,7 @@ async fn completion_claim_preserves_running_gate_and_excludes_late_cancel() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "claim".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -2825,7 +3979,7 @@ fn test_parse_spawn_request_rejects_conflicting_type_and_role() {
     let err = parse_spawn_request(&input).expect_err("conflicting type+role should fail");
     assert!(
         err.to_string()
-            .contains("Conflicting type/agent_type and role/agent_role")
+            .contains("Fleet role conflicts with the explicit legacy agent type")
     );
 }
 
@@ -2835,8 +3989,8 @@ fn test_build_allowed_tools_independent_of_allow_shell() {
     // level — the registry builder controls shell-tool registration.
     // Both calls return None (full inheritance) for a default General
     // agent.
-    let with_shell = build_allowed_tools(&SubAgentType::General, None, true).unwrap();
-    let without_shell = build_allowed_tools(&SubAgentType::General, None, false).unwrap();
+    let with_shell = build_allowed_tools(&FleetRole::Worker, None, true).unwrap();
+    let without_shell = build_allowed_tools(&FleetRole::Worker, None, false).unwrap();
     assert!(with_shell.is_none());
     assert!(without_shell.is_none());
 }
@@ -2844,7 +3998,7 @@ fn test_build_allowed_tools_independent_of_allow_shell() {
 #[test]
 fn test_allowed_tools_are_deduplicated() {
     let tools = build_allowed_tools(
-        &SubAgentType::Custom,
+        &FleetRole::Custom,
         Some(vec![
             "read_file".to_string(),
             "read_file".to_string(),
@@ -2862,7 +4016,7 @@ fn test_allowed_tools_are_deduplicated() {
 
 #[test]
 fn test_custom_agent_requires_allowed_tools() {
-    let err = build_allowed_tools(&SubAgentType::Custom, None, true).unwrap_err();
+    let err = build_allowed_tools(&FleetRole::Custom, None, true).unwrap_err();
     assert!(err.to_string().contains("requires"));
 }
 
@@ -2871,10 +4025,10 @@ fn role_posture_blocks_writes_and_shell_for_read_only_roles() {
     // #3217: read-only roles may never run write/edit/patch tools, regardless
     // of parent auto-approval, but can always read.
     for role in [
-        SubAgentType::Explore,
-        SubAgentType::Review,
-        SubAgentType::Plan,
-        SubAgentType::Verifier,
+        FleetRole::Scout,
+        FleetRole::Reviewer,
+        FleetRole::Planner,
+        FleetRole::Verifier,
     ] {
         assert!(
             !role_posture_permits(&role, ApprovalRequirement::Suggest),
@@ -2887,7 +4041,7 @@ fn role_posture_blocks_writes_and_shell_for_read_only_roles() {
     }
 
     // Write-capable roles keep write access.
-    for role in [SubAgentType::Implementer, SubAgentType::General] {
+    for role in [FleetRole::Builder, FleetRole::Worker] {
         assert!(
             role_posture_permits(&role, ApprovalRequirement::Suggest),
             "{role:?} writes"
@@ -2895,35 +4049,27 @@ fn role_posture_blocks_writes_and_shell_for_read_only_roles() {
     }
 
     // Only Full-shell roles may run shell (Required) tools.
-    for role in [
-        SubAgentType::Verifier,
-        SubAgentType::Implementer,
-        SubAgentType::General,
-    ] {
+    for role in [FleetRole::Verifier, FleetRole::Builder, FleetRole::Worker] {
         assert!(
             role_posture_permits(&role, ApprovalRequirement::Required),
             "{role:?} has full shell"
         );
     }
-    for role in [
-        SubAgentType::Plan,
-        SubAgentType::Explore,
-        SubAgentType::Review,
-    ] {
+    for role in [FleetRole::Planner, FleetRole::Scout, FleetRole::Reviewer] {
         assert!(
             !role_posture_permits(&role, ApprovalRequirement::Required),
             "{role:?} must not run shell tools"
         );
     }
 
-    // Custom is governed by its explicit allowed_tools list, so the posture
-    // check permits it (the allowlist is the authority for that role).
+    // Custom passes the role-only check; its explicit allowlist, bounded write
+    // authority, and parent-intersected runtime profile are enforced together.
     assert!(role_posture_permits(
-        &SubAgentType::Custom,
+        &FleetRole::Custom,
         ApprovalRequirement::Suggest
     ));
     assert!(role_posture_permits(
-        &SubAgentType::Custom,
+        &FleetRole::Custom,
         ApprovalRequirement::Required
     ));
 }
@@ -2934,14 +4080,10 @@ fn test_build_assignment_prompt_includes_metadata() {
         "Inspect parser behavior".to_string(),
         Some("explorer".to_string()),
     );
-    let prompt = build_assignment_prompt(
-        "Inspect parser behavior",
-        &assignment,
-        &SubAgentType::Explore,
-    );
+    let prompt = build_assignment_prompt("Inspect parser behavior", &assignment, &FleetRole::Scout);
     assert!(prompt.contains("Assignment metadata"));
-    assert!(prompt.contains("resolved_type: explore"));
-    assert!(prompt.contains("role: explorer"));
+    assert!(prompt.contains("resolved_type: scout"));
+    assert!(prompt.contains("role: scout"));
 }
 
 #[test]
@@ -3036,7 +4178,7 @@ async fn route_resolution_matrix_uses_explicit_model_strength_routes() {
     runtime.model = "deepseek-v4-pro".to_string();
 
     struct RouteCase {
-        agent_type: SubAgentType,
+        agent_type: FleetRole,
         configured_model: Option<&'static str>,
         requested_route: ModelRoute,
         prompt: &'static str,
@@ -3048,7 +4190,7 @@ async fn route_resolution_matrix_uses_explicit_model_strength_routes() {
 
     let cases = vec![
         RouteCase {
-            agent_type: SubAgentType::Explore,
+            agent_type: FleetRole::Scout,
             configured_model: None,
             requested_route: ModelRoute::Inherit,
             prompt: "inspect the parser and report what changed",
@@ -3058,7 +4200,7 @@ async fn route_resolution_matrix_uses_explicit_model_strength_routes() {
             expected_tuning_effort: Some(ReasoningEffort::Max),
         },
         RouteCase {
-            agent_type: SubAgentType::Explore,
+            agent_type: FleetRole::Scout,
             configured_model: None,
             requested_route: ModelRoute::Faster,
             prompt: "inspect the parser and report what changed",
@@ -3068,7 +4210,7 @@ async fn route_resolution_matrix_uses_explicit_model_strength_routes() {
             expected_tuning_effort: Some(ReasoningEffort::Off),
         },
         RouteCase {
-            agent_type: SubAgentType::General,
+            agent_type: FleetRole::Worker,
             configured_model: None,
             requested_route: ModelRoute::Inherit,
             prompt: "synthesize the release blocker fix",
@@ -3078,7 +4220,7 @@ async fn route_resolution_matrix_uses_explicit_model_strength_routes() {
             expected_tuning_effort: Some(ReasoningEffort::Max),
         },
         RouteCase {
-            agent_type: SubAgentType::Implementer,
+            agent_type: FleetRole::Builder,
             configured_model: Some("deepseek-v4-flash"),
             requested_route: ModelRoute::Inherit,
             prompt: "apply the narrow code edit",
@@ -3162,7 +4304,7 @@ fn test_subagent_tool_registry_reports_unavailable_tools() {
     runtime.allow_shell = false;
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::Explore,
+        FleetRole::Scout,
         Some(vec![
             "read_file".to_string(),
             "update_goal".to_string(),
@@ -3186,12 +4328,12 @@ fn test_subagent_tools_respect_nested_agent_depth_budget() {
     runtime.max_spawn_depth = 2;
     let registry = SubAgentToolRegistry::new(
         runtime.clone(),
-        SubAgentType::Explore,
+        FleetRole::Scout,
         None,
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
     );
-    let tools = registry.tools_for_model(&SubAgentType::Explore);
+    let tools = registry.tools_for_model(&FleetRole::Scout);
     let names: Vec<_> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(
         names.contains(&"agent"),
@@ -3202,12 +4344,12 @@ fn test_subagent_tools_respect_nested_agent_depth_budget() {
     runtime.spawn_depth = 2;
     let capped = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::Explore,
+        FleetRole::Scout,
         None,
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
     );
-    let capped_tools = capped.tools_for_model(&SubAgentType::Explore);
+    let capped_tools = capped.tools_for_model(&FleetRole::Scout);
     let capped_names: Vec<_> = capped_tools.iter().map(|t| t.name.as_str()).collect();
     assert!(
         !capped_names.contains(&"agent"),
@@ -3240,12 +4382,12 @@ pub(crate) fn kimi_general_child_request_tools_fixture() -> Vec<Tool> {
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::General,
+        FleetRole::Worker,
         None,
         crate::tools::todo::new_shared_todo_list(),
         crate::tools::plan::new_shared_plan_state(),
     );
-    let tools = registry.tools_for_model(&SubAgentType::General);
+    let tools = registry.tools_for_model(&FleetRole::Worker);
     let names = tools
         .iter()
         .map(|tool| tool.name.as_str())
@@ -3284,10 +4426,10 @@ fn subagent_general_catalog_keeps_parent_surface_except_root_goal_mutators() {
         )
         .build(runtime.context.clone());
     let child_registry =
-        SubAgentToolRegistry::new(runtime, SubAgentType::General, None, todo_list, plan_state);
+        SubAgentToolRegistry::new(runtime, FleetRole::Worker, None, todo_list, plan_state);
 
     let parent_names = tool_names(parent_registry.to_api_tools());
-    let child_names = tool_names(child_registry.tools_for_model(&SubAgentType::General));
+    let child_names = tool_names(child_registry.tools_for_model(&FleetRole::Worker));
     let expected_child_names = parent_names
         .iter()
         .filter(|name| !matches!(name.as_str(), "create_goal" | "update_goal"))
@@ -3325,16 +4467,11 @@ fn subagent_feature_gates_match_parent_agent_surface() {
             plan_state.clone(),
         )
         .build(runtime.context.clone());
-    let child_registry = SubAgentToolRegistry::new(
-        runtime,
-        SubAgentType::Implementer,
-        None,
-        todo_list,
-        plan_state,
-    );
+    let child_registry =
+        SubAgentToolRegistry::new(runtime, FleetRole::Builder, None, todo_list, plan_state);
 
     let parent_names = tool_names(parent_registry.to_api_tools());
-    let child_names = tool_names(child_registry.tools_for_model(&SubAgentType::Implementer));
+    let child_names = tool_names(child_registry.tools_for_model(&FleetRole::Builder));
     for name in [
         "apply_patch",
         "web_search",
@@ -3360,17 +4497,20 @@ fn explore_catalog_inherits_web_but_hides_write_shell_and_fim_tools() {
     runtime.context.auto_approve = true;
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::Explore,
+        FleetRole::Scout,
         None,
         crate::tools::todo::new_shared_todo_list(),
         crate::tools::plan::new_shared_plan_state(),
     );
 
-    let names = tool_names(registry.tools_for_model(&SubAgentType::Explore));
-    for name in ["web_search", "fetch_url", "web.run", "wait_for_dev_server"] {
+    let tools = registry.tools_for_model(&FleetRole::Scout);
+    let names = tool_names(tools.clone());
+    for name in ["File", "Git", "Web", "web.run"] {
         assert!(names.contains(name), "Explore should inherit {name}");
     }
     for name in [
+        "Bash",
+        "Run",
         "write_file",
         "edit_file",
         "apply_patch",
@@ -3380,6 +4520,11 @@ fn explore_catalog_inherits_web_but_hides_write_shell_and_fim_tools() {
     ] {
         assert!(!names.contains(name), "Explore must hide {name}");
     }
+    let file = tools.iter().find(|tool| tool.name == "File").unwrap();
+    assert_eq!(
+        file.input_schema["properties"]["action"]["enum"],
+        json!(["read", "list", "search_name", "search_content"])
+    );
 }
 
 #[test]
@@ -3390,19 +4535,158 @@ fn implementer_catalog_inherits_patch_and_fim_when_enabled() {
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::Implementer,
+        FleetRole::Builder,
         None,
         crate::tools::todo::new_shared_todo_list(),
         crate::tools::plan::new_shared_plan_state(),
     );
 
-    let names = tool_names(registry.tools_for_model(&SubAgentType::Implementer));
-    for name in ["apply_patch", "fim_edit", "write_file", "edit_file"] {
+    let tools = registry.tools_for_model(&FleetRole::Builder);
+    let names = tool_names(tools.clone());
+    for name in ["File", "fim_edit"] {
         assert!(
             names.contains(name),
             "Implementer should inherit write-capable tool {name}"
         );
     }
+    let file = tools.iter().find(|tool| tool.name == "File").unwrap();
+    let actions = file.input_schema["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap();
+    for action in ["write", "edit", "patch"] {
+        assert!(actions.iter().any(|value| value.as_str() == Some(action)));
+    }
+}
+
+#[test]
+fn every_fleet_role_catalog_advertises_one_executable_load_skill() {
+    // load_skill contract (#4651): the parent Agent surface and every
+    // default Fleet role child keep first-class skill listing/loading, and
+    // read-only roles get it without gaining write or shell authority.
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.context.auto_approve = true;
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+
+    let parent_registry = ToolRegistryBuilder::new()
+        .with_full_agent_surface_options(
+            Some(runtime.client.clone()),
+            runtime.model.clone(),
+            runtime.manager.clone(),
+            runtime.clone(),
+            runtime.agent_tool_surface_options.clone(),
+            todo_list.clone(),
+            plan_state.clone(),
+        )
+        .build(runtime.context.clone());
+    let parent_load_skills = parent_registry
+        .to_api_tools()
+        .into_iter()
+        .filter(|tool| tool.name == "load_skill")
+        .count();
+    assert_eq!(
+        parent_load_skills, 1,
+        "parent agent surface advertises exactly one load_skill"
+    );
+
+    for role in [
+        FleetRole::Worker,
+        FleetRole::Scout,
+        FleetRole::Planner,
+        FleetRole::Reviewer,
+        FleetRole::Builder,
+        FleetRole::Verifier,
+    ] {
+        let registry = SubAgentToolRegistry::new(
+            runtime.clone(),
+            role.clone(),
+            None,
+            todo_list.clone(),
+            plan_state.clone(),
+        );
+        let tools = registry.tools_for_model(&role);
+        let load_skills = tools
+            .iter()
+            .filter(|tool| tool.name == "load_skill")
+            .count();
+        assert_eq!(
+            load_skills, 1,
+            "Fleet role {role:?} must advertise exactly one load_skill"
+        );
+        assert!(
+            registry.is_tool_allowed("load_skill"),
+            "Fleet role {role:?} must be able to execute the advertised load_skill"
+        );
+
+        if matches!(
+            role,
+            FleetRole::Scout | FleetRole::Planner | FleetRole::Reviewer | FleetRole::Verifier
+        ) {
+            let names = tool_names(tools);
+            // All read-only roles keep load_skill without write authority.
+            for denied in ["write_file", "edit_file", "apply_patch", "fim_edit"] {
+                assert!(
+                    !names.contains(denied),
+                    "read-only role {role:?} keeps load_skill without gaining {denied}"
+                );
+            }
+            // Verifier intentionally keeps shell (it runs the test suite);
+            // the other read-only roles must not gain arbitrary shell.
+            if !matches!(role, FleetRole::Verifier) {
+                for denied in ["exec_shell", "task_shell_start", "Bash", "Run"] {
+                    assert!(
+                        !names.contains(denied),
+                        "read-only role {role:?} keeps load_skill without gaining {denied}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn custom_child_allowlist_omitting_load_skill_fails_closed() {
+    // Custom children get exactly their explicit allow-list: load_skill is
+    // never auto-injected, and listing it grants it.
+    let tmp = tempdir().expect("tempdir");
+    let mut runtime =
+        stub_runtime().with_agent_tool_surface_options(enabled_agent_surface_options());
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    let todo_list = crate::tools::todo::new_shared_todo_list();
+    let plan_state = crate::tools::plan::new_shared_plan_state();
+
+    let without = SubAgentToolRegistry::new(
+        runtime.clone(),
+        FleetRole::Custom,
+        Some(vec!["read_file".to_string()]),
+        todo_list.clone(),
+        plan_state.clone(),
+    );
+    let names = tool_names(without.tools_for_model(&FleetRole::Custom));
+    assert!(
+        names.contains("File"),
+        "explicitly listed read_file surfaces as the unified File tool: {names:?}"
+    );
+    assert!(
+        !names.contains("load_skill"),
+        "load_skill must not be auto-injected into a custom allow-list: {names:?}"
+    );
+
+    let with = SubAgentToolRegistry::new(
+        runtime,
+        FleetRole::Custom,
+        Some(vec!["read_file".to_string(), "load_skill".to_string()]),
+        todo_list,
+        plan_state,
+    );
+    let names = tool_names(with.tools_for_model(&FleetRole::Custom));
+    assert!(
+        names.contains("load_skill"),
+        "explicitly listed load_skill is granted: {names:?}"
+    );
 }
 
 #[tokio::test]
@@ -3414,18 +4698,18 @@ async fn plan_parent_profile_narrows_even_implementer_child_to_read_only() {
     runtime.context = ToolContext::new(workspace.clone());
     runtime.context.auto_approve = true;
     runtime.allow_shell = false;
-    runtime.worker_profile = WorkerRuntimeProfile::for_role(SubAgentType::Plan);
+    runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Planner);
     runtime.agent_tool_surface_options.shell_policy = ShellPolicy::None;
 
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::Implementer,
+        FleetRole::Builder,
         None,
         crate::tools::todo::new_shared_todo_list(),
         crate::tools::plan::new_shared_plan_state(),
     );
 
-    let names = tool_names(registry.tools_for_model(&SubAgentType::Implementer));
+    let names = tool_names(registry.tools_for_model(&FleetRole::Builder));
     assert!(names.contains("agent"), "Plan children may still delegate");
     for name in [
         "write_file",
@@ -3467,7 +4751,7 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
     let (task_input_tx, task_input_rx) = mpsc::unbounded_channel();
     let agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "Inspect checkpoint behavior".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -3497,7 +4781,7 @@ async fn api_timeout_preserves_checkpoint_and_returns_needs_input_without_parkin
         manager_handle: Arc::clone(&manager),
         runtime: runtime.clone(),
         agent_id: agent_id.clone(),
-        agent_type: SubAgentType::General,
+        agent_type: FleetRole::Worker,
         prompt: "Inspect checkpoint behavior".to_string(),
         assignment: make_assignment(),
         allowed_tools: Some(vec![]),
@@ -3651,7 +4935,7 @@ async fn subagent_retries_transient_provider_header_timeout_before_succeeding() 
     let (task_input_tx, task_input_rx) = mpsc::unbounded_channel();
     let agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "Inspect transient provider recovery".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -3678,7 +4962,7 @@ async fn subagent_retries_transient_provider_header_timeout_before_succeeding() 
         manager_handle: Arc::clone(&manager),
         runtime,
         agent_id: agent_id.clone(),
-        agent_type: SubAgentType::General,
+        agent_type: FleetRole::Worker,
         prompt: "Inspect transient provider recovery".to_string(),
         assignment: make_assignment(),
         allowed_tools: Some(vec![]),
@@ -3725,7 +5009,7 @@ async fn subagent_rate_limit_exhaustion_interrupts_with_checkpoint() {
     let (task_input_tx, task_input_rx) = mpsc::unbounded_channel();
     let agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "Inspect rate-limit recovery".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -3751,7 +5035,7 @@ async fn subagent_rate_limit_exhaustion_interrupts_with_checkpoint() {
         manager_handle: Arc::clone(&manager),
         runtime,
         agent_id: agent_id.clone(),
-        agent_type: SubAgentType::General,
+        agent_type: FleetRole::Worker,
         prompt: "Inspect rate-limit recovery".to_string(),
         assignment: make_assignment(),
         allowed_tools: Some(vec![]),
@@ -3807,7 +5091,7 @@ async fn spawn_duplicate_session_name_error_names_conflicting_agent() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut existing = SubAgent::new(
         "test_agent_existing".to_string(),
-        SubAgentType::Explore,
+        FleetRole::Scout,
         "scan".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -3831,7 +5115,7 @@ async fn spawn_duplicate_session_name_error_names_conflicting_agent() {
             .spawn_background_with_assignment_options(
                 manager.clone(),
                 stub_runtime(),
-                SubAgentType::Explore,
+                FleetRole::Scout,
                 "new work".to_string(),
                 make_assignment(),
                 Some(vec!["read_file".to_string()]),
@@ -3860,12 +5144,205 @@ async fn spawn_duplicate_session_name_error_names_conflicting_agent() {
 }
 
 #[tokio::test]
+async fn shared_write_claim_is_registered_before_parallel_launch_and_manifested() {
+    let tmp = tempdir().expect("tempdir");
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 4);
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
+    let options = SubAgentSpawnOptions {
+        name: Some("writer-a".into()),
+        write_claim: Some(WriteScopeClaim {
+            owner: String::new(),
+            roots: vec!["src".into()],
+            exact_files: vec![],
+            contracts: vec!["public-api".into()],
+        }),
+        expected_artifact: Some("tested patch".into()),
+        ..Default::default()
+    };
+    let (first_id, contention) = {
+        let mut guard = manager.write().await;
+        let first = guard
+            .spawn_background_with_assignment_options(
+                Arc::clone(&manager),
+                runtime.clone(),
+                FleetRole::Builder,
+                "edit src".into(),
+                make_assignment(),
+                Some(vec![]),
+                options,
+            )
+            .expect("first writer admitted");
+        let second = guard
+            .spawn_background_with_assignment_options(
+                Arc::clone(&manager),
+                runtime,
+                FleetRole::Builder,
+                "edit same contract".into(),
+                make_assignment(),
+                Some(vec![]),
+                SubAgentSpawnOptions {
+                    name: Some("writer-b".into()),
+                    write_claim: Some(WriteScopeClaim {
+                        owner: String::new(),
+                        roots: vec!["docs".into()],
+                        exact_files: vec![],
+                        contracts: vec!["public-api".into()],
+                    }),
+                    ..Default::default()
+                },
+            )
+            .expect_err("overlapping live contract must contend");
+        (first.agent_id, second.to_string())
+    };
+    assert!(
+        contention.contains("contention") && contention.contains(&first_id),
+        "{contention}"
+    );
+    let guard = manager.read().await;
+    let record = guard.get_worker_record(&first_id).expect("worker record");
+    let manifest = record
+        .spec
+        .launch_manifest
+        .as_ref()
+        .expect("launch manifest");
+    assert_eq!(manifest.child_id, first_id);
+    assert_eq!(manifest.writable_roots, vec!["src"]);
+    assert_eq!(manifest.coordination_contracts, vec!["public-api"]);
+    assert_eq!(manifest.expected_artifact.as_deref(), Some("tested patch"));
+}
+
+#[tokio::test]
+async fn write_capable_agent_does_not_launch_when_durable_registration_fails() {
+    let tmp = tempdir().expect("tempdir");
+    let blocked_state_path = tmp.path().join("blocked-state.json");
+    std::fs::create_dir(&blocked_state_path).expect("directory blocks atomic state rename");
+    let manager = Arc::new(RwLock::new(
+        SubAgentManager::new(tmp.path().to_path_buf(), 4)
+            .with_state_path(blocked_state_path.clone()),
+    ));
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
+
+    let error = manager
+        .write()
+        .await
+        .spawn_background_with_assignment_options(
+            Arc::clone(&manager),
+            runtime,
+            FleetRole::Builder,
+            "must never execute".into(),
+            make_assignment(),
+            Some(vec![]),
+            SubAgentSpawnOptions {
+                name: Some("durable-writer".into()),
+                write_claim: Some(WriteScopeClaim {
+                    owner: String::new(),
+                    roots: vec!["src".into()],
+                    exact_files: Vec::new(),
+                    contracts: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        )
+        .expect_err("writer must fail before spawn when its durable claim cannot commit")
+        .to_string();
+    assert!(error.contains("durably register"), "{error}");
+
+    let guard = manager.read().await;
+    assert!(guard.agents.is_empty(), "no child task was admitted");
+    assert!(
+        guard.list_worker_records().is_empty(),
+        "failed durable registration rolls back worker identity"
+    );
+    assert!(
+        guard.coordination_snapshot().write_claims.is_empty(),
+        "failed durable registration rolls back write ownership"
+    );
+    assert!(blocked_state_path.is_dir());
+}
+
+#[tokio::test]
+async fn write_scope_contention_covers_regular_agent_and_active_fleet_writer() {
+    let tmp = tempdir().expect("tempdir");
+    let mut inner = SubAgentManager::new(tmp.path().to_path_buf(), 4);
+    inner
+        .register_worker_with_coordination(make_write_worker_spec(
+            "fleet-writer",
+            tmp.path().to_path_buf(),
+            "src/shared",
+        ))
+        .expect("active Fleet writer claim");
+
+    let regular_id = inner.insert_test_running_agent("regular", tmp.path());
+    inner
+        .coordination
+        .register_claim(
+            WriteScopeClaim {
+                owner: regular_id.clone(),
+                roots: vec!["docs".into()],
+                exact_files: Vec::new(),
+                contracts: Vec::new(),
+            },
+            false,
+            |_| false,
+        )
+        .expect("regular agent initial claim");
+    let expansion = inner
+        .expand_write_claim(
+            &regular_id,
+            vec!["src/shared/api".into()],
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect_err("regular-agent scope expansion must see active Fleet ownership");
+    assert!(
+        expansion.contains("fleet-writer") && expansion.contains("contention"),
+        "{expansion}"
+    );
+
+    let manager = Arc::new(RwLock::new(inner));
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
+    let launch = manager
+        .write()
+        .await
+        .spawn_background_with_assignment_options(
+            Arc::clone(&manager),
+            runtime,
+            FleetRole::Builder,
+            "edit Fleet-owned scope".into(),
+            make_assignment(),
+            Some(vec![]),
+            SubAgentSpawnOptions {
+                name: Some("regular-writer".into()),
+                write_claim: Some(WriteScopeClaim {
+                    owner: String::new(),
+                    roots: vec!["src/shared".into()],
+                    exact_files: Vec::new(),
+                    contracts: Vec::new(),
+                }),
+                ..Default::default()
+            },
+        )
+        .expect_err("regular-agent launch must see active Fleet ownership");
+    let launch = launch.to_string();
+    assert!(
+        launch.contains("fleet-writer") && launch.contains("contention"),
+        "{launch}"
+    );
+}
+
+#[tokio::test]
 async fn test_running_count_counts_only_agents_with_live_task_handles() {
     let mut manager = SubAgentManager::new(PathBuf::from("."), 1);
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         "test_agent_3".to_string(),
-        SubAgentType::Explore,
+        FleetRole::Scout,
         "prompt".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -3898,7 +5375,7 @@ fn test_running_count_ignores_running_status_without_task_handle() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         "test_agent_4".to_string(),
-        SubAgentType::Explore,
+        FleetRole::Scout,
         "prompt".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -3920,7 +5397,7 @@ async fn test_running_count_counts_running_agents_until_status_reconciles() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         "test_agent_5".to_string(),
-        SubAgentType::Explore,
+        FleetRole::Scout,
         "prompt".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -3955,7 +5432,7 @@ async fn admission_limit_counts_queued_and_running_workers_separately() {
         let (input_tx, _input_rx) = mpsc::unbounded_channel();
         let mut agent = SubAgent::new(
             agent_id.to_string(),
-            SubAgentType::Explore,
+            FleetRole::Scout,
             "prompt".to_string(),
             make_assignment(),
             "deepseek-v4-flash".to_string(),
@@ -4020,7 +5497,7 @@ async fn cleanup_auto_cancels_stale_running_agent_and_releases_slot() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         "test_agent_stale".to_string(),
-        SubAgentType::Explore,
+        FleetRole::Scout,
         "prompt".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -4096,7 +5573,7 @@ async fn status_projection_reconciles_stale_running_agent() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         "test_agent_status_stale".to_string(),
-        SubAgentType::Explore,
+        FleetRole::Scout,
         "prompt".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -4145,7 +5622,7 @@ async fn cleanup_keeps_recent_running_agent() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         "test_agent_recent".to_string(),
-        SubAgentType::Explore,
+        FleetRole::Scout,
         "prompt".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -4190,7 +5667,7 @@ async fn touch_refreshes_stale_running_agent_heartbeat() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         "test_agent_touched".to_string(),
-        SubAgentType::Explore,
+        FleetRole::Scout,
         "prompt".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -4231,7 +5708,7 @@ fn test_persist_and_reload_marks_running_agent_as_interrupted() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let running = SubAgent::new(
         "test_agent_9_running".to_string(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "work".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -4274,7 +5751,7 @@ fn generated_whale_name_is_not_persisted_or_replayed_on_load() {
     let generated = whale_name_for_id_in_locale(agent_id, "ja");
     let mut agent = SubAgent::new(
         agent_id.to_string(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "work".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -4333,7 +5810,7 @@ fn explicit_nonmatching_whale_word_is_persisted_and_loaded() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let agent = SubAgent::new(
         agent_id.to_string(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "work".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -4375,7 +5852,7 @@ fn persist_and_reload_preserves_checkpoint_for_interrupted_running_agent() {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut running = SubAgent::new(
         "test_agent_checkpoint_reload".to_string(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "work".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -4427,7 +5904,7 @@ fn restart_reconciles_every_orphan_execution_status_once_and_preserves_receipts(
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut running = SubAgent::new(
         "agent_restart_model_wait".to_string(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "resume after restart".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -4664,7 +6141,7 @@ fn test_interrupted_status_name_and_summary() {
 fn build_allowed_tools_general_returns_none_for_full_inheritance() {
     // Default behavior: General agent with no explicit list inherits the
     // parent's full registry (None signals no narrowing).
-    let result = build_allowed_tools(&SubAgentType::General, None, true).unwrap();
+    let result = build_allowed_tools(&FleetRole::Worker, None, true).unwrap();
     assert!(
         result.is_none(),
         "General with no explicit_tools should default to full inheritance (None), got {result:?}"
@@ -4675,7 +6152,7 @@ fn build_allowed_tools_general_returns_none_for_full_inheritance() {
 fn build_allowed_tools_explore_returns_none_for_full_inheritance() {
     // Per-type allowlists are now advisory — Explore also gets the full
     // surface unless an explicit list is passed.
-    let result = build_allowed_tools(&SubAgentType::Explore, None, true).unwrap();
+    let result = build_allowed_tools(&FleetRole::Scout, None, true).unwrap();
     assert!(
         result.is_none(),
         "Explore with no explicit_tools should default to full inheritance"
@@ -4685,7 +6162,7 @@ fn build_allowed_tools_explore_returns_none_for_full_inheritance() {
 #[test]
 fn build_allowed_tools_custom_requires_explicit_list() {
     // Custom is the one type that REQUIRES explicit allowed_tools.
-    let err = build_allowed_tools(&SubAgentType::Custom, None, true).unwrap_err();
+    let err = build_allowed_tools(&FleetRole::Custom, None, true).unwrap_err();
     assert!(
         err.to_string().contains("Custom sub-agent requires"),
         "got: {err}"
@@ -4695,7 +6172,7 @@ fn build_allowed_tools_custom_requires_explicit_list() {
 #[test]
 fn build_allowed_tools_explicit_list_returned_as_some() {
     let explicit = vec!["read_file".to_string(), "list_dir".to_string()];
-    let result = build_allowed_tools(&SubAgentType::Custom, Some(explicit.clone()), true).unwrap();
+    let result = build_allowed_tools(&FleetRole::Custom, Some(explicit.clone()), true).unwrap();
     assert_eq!(result, Some(explicit));
 }
 
@@ -4707,7 +6184,7 @@ fn build_allowed_tools_explicit_list_dedupes_and_trims() {
         "list_dir".to_string(),
         "".to_string(), // skip empty
     ];
-    let result = build_allowed_tools(&SubAgentType::Custom, Some(explicit), true).unwrap();
+    let result = build_allowed_tools(&FleetRole::Custom, Some(explicit), true).unwrap();
     assert_eq!(
         result,
         Some(vec!["read_file".to_string(), "list_dir".to_string()])
@@ -4845,7 +6322,7 @@ fn create_isolated_worktree_creates_branch_checkout_outside_parent_repo() {
         repo.path(),
         &request,
         Some("isolated-test"),
-        &SubAgentType::Implementer,
+        &FleetRole::Builder,
     )
     .expect("worktree should be created");
 
@@ -4874,7 +6351,7 @@ fn create_isolated_worktree_rejects_invalid_branch_as_input() {
         repo.path(),
         &request,
         Some("isolated-test"),
-        &SubAgentType::Implementer,
+        &FleetRole::Builder,
     )
     .expect_err("invalid branch should fail");
 
@@ -4925,7 +6402,7 @@ fn create_isolated_worktree_discovers_nested_repo_from_harness_parent() {
         harness.path(),
         &request,
         Some("harness-nested"),
-        &SubAgentType::Explore,
+        &FleetRole::Scout,
     )
     .expect("harness parent should discover nested repo");
 
@@ -4960,7 +6437,7 @@ fn create_isolated_worktree_reports_friendly_error_when_no_repo_found() {
         base_ref: None,
     };
 
-    let err = create_isolated_worktree(&no_repo, &request, None, &SubAgentType::General)
+    let err = create_isolated_worktree(&no_repo, &request, None, &FleetRole::Worker)
         .expect_err("missing repo should fail with friendly error");
 
     let message = err.to_string();
@@ -4985,7 +6462,7 @@ fn create_isolated_worktree_rejects_ambiguous_nested_repos() {
         base_ref: None,
     };
 
-    let err = create_isolated_worktree(harness.path(), &request, None, &SubAgentType::General)
+    let err = create_isolated_worktree(harness.path(), &request, None, &FleetRole::Worker)
         .expect_err("multiple nested repos should fail deterministically");
 
     let message = err.to_string();
@@ -4998,7 +6475,7 @@ fn create_isolated_worktree_rejects_ambiguous_nested_repos() {
 #[test]
 fn build_subagent_system_prompt_appends_role_when_set() {
     let assignment = SubAgentAssignment::new("p".to_string(), Some("worker".to_string()));
-    let prompt = build_subagent_system_prompt(&SubAgentType::General, &assignment);
+    let prompt = build_subagent_system_prompt(&FleetRole::Worker, &assignment);
     assert!(
         prompt.contains("You are operating in the role of `worker`."),
         "expected role line present, got: {}",
@@ -5011,14 +6488,14 @@ fn build_subagent_system_prompt_appends_role_when_set() {
 #[test]
 fn build_subagent_system_prompt_skips_role_when_none() {
     let assignment = SubAgentAssignment::new("p".to_string(), None);
-    let prompt = build_subagent_system_prompt(&SubAgentType::General, &assignment);
+    let prompt = build_subagent_system_prompt(&FleetRole::Worker, &assignment);
     assert!(!prompt.contains("You are operating in the role of"));
 }
 
 #[test]
 fn build_subagent_system_prompt_skips_role_when_blank() {
     let assignment = SubAgentAssignment::new("p".to_string(), Some("   ".to_string()));
-    let prompt = build_subagent_system_prompt(&SubAgentType::General, &assignment);
+    let prompt = build_subagent_system_prompt(&FleetRole::Worker, &assignment);
     assert!(!prompt.contains("You are operating in the role of"));
 }
 
@@ -5060,7 +6537,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
     let context = ToolContext::new(&workspace).with_plugin_registry(Arc::new(plugins));
     let assignment = SubAgentAssignment::new("review".to_string(), None);
     let system =
-        build_subagent_system_prompt_with_skills(&SubAgentType::Review, &assignment, &context);
+        build_subagent_system_prompt_with_skills(&FleetRole::Reviewer, &assignment, &context);
 
     assert!(system.contains("`native-review`"), "{system}");
     assert!(system.contains("`demo:review`"), "{system}");
@@ -5089,7 +6566,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
     let forked = build_initial_subagent_messages_with_system(
         "review",
         &assignment,
-        &SubAgentType::Review,
+        &FleetRole::Reviewer,
         &system,
         Some(&fork_context),
     );
@@ -5112,7 +6589,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
         },
     );
     let nested_system = build_subagent_system_prompt_with_skills(
-        &SubAgentType::Review,
+        &FleetRole::Reviewer,
         &assignment,
         &nested_runtime.context,
     );
@@ -5127,7 +6604,7 @@ fn fresh_forked_and_nested_subagents_share_authority_bound_skill_catalogs() {
         .rediscover_for_workspace(&isolated_workspace);
     let isolated = ToolContext::new(&isolated_workspace).with_plugin_registry(isolated_plugins);
     let isolated_system =
-        build_subagent_system_prompt_with_skills(&SubAgentType::Review, &assignment, &isolated);
+        build_subagent_system_prompt_with_skills(&FleetRole::Reviewer, &assignment, &isolated);
     assert!(
         !isolated_system.contains("`demo:review`"),
         "workspace plugin authority must not leak into another worktree: {isolated_system}"
@@ -5148,7 +6625,7 @@ fn subagent_done_sentinel_format_is_well_formed() {
     let parsed: serde_json::Value = serde_json::from_str(inner).expect("inner JSON parses");
     assert_eq!(parsed["agent_id"], "agent_xyz");
     assert_eq!(parsed["status"], "completed");
-    assert_eq!(parsed["agent_type"], "general");
+    assert_eq!(parsed["agent_type"], "worker");
     assert_eq!(parsed["summary_location"], "previous_line");
     // issue #2652: a complete (non-truncated) summary is tagged as such.
     assert_eq!(parsed["summary_kind"], "complete");
@@ -5559,7 +7036,7 @@ async fn subagent_registry_blocks_approval_tools_without_parent_auto_approve() {
     runtime.context.auto_approve = false;
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::General,
+        FleetRole::Worker,
         Some(vec!["exec_shell".to_string()]),
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -5576,6 +7053,52 @@ async fn subagent_registry_blocks_approval_tools_without_parent_auto_approve() {
     );
 }
 
+#[tokio::test]
+async fn prompt_only_general_cannot_mutate_under_parent_auto_approve() {
+    let tmp = tempdir().expect("tempdir");
+    let request = parse_spawn_request(&json!({"prompt": "inspect only"})).unwrap();
+    let mut runtime = stub_runtime();
+    runtime.context = ToolContext::new(tmp.path().to_path_buf());
+    runtime.context.auto_approve = true;
+    apply_spawn_write_authority(&mut runtime, &request);
+    runtime.worker_profile = worker_profile_for_spawn(
+        &runtime,
+        &request.agent_type,
+        &AgentWorkerToolProfile::Inherited,
+        "deepseek-v4-pro",
+        None,
+        false,
+    );
+    let registry = SubAgentToolRegistry::new(
+        runtime,
+        request.agent_type,
+        None,
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+
+    let write_error = registry
+        .execute(
+            "agent_test",
+            "write_file",
+            json!({"path": "forbidden.txt", "content": "no"}),
+        )
+        .await
+        .expect_err("read-only General must not write under auto approval");
+    assert!(write_error.to_string().contains("not permitted"));
+    let shell_error = registry
+        .execute(
+            "agent_test",
+            "exec_shell",
+            json!({"command": "touch shell.txt"}),
+        )
+        .await
+        .expect_err("read-only General must not receive mutating shell");
+    assert!(shell_error.to_string().contains("not permitted"));
+    assert!(!tmp.path().join("forbidden.txt").exists());
+    assert!(!tmp.path().join("shell.txt").exists());
+}
+
 const MCP_ACTION_TOOL: &str = "mcp_github_create_pull_request";
 
 fn subagent_registry_with_mcp_action(auto_approve: bool) -> SubAgentToolRegistry {
@@ -5583,7 +7106,7 @@ fn subagent_registry_with_mcp_action(auto_approve: bool) -> SubAgentToolRegistry
     runtime.context.auto_approve = auto_approve;
     let mut registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::General,
+        FleetRole::Worker,
         Some(vec![MCP_ACTION_TOOL.to_string()]),
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -5594,6 +7117,222 @@ fn subagent_registry_with_mcp_action(auto_approve: bool) -> SubAgentToolRegistry
             MCP_ACTION_TOOL,
         ));
     registry
+}
+
+#[tokio::test]
+async fn child_write_tool_fails_closed_outside_registered_scope() {
+    let tmp = tempdir().expect("tempdir");
+    std::fs::create_dir_all(tmp.path().join("src")).unwrap();
+    std::fs::create_dir_all(tmp.path().join("outside")).unwrap();
+    let manager = new_shared_subagent_manager(tmp.path().to_path_buf(), 2);
+    {
+        let mut guard = manager.write().await;
+        guard
+            .coordination
+            .register_claim(
+                WriteScopeClaim {
+                    owner: "agent_scoped".into(),
+                    roots: vec!["src".into()],
+                    exact_files: vec![],
+                    contracts: vec![],
+                },
+                false,
+                |_| false,
+            )
+            .unwrap();
+        guard
+            .register_worker_with_coordination(make_write_worker_spec(
+                "other-writer",
+                tmp.path().to_path_buf(),
+                "conflict",
+            ))
+            .expect("active conflicting writer");
+    }
+    let mut runtime = stub_runtime();
+    runtime.manager = Arc::clone(&manager);
+    runtime.context = ToolContext::new(tmp.path());
+    runtime.context.auto_approve = true;
+    runtime.worker_profile = WorkerRuntimeProfile::for_role(FleetRole::Builder);
+    let registry = SubAgentToolRegistry::new_with_owner(
+        runtime,
+        FleetRole::Builder,
+        "agent_scoped".into(),
+        "implementer".into(),
+        Some(vec![
+            "write_file".into(),
+            "exec_shell".into(),
+            "Bash".into(),
+            "Run".into(),
+            "agents/coordinate".into(),
+            "work_update".into(),
+            "agent".into(),
+        ]),
+        Arc::new(Mutex::new(TodoList::new())),
+        Arc::new(Mutex::new(PlanState::default())),
+    );
+    registry
+        .execute(
+            "agent_scoped",
+            "write_file",
+            json!({"path": "src/ok.txt", "content": "ok"}),
+        )
+        .await
+        .expect("in-scope write");
+    registry
+        .execute(
+            "agent_scoped",
+            "agents/coordinate",
+            json!({"action": "claim", "roots": ["docs/guides"]}),
+        )
+        .await
+        .expect("coordination-only non-overlapping scope expansion stays available");
+    let claim_collision = registry
+        .execute(
+            "agent_scoped",
+            "agents/coordinate",
+            json!({"action": "claim", "roots": ["conflict/nested"]}),
+        )
+        .await
+        .expect_err("coordination scope expansion still rejects live overlap")
+        .to_string();
+    assert!(
+        claim_collision.contains("contention") && claim_collision.contains("other-writer"),
+        "{claim_collision}"
+    );
+    registry
+        .execute(
+            "agent_scoped",
+            "work_update",
+            json!({
+                "todos": [{"content": "bounded edit", "status": "in_progress"}]
+            }),
+        )
+        .await
+        .expect("shared writers can still publish internal Work progress");
+    let child_collision = registry
+        .execute(
+            "agent_scoped",
+            "agent",
+            json!({
+                "prompt": "edit the same scope",
+                "type": "implementer",
+                "workspace_policy": "shared",
+                "write_authority": "workspace_write",
+                "write_roots": ["conflict"],
+                "expected_artifact": "tested patch"
+            }),
+        )
+        .await
+        .expect_err("agent exemption still subjects child writers to coordination")
+        .to_string();
+    assert!(
+        child_collision.contains("contention") && child_collision.contains("other-writer"),
+        "{child_collision}"
+    );
+    registry
+        .execute(
+            "agent_scoped",
+            "agent",
+            json!({
+                "prompt": "inspect without mutation",
+                "write_authority": "read_only"
+            }),
+        )
+        .await
+        .expect("shared writers may still delegate a read-only child");
+    let spawned_id = manager
+        .read()
+        .await
+        .agents
+        .keys()
+        .next()
+        .cloned()
+        .expect("read-only child registered");
+    manager
+        .write()
+        .await
+        .cancel_agent(&spawned_id)
+        .expect("stop test child");
+    let err = registry
+        .execute(
+            "agent_scoped",
+            "write_file",
+            json!({"path": "docs/no.txt", "content": "no"}),
+        )
+        .await
+        .expect_err("out-of-scope write must fail")
+        .to_string();
+    assert!(
+        err.contains("outside") && err.contains("agents/coordinate"),
+        "{err}"
+    );
+    assert!(!tmp.path().join("docs/no.txt").exists());
+    for (tool_name, input, target) in [
+        (
+            "exec_shell",
+            json!({"command": "touch outside/compat.txt"}),
+            "outside/compat.txt",
+        ),
+        (
+            "Bash",
+            json!({"action": "run", "command": "touch outside/canonical.txt"}),
+            "outside/canonical.txt",
+        ),
+    ] {
+        let shell_err = registry
+            .execute("agent_scoped", tool_name, input)
+            .await
+            .expect_err("unbounded shared-workspace shell must fail")
+            .to_string();
+        assert!(
+            shell_err.contains("cannot prove a bounded file target"),
+            "{tool_name}: {shell_err}"
+        );
+        assert!(
+            !tmp.path().join(target).exists(),
+            "{tool_name} created {target} outside its registered claim"
+        );
+    }
+    let run_err = registry
+        .execute(
+            "agent_scoped",
+            "Run",
+            json!({
+                "action": "verifiers",
+                "commands": [{
+                    "name": "escape",
+                    "program": "/bin/sh",
+                    "args": ["-c", "touch docs/run-escape.txt"]
+                }]
+            }),
+        )
+        .await
+        .expect_err("custom verifier commands cannot bypass shared write ownership")
+        .to_string();
+    assert!(
+        run_err.contains("cannot prove a bounded file target"),
+        "{run_err}"
+    );
+    assert!(!tmp.path().join("docs/run-escape.txt").exists());
+}
+
+#[test]
+fn shared_claim_shell_gate_normalizes_only_the_run_action() {
+    assert!(is_unbounded_shell_run(
+        "exec_shell",
+        &json!({"command": "true"})
+    ));
+    assert!(is_unbounded_shell_run(
+        "Bash",
+        &json!({"action": "run", "command": "true"})
+    ));
+    assert!(is_unbounded_shell_run("Bash", &json!({"command": "true"})));
+    for action in ["wait", "interact", "cancel"] {
+        assert!(
+            !is_unbounded_shell_run("Bash", &json!({"action": action})),
+            "Bash.{action} must retain its existing non-run claim behavior"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5646,7 +7385,7 @@ async fn implementer_delegation_allows_suggest_write_without_parent_auto_approve
     runtime.context.auto_approve = false;
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::Implementer,
+        FleetRole::Builder,
         None,
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -5682,7 +7421,7 @@ async fn workflow_accept_edits_allows_general_file_write_without_parent_auto_app
     runtime.accept_edits = true;
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::General,
+        FleetRole::Worker,
         None,
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -5720,7 +7459,7 @@ async fn general_delegation_still_blocks_suggest_write_without_parent_auto_appro
     runtime.context.auto_approve = false;
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::General,
+        FleetRole::Worker,
         None,
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -5736,7 +7475,7 @@ async fn general_delegation_still_blocks_suggest_write_without_parent_auto_appro
         .expect_err("general agent should not silently gain write permission");
     let msg = err.to_string();
     assert!(
-        msg.contains("not delegated to general sub-agents"),
+        msg.contains("not delegated to worker sub-agents"),
         "general writes should be rejected with a role-aware message: {msg}"
     );
 
@@ -5757,7 +7496,7 @@ async fn explore_role_still_blocks_suggest_writes_without_parent_auto_approve() 
     runtime.context.auto_approve = false;
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::Explore,
+        FleetRole::Scout,
         None,
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -5773,7 +7512,7 @@ async fn explore_role_still_blocks_suggest_writes_without_parent_auto_approve() 
         .expect_err("explore agents must not write");
     let msg = err.to_string();
     assert!(
-        msg.contains("explore") && msg.contains("not permitted"),
+        msg.contains("scout") && msg.contains("not permitted"),
         "explore writes should be rejected with a role-aware message: {msg}"
     );
     assert!(
@@ -5793,17 +7532,28 @@ async fn explore_role_blocks_writes_even_under_parent_auto_approve() {
     runtime.context.auto_approve = true;
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::Explore,
+        FleetRole::Scout,
         None,
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
     );
 
+    std::fs::write(tmp.path().join("allowed.txt"), "visible").unwrap();
+    let read = registry
+        .execute(
+            "agent_test",
+            "File",
+            json!({"action": "read", "path": "allowed.txt"}),
+        )
+        .await
+        .expect("Explore should retain canonical read access");
+    assert!(read.contains("visible"));
+
     let err = registry
         .execute(
             "agent_test",
-            "write_file",
-            json!({"path": "nope.txt", "content": "denied"}),
+            "File",
+            json!({"action": "write", "path": "nope.txt", "content": "denied"}),
         )
         .await
         .expect_err("explore must not write even under parent auto-approve");
@@ -5828,7 +7578,7 @@ async fn delegated_write_role_still_blocks_required_tools() {
     runtime.context.auto_approve = false;
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::Implementer,
+        FleetRole::Builder,
         Some(vec!["exec_shell".to_string()]),
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -5856,7 +7606,7 @@ async fn auto_approved_parent_runs_required_tools_in_subagent() {
     runtime.context.auto_approve = true;
     let registry = SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::General,
+        FleetRole::Worker,
         None,
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -6190,7 +7940,7 @@ fn stub_runtime() -> SubAgentRuntime {
         accept_edits: false,
         accept_verification: false,
         agent_tool_surface_options: AgentToolSurfaceOptions::new(ShellPolicy::Full),
-        worker_profile: WorkerRuntimeProfile::for_role(SubAgentType::General),
+        worker_profile: WorkerRuntimeProfile::for_role(FleetRole::Worker),
         event_tx: None,
         manager: new_shared_subagent_manager(workspace, 5),
         spawn_depth: 0,
@@ -6249,7 +7999,7 @@ async fn root_operate_dispatch_delegates_builtin_verification_but_not_shell() {
     apply_session_spawn_defaults(&mut runtime);
     let registry = SubAgentToolRegistry::new(
         runtime.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         None,
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -6653,10 +8403,11 @@ fn cross_custom_child_rebinds_config_receipts_and_grandchild_route_atomically() 
     );
     let worker_profile = worker_profile_for_spawn(
         &child_runtime,
-        &SubAgentType::Implementer,
+        &FleetRole::Builder,
         &AgentWorkerToolProfile::Inherited,
         "model-b",
         None,
+        false,
     );
     assert_eq!(worker_profile.provider.as_deref(), Some("custom-b"));
 
@@ -6793,7 +8544,7 @@ fn insert_prior_session_agent(
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         id.to_string(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "old prompt".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -7106,7 +8857,7 @@ fn terminal_results_excluding_returns_only_current_root_undelivered_agents() {
 
     let mut root = SubAgent::new(
         "agent_root_done".to_string(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "root".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -7121,7 +8872,7 @@ fn terminal_results_excluding_returns_only_current_root_undelivered_agents() {
 
     let mut nested = SubAgent::new(
         "agent_nested_done".to_string(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "nested".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -7135,7 +8886,7 @@ fn terminal_results_excluding_returns_only_current_root_undelivered_agents() {
 
     let mut prior = SubAgent::new(
         "agent_prior_done".to_string(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "prior".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -7179,7 +8930,7 @@ async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
     let agent_id = "agent_noop".to_string();
     let mut agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "noop".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -7201,7 +8952,7 @@ async fn run_subagent_task_claims_before_delivery_and_then_finalizes() {
         manager_handle: manager.clone(),
         runtime,
         agent_id: agent_id.clone(),
-        agent_type: SubAgentType::General,
+        agent_type: FleetRole::Worker,
         prompt: "no-op child run".to_string(),
         assignment: make_assignment(),
         allowed_tools: None,
@@ -7262,7 +9013,7 @@ async fn cancellation_wins_task_race_but_still_fans_in_exactly_once() {
     let agent_id = "agent_cancelled_at_epilogue".to_string();
     let mut agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "noop".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -7287,7 +9038,7 @@ async fn cancellation_wins_task_race_but_still_fans_in_exactly_once() {
         manager_handle: manager.clone(),
         runtime,
         agent_id: agent_id.clone(),
-        agent_type: SubAgentType::General,
+        agent_type: FleetRole::Worker,
         prompt: "no-op child run".to_string(),
         assignment: make_assignment(),
         allowed_tools: None,
@@ -7384,7 +9135,7 @@ async fn non_retryable_provider_failure_fans_in_to_every_terminal_sink() {
     let agent_id = "agent_fatal_provider_failure".to_string();
     let mut agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "noop".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -7416,7 +9167,7 @@ async fn non_retryable_provider_failure_fans_in_to_every_terminal_sink() {
         manager_handle: Arc::clone(&manager),
         runtime,
         agent_id: agent_id.clone(),
-        agent_type: SubAgentType::General,
+        agent_type: FleetRole::Worker,
         prompt: "Request a model response".to_string(),
         assignment: make_assignment(),
         allowed_tools: Some(Vec::new()),
@@ -7705,9 +9456,10 @@ fn child_runtime_preserves_step_api_timeout() {
 #[test]
 fn subagent_completion_payload_carries_existing_sentinel_format() {
     // The payload format is the same one already documented in
-    // prompts/constitution.md: human summary on line 1, `<codewhale:subagent.done>`
-    // sentinel on line 2. This test pins the format so future refactors
-    // don't silently break the model's parsing contract.
+    // prompts/text.rs (SUBAGENT_OUTPUT_FORMAT): human summary on line 1,
+    // `<codewhale:subagent.done>` sentinel on line 2. This test pins the
+    // format so future refactors don't silently break the model's parsing
+    // contract.
     let mut snap = make_snapshot(SubAgentStatus::Completed);
     snap.result = Some("Found three errors.".to_string());
 
@@ -7782,7 +9534,7 @@ async fn faster_route_on_provider_without_known_sibling_stays_on_parent_model() 
             &runtime,
             None,
             prompt,
-            &SubAgentType::General,
+            &FleetRole::Worker,
             ModelRoute::Faster,
             SubAgentThinking::Inherit,
         )
@@ -7957,7 +9709,7 @@ fn role_model_validation_accepts_provider_native_ids() {
         .role_models
         .insert("worker".to_string(), "kimi-k2.5".to_string());
 
-    let model = configured_model_for_role_or_type(&runtime, Some("worker"), &SubAgentType::General)
+    let model = configured_model_for_role_or_type(&runtime, Some("worker"), &FleetRole::Worker)
         .expect("provider-native id is accepted");
     assert_eq!(model.as_deref(), Some("kimi-k2.5"));
 }
@@ -7969,7 +9721,7 @@ fn role_model_validation_stays_strict_on_official_deepseek() {
         .role_models
         .insert("worker".to_string(), "kimi-k2.5".to_string());
 
-    let err = configured_model_for_role_or_type(&runtime, Some("worker"), &SubAgentType::General)
+    let err = configured_model_for_role_or_type(&runtime, Some("worker"), &FleetRole::Worker)
         .expect_err("non-DeepSeek id is rejected on the official API");
     let msg = err.to_string();
     assert!(msg.contains("kimi-k2.5"), "names the bad id: {msg}");
@@ -8071,13 +9823,10 @@ fn format_step_counter_keeps_concrete_budgets() {
 
 #[test]
 fn child_step_override_wins_and_clamps_to_hard_ceiling() {
-    assert_eq!(resolve_max_steps(SubAgentType::Explore, None, None), 60);
+    assert_eq!(resolve_max_steps(FleetRole::Scout, None, None), 60);
+    assert_eq!(resolve_max_steps(FleetRole::Builder, Some(7), None), 7);
     assert_eq!(
-        resolve_max_steps(SubAgentType::Implementer, Some(7), None),
-        7
-    );
-    assert_eq!(
-        resolve_max_steps(SubAgentType::General, Some(u32::MAX), None),
+        resolve_max_steps(FleetRole::Worker, Some(u32::MAX), None),
         MAX_SUBAGENT_STEPS
     );
 }
@@ -8143,7 +9892,7 @@ async fn launch_gate_queues_extra_direct_children() {
         let (input_tx, input_rx) = mpsc::unbounded_channel();
         let agent = SubAgent::new(
             agent_id.to_string(),
-            SubAgentType::General,
+            FleetRole::Worker,
             "Answer".to_string(),
             make_assignment(),
             "deepseek-v4-flash".to_string(),
@@ -8157,7 +9906,7 @@ async fn launch_gate_queues_extra_direct_children() {
             manager_handle: Arc::clone(&manager),
             runtime: runtime.clone(),
             agent_id: agent_id.to_string(),
-            agent_type: SubAgentType::General,
+            agent_type: FleetRole::Worker,
             prompt: "Answer".to_string(),
             assignment: make_assignment(),
             allowed_tools: Some(vec![]),
@@ -8280,7 +10029,7 @@ async fn launch_gate_wait_counts_against_child_wall_timeout() {
     let agent_id = "agent_gate_wall_timeout".to_string();
     let mut agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "Answer".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -8307,7 +10056,7 @@ async fn launch_gate_wait_counts_against_child_wall_timeout() {
         manager_handle: Arc::clone(&manager),
         runtime,
         agent_id: agent_id.clone(),
-        agent_type: SubAgentType::General,
+        agent_type: FleetRole::Worker,
         prompt: "Answer".to_string(),
         assignment: make_assignment(),
         allowed_tools: Some(vec![]),
@@ -8476,7 +10225,7 @@ async fn spawn_budget_capped_worker(
     let (task_input_tx, task_input_rx) = mpsc::unbounded_channel();
     let agent = SubAgent::new(
         agent_id.clone(),
-        SubAgentType::General,
+        FleetRole::Worker,
         "Work within budget".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -8503,7 +10252,7 @@ async fn spawn_budget_capped_worker(
         manager_handle: Arc::clone(&manager),
         runtime: runtime.clone(),
         agent_id: agent_id.clone(),
-        agent_type: SubAgentType::General,
+        agent_type: FleetRole::Worker,
         prompt: "Work within budget".to_string(),
         assignment: make_assignment(),
         allowed_tools: Some(vec![]),
@@ -8836,13 +10585,19 @@ fn with_spillover_root<F: FnOnce()>(root: &std::path::Path, f: F) {
         .lock()
         .unwrap_or_else(|err| err.into_inner());
     let prior = crate::tools::truncate::set_test_spillover_root(Some(root.to_path_buf()));
-    struct Restore(Option<std::path::PathBuf>);
+    let _artifact_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(|err| err.into_inner());
+    let prior_artifacts =
+        crate::artifacts::set_test_artifact_sessions_root(Some(root.join("sessions")));
+    struct Restore(Option<std::path::PathBuf>, Option<std::path::PathBuf>);
     impl Drop for Restore {
         fn drop(&mut self) {
             crate::tools::truncate::set_test_spillover_root(self.0.take());
+            crate::artifacts::set_test_artifact_sessions_root(self.1.take());
         }
     }
-    let _restore = Restore(prior);
+    let _restore = Restore(prior, prior_artifacts);
     f();
 }
 
@@ -8908,7 +10663,7 @@ async fn complete_transcript_artifact_survives_resident_handle_compaction() {
     let handle = insert_subagent_full_transcript_handle(
         &runtime,
         agent_id,
-        &SubAgentType::General,
+        &FleetRole::Worker,
         &make_assignment(),
         &SubAgentStatus::Completed,
         Some(&"LAST-TURN-MARKER".to_string()),
@@ -9061,32 +10816,50 @@ fn subagent_tool_results_spill_to_disk_and_stay_bounded_inline() {
         let raw = "cargo build noise line\n".repeat(220_000); // ~5 MB
         let raw_len = raw.len();
 
-        let (inline, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-42", raw.clone());
+        let (inline, spilled) = bound_subagent_tool_result(
+            "fleet-worker-1",
+            "call-42",
+            "exec_shell",
+            "session-test",
+            true,
+            raw.clone(),
+        );
 
         let path = spilled.expect("multi-MB output must spill");
         // Model-visible content is bounded to head + footer.
-        assert!(inline.len() <= crate::tools::truncate::SPILLOVER_HEAD_BYTES + 1024);
-        assert!(inline.contains("Sub-agent tool output truncated"));
-        assert!(inline.contains(&path.display().to_string()));
-        assert!(inline.contains("read_file"));
+        assert!(inline.len() <= 4 * 1024);
+        assert!(inline.contains("Exact evidence retained"));
+        assert!(!inline.contains(&path.display().to_string()));
+        assert!(inline.contains("retrieve_tool_result"));
         // Full output remains recoverable from disk.
         let on_disk = std::fs::read_to_string(&path).expect("spill file readable");
         assert_eq!(on_disk.len(), raw_len);
 
         // Small outputs pass through untouched, no spill file.
-        let (small, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-43", "ok".to_string());
+        let (small, spilled) = bound_subagent_tool_result(
+            "fleet-worker-1",
+            "call-43",
+            "read_file",
+            "session-test",
+            true,
+            "ok".to_string(),
+        );
         assert_eq!(small, "ok");
         assert!(spilled.is_none());
 
         // Oversized error output is bounded too: sub-agent errors are
         // routinely full build logs, unlike the root loop's short errors.
-        let (bounded_err, spilled) =
-            bound_subagent_tool_result("fleet-worker-1", "call-44", format!("Error: {raw}"));
+        let (bounded_err, spilled) = bound_subagent_tool_result(
+            "fleet-worker-1",
+            "call-44",
+            "exec_shell",
+            "session-test",
+            false,
+            format!("Error: {raw}"),
+        );
         assert!(spilled.is_some());
-        assert!(bounded_err.len() <= crate::tools::truncate::SPILLOVER_HEAD_BYTES + 1024);
-        assert!(bounded_err.starts_with("Error:"));
+        assert!(bounded_err.len() <= 4 * 1024);
+        assert!(bounded_err.contains("Exact evidence retained"));
     });
 }
 
@@ -9104,8 +10877,14 @@ fn fanout_of_workers_with_huge_outputs_keeps_resident_state_bounded() {
             let agent_id = format!("fleet-worker-{worker}");
             let mut messages = Vec::new();
             for call in 0..3 {
-                let (inline, spilled) =
-                    bound_subagent_tool_result(&agent_id, &format!("call-{call}"), huge.clone());
+                let (inline, spilled) = bound_subagent_tool_result(
+                    &agent_id,
+                    &format!("call-{call}"),
+                    "exec_shell",
+                    "session-test",
+                    true,
+                    huge.clone(),
+                );
                 let path = spilled.expect("should spill");
                 assert_eq!(
                     std::fs::read_to_string(&path).expect("readable").len(),
@@ -9150,7 +10929,10 @@ fn write_json_atomic_survives_concurrent_writers() {
         let ws = Arc::clone(&workspace);
         let p = Arc::clone(&path);
         handles.push(std::thread::spawn(move || {
-            let payload = serde_json::json!({ "writer": i, "blob": "x".repeat(8192) });
+            let payload = PersistedSubAgentState {
+                snapshot_sequence: i + 1,
+                ..PersistedSubAgentState::default()
+            };
             let _ = write_json_atomic(&ws, &p, &payload);
         }));
     }
@@ -9161,7 +10943,7 @@ fn write_json_atomic_survives_concurrent_writers() {
     let contents = std::fs::read_to_string(&*path).expect("read state.json");
     let parsed: serde_json::Value =
         serde_json::from_str(&contents).expect("state.json must be complete/valid JSON");
-    assert!(parsed.get("writer").is_some());
+    assert!(parsed.get("snapshot_sequence").is_some());
     // No stray temp files left behind.
     let leftover: Vec<_> = std::fs::read_dir(path.parent().unwrap())
         .expect("read subagents dir")
@@ -9171,6 +10953,98 @@ fn write_json_atomic_survives_concurrent_writers() {
     assert!(leftover.is_empty(), "temp files leaked: {leftover:?}");
 }
 
+#[test]
+fn coordination_process_lock_rejects_second_process() {
+    const ROLE_ENV: &str = "CODEWHALE_TEST_COORDINATION_LOCK_ROLE";
+    const WORKSPACE_ENV: &str = "CODEWHALE_TEST_COORDINATION_LOCK_WORKSPACE";
+    const TEST_NAME: &str =
+        "tools::subagent::tests::coordination_process_lock_rejects_second_process";
+
+    if let Some(role) = std::env::var_os(ROLE_ENV) {
+        let workspace = PathBuf::from(std::env::var_os(WORKSPACE_ENV).expect("workspace env"));
+        let manager = new_shared_subagent_manager_with_timeout(
+            workspace.clone(),
+            4,
+            4,
+            Duration::from_secs(30),
+            4,
+            None,
+        );
+        if role == "holder" {
+            manager
+                .try_read()
+                .unwrap()
+                .ensure_coordination_process_lock()
+                .expect("holder owns lock");
+            std::fs::write(workspace.join("holder.ready"), b"ready").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !workspace.join("holder.release").exists() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert!(workspace.join("holder.release").exists(), "release timeout");
+        } else {
+            let error = manager
+                .try_read()
+                .unwrap()
+                .ensure_coordination_process_lock()
+                .expect_err("second process must fail closed");
+            assert!(error.contains("another Codewhale process"), "{error}");
+        }
+        return;
+    }
+
+    let dir = tempdir().expect("tempdir");
+    let workspace = dir.path().canonicalize().expect("canonical workspace");
+    let test_binary = std::env::current_exe().expect("test binary");
+    let mut holder = std::process::Command::new(&test_binary)
+        .arg("--exact")
+        .arg(TEST_NAME)
+        .arg("--nocapture")
+        .env(ROLE_ENV, "holder")
+        .env(WORKSPACE_ENV, &workspace)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn lock holder");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !workspace.join("holder.ready").exists() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    if !workspace.join("holder.ready").exists() {
+        let _ = holder.kill();
+        let output = holder.wait_with_output().expect("holder output");
+        panic!(
+            "holder never acquired lock:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let contender = std::process::Command::new(&test_binary)
+        .arg("--exact")
+        .arg(TEST_NAME)
+        .arg("--nocapture")
+        .env(ROLE_ENV, "contender")
+        .env(WORKSPACE_ENV, &workspace)
+        .output()
+        .expect("spawn lock contender");
+    assert!(
+        contender.status.success(),
+        "contender failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&contender.stdout),
+        String::from_utf8_lossy(&contender.stderr)
+    );
+
+    std::fs::write(workspace.join("holder.release"), b"release").unwrap();
+    let output = holder.wait_with_output().expect("holder output");
+    assert!(
+        output.status.success(),
+        "holder failed:\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 // === agent(action="wait") + peek throttling (#4097) ===
 
 fn insert_running_agent(inner: &mut SubAgentManager, name: &str) -> String {
@@ -9178,7 +11052,7 @@ fn insert_running_agent(inner: &mut SubAgentManager, name: &str) -> String {
     let (input_tx, _input_rx) = mpsc::unbounded_channel();
     let mut agent = SubAgent::new(
         name.to_string(),
-        SubAgentType::Explore,
+        FleetRole::Scout,
         "prompt".to_string(),
         make_assignment(),
         "deepseek-v4-flash".to_string(),
@@ -9371,7 +11245,7 @@ fn new_registry_with_disallowed(
 ) -> SubAgentToolRegistry {
     SubAgentToolRegistry::new(
         runtime,
-        SubAgentType::General,
+        FleetRole::Worker,
         allowed_tools,
         Arc::new(Mutex::new(TodoList::new())),
         Arc::new(Mutex::new(PlanState::default())),
@@ -9403,11 +11277,20 @@ fn test_disallowed_tools_inheritance_denies_tool() {
         "unrelated tools should be allowed"
     );
 
-    let tools = registry.tools_for_model(&SubAgentType::General);
-    let names: HashSet<_> = tools.into_iter().map(|t| t.name).collect();
+    let tools = registry.tools_for_model(&FleetRole::Worker);
+    let names: HashSet<_> = tools.iter().map(|t| t.name.clone()).collect();
     assert!(!names.contains("exec_shell"), "catalog excludes exec_shell");
     assert!(!names.contains("write_file"), "catalog excludes write_file");
-    assert!(names.contains("read_file"), "catalog includes read_file");
+    assert!(names.contains("File"), "catalog includes canonical File");
+    let file = tools.into_iter().find(|tool| tool.name == "File").unwrap();
+    let actions = file.input_schema["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap();
+    assert!(
+        !actions
+            .iter()
+            .any(|action| action.as_str() == Some("write"))
+    );
 }
 
 #[test]
@@ -9430,13 +11313,17 @@ fn test_disallowed_tools_deny_wins_over_allow() {
         "read_file is allowed and not denied"
     );
 
-    let tools = registry.tools_for_model(&SubAgentType::General);
-    let names: HashSet<_> = tools.into_iter().map(|t| t.name).collect();
+    let tools = registry.tools_for_model(&FleetRole::Worker);
+    let names: HashSet<_> = tools.iter().map(|t| t.name.clone()).collect();
     assert!(
         !names.contains("exec_shell"),
         "catalog must exclude denied tool even when allowlisted"
     );
-    assert!(names.contains("read_file"), "catalog includes allowed tool");
+    assert!(
+        names.contains("File"),
+        "legacy read allow exposes canonical File"
+    );
+    assert!(!names.contains("Bash"), "denied shell alias removes Bash");
 }
 
 #[test]
@@ -9509,8 +11396,8 @@ fn test_disallowed_tools_tools_for_model_excludes_denied() {
     runtime.context = ToolContext::new(tmp.path().to_path_buf());
     let registry = new_registry_with_disallowed(runtime, None);
 
-    let tools = registry.tools_for_model(&SubAgentType::General);
-    let names: HashSet<_> = tools.into_iter().map(|t| t.name).collect();
+    let tools = registry.tools_for_model(&FleetRole::Worker);
+    let names: HashSet<_> = tools.iter().map(|t| t.name.clone()).collect();
 
     assert!(!names.contains("exec_shell"), "catalog excludes exec_shell");
     assert!(!names.contains("write_file"), "catalog excludes write_file");
@@ -9518,8 +11405,14 @@ fn test_disallowed_tools_tools_for_model_excludes_denied() {
         !names.contains("apply_patch"),
         "catalog excludes apply_patch"
     );
-    assert!(names.contains("read_file"), "catalog includes read_file");
-    assert!(names.contains("grep_files"), "catalog includes grep_files");
+    assert!(names.contains("File"), "catalog includes canonical File");
+    let file = tools.into_iter().find(|tool| tool.name == "File").unwrap();
+    let actions = file.input_schema["properties"]["action"]["enum"]
+        .as_array()
+        .unwrap();
+    for denied in ["write", "patch"] {
+        assert!(!actions.iter().any(|action| action.as_str() == Some(denied)));
+    }
 }
 
 #[tokio::test]

@@ -7,9 +7,8 @@
 //!   (`final_tool_input`, `parse_tool_input`, fenced/JSON segment helpers).
 //! * The `multi_tool_use.parallel` payload parser.
 //! * Policy predicates the turn loop consults — when a batch can run in
-//!   parallel, when an `update_plan` step should stop the turn, when a Plan
-//!   prompt should force a plan-first hop, and the small set of read-only
-//!   MCP tools that are safe to run in parallel.
+//!   parallel and the small set of read-only MCP tools that are safe to run
+//!   in parallel.
 //! * The tool execution plan/outcome types the batch driver passes around.
 //!
 //! All items are `pub(super)`-only: the public engine surface (Op/Event,
@@ -23,7 +22,6 @@ use crate::models::{Tool, ToolCaller};
 use crate::tools::spec::{
     ResourceClaim, ToolError, ToolExecutionOutcome, ToolResult, schedule_non_conflicting,
 };
-use crate::tui::app::AppMode;
 
 use super::ToolUseState;
 use super::read_repeat_guard::{ReadRepeatGuard, ReadRepeatOccurrence};
@@ -619,75 +617,6 @@ pub(super) fn plan_tool_execution_batches(
     flush_parallel(&mut parallel_candidates, &mut batches);
 
     batches
-}
-
-pub(super) fn should_stop_after_plan_tool(
-    mode: AppMode,
-    tool_name: &str,
-    result: &Result<ToolResult, ToolError>,
-) -> bool {
-    mode == AppMode::Plan && tool_name == "update_plan" && result.is_ok()
-}
-
-pub(super) fn should_force_update_plan_first(mode: AppMode, content: &str) -> bool {
-    if mode != AppMode::Plan {
-        return false;
-    }
-
-    let lower = content.to_ascii_lowercase();
-    // Only shortcut genuinely lightweight plan asks. Bare "make a plan" wording
-    // is often used for repo/version/build work where Plan mode still needs to
-    // inspect available context before publishing the handoff artifact.
-    let asks_for_direct_plan = [
-        "quick plan",
-        "short plan",
-        "simple plan",
-        "3-step plan",
-        "3 step plan",
-        "three-step plan",
-        "three step plan",
-        "high-level plan",
-        "high level plan",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-
-    if !asks_for_direct_plan {
-        return false;
-    }
-
-    let asks_for_repo_exploration = [
-        "inspect the repo",
-        "inspect the code",
-        "explore the repo",
-        "search the repo",
-        "read the code",
-        "review the code",
-        "analyze the code",
-        "investigate",
-        "figure out",
-        "figuring out",
-        "look through",
-        "understand the current",
-        "current state",
-        "ground it in the codebase",
-        "based on the codebase",
-        "repo",
-        "codebase",
-        "version",
-        "ver ",
-        "release",
-        "build",
-        "benchmark",
-        "api server",
-        "github.com",
-        "http://",
-        "https://",
-    ]
-    .iter()
-    .any(|needle| lower.contains(needle));
-
-    !asks_for_repo_exploration
 }
 
 pub(super) fn mcp_tool_is_parallel_safe(name: &str) -> bool {

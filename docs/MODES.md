@@ -1,9 +1,9 @@
-# Modes and Approvals
+# Modes and Permission Postures
 
 codewhale has three related concepts:
 
 - **TUI mode**: what kind of visible interaction you're in (Plan/Act/Operate).
-- **Approval posture**: how aggressively the UI asks before executing tools.
+- **Permission posture**: how aggressively the UI asks before executing tools.
 - **Workflow overlay**: optional long-running orchestration that can
   run on top of any TUI mode when a task needs many coordinated workers.
 
@@ -29,8 +29,8 @@ Run `/mode` to open the mode picker, or switch directly with `/mode act`,
 `/mode plan`, or `/mode operate`.
 
 - **Plan**: design-first prompting. Read-only investigation tools stay available; shell and patch execution stay off. Use this when you want to think out loud and produce a plan to hand to a human (yourself later, or a reviewer).
-- **Act** (Agent): multi-step tool use. In interactive TUI sessions, shell tools (`exec_shell`, `task_shell_start`, `task_shell_wait`) are available by default and approval prompts gate each call. Set top-level `allow_shell = false` to hide shell tools for a workspace/profile. File writes are allowed without a prompt.
-- **Operate**: multitask conductor posture. Send ordinary messages and use the same direct tools, shell configuration, sandbox, approval posture, ask-rules, and repository protections as Act. Codewhale prefers Fleet workers for independent, parallel, background, or long-running work, but delegation is not mandatory. New messages can start additional lanes while workers continue. Workflow is optional and reserved for work that needs ordered phases, gates, shared budgets, or deterministic fan-in.
+- **Act** (Agent): multi-step tool use. In interactive TUI sessions, the canonical `Bash` tool is available by default and approval prompts gate each call. Set top-level `allow_shell = false` to hide it for a workspace/profile. The canonical `File`, `Git`, and `Run` action tools cover structured workspace work.
+- **Operate**: multitask conductor posture. Send ordinary messages and use the same direct tools, shell configuration, sandbox, permission posture, ask-rules, and repository protections as Act. The parent session is the **operator**: dispatching background workers is the **default** way real multi-step or independent work happens (no special multitask command). Handle small or tightly coupled tasks in the parent; for everything else, set a goal when work spans streams, start background `agent` workers early, treat queued follow-ups as new tasks, and keep the parent free for steers and synthesis. **Dispatch is not completion** — every write-capable child must return verification evidence (verifier child, `run_verifiers`, or structured PASS/FAIL with real commands). Prefer direct workers for independent streams; use Workflow when order, phases, gates, shared budgets, or deterministic fan-in matter (starter recipes under `workflows/operate_*.workflow.js`: staged-fix, read-audit, parallel-scout, best-of-n). Best-of-N (skill + starter workflow) runs N worktree implementers then a reviewer; apply the winner only after PASS.
 
 **Act** is accepted as an alias for Agent mode. Saved settings still normalize to `agent` for backward compatibility.
 
@@ -40,8 +40,8 @@ Run `/mode` to open the mode picker, or switch directly with `/mode act`,
 |:---|:---:|:---:|:---:|
 | Read-only file, search, and diagnostic tools | yes | yes | yes |
 | File write and patch tools | no | yes | yes; same active posture and protections as Act |
-| Shell tools (`exec_shell`, `task_shell_start`, waits, interact, cancel) | no | approval-gated by default, hidden when `allow_shell = false` | same as Act; delegation is preferred when parallelism or isolation helps |
-| Paid or external-service tools | follows approval posture | follows approval posture | follows approval posture |
+| `Bash` (`run`, `wait`, `interact`, `cancel`) | no | approval-gated by default, hidden when `allow_shell = false` | same as Act; delegation is preferred when parallelism or isolation helps |
+| Paid or external-service tools | follows permission posture | follows permission posture | follows permission posture |
 | Access outside the workspace root | explicit trusted paths only | only through trusted paths or trust mode | same trusted-path/trust policy as Act; Fleet profiles never widen it |
 
 Operate changes scheduling emphasis, not authority. It neither adds a
@@ -49,17 +49,36 @@ mode-specific tool denial nor bypasses the active approval, sandbox, shell,
 ask-rule, repository-law, or managed-policy boundary. Plan remains the
 mode-specific read-only boundary for shell and write-capable tools.
 
+### Operate loop (one screen)
+
+```text
+User message
+  → small / chat / one-file?  → parent does it (Act-equivalent tools)
+  → real / multi-stream work? → goal (if needed) → dispatch background workers
+       → each write child: implement → VERDICT PASS/FAIL with evidence
+       → ordered / gated fan-in? → Workflow (operate_* starters)
+       → high-stakes ambiguous? → best-of-n (N worktrees + reviewer; apply on PASS)
+  → parent synthesizes receipts; stays free for the next ask
+```
+
+Lifecycle claims stay exact: dispatched ≠ settled ≠ verified.
+
 If a shell tool is missing from the model-visible catalog in Act or Operate, check
 for an explicit `allow_shell = false` in the active config/profile or runtime
 session. Durable tasks and automation keep conservative omitted-field defaults;
 they only receive shell access when their task settings explicitly grant it.
-`allow_shell = true` controls shell availability only; direct multiline
-`exec_shell` commands remain blocked by shell safety validation. For heredocs,
+`allow_shell = true` controls shell availability only; direct multiline `Bash`
+`run` commands remain blocked by shell safety validation. For heredocs,
 embedded scripts, or long manual flows, use single-line commands, write a
-script/file first, or run through `task_shell_start`/background shell.
+script/file first, or use `Bash` with its background, `wait`, and `interact`
+actions.
 Full Access turns shell access on together with trust mode and auto-approval.
 
-All action-capable modes have access to persistent RLM sessions through `rlm_open`, `rlm_eval`, `rlm_configure`, and `rlm_close`. Inside an RLM Python REPL, `sub_query_batch` fans out 1-16 cheap parallel child calls pinned to `deepseek-v4-flash`. The model reaches for it when work is too large or repetitive for the parent transcript.
+Action-capable modes can discover the deferred `rlm` family through
+`tool_search`; its `open`, `eval`, `configure`, and `close` actions own persistent
+RLM sessions. The legacy split `rlm_*` spellings remain replay-only aliases.
+Inside an RLM Python REPL, `sub_query_batch` fans out 1-16 cheap parallel child
+calls pinned to `deepseek-v4-flash`.
 
 The fast `deepseek-v4-flash` / thinking-off path is called Fin in the product
 language. Fin is a seam for routing, summaries, cheap child calls, and
@@ -70,7 +89,7 @@ objectives visible as Work context. `/goal pause` stops goal continuation withou
 changing the objective, `/goal resume` resumes and sends the objective back into
 the turn, `/goal complete` marks it done, `/goal blocked` marks it blocked, and
 `/goal clear` removes it. Goal state does not change the active TUI mode,
-approval mode, or model route. This remains distinct from `--model auto`, which
+permission posture, or model route. This remains distinct from `--model auto`, which
 only controls model and thinking selection.
 
 Workflow builds on the same separation: a goal can ask the agent to keep
@@ -151,7 +170,10 @@ Full Access enables trust mode automatically.
 
 ## MCP Behavior
 
-MCP tools are exposed as `mcp_<server>_<tool>` and use the same approval flow as built-in tools. Read-only MCP helpers may auto-run in suggestive approval modes; MCP tools with possible side effects require approval.
+MCP tools are exposed as `mcp_<server>_<tool>` and use the same approval flow as
+built-in tools. Read-only MCP helpers may auto-run in Ask and Auto-Review when
+policy permits; MCP tools with possible side effects require approval. Full
+Access does not bypass hard policy holds.
 
 See `MCP.md`.
 

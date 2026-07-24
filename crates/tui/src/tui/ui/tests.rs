@@ -62,6 +62,25 @@ fn permission_cycle_shortcut_accepts_both_shift_tab_encodings() {
 }
 
 #[test]
+fn settings_toggle_opens_and_closes_without_stacking_duplicates() {
+    let _lock = crate::test_support::lock_test_env();
+    let mut app = create_test_app();
+
+    toggle_settings_view(&mut app);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Config));
+
+    app.view_stack.push(HelpView::new_for_locale(app.ui_locale));
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Help));
+    toggle_settings_view(&mut app);
+    assert!(app.view_stack.is_empty());
+
+    toggle_settings_view(&mut app);
+    assert_eq!(app.view_stack.top_kind(), Some(ModalKind::Config));
+    toggle_settings_view(&mut app);
+    assert!(app.view_stack.is_empty());
+}
+
+#[test]
 fn ctrl_t_key_event_reaches_reasoning_effort_cycle() {
     let mut app = create_test_app();
     app.api_provider = crate::config::ApiProvider::Deepseek;
@@ -110,6 +129,341 @@ fn underwater_motion_keeps_its_smoother_cadence_during_live_status() {
 }
 
 #[test]
+fn canonical_bash_actions_use_exec_cells_without_rewriting_detail_identity() {
+    let cases = [
+        (
+            "run",
+            serde_json::json!({"action": "run", "command": "pwd"}),
+        ),
+        (
+            "wait",
+            serde_json::json!({"action": "wait", "task_id": "shell-1"}),
+        ),
+        (
+            "interact",
+            serde_json::json!({"action": "interact", "task_id": "shell-1", "stdin": "y\n"}),
+        ),
+        (
+            "cancel",
+            serde_json::json!({"action": "cancel", "task_id": "shell-1"}),
+        ),
+    ];
+
+    for (action, input) in cases {
+        let mut app = create_test_app();
+        let id = format!("bash-{action}");
+        handle_tool_call_started(&mut app, &id, "Bash", &input);
+        let active = app.active_cell.as_ref().expect("active cell");
+        let HistoryCell::Tool(ToolCell::Exec(exec)) = &active.entries()[0] else {
+            panic!("Bash.{action} must use ExecCell")
+        };
+        assert_eq!(exec.interaction.is_some(), action != "run", "Bash.{action}");
+        assert_eq!(app.active_tool_details[&id].tool_name, "Bash");
+        assert_eq!(app.active_tool_details[&id].input, input);
+    }
+
+    let mut legacy = create_test_app();
+    handle_tool_call_started(
+        &mut legacy,
+        "legacy-cancel",
+        "exec_shell_cancel",
+        &serde_json::json!({"task_id": "shell-legacy"}),
+    );
+    let active = legacy.active_cell.as_ref().expect("active cell");
+    assert!(matches!(
+        active.entries()[0],
+        HistoryCell::Tool(ToolCell::Exec(_))
+    ));
+    assert_eq!(
+        legacy.active_tool_details["legacy-cancel"].tool_name,
+        "exec_shell_cancel"
+    );
+}
+
+#[test]
+fn canonical_background_bash_keeps_live_task_identity_for_follow_up_actions() {
+    let mut app = create_test_app();
+    handle_tool_call_started(
+        &mut app,
+        "bash-background",
+        "Bash",
+        &serde_json::json!({
+            "action": "run",
+            "command": "cargo test --workspace",
+            "background": true
+        }),
+    );
+    let running = Ok(
+        crate::tools::spec::ToolResult::success("Background task started: shell-42").with_metadata(
+            serde_json::json!({
+                "status": "Running",
+                "task_id": "shell-42",
+                "command": "cargo test --workspace",
+                "duration_ms": 25_u64
+            }),
+        ),
+    );
+    handle_tool_call_complete(&mut app, "bash-background", "Bash", &running);
+
+    let active = app.active_cell.as_ref().expect("active cell");
+    let HistoryCell::Tool(ToolCell::Exec(exec)) = &active.entries()[0] else {
+        panic!("canonical background Bash must remain an ExecCell")
+    };
+    assert_eq!(exec.status, ToolStatus::Running);
+    assert_eq!(exec.shell_task_id.as_deref(), Some("shell-42"));
+    assert_eq!(exec.command, "cargo test --workspace");
+    assert!(exec.output.is_none());
+    assert!(
+        exec.live_output
+            .as_deref()
+            .is_some_and(|output| { output.contains("Background task started: shell-42") })
+    );
+}
+
+#[test]
+fn canonical_file_actions_split_reads_searches_and_mutations_truthfully() {
+    let cases = [
+        ("read", "exploring"),
+        ("list", "exploring"),
+        ("search_name", "file_search"),
+        ("search_content", "exploring"),
+        ("write", "patch_summary"),
+        ("edit", "patch_summary"),
+        ("patch", "patch_summary"),
+    ];
+
+    for (action, expected) in cases {
+        let mut app = create_test_app();
+        let id = format!("file-{action}");
+        let input = match action {
+            "read" | "list" => serde_json::json!({"action": action, "path": "src"}),
+            "search_name" => serde_json::json!({"action": action, "query": "lib.rs"}),
+            "search_content" => {
+                serde_json::json!({"action": action, "pattern": "whale", "path": "src"})
+            }
+            "write" => serde_json::json!({
+                "action": action,
+                "path": "src/new.rs",
+                "content": "pub fn new() {}\n"
+            }),
+            "edit" => serde_json::json!({
+                "action": action,
+                "path": "src/lib.rs",
+                "search": "old",
+                "replace": "new"
+            }),
+            "patch" => serde_json::json!({
+                "action": action,
+                "patch": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+            }),
+            _ => unreachable!(),
+        };
+        handle_tool_call_started(&mut app, &id, "File", &input);
+        let active = app.active_cell.as_ref().expect("active cell");
+        let tool = match &active.entries()[0] {
+            HistoryCell::Tool(tool) => tool,
+            other => panic!("expected tool cell, got {other:?}"),
+        };
+        match expected {
+            "exploring" => assert!(matches!(tool, ToolCell::Exploring(_)), "File.{action}"),
+            "patch_summary" => {
+                assert!(matches!(tool, ToolCell::PatchSummary(_)), "File.{action}")
+            }
+            semantic_name => {
+                let ToolCell::Generic(generic) = tool else {
+                    panic!("File.{action} must use GenericToolCell")
+                };
+                assert_eq!(generic.name, semantic_name, "File.{action}");
+            }
+        }
+        assert_eq!(app.active_tool_details[&id].tool_name, "File");
+    }
+}
+
+#[test]
+fn canonical_file_mutations_attach_receipts_only_to_successful_outcomes() {
+    for approval_mode in [
+        ApprovalMode::Suggest,
+        ApprovalMode::Auto,
+        ApprovalMode::Bypass,
+    ] {
+        for action in ["write", "edit", "patch"] {
+            let mut app = create_test_app();
+            app.approval_mode = approval_mode;
+            let id = format!("file-{approval_mode:?}-{action}-success");
+            let input = if action == "patch" {
+                serde_json::json!({
+                    "action": action,
+                    "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"
+                })
+            } else {
+                serde_json::json!({"action": action, "path": "src/lib.rs"})
+            };
+            handle_tool_call_started(&mut app, &id, "File", &input);
+            handle_tool_call_complete(
+                &mut app,
+                &id,
+                "File",
+                &Ok(crate::tools::spec::ToolResult::success("ok").with_metadata(
+                    serde_json::json!({
+                        "mutation": {
+                            "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                            "files": [{ "path": "src/lib.rs", "outcome": "updated" }],
+                            "renames": []
+                        }
+                    }),
+                )),
+            );
+
+            let active = app.active_cell.as_ref().expect("active cell");
+            let HistoryCell::Tool(ToolCell::PatchSummary(cell)) = &active.entries()[0] else {
+                panic!("File.{action} must stay on the calm File receipt path")
+            };
+            assert_eq!(
+                cell.status,
+                ToolStatus::Success,
+                "{approval_mode:?} File.{action}"
+            );
+            assert!(cell.receipt.is_some(), "{approval_mode:?} File.{action}");
+            assert_eq!(
+                cell.receipt.as_ref().unwrap().outcome_label(),
+                "Updated src/lib.rs",
+                "{approval_mode:?} File.{action}"
+            );
+        }
+    }
+
+    let mut failed = create_test_app();
+    handle_tool_call_started(
+        &mut failed,
+        "file-write-failed",
+        "File",
+        &serde_json::json!({"action": "write", "path": "src/lib.rs"}),
+    );
+    handle_tool_call_complete(
+        &mut failed,
+        "file-write-failed",
+        "File",
+        &Ok(
+            crate::tools::spec::ToolResult::error("cancelled before mutation").with_metadata(
+                serde_json::json!({
+                    "mutation": {
+                        "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+FORGED\n",
+                        "files": [{ "path": "src/lib.rs", "outcome": "updated" }],
+                        "renames": []
+                    }
+                }),
+            ),
+        ),
+    );
+    let active = failed.active_cell.as_ref().expect("active cell");
+    let HistoryCell::Tool(ToolCell::PatchSummary(cell)) = &active.entries()[0] else {
+        panic!("failed File.write must remain a File receipt cell")
+    };
+    assert_eq!(cell.status, ToolStatus::Failed);
+    assert!(cell.receipt.is_none());
+    assert_eq!(cell.error.as_deref(), Some("cancelled before mutation"));
+}
+
+#[test]
+fn canonical_git_run_and_web_actions_use_semantic_history_cells() {
+    for (family, action, expected) in [
+        ("Git", "status", "git_status"),
+        ("Git", "diff", "git_diff"),
+        ("Git", "log", "git_log"),
+        ("Git", "show", "git_show"),
+        ("Git", "blame", "git_blame"),
+        ("Run", "tests", "run_tests"),
+        ("Run", "verifiers", "run_verifiers"),
+        ("Web", "fetch", "fetch_url"),
+        ("Web", "wait", "wait_for_dev_server"),
+    ] {
+        let mut app = create_test_app();
+        let id = format!("{family}-{action}");
+        handle_tool_call_started(
+            &mut app,
+            &id,
+            family,
+            &serde_json::json!({"action": action}),
+        );
+        let active = app.active_cell.as_ref().expect("active cell");
+        let HistoryCell::Tool(ToolCell::Generic(generic)) = &active.entries()[0] else {
+            panic!("{family}.{action} must use GenericToolCell")
+        };
+        assert_eq!(generic.name, expected, "{family}.{action}");
+        assert_eq!(app.active_tool_details[&id].tool_name, family);
+    }
+
+    let mut app = create_test_app();
+    handle_tool_call_started(
+        &mut app,
+        "Web-search",
+        "Web",
+        &serde_json::json!({"action": "search", "query": "Codewhale"}),
+    );
+    let active = app.active_cell.as_ref().expect("active cell");
+    assert!(matches!(
+        active.entries()[0],
+        HistoryCell::Tool(ToolCell::WebSearch(_))
+    ));
+    assert_eq!(app.active_tool_details["Web-search"].tool_name, "Web");
+}
+
+#[test]
+fn canonical_completion_refreshes_workspace_only_for_semantic_mutations() {
+    let stale = Instant::now() - Duration::from_secs(60);
+
+    let mut reading = create_test_app();
+    reading.workspace_context_refreshed_at = Some(stale);
+    handle_tool_call_started(
+        &mut reading,
+        "file-read",
+        "File",
+        &serde_json::json!({"action": "read", "path": "src/lib.rs"}),
+    );
+    handle_tool_call_complete(&mut reading, "file-read", "File", &ok_result("contents"));
+    assert_eq!(reading.workspace_context_refreshed_at, Some(stale));
+
+    for (action, input) in [
+        (
+            "write",
+            serde_json::json!({
+                "action": "write",
+                "path": "src/new.rs",
+                "content": "new\n"
+            }),
+        ),
+        (
+            "edit",
+            serde_json::json!({
+                "action": "edit",
+                "path": "src/lib.rs",
+                "search": "old",
+                "replace": "new"
+            }),
+        ),
+        (
+            "patch",
+            serde_json::json!({
+                "action": "patch",
+                "patch": "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n"
+            }),
+        ),
+    ] {
+        let mut app = create_test_app();
+        app.workspace_context_refreshed_at = Some(stale);
+        let id = format!("file-{action}");
+        handle_tool_call_started(&mut app, &id, "File", &input);
+        handle_tool_call_complete(&mut app, &id, "File", &ok_result("ok"));
+        assert!(
+            app.workspace_context_refreshed_at
+                .is_some_and(|when| when > stale),
+            "File.{action} must refresh the workspace badge"
+        );
+    }
+}
+
+#[test]
 fn underwater_motion_ticks_only_for_visible_unobscured_owners() {
     assert!(!underwater_motion_surface_visible(None, true, true, false));
     assert!(!underwater_motion_surface_visible(
@@ -130,7 +484,7 @@ fn underwater_motion_ticks_only_for_visible_unobscured_owners() {
         true,
         false,
     ));
-    assert!(!underwater_motion_surface_visible(
+    assert!(underwater_motion_surface_visible(
         Some(Rect::new(0, 0, 60, 16)),
         false,
         false,
@@ -265,6 +619,47 @@ fn closing_work_inspector_pager_clears_opened_row_owner() {
 
     assert_eq!(app.view_stack.top_kind(), None);
     assert!(app.work_surface.opened.is_none());
+}
+
+#[test]
+fn coordination_event_projection_is_retained_as_typed_app_state() {
+    use crate::tools::subagent::CoordinationDetailProjection;
+    use crate::tools::subagent::coord::{
+        CoordinationDetailMetrics, DecisionRecord, DecisionStatus,
+    };
+
+    let mut app = create_test_app();
+    let projection = CoordinationDetailProjection {
+        schema_version: 1,
+        sequence: 4,
+        decisions: vec![DecisionRecord {
+            decision_id: "decision-app".to_string(),
+            subject: "typed app state".to_string(),
+            status: DecisionStatus::Accepted,
+            owner: "root".to_string(),
+            scope: Vec::new(),
+            constraints: Vec::new(),
+            evidence_handles: Vec::new(),
+            version: 2,
+            sequence: 4,
+        }],
+        write_claims: Vec::new(),
+        reconciliations: Vec::new(),
+        context_projections: Vec::new(),
+        contentions: Vec::new(),
+        metrics: CoordinationDetailMetrics {
+            hottest_paths: Vec::new(),
+            package_or_module_growth: None,
+            route_or_cost: None,
+            note: "No authoritative metric source".to_string(),
+        },
+        bounded: true,
+        limit: 24,
+    };
+
+    apply_coordination_detail_projection(&mut app, projection.clone());
+
+    assert_eq!(app.coordination_detail, Some(projection));
 }
 
 #[test]
@@ -1407,7 +1802,7 @@ fn mouse_selection_autocopies_on_release_without_ctrl_c() {
 }
 
 #[test]
-fn loading_mouse_filter_keeps_active_drags() {
+fn loading_mouse_filter_keeps_hover_and_active_drags() {
     let mut app = create_test_app();
     app.is_loading = true;
 
@@ -1424,7 +1819,7 @@ fn loading_mouse_filter_keeps_active_drags() {
         modifiers: KeyModifiers::NONE,
     };
 
-    assert!(should_drop_loading_mouse_motion(&app, moved));
+    assert!(!should_drop_loading_mouse_motion(&app, moved));
     assert!(should_drop_loading_mouse_motion(&app, drag));
 
     app.viewport.transcript_selection.dragging = true;
@@ -1438,6 +1833,23 @@ fn loading_mouse_filter_keeps_active_drags() {
     app.viewport.transcript_scrollbar_dragging = false;
     app.sidebar_resizing = true;
     assert!(!should_drop_loading_mouse_motion(&app, drag));
+
+    app.sidebar_resizing = false;
+    app.work_surface.last_area = Some(Rect::new(0, 0, 80, 3));
+    let started = crate::tui::work_surface::handle_mouse(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(started.consumed);
+    assert!(
+        !should_drop_loading_mouse_motion(&app, drag),
+        "Underwater Work divider drag must survive the loading filter"
+    );
 }
 
 #[test]
@@ -1560,7 +1972,7 @@ fn loading_mouse_filter_allows_sidebar_exit_to_clear_highlight() {
     handle_mouse_event(&mut app, exit_left);
 
     assert_eq!(app.last_mouse_pos, Some((59, 5)));
-    assert!(should_drop_loading_mouse_motion(
+    assert!(!should_drop_loading_mouse_motion(
         &app,
         MouseEvent {
             kind: MouseEventKind::Moved,
@@ -2231,44 +2643,6 @@ fn file_tree_shortcut_does_not_steal_plain_ctrl_e() {
 }
 
 #[test]
-fn parse_plan_choice_accepts_numbers() {
-    assert_eq!(parse_plan_choice("1"), Some(PlanChoice::AcceptAgent));
-    assert_eq!(parse_plan_choice("2"), Some(PlanChoice::AcceptYolo));
-    assert_eq!(parse_plan_choice("3"), Some(PlanChoice::RevisePlan));
-    assert_eq!(parse_plan_choice("4"), Some(PlanChoice::ExitPlan));
-}
-
-#[test]
-fn parse_plan_choice_rejects_aliases_and_extra_text() {
-    assert_eq!(parse_plan_choice("accept"), None);
-    assert_eq!(parse_plan_choice("agent"), None);
-    assert_eq!(parse_plan_choice("yolo"), None);
-    assert_eq!(parse_plan_choice("3 revise"), None);
-    assert_eq!(parse_plan_choice("unknown"), None);
-}
-
-#[test]
-fn plan_choice_from_option_maps_expected_values() {
-    assert_eq!(plan_choice_from_option(1), Some(PlanChoice::AcceptAgent));
-    assert_eq!(plan_choice_from_option(2), Some(PlanChoice::AcceptYolo));
-    assert_eq!(plan_choice_from_option(3), Some(PlanChoice::RevisePlan));
-    assert_eq!(plan_choice_from_option(4), Some(PlanChoice::ExitPlan));
-    assert_eq!(plan_choice_from_option(5), None);
-}
-
-#[test]
-fn plan_prompt_view_escape_emits_dismiss_event() {
-    let mut view = PlanPromptView::new(None);
-
-    let action = view.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
-
-    assert!(matches!(
-        action,
-        ViewAction::EmitAndClose(ViewEvent::PlanPromptDismissed)
-    ));
-}
-
-#[test]
 fn transcript_scroll_percent_is_clamped_and_relative() {
     assert_eq!(transcript_scroll_percent(0, 20, 120), Some(0));
     assert_eq!(transcript_scroll_percent(50, 20, 120), Some(50));
@@ -2758,6 +3132,21 @@ async fn session_denied_cache_notice_preserves_parallel_tool_indices() {
         app.history.get(history_len + 2),
         Some(HistoryCell::System { content }) if content.contains("Auto-denied")
     ));
+    let first_detail = app
+        .tool_detail_record_for_cell(history_len)
+        .expect("first completed tool keeps its own raw detail record");
+    assert_eq!(first_detail.tool_id, "tool-first");
+    assert_eq!(first_detail.output.as_deref(), Some("first output"));
+    let denied_detail = app
+        .tool_detail_record_for_cell(history_len + 1)
+        .expect("second completed tool keeps its own raw detail record");
+    assert_eq!(denied_detail.tool_id, "tool-denied");
+    assert!(
+        denied_detail
+            .output
+            .as_deref()
+            .is_some_and(|output| output.contains("cached approval"))
+    );
 }
 
 #[tokio::test]
@@ -2944,85 +3333,132 @@ fn session_approved_cache_keeps_tool_name_session_grants() {
 
 #[test]
 fn forced_approval_prompt_bypasses_auto_mode_shortcut() {
+    use crate::core::authority::ApprovalRequestDisposition;
     let mut app = create_test_app();
     app.approval_mode = ApprovalMode::Auto;
 
-    assert!(!should_auto_approve_approval_request(
-        &app,
-        "exec_shell",
-        "shell:exec_shell:cargo test",
-        true,
-    ));
+    // Auto-Review does not full-access auto-approve; a forced hold still
+    // reaches a modal Prompt disposition (not Full Access policy deny).
+    assert_eq!(
+        resolve_ui_approval_disposition(
+            &app,
+            "exec_shell",
+            "shell:exec_shell:cargo test",
+            "key",
+            true,
+        ),
+        ApprovalRequestDisposition::Prompt
+    );
 }
 
 #[test]
 fn forced_approval_prompt_bypasses_session_approval_shortcut() {
+    use crate::core::authority::ApprovalRequestDisposition;
     let mut app = create_test_app();
     app.mode = AppMode::Agent;
     app.approval_mode = ApprovalMode::Suggest;
     app.approval_session_approved
         .insert("shell:exec_shell:cargo test".to_string());
 
-    assert!(!should_auto_approve_approval_request(
-        &app,
-        "exec_shell",
-        "shell:exec_shell:cargo test",
-        true,
-    ));
+    // Session grant alone cannot auto-approve a forced policy hold under Ask —
+    // the disposition stays Prompt so the user still sees the hold.
+    assert_eq!(
+        resolve_ui_approval_disposition(
+            &app,
+            "exec_shell",
+            "shell:exec_shell:cargo test",
+            "key",
+            true,
+        ),
+        ApprovalRequestDisposition::Prompt
+    );
 }
 
 #[test]
 fn full_access_auto_approves_requests_while_auto_review_does_not() {
+    use crate::core::authority::ApprovalRequestDisposition;
     let mut app = create_test_app();
     app.approval_mode = ApprovalMode::Auto;
-    assert!(!should_auto_approve_approval_request(
-        &app,
-        "exec_shell",
-        "shell:exec_shell:cargo test",
-        false,
-    ));
+    assert_eq!(
+        resolve_ui_approval_disposition(
+            &app,
+            "exec_shell",
+            "shell:exec_shell:cargo test",
+            "key",
+            false,
+        ),
+        ApprovalRequestDisposition::Prompt
+    );
 
     app.approval_mode = ApprovalMode::Bypass;
-    assert!(should_auto_approve_approval_request(
-        &app,
-        "exec_shell",
-        "shell:exec_shell:cargo test",
-        false,
-    ));
-    assert!(!should_auto_approve_approval_request(
-        &app,
-        "exec_shell",
-        "shell:exec_shell:cargo test",
-        true,
-    ));
-    assert!(should_auto_deny_forced_approval_request(&app, true));
+    assert_eq!(
+        resolve_ui_approval_disposition(
+            &app,
+            "exec_shell",
+            "shell:exec_shell:cargo test",
+            "key",
+            false,
+        ),
+        ApprovalRequestDisposition::AutoApprove
+    );
+    assert_eq!(
+        resolve_ui_approval_disposition(
+            &app,
+            "exec_shell",
+            "shell:exec_shell:cargo test",
+            "key",
+            true,
+        ),
+        ApprovalRequestDisposition::AutoDenyFullAccessPolicyHold
+    );
 
     app.approval_mode = ApprovalMode::Suggest;
     app.mode = AppMode::Yolo;
-    assert!(should_auto_approve_approval_request(
-        &app,
-        "exec_shell",
-        "shell:exec_shell:cargo test",
-        false,
-    ));
-    assert!(!should_auto_approve_approval_request(
-        &app,
-        "exec_shell",
-        "shell:exec_shell:cargo test",
-        true,
-    ));
-    assert!(should_auto_deny_forced_approval_request(&app, true));
+    assert_eq!(
+        resolve_ui_approval_disposition(
+            &app,
+            "exec_shell",
+            "shell:exec_shell:cargo test",
+            "key",
+            false,
+        ),
+        ApprovalRequestDisposition::AutoApprove
+    );
+    assert_eq!(
+        resolve_ui_approval_disposition(
+            &app,
+            "exec_shell",
+            "shell:exec_shell:cargo test",
+            "key",
+            true,
+        ),
+        ApprovalRequestDisposition::AutoDenyFullAccessPolicyHold
+    );
 
     app.mode = AppMode::Agent;
     app.approval_session_approved
         .insert("shell:exec_shell:cargo test".to_string());
-    assert!(should_auto_approve_approval_request(
-        &app,
-        "exec_shell",
-        "shell:exec_shell:cargo test",
-        false,
-    ));
-    assert!(!should_auto_deny_forced_approval_request(&app, true));
+    assert_eq!(
+        resolve_ui_approval_disposition(
+            &app,
+            "exec_shell",
+            "shell:exec_shell:cargo test",
+            "key",
+            false,
+        ),
+        ApprovalRequestDisposition::AutoApprove
+    );
+    // Without Full Access, a forced hold still opens a modal (Prompt).
+    assert_eq!(
+        resolve_ui_approval_disposition(
+            &app,
+            "exec_shell",
+            "shell:exec_shell:cargo test",
+            "key",
+            true,
+        ),
+        ApprovalRequestDisposition::Prompt
+    );
 }
 
 #[test]
@@ -3548,25 +3984,7 @@ fn setup_presets_cannot_override_managed_runtime_requirements() {
 }
 
 #[tokio::test]
-// This test intentionally pins the process-global spillover root until the
-// async receipt path finishes.
-#[allow(clippy::await_holding_lock)]
-async fn tool_result_api_content_receipts_large_live_output() {
-    let _guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
-        .lock()
-        .unwrap_or_else(|err| err.into_inner());
-    let tmp = TempDir::new().expect("spillover tempdir");
-    let prior = crate::tools::truncate::set_test_spillover_root(Some(
-        tmp.path().join(".deepseek").join("tool_outputs"),
-    ));
-    struct Restore(Option<PathBuf>);
-    impl Drop for Restore {
-        fn drop(&mut self) {
-            crate::tools::truncate::set_test_spillover_root(self.0.take());
-        }
-    }
-    let _restore = Restore(prior);
-
+async fn tool_result_api_content_never_advertises_unowned_live_output_as_retrievable() {
     let mut app = App::new(create_test_options(), &Config::default());
     app.api_messages.push(Message {
         role: "assistant".to_string(),
@@ -3586,8 +4004,10 @@ async fn tool_result_api_content_receipts_large_live_output() {
     assert!(content.contains("[TOOL_OUTPUT_RECEIPT]"));
     assert!(content.contains("tool: exec_shell"));
     assert!(content.contains("tool_call_id: call-live-big"));
-    assert!(content.contains("detail_handle: sha:"));
-    assert!(content.contains("retrieve: retrieve_tool_result ref=sha:"));
+    assert!(content.contains("detail_handle: unavailable (sha256:"));
+    assert!(content.contains("retrieve: unavailable"));
+    assert!(content.contains("storage: no session-owned artifact was recorded"));
+    assert!(!content.contains("retrieve_tool_result"));
     assert!(!content.contains(&raw));
     assert!(
         content.chars().count()
@@ -3751,6 +4171,48 @@ fn apply_loaded_session_does_not_restore_slash_command_tail_as_retry_draft() {
             .iter()
             .any(|cell| matches!(cell, HistoryCell::User { .. }))
     );
+}
+
+#[test]
+fn apply_loaded_session_hides_turn_metadata_without_mutating_api_history() {
+    let turn_meta = concat!(
+        "<turn_meta>\n",
+        "Current local date: 2026-07-22\n",
+        "Input provenance: external_user\n",
+        "Input authority: external_current_turn\n",
+        "</turn_meta>",
+    );
+    let user_message = Message {
+        role: "user".to_string(),
+        content: vec![
+            ContentBlock::Text {
+                text: "Keep the restored transcript calm".to_string(),
+                cache_control: None,
+            },
+            ContentBlock::Text {
+                text: turn_meta.to_string(),
+                cache_control: None,
+            },
+        ],
+    };
+    let session = saved_session_with_messages(vec![
+        user_message,
+        text_message("assistant", "The wire context stays complete."),
+    ]);
+    let mut app = create_test_app();
+
+    apply_loaded_session(&mut app, &mut Config::default(), &session).expect("restore session");
+
+    assert!(matches!(
+        app.history.as_slice(),
+        [HistoryCell::User { content }, HistoryCell::Assistant { .. }]
+            if content == "Keep the restored transcript calm"
+    ));
+    assert!(matches!(
+        app.api_messages[0].content.as_slice(),
+        [ContentBlock::Text { text: visible, .. }, ContentBlock::Text { text: meta, .. }]
+            if visible == "Keep the restored transcript calm" && meta == turn_meta
+    ));
 }
 
 #[test]
@@ -4094,7 +4556,7 @@ fn active_tool_status_label_summarizes_live_tool_group() {
     assert!(label.contains("cargo test"));
     assert!(label.contains("1 active"));
     assert!(label.contains("1 done"));
-    assert!(label.contains(crate::tui::key_shortcuts::tool_details_shortcut_label()));
+    assert!(label.contains(crate::tui::key_shortcuts::tool_details_shortcut_label().as_ref()));
     assert!(label.contains("opens details"));
 }
 
@@ -4155,15 +4617,93 @@ fn shell_live_output_update_matches_exact_task_id_only() {
     );
 
     assert!(shell_exec_live_update(&app, 0, &jobs).is_none());
-    let (_task_id, status, output, duration) =
+    let (_task_id, status, output, duration, finalized) =
         shell_exec_live_update(&app, 1, &jobs).expect("matching task id updates");
 
     assert_eq!(status, ToolStatus::Running);
     assert_eq!(duration, 777);
+    assert!(!finalized);
     assert_eq!(
         output.as_deref(),
         Some("stdout tail\n\n\nSTDERR:\nstderr tail\n")
     );
+}
+
+#[test]
+fn shell_live_output_update_finalizes_background_exec_output() {
+    let mut app = create_test_app();
+    app.push_history_cell(HistoryCell::Tool(ToolCell::Exec(ExecCell {
+        command: "cargo test --workspace".to_string(),
+        status: ToolStatus::Running,
+        output: None,
+        live_output: Some("previous output".to_string()),
+        shell_task_id: Some("shell_a".to_string()),
+        owner_agent_id: None,
+        owner_agent_name: None,
+        started_at: None,
+        duration_ms: None,
+        source: ExecSource::Assistant,
+        interaction: None,
+        output_summary: None,
+    })));
+
+    let mut jobs = std::collections::HashMap::new();
+    jobs.insert(
+        "shell_a".to_string(),
+        ShellJobSnapshot {
+            id: "shell_a".to_string(),
+            job_id: "shell_a".to_string(),
+            command: "cargo test --workspace".to_string(),
+            cwd: PathBuf::from("/tmp/repo"),
+            status: ShellStatus::Completed,
+            exit_code: Some(0),
+            elapsed_ms: 999,
+            stdout_tail: "final stdout\n".to_string(),
+            stderr_tail: "final stderr\n".to_string(),
+            stdout_len: 13,
+            stderr_len: 13,
+            stdin_available: false,
+            stale: false,
+            elapsed_since_output_ms: None,
+            linked_task_id: None,
+            owner_agent_id: None,
+            owner_agent_name: None,
+        },
+    );
+
+    let (task_id, status, output, duration, finalized) =
+        shell_exec_live_update(&app, 0, &jobs).expect("completed shell updates");
+    assert_eq!(task_id, "shell_a");
+    assert_eq!(status, ToolStatus::Success);
+    assert_eq!(duration, 999);
+    assert!(finalized);
+    assert_eq!(
+        output.as_deref(),
+        Some("final stdout\n\n\nSTDERR:\nfinal stderr\n")
+    );
+
+    let HistoryCell::Tool(ToolCell::Exec(exec)) =
+        app.cell_at_virtual_index_mut(0).expect("exec cell")
+    else {
+        panic!("expected exec cell");
+    };
+    exec.status = status;
+    exec.duration_ms = Some(duration);
+    exec.output = output;
+    exec.output_summary = exec
+        .output
+        .as_deref()
+        .map(crate::tui::history::summarize_tool_output);
+    exec.live_output = None;
+
+    assert_eq!(exec.status, ToolStatus::Success);
+    assert_eq!(
+        exec.output.as_deref(),
+        Some("final stdout\n\n\nSTDERR:\nfinal stderr\n")
+    );
+    assert!(exec.live_output.is_none());
+    assert_eq!(exec.duration_ms, Some(999));
+    assert!(exec.output_summary.is_some());
 }
 
 #[test]
@@ -5299,7 +5839,10 @@ async fn immediate_submit_closed_mailbox_restores_composer_and_skill() {
         .as_ref()
         .expect("dispatch failure should stay visible");
     assert_eq!(sticky.level, StatusToastLevel::Error);
-    assert!(sticky.ttl_ms.is_none());
+    assert_eq!(
+        sticky.ttl_ms,
+        Some(crate::tui::app::App::STICKY_ERROR_TTL_MS)
+    );
 }
 
 #[tokio::test]
@@ -6026,7 +6569,12 @@ async fn dispatch_user_message_keeps_auto_review_separate_from_bypass() {
     assert_eq!(pending_route.1, app.model);
     assert!(!pending_route.2);
 
-    match engine.rx_op.recv().await.expect("send message op") {
+    // #4605: dispatch spawns the async phase; the Op arrives from the spawned task.
+    let op = tokio::time::timeout(std::time::Duration::from_secs(2), engine.rx_op.recv())
+        .await
+        .expect("spawned dispatch should deliver Op within timeout")
+        .expect("send message op");
+    match op {
         crate::core::ops::Op::SendMessage {
             mode,
             auto_approve,
@@ -6060,11 +6608,14 @@ fn apply_goal_snapshot_updates_visible_goal_status() {
         elapsed_seconds: Some(12),
         evidence: Some("focused tests passed".to_string()),
         blocker: None,
+        pause_reason: None,
         completion_verification: Some(crate::tools::goal::GoalCompletionVerification {
             status: "passed".to_string(),
             check: "cargo test".to_string(),
             summary: "focused tests passed".to_string(),
+            ..Default::default()
         }),
+        ..Default::default()
     };
 
     assert!(apply_goal_snapshot_to_app(&mut app, &completed));
@@ -6092,7 +6643,9 @@ fn apply_goal_snapshot_updates_visible_goal_status() {
         elapsed_seconds: Some(1),
         evidence: None,
         blocker: Some("needs user approval".to_string()),
+        pause_reason: None,
         completion_verification: None,
+        ..Default::default()
     };
 
     assert!(apply_goal_snapshot_to_app(&mut app, &blocked));
@@ -6122,7 +6675,9 @@ fn canonical_goal_clear_wins_after_stale_active_snapshot() {
         elapsed_seconds: Some(5),
         evidence: None,
         blocker: None,
+        pause_reason: None,
         completion_verification: None,
+        ..Default::default()
     };
     assert!(apply_goal_snapshot_to_app(&mut app, &stale_active));
     assert!(app.hunt.quarry.is_some());
@@ -6139,7 +6694,9 @@ fn canonical_goal_clear_wins_after_stale_active_snapshot() {
         elapsed_seconds: None,
         evidence: None,
         blocker: None,
+        pause_reason: None,
         completion_verification: None,
+        ..Default::default()
     };
     assert!(apply_goal_snapshot_to_app(&mut app, &cleared));
     assert!(app.hunt.quarry.is_none());
@@ -6187,11 +6744,14 @@ fn apply_goal_snapshot_resume_clears_frozen_timer() {
         elapsed_seconds: Some(0),
         evidence: Some("done".to_string()),
         blocker: None,
+        pause_reason: None,
         completion_verification: Some(crate::tools::goal::GoalCompletionVerification {
             status: "passed".to_string(),
             check: "cargo test".to_string(),
             summary: "ok".to_string(),
+            ..Default::default()
         }),
+        ..Default::default()
     };
     assert!(apply_goal_snapshot_to_app(&mut app, &completed));
     assert_eq!(app.hunt.verdict, crate::tui::app::HuntVerdict::Hunted);
@@ -6209,7 +6769,9 @@ fn apply_goal_snapshot_resume_clears_frozen_timer() {
         elapsed_seconds: Some(0),
         evidence: None,
         blocker: None,
+        pause_reason: None,
         completion_verification: None,
+        ..Default::default()
     };
     assert!(apply_goal_snapshot_to_app(&mut app, &resumed));
     assert_eq!(app.hunt.verdict, crate::tui::app::HuntVerdict::Hunting);
@@ -6237,10 +6799,16 @@ fn apply_goal_snapshot_keeps_paused_timer_frozen_across_usage_updates() {
         elapsed_seconds: Some(10),
         evidence: None,
         blocker: None,
+        pause_reason: Some(crate::tools::goal::GoalPauseReason::User),
         completion_verification: None,
+        ..Default::default()
     };
     assert!(apply_goal_snapshot_to_app(&mut app, &paused));
     assert_eq!(app.hunt.verdict, crate::tui::app::HuntVerdict::Wounded);
+    assert_eq!(
+        app.hunt.pause_reason,
+        Some(crate::tools::goal::GoalPauseReason::User)
+    );
     let frozen_at = app
         .hunt
         .finished_at
@@ -6259,7 +6827,9 @@ fn apply_goal_snapshot_keeps_paused_timer_frozen_across_usage_updates() {
         elapsed_seconds: Some(25),
         evidence: None,
         blocker: None,
+        pause_reason: Some(crate::tools::goal::GoalPauseReason::User),
         completion_verification: None,
+        ..Default::default()
     };
     assert!(apply_goal_snapshot_to_app(&mut app, &paused_with_usage));
     assert_eq!(app.hunt.verdict, crate::tui::app::HuntVerdict::Wounded);
@@ -6280,10 +6850,13 @@ fn apply_goal_snapshot_keeps_paused_timer_frozen_across_usage_updates() {
         elapsed_seconds: Some(25),
         evidence: None,
         blocker: None,
+        pause_reason: None,
         completion_verification: None,
+        ..Default::default()
     };
     assert!(apply_goal_snapshot_to_app(&mut app, &resumed));
     assert_eq!(app.hunt.verdict, crate::tui::app::HuntVerdict::Hunting);
+    assert_eq!(app.hunt.pause_reason, None);
     assert!(
         app.hunt.finished_at.is_none(),
         "resuming a paused goal should re-arm the elapsed timer"
@@ -7202,6 +7775,9 @@ fn jobs_panel_ignores_completed_history_but_shows_for_real_jobs() {
         elapsed_since_output_ms: None,
         owner_agent_id: None,
         owner_agent_name: None,
+        current_tool: None,
+        role: None,
+        files_touched: 0,
     });
     assert!(
         crate::tui::sidebar::sidebar_auto_idle(&mut app),
@@ -7219,6 +7795,9 @@ fn jobs_panel_ignores_completed_history_but_shows_for_real_jobs() {
         elapsed_since_output_ms: None,
         owner_agent_id: None,
         owner_agent_name: None,
+        current_tool: None,
+        role: None,
+        files_touched: 0,
     });
     assert!(
         !crate::tui::sidebar::sidebar_auto_idle(&mut app),
@@ -7252,6 +7831,9 @@ fn ctrl_x_jobs_prefill_only_catches_running_shell_jobs_in_tasks_sidebar() {
         elapsed_since_output_ms: None,
         owner_agent_id: None,
         owner_agent_name: None,
+        current_tool: None,
+        role: None,
+        files_touched: 0,
     });
 
     assert!(prefill_jobs_cancel_all_if_tasks_sidebar(&mut app));
@@ -7279,6 +7861,9 @@ fn ctrl_x_jobs_prefill_falls_through_outside_tasks_sidebar_shell_jobs() {
         elapsed_since_output_ms: None,
         owner_agent_id: None,
         owner_agent_name: None,
+        current_tool: None,
+        role: None,
+        files_touched: 0,
     });
 
     assert!(!prefill_jobs_cancel_all_if_tasks_sidebar(&mut non_shell));
@@ -7298,6 +7883,9 @@ fn ctrl_x_jobs_prefill_falls_through_outside_tasks_sidebar_shell_jobs() {
         elapsed_since_output_ms: None,
         owner_agent_id: None,
         owner_agent_name: None,
+        current_tool: None,
+        role: None,
+        files_touched: 0,
     });
 
     assert!(!prefill_jobs_cancel_all_if_tasks_sidebar(
@@ -7348,6 +7936,34 @@ fn sidebar_resize_down_on_handle_starts_resizing() {
     );
     assert_eq!(app.sidebar_resize_anchor_x, 80);
     assert_eq!(app.sidebar_resize_anchor_width, 33);
+}
+
+#[test]
+fn sidebar_resize_handle_tracks_hover_for_visible_feedback() {
+    let mut app = create_test_app();
+    setup_resize_handle(&mut app, 80, 33, 120);
+
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 80,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(app.sidebar_resize_hovered);
+
+    handle_mouse_event(
+        &mut app,
+        MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 79,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        },
+    );
+    assert!(!app.sidebar_resize_hovered);
 }
 
 #[test]
@@ -7491,7 +8107,7 @@ fn make_subagent(
         fork_context: false,
         workspace: None,
         git_branch: None,
-        agent_type: crate::tools::subagent::SubAgentType::General,
+        agent_type: crate::tools::subagent::FleetRole::Worker,
         assignment: crate::tools::subagent::SubAgentAssignment {
             objective: format!("objective-{id}"),
             role: Some("worker".to_string()),
@@ -7963,8 +8579,8 @@ fn stall_reason_provider_wait_includes_route_and_idle_budget() {
     let reason = crate::tui::footer_ui::stall_reason(&app).expect("stalled turn has a reason");
     assert!(reason.contains("waiting for model"), "{reason}");
     // idle >= 60s, so the counter appears, but < 75% budget (225s) so no budget detail.
-    assert!(reason.contains("65s"), "{reason}");
-    assert!(!reason.contains("/300s"), "{reason}");
+    assert!(reason.contains("1m 05s"), "{reason}");
+    assert!(!reason.contains("/5m 00s"), "{reason}");
 }
 
 #[test]
@@ -9398,6 +10014,46 @@ fn apply_slash_menu_selection_appends_space_for_arg_commands() {
 }
 
 #[test]
+fn apply_slash_menu_selection_honors_user_argument_metadata_and_builtin_override() {
+    let tmp = TempDir::new().expect("tempdir");
+    let commands_dir = tmp.path().join(".codewhale").join("commands");
+    std::fs::create_dir_all(&commands_dir).expect("create commands dir");
+    std::fs::write(
+        commands_dir.join("custom-model.md"),
+        "---\nname: model\n---\ncustom model",
+    )
+    .expect("write no-argument builtin override");
+    std::fs::write(
+        commands_dir.join("inspect.md"),
+        "---\narguments: <path>\n---\ninspect",
+    )
+    .expect("write argument command");
+    let mut app = create_test_app();
+    app.workspace = tmp.path().to_path_buf();
+    let entries = vec![
+        crate::tui::widgets::SlashMenuEntry {
+            name: "/model".to_string(),
+            description: String::new(),
+            is_skill: false,
+            alias_hint: None,
+        },
+        crate::tui::widgets::SlashMenuEntry {
+            name: "/inspect".to_string(),
+            description: String::new(),
+            is_skill: false,
+            alias_hint: None,
+        },
+    ];
+
+    assert!(apply_slash_menu_selection(&mut app, &entries, true));
+    assert_eq!(app.input, "/model");
+
+    app.slash_menu_selected = 1;
+    assert!(apply_slash_menu_selection(&mut app, &entries, true));
+    assert_eq!(app.input, "/inspect ");
+}
+
+#[test]
 fn apply_slash_menu_selection_keeps_change_executable_without_version() {
     let mut app = create_test_app();
     let entries = vec![crate::tui::widgets::SlashMenuEntry {
@@ -9807,42 +10463,6 @@ fn workspace_context_drain_requests_redraw_when_context_changes() {
 }
 
 #[tokio::test]
-async fn dismissed_plan_prompt_leaves_non_numeric_input_for_normal_send_path() {
-    let mut app = create_test_app();
-    app.mode = AppMode::Plan;
-    app.plan_prompt_pending = true;
-    app.offline_mode = true;
-
-    let engine = crate::core::engine::mock_engine_handle();
-    let config = Config::default();
-
-    let handled = handle_plan_choice(&mut app, &config, &engine.handle, "yolo")
-        .await
-        .expect("plan choice");
-
-    assert!(!handled);
-    assert!(!app.plan_prompt_pending);
-    assert_eq!(app.mode, AppMode::Plan);
-
-    let queued = build_queued_message(&mut app, "yolo".to_string());
-    submit_or_steer_message(&mut app, &config, &engine.handle, queued)
-        .await
-        .expect("submit normal message");
-
-    assert_eq!(app.queued_message_count(), 1);
-    assert_eq!(
-        app.queued_messages
-            .front()
-            .map(crate::tui::app::QueuedMessage::content),
-        Some("yolo".to_string())
-    );
-    assert_eq!(
-        app.status_message.as_deref(),
-        Some("Offline: 1 queued follow-up(s) — ↑ edit last, /queue send <n>")
-    );
-}
-
-#[tokio::test]
 async fn dispatch_user_message_records_prompt_for_cancel_restore() {
     let mut app = create_test_app();
     app.show_thinking = false;
@@ -10137,6 +10757,36 @@ async fn streaming_enter_queue_pushes_visible_toast() {
 }
 
 #[tokio::test]
+async fn empty_composer_double_enter_steers_just_queued_message() {
+    // Live path regression: first Enter queues+clears; second bare Enter must
+    // still steer the just-queued body (not require retyping).
+    let mut app = create_test_app();
+    app.is_loading = true;
+    app.streaming_message_index = Some(0);
+    let config = Config::default();
+    let mut engine = crate::core::engine::mock_engine_handle();
+    let queued = build_queued_message(&mut app, "coordinate parallel tasks".to_string());
+
+    submit_or_steer_message(&mut app, &config, &engine.handle, queued)
+        .await
+        .expect("first enter queues while streaming");
+    assert_eq!(app.queued_message_count(), 1);
+    assert!(app.input.is_empty());
+    assert!(app.last_enter_instant.is_some());
+
+    let escalated = app
+        .take_queued_for_double_tap_steer()
+        .expect("second enter takes queued body");
+    attempt_steer_with_queue_fallback(&mut app, &engine.handle, escalated).await;
+
+    assert_eq!(app.queued_message_count(), 0);
+    assert_eq!(
+        engine.rx_steer.recv().await.as_deref(),
+        Some("coordinate parallel tasks")
+    );
+}
+
+#[tokio::test]
 async fn operate_streaming_enter_queues_another_parallel_task() {
     let mut app = create_test_app();
     app.mode = AppMode::Operate;
@@ -10180,38 +10830,6 @@ async fn inline_skill_request_keeps_instruction_when_busy_queueing() {
     assert_eq!(
         queued.skill_instruction.as_deref(),
         Some("Use the test skill")
-    );
-}
-
-#[tokio::test]
-async fn numeric_plan_choice_still_queues_follow_up_when_busy() {
-    let mut app = create_test_app();
-    app.mode = AppMode::Plan;
-    app.plan_prompt_pending = true;
-    app.is_loading = true;
-
-    let engine = crate::core::engine::mock_engine_handle();
-    let config = Config::default();
-
-    let handled = handle_plan_choice(&mut app, &config, &engine.handle, "2")
-        .await
-        .expect("plan choice");
-
-    assert!(handled);
-    assert!(!app.plan_prompt_pending);
-    // Plan choice 2 (accept in YOLO) lands in Agent mode + bypass approvals
-    // via the M6 compat shim.
-    assert_eq!(app.mode, AppMode::Agent);
-    assert_eq!(
-        app.approval_mode,
-        crate::tui::approval::ApprovalMode::Bypass
-    );
-    assert_eq!(app.queued_message_count(), 1);
-    assert_eq!(
-        app.queued_messages
-            .front()
-            .map(crate::tui::app::QueuedMessage::content),
-        Some("Proceed with the accepted plan.".to_string())
     );
 }
 
@@ -10783,6 +11401,49 @@ fn tool_details_pager_frames_leaf_scope_and_preserves_raw_content() {
 }
 
 #[test]
+fn tool_details_pager_keeps_exact_file_change_when_inline_diffs_are_off() {
+    let mut app = create_test_app();
+    app.inline_diff_mode = crate::settings::InlineDiffMode::Off;
+    let tool_result = crate::tools::spec::ToolResult::success("structured success").with_metadata(
+        serde_json::json!({
+            "mutation": {
+                "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+EXACT-SENTINEL\n",
+                "files": [{ "path": "src/lib.rs", "outcome": "updated" }],
+                "renames": []
+            }
+        }),
+    );
+    let receipt =
+        crate::tui::history::FileMutationReceipt::from_success(&app.workspace, &tool_result)
+            .expect("receipt");
+    app.history = vec![HistoryCell::Tool(ToolCell::PatchSummary(
+        crate::tui::history::PatchSummaryCell {
+            path: "src/lib.rs".to_string(),
+            summary: "updated one file".to_string(),
+            status: ToolStatus::Success,
+            error: None,
+            receipt: Some(receipt),
+        },
+    ))];
+    app.tool_details_by_cell.insert(
+        0,
+        ToolDetailRecord {
+            tool_id: "file-1".to_string(),
+            tool_name: "File".to_string(),
+            input: serde_json::json!({"action": "edit", "path": "src/lib.rs"}),
+            output: Some("structured success".to_string()),
+        },
+    );
+    app.resync_history_revisions();
+
+    assert!(open_details_pager_for_cell(&mut app, 0));
+    let body = pop_pager_body(&mut app);
+    assert!(body.contains("── Exact File change ──"), "{body}");
+    assert!(body.contains("+EXACT-SENTINEL"), "{body}");
+    assert!(body.contains("Updated src/lib.rs · +1 -1"), "{body}");
+}
+
+#[test]
 fn tool_details_empty_state_points_to_turn_inspector() {
     let mut app = create_test_app();
     // A selection index with no raw detail record and no backing cell: the
@@ -10814,13 +11475,27 @@ fn spillover_pager_section_returns_none_when_no_spillover() {
 
 #[test]
 fn spillover_pager_section_loads_file_when_present() {
-    use std::io::Write;
+    let _spillover_guard = crate::tools::truncate::TEST_SPILLOVER_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("call-test.txt");
-    let mut f = std::fs::File::create(&path).unwrap();
-    writeln!(f, "FULL_OUTPUT_BYTES_HERE").unwrap();
+    let prior =
+        crate::tools::truncate::set_test_spillover_root(Some(dir.path().join("tool_outputs")));
+    struct RestoreSpilloverRoot(Option<PathBuf>);
+    impl Drop for RestoreSpilloverRoot {
+        fn drop(&mut self) {
+            crate::tools::truncate::set_test_spillover_root(self.0.take());
+        }
+    }
+    let _restore = RestoreSpilloverRoot(prior);
+    let session_id = "session-pager";
+    let body = "FULL_OUTPUT_BYTES_HERE\n";
+    let path = crate::tools::truncate::write_spillover("call-test", body).unwrap();
+    crate::tools::truncate::publish_legacy_spillover_ownership(&path, session_id, body.as_bytes())
+        .unwrap();
 
     let mut app = create_test_app();
+    app.current_session_id = Some(session_id.to_string());
     app.history = vec![HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
         name: "exec_shell".to_string(),
         status: ToolStatus::Success,
@@ -10839,13 +11514,16 @@ fn spillover_pager_section_loads_file_when_present() {
         section.contains("FULL_OUTPUT_BYTES_HERE"),
         "section missing file body: {section}"
     );
-    assert!(section.contains(&path.display().to_string()));
+    assert!(
+        !section.contains(&path.display().to_string()),
+        "pager must not expose the artifact path: {section}"
+    );
 }
 
 #[test]
 fn spillover_pager_section_returns_notice_when_file_missing() {
     let mut app = create_test_app();
-    let bogus = std::path::PathBuf::from("/tmp/this/path/does/not/exist-spill.txt");
+    let bogus = std::path::PathBuf::from("/private/sensitive/session/does-not-exist.txt");
     app.history = vec![HistoryCell::Tool(ToolCell::Generic(GenericToolCell {
         name: "exec_shell".to_string(),
         status: ToolStatus::Success,
@@ -10859,7 +11537,90 @@ fn spillover_pager_section_returns_notice_when_file_missing() {
     app.resync_history_revisions();
 
     let section = spillover_pager_section(&app, 0).expect("still emits a notice section");
-    assert!(section.contains("could not read spillover file"));
+    assert!(section.contains("retained output is unavailable"));
+    assert!(!section.contains("/private/sensitive"));
+    assert!(!section.contains("No such file"));
+}
+
+#[test]
+fn spillover_pager_uses_session_artifact_for_specialized_bash_cell() {
+    let _artifact_guard = crate::artifacts::TEST_ARTIFACT_SESSIONS_GUARD
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let dir = tempfile::tempdir().unwrap();
+    let prior =
+        crate::artifacts::set_test_artifact_sessions_root(Some(dir.path().join("sessions")));
+    struct RestoreArtifactRoot(Option<PathBuf>);
+    impl Drop for RestoreArtifactRoot {
+        fn drop(&mut self) {
+            crate::artifacts::set_test_artifact_sessions_root(self.0.take());
+        }
+    }
+    let _restore = RestoreArtifactRoot(prior);
+    let session_id = "session-bash";
+    let relative_path = PathBuf::from("artifacts/art_call-bash.txt");
+    let path = crate::artifacts::session_artifact_absolute_path(session_id, &relative_path)
+        .expect("isolated artifact path");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, "BASH_EXACT_DEEP_SENTINEL\n").unwrap();
+
+    let mut app = create_test_app();
+    app.current_session_id = Some(session_id.to_string());
+    app.history = vec![HistoryCell::Tool(ToolCell::Exec(ExecCell {
+        command: "cargo test".to_string(),
+        status: ToolStatus::Success,
+        output: Some("[Exact evidence retained · 23 B]".to_string()),
+        live_output: None,
+        shell_task_id: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        started_at: None,
+        duration_ms: None,
+        source: ExecSource::Assistant,
+        interaction: None,
+        output_summary: None,
+    }))];
+    app.tool_details_by_cell.insert(
+        0,
+        ToolDetailRecord {
+            tool_id: "call-bash".to_string(),
+            tool_name: "Bash".to_string(),
+            input: serde_json::json!({"action": "run", "command": "cargo test"}),
+            output: Some("[Exact evidence retained · 23 B]".to_string()),
+        },
+    );
+    let artifact = crate::artifacts::ArtifactRecord {
+        id: "art_call-bash".to_string(),
+        kind: crate::artifacts::ArtifactKind::ToolOutput,
+        session_id: session_id.to_string(),
+        tool_call_id: "call-bash".to_string(),
+        tool_name: "Bash".to_string(),
+        created_at: chrono::Utc::now(),
+        byte_size: 25,
+        preview: "BASH_EXACT_DEEP_SENTINEL".to_string(),
+        storage_path: relative_path.clone(),
+    };
+    app.session_artifacts.push(artifact.clone());
+    app.resync_history_revisions();
+
+    let section = spillover_pager_section(&app, 0).expect("session artifact section");
+    assert!(section.contains("BASH_EXACT_DEEP_SENTINEL"));
+    assert!(!section.contains(&path.display().to_string()));
+
+    app.session_artifacts[0].storage_path = path.clone();
+    let absolute = spillover_pager_section(&app, 0).expect("unavailable absolute-path section");
+    assert!(absolute.contains("retained output is unavailable"));
+    assert!(!absolute.contains("BASH_EXACT_DEEP_SENTINEL"));
+
+    app.session_artifacts[0] = crate::artifacts::ArtifactRecord {
+        session_id: "foreign-session".to_string(),
+        storage_path: relative_path,
+        ..artifact
+    };
+    assert!(
+        spillover_pager_section(&app, 0).is_none(),
+        "a foreign artifact record must not become an Option+V detail source"
+    );
 }
 
 #[test]
@@ -13313,6 +14074,32 @@ fn orphan_during_active_keeps_subsequent_completion_routed_correctly() {
 }
 
 #[test]
+fn orphan_success_with_mutation_metadata_keeps_the_file_receipt() {
+    let mut app = create_test_app();
+    let result = crate::tools::spec::ToolResult::success("structured success").with_metadata(
+        serde_json::json!({
+            "mutation": {
+                "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+                "files": [{ "path": "src/lib.rs", "outcome": "updated" }],
+                "renames": []
+            }
+        }),
+    );
+
+    handle_tool_call_complete(&mut app, "orphan-file", "File", &Ok(result));
+
+    let HistoryCell::Tool(ToolCell::PatchSummary(cell)) = &app.history[0] else {
+        panic!("structured orphan mutation must retain a calm File receipt")
+    };
+    assert_eq!(cell.status, ToolStatus::Success);
+    assert_eq!(
+        cell.receipt.as_ref().map(|receipt| receipt.outcome_label()),
+        Some("Updated src/lib.rs".to_string())
+    );
+    assert_eq!(app.tool_details_by_cell[&0].tool_name, "File");
+}
+
+#[test]
 fn tool_details_survive_active_cell_flush() {
     // Detail pagers resolve tool details by cell index. Flushing the
     // active cell must move detail records into `tool_details_by_cell` so
@@ -13920,6 +14707,7 @@ fn turn_inspector_renders_overview_sections_for_active_turn() {
                 summary: "guard against empty token".to_string(),
                 status: ToolStatus::Success,
                 error: None,
+                receipt: None,
             },
         )),
         HistoryCell::Assistant {
@@ -13957,7 +14745,7 @@ fn turn_inspector_renders_overview_sections_for_active_turn() {
     // Section headers for all nine sections must be present.
     for header in [
         "── Intent ──",
-        "── Strategy / To-do ──",
+        "── To-do ──",
         "── Turn timeline ──",
         "── Files changed ──",
         "── Diagnostics loop ──",
@@ -13971,7 +14759,7 @@ fn turn_inspector_renders_overview_sections_for_active_turn() {
     // Intent + tool timeline + files + result are the must-have populated ones.
     assert!(body.contains("Fix the flaky login test"), "{body}");
     assert!(body.contains("test/verifier: cargo test login"), "{body}");
-    assert!(body.contains("2.4s"), "duration missing: {body}");
+    assert!(body.contains("2s"), "duration missing: {body}");
     assert!(body.contains("src/login.rs"), "{body}");
     assert!(
         body.contains("cargo test login — done"),
@@ -14055,6 +14843,7 @@ fn turn_inspector_timeline_numbers_semantic_entries_and_checkpoint_actions() {
                 summary: "add timeline evidence".to_string(),
                 status: ToolStatus::Success,
                 error: None,
+                receipt: None,
             },
         )),
         HistoryCell::Tool(ToolCell::Exec(ExecCell {
@@ -14103,7 +14892,7 @@ fn turn_inspector_timeline_numbers_semantic_entries_and_checkpoint_actions() {
     );
     assert!(
         body.contains(&format!(
-            "4. test/verifier: cargo test timeline — done · 1.2s · actions: {details_chord} raw detail"
+            "4. test/verifier: cargo test timeline — done · 1s · actions: {details_chord} raw detail"
         )),
         "{body}"
     );
@@ -14129,7 +14918,7 @@ fn turn_inspector_degrades_empty_sections_without_panic() {
     let body = turn_inspector_text(&app);
 
     // Unavailable sections degrade to `none`, never a blank void.
-    assert!(body.contains("── Strategy / To-do ──\nnone"), "{body}");
+    assert!(body.contains("── To-do ──\nnone"), "{body}");
     assert!(body.contains("── Files changed ──\nnone"), "{body}");
     assert!(body.contains("── Tests / verifier ──\nnone"), "{body}");
     assert!(body.contains("── Approvals / denials ──\nnone"), "{body}");
@@ -14238,6 +15027,7 @@ fn turn_handoff_markdown_renders_compact_sections_for_active_turn() {
                 summary: "guard against empty token".to_string(),
                 status: ToolStatus::Success,
                 error: None,
+                receipt: None,
             },
         )),
         HistoryCell::Assistant {
@@ -14278,7 +15068,7 @@ fn turn_handoff_markdown_renders_compact_sections_for_active_turn() {
 #[test]
 fn turn_handoff_markdown_degrades_empty_sections_without_panic() {
     // A minimal turn: only a user prompt. Empty sections must degrade to `—`
-    // (never a heading over a void), and the optional Plan section is omitted.
+    // (never a heading over a void), and the optional To-do section is omitted.
     let mut app = create_test_app();
     app.history = vec![HistoryCell::User {
         content: "hello".to_string(),
@@ -14289,8 +15079,8 @@ fn turn_handoff_markdown_degrades_empty_sections_without_panic() {
 
     assert!(md.contains("## Files changed\n—"), "{md}");
     assert!(md.contains("## Tests / verifier\n—"), "{md}");
-    // The optional plan section is dropped entirely when no plan ran.
-    assert!(!md.contains("## Strategy / To-do"), "{md}");
+    // The optional To-do section is dropped entirely when the list is empty.
+    assert!(!md.contains("## To-do"), "{md}");
     // Intent still resolves; status reflects the live turn.
     assert!(md.contains("## Intent\nhello"), "{md}");
     assert!(md.contains("Status: in progress"), "{md}");
@@ -14423,6 +15213,52 @@ fn approval_prompt_uses_event_input_after_message_complete_drain() {
     assert!(content.contains("/repo"));
     assert!(!content.contains("stale value from drained list"));
     assert_ne!(content.trim(), "{}");
+}
+
+#[test]
+fn patch_approval_modal_does_not_displace_the_active_file_receipt() {
+    let mut app = create_test_app();
+    let input = serde_json::json!({
+        "action": "patch",
+        "patch": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n"
+    });
+    handle_tool_call_started(&mut app, "file-ask", "File", &input);
+    let active_index = app.tool_cells["file-ask"];
+
+    push_approval_request_view(
+        &mut app,
+        "file-ask",
+        "File",
+        "Apply a file patch",
+        &input,
+        "approval-key",
+        None,
+    );
+
+    assert!(
+        app.history.is_empty(),
+        "the modal owns the preflight preview; successful evidence belongs to the File receipt"
+    );
+    assert_eq!(app.tool_cells["file-ask"], active_index);
+
+    let result = crate::tools::spec::ToolResult::success("ok").with_metadata(serde_json::json!({
+        "mutation": {
+            "diff": "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
+            "files": [{ "path": "src/lib.rs", "outcome": "updated" }],
+            "renames": []
+        }
+    }));
+    handle_tool_call_complete(&mut app, "file-ask", "apply_patch", &Ok(result));
+
+    let active = app.active_cell.as_ref().expect("active File cell");
+    let HistoryCell::Tool(ToolCell::PatchSummary(cell)) = &active.entries()[0] else {
+        panic!("Ask approval must leave the canonical File receipt addressable")
+    };
+    assert_eq!(cell.status, ToolStatus::Success);
+    assert_eq!(
+        cell.receipt.as_ref().map(|receipt| receipt.outcome_label()),
+        Some("Updated src/lib.rs".to_string())
+    );
 }
 
 #[tokio::test]
@@ -15115,6 +15951,8 @@ fn non_recoverable_engine_error_enters_offline_mode() {
 fn env_only_auth_failure_reopens_provider_onboarding() {
     use crate::error_taxonomy::ErrorEnvelope;
     let mut app = create_test_app();
+    app.api_provider = crate::config::ApiProvider::Anthropic;
+    app.config_path = Some(std::path::PathBuf::from("/tmp/codewhale-phase2.toml"));
     app.api_key_env_only = true;
     app.onboarding = crate::tui::app::OnboardingState::None;
     app.onboarding_needs_api_key = false;
@@ -15137,9 +15975,12 @@ fn env_only_auth_failure_reopens_provider_onboarding() {
         .as_deref()
         .expect("auth recovery should explain the env key source");
     assert!(
-        status.contains("DEEPSEEK_API_KEY"),
-        "expected env-specific recovery hint, got {status:?}"
+        status.contains("anthropic")
+            && status.contains("ANTHROPIC_API_KEY")
+            && status.contains("/tmp/codewhale-phase2.toml"),
+        "expected active-provider/env/path recovery hint, got {status:?}"
     );
+    assert!(!status.contains("DEEPSEEK_API_KEY"), "{status}");
 }
 
 // ---- Issue #208: in-flight input routing ----
@@ -15468,6 +16309,9 @@ fn render_footer_from_surfaces_background_shell_even_without_tasks_panel() {
         elapsed_since_output_ms: None,
         owner_agent_id: None,
         owner_agent_name: None,
+        current_tool: None,
+        role: None,
+        files_touched: 0,
     }];
 
     let props = render_footer_from(&app, &[], None);
@@ -15747,7 +16591,7 @@ fn checklist_write_renders_dedicated_card() {
         status: ToolStatus::Success,
         input_summary: None,
         output: Some(
-            "Todo list updated (3 items, 33% complete)\n{\"items\":[{\"id\":1,\"content\":\"Plan it out\",\"status\":\"completed\"},{\"id\":2,\"content\":\"Wire the thing\",\"status\":\"in_progress\"},{\"id\":3,\"content\":\"Run gates\",\"status\":\"pending\"}],\"completion_pct\":33,\"in_progress_id\":2}"
+            "Todo list updated (3 items, 33% settled)\n{\"items\":[{\"id\":1,\"content\":\"Plan it out\",\"status\":\"completed\"},{\"id\":2,\"content\":\"Wire the thing\",\"status\":\"in_progress\"},{\"id\":3,\"content\":\"Run gates\",\"status\":\"pending\"}],\"completion_pct\":33,\"in_progress_id\":2}"
                 .to_string(),
         ),
         prompts: None,
@@ -16293,7 +17137,7 @@ fn completed_turn_notification_leads_with_user_locale() {
         Duration::from_secs(65),
         None,
     );
-    assert_eq!(msg, "ターン完了 (1m 5s)\n完了しました。");
+    assert_eq!(msg, "ターン完了 (1m 05s)\n完了しました。");
 }
 
 #[test]
@@ -16325,7 +17169,7 @@ fn subagent_completion_notification_can_include_elapsed_summary() {
         Duration::from_secs(65),
     );
 
-    assert_eq!(msg, "Sub-agent complete (1m 5s)\nagent_live");
+    assert_eq!(msg, "Sub-agent complete (1m 05s)\nagent_live");
 }
 
 #[test]
@@ -16757,6 +17601,9 @@ mod work_sidebar_projection_tests {
             elapsed_since_output_ms: None,
             owner_agent_id: None,
             owner_agent_name: None,
+            current_tool: None,
+            role: None,
+            files_touched: 0,
         };
         assert_eq!(entry.status, "completed");
         assert_ne!(entry.status, "running");
@@ -16871,7 +17718,7 @@ fn status_animation_ticks_for_lone_running_history_tool() {
         "running workflow tool should count as live motion"
     );
     assert!(
-        should_tick_status_animation(&app, false, history_motion, active_motion),
+        should_tick_status_animation(&app, false, history_motion, active_motion, false),
         "a lone running tool in history must force timed redraws for the spout"
     );
 }
@@ -16891,7 +17738,7 @@ fn status_animation_ticks_for_lone_running_active_tool() {
         "running active-cell tool should count as live motion"
     );
     assert!(
-        should_tick_status_animation(&app, false, history_motion, active_motion),
+        should_tick_status_animation(&app, false, history_motion, active_motion, false),
         "a lone running active tool must force timed redraws for the spout"
     );
 }
@@ -16903,9 +17750,130 @@ fn status_animation_stays_idle_without_live_motion() {
     assert!(!history_has_live_motion(&app.history));
     assert!(!active_cell_has_live_motion(&app));
     assert!(
-        !should_tick_status_animation(&app, false, false, false),
+        !should_tick_status_animation(&app, false, false, false, false),
         "idle sessions should not wake the animation timer"
     );
+
+    // Exercise the actual coalescing counter over a representative settled
+    // interval. A regression that starts requesting ambient frames will make
+    // this counter non-zero even if individual widgets still look static.
+    let policy = crate::tui::motion::MotionPolicy::from_settings(false, true, false);
+    let mut requester = FrameRequester::new();
+    let started = Instant::now();
+    for tick in 0..=50 {
+        let now = started + Duration::from_millis(tick * 100);
+        if should_tick_status_animation(&app, false, false, false, false) {
+            requester.request_frame(now, policy);
+        }
+        let _ = requester.take_due(now, policy);
+    }
+    assert_eq!(requester.request_count(), 0, "settled TUI requested frames");
+    assert_eq!(requester.emit_count(), 0, "settled TUI emitted frames");
+}
+
+#[test]
+fn status_animation_ticks_for_a_visible_background_task() {
+    let mut app = create_test_app();
+    app.low_motion = false;
+    app.fancy_animations = true;
+    app.sidebar_focus = SidebarFocus::Tasks;
+    app.last_sidebar_area = Some(Rect::new(80, 0, 20, 20));
+    app.task_panel.push(TaskPanelEntry {
+        id: "shell_smooth".to_string(),
+        status: "running".to_string(),
+        prompt_summary: "shell: cargo test --locked".to_string(),
+        duration_ms: Some(crate::tui::spinner::LIVE_MARKER_DELAY_MS),
+        kind: TaskPanelEntryKind::Background,
+        stale: false,
+        elapsed_since_output_ms: None,
+        owner_agent_id: None,
+        owner_agent_name: None,
+        current_tool: None,
+        role: None,
+        files_touched: 0,
+    });
+
+    assert!(visible_background_task_has_live_motion(&app));
+    assert!(should_tick_status_animation(
+        &app, false, false, false, false
+    ));
+
+    app.last_sidebar_area = None;
+    assert!(!visible_background_task_has_live_motion(&app));
+    assert!(!should_tick_status_animation(
+        &app, false, false, false, false
+    ));
+}
+
+#[test]
+fn status_animation_timer_respects_reduced_and_still_policies() {
+    let mut app = create_test_app();
+    app.history.push(running_generic_tool_cell("workflow"));
+    let history_motion = history_has_live_motion(&app.history);
+
+    app.low_motion = false;
+    app.fancy_animations = true;
+    assert!(should_tick_status_animation(
+        &app,
+        false,
+        history_motion,
+        false,
+        false
+    ));
+
+    app.low_motion = true;
+    assert!(
+        should_tick_status_animation(&app, false, history_motion, false, false),
+        "reduced motion keeps its calm liveness refresh while markers stay static"
+    );
+
+    app.low_motion = false;
+    app.fancy_animations = false;
+    assert!(
+        !should_tick_status_animation(&app, false, history_motion, false, false),
+        "still mode must not wake the status animation timer"
+    );
+    assert_eq!(status_animation_interval_ms(&app), 2_400);
+    assert_eq!(active_poll_ms(&app), UI_ACTIVE_POLL_MS);
+    assert_eq!(idle_poll_ms(&app), UI_IDLE_POLL_MS);
+}
+
+#[test]
+fn translation_placeholder_keeps_a_calm_refresh_without_repainting_still_mode() {
+    let mut app = create_test_app();
+    app.low_motion = false;
+    app.fancy_animations = true;
+    assert!(should_tick_status_animation(
+        &app, false, false, false, true
+    ));
+
+    app.low_motion = true;
+    assert!(should_tick_status_animation(
+        &app, false, false, false, true
+    ));
+
+    app.low_motion = false;
+    app.fancy_animations = false;
+    assert!(!should_tick_status_animation(
+        &app, false, false, false, true
+    ));
+}
+
+#[test]
+fn classic_header_indicator_animates_only_in_full_motion() {
+    let mut app = create_test_app();
+    app.turn_started_at = Some(Instant::now());
+
+    app.low_motion = false;
+    app.fancy_animations = true;
+    assert!(classic_header_indicator_started_at(&app).is_some());
+
+    app.low_motion = true;
+    assert!(classic_header_indicator_started_at(&app).is_none());
+
+    app.low_motion = false;
+    app.fancy_animations = false;
+    assert!(classic_header_indicator_started_at(&app).is_none());
 }
 
 #[test]

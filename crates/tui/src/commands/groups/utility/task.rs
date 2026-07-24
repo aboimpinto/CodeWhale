@@ -9,7 +9,7 @@ use crate::commands::CommandResult;
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "task",
     aliases: &["tasks"],
-    usage: "/task [add <prompt>|list|show <id>|cancel <id>]",
+    usage: "/task [add <prompt>|list|digest|show <id>|cancel <id>]",
     description_id: MessageId::CmdTaskDescription,
 };
 
@@ -25,7 +25,7 @@ impl RegisterCommand for TaskCmd {
     }
 }
 
-fn task(_app: &mut App, args: Option<&str>) -> CommandResult {
+fn task(app: &mut App, args: Option<&str>) -> CommandResult {
     let raw = args.unwrap_or("").trim();
     if raw.is_empty() || raw.eq_ignore_ascii_case("list") {
         return CommandResult::action(AppAction::TaskList);
@@ -45,6 +45,19 @@ fn task(_app: &mut App, args: Option<&str>) -> CommandResult {
             })
         }
         "list" => CommandResult::action(AppAction::TaskList),
+        "digest" => {
+            let Some(work) = app.runtime_services.work.as_ref() else {
+                return CommandResult::message("No active operations or to-do items.");
+            };
+            match work.capture(app.current_session_id.as_deref()) {
+                Ok(snapshot) => CommandResult::message(crate::work_graph::format_operation_digest(
+                    snapshot.as_ref(),
+                )),
+                Err(error) => CommandResult::error(format!(
+                    "Operation digest is temporarily unavailable: {error}"
+                )),
+            }
+        }
         "show" => {
             let Some(id) = remainder else {
                 return CommandResult::error("Usage: /task show <id>");
@@ -57,7 +70,7 @@ fn task(_app: &mut App, args: Option<&str>) -> CommandResult {
             };
             CommandResult::action(AppAction::TaskCancel { id: id.to_string() })
         }
-        _ => CommandResult::error("Usage: /task [add <prompt>|list|show <id>|cancel <id>]"),
+        _ => CommandResult::error("Usage: /task [add <prompt>|list|digest|show <id>|cancel <id>]"),
     }
 }
 
@@ -116,6 +129,17 @@ mod tests {
         let mut app = app();
         let result = task(&mut app, Some("add"));
         assert!(result.message.is_some());
+        assert!(result.action.is_none());
+    }
+
+    #[test]
+    fn digest_uses_canonical_work_runtime_without_another_state_store() {
+        let mut app = app();
+        let result = task(&mut app, Some("digest"));
+        assert_eq!(
+            result.message.as_deref(),
+            Some("No active operations or to-do items.")
+        );
         assert!(result.action.is_none());
     }
 }

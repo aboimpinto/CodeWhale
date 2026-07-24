@@ -22,8 +22,8 @@ use codewhale_protocol::fleet::{
 use super::profile::AgentProfile;
 use crate::config::{ApiProvider, Config};
 use crate::route_runtime::{resolve_route_candidate, resolve_runtime_route};
-use crate::tools::subagent::{AgentWorkerSpec, AgentWorkerToolProfile, SubAgentType};
-use crate::worker_profile::{ModelRoute, ToolScope, WorkerRuntimeProfile};
+use crate::tools::subagent::{AgentWorkerSpec, AgentWorkerToolProfile, FleetRole};
+use crate::worker_profile::{ChildLaunchManifest, ModelRoute, ToolScope, WorkerRuntimeProfile};
 
 /// Validate that every task referencing a workspace agent profile can resolve it.
 ///
@@ -85,12 +85,42 @@ pub fn fleet_task_to_worker_spec_with_profiles(
     let runtime_profile = parent_runtime_profile
         .map(|parent| parent.derive_child(&requested_runtime))
         .unwrap_or(requested_runtime);
+    let writable_roots = fleet_write_roots(task_spec)?;
+    let coordination_contracts = fleet_coordination_contracts(task_spec)?;
+    if runtime_profile.permissions.write
+        && writable_roots.is_empty()
+        && coordination_contracts.is_empty()
+    {
+        bail!(
+            "fleet task '{}' is write-capable but declares no workspace.writable_paths or metadata.coordination_contracts",
+            task_spec.id
+        );
+    }
+    let session_name = format!("fleet-{}-{}", worker_id, task_spec.id);
+    let launch_manifest = ChildLaunchManifest {
+        owner_session: run_id.to_string(),
+        child_id: worker_id.to_string(),
+        profile: runtime_profile.clone(),
+        prompt: objective.clone(),
+        cwd: Some(workspace.display().to_string()),
+        worktree: false,
+        writable_roots,
+        writable_files: Vec::new(),
+        coordination_contracts,
+        expected_artifact: None,
+        token_budget: task_spec
+            .budget
+            .as_ref()
+            .and_then(|budget| budget.max_tokens),
+        resume_identity: Some(session_name.clone()),
+        generation: 1,
+    };
 
     Ok(AgentWorkerSpec {
         worker_id: worker_id.to_string(),
         run_id: run_id.to_string(),
         parent_run_id: None,
-        session_name: Some(format!("fleet-{}-{}", worker_id, task_spec.id)),
+        session_name: Some(session_name),
         objective,
         role,
         agent_type,
@@ -108,7 +138,131 @@ pub fn fleet_task_to_worker_spec_with_profiles(
             .unwrap_or(u32::MAX),
         spawn_depth: 0,
         max_spawn_depth: runtime_profile.max_spawn_depth,
+        launch_manifest: Some(launch_manifest),
     })
+}
+
+fn fleet_write_roots(task_spec: &FleetTaskSpec) -> Result<Vec<String>> {
+    let task_root = normalize_fleet_relative_path(
+        task_spec
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.root.as_deref())
+            .unwrap_or_else(|| std::path::Path::new(".")),
+        &task_spec.id,
+        "workspace.root",
+    )?;
+    let mut roots = Vec::new();
+    for runtime_root in fleet_runtime_write_roots(task_spec)? {
+        let claim_root = match (task_root.as_str(), runtime_root.as_str()) {
+            (".", path) | (path, ".") => path.to_string(),
+            (root, path) => format!("{root}/{path}"),
+        };
+        if !roots.contains(&claim_root) {
+            roots.push(claim_root);
+        }
+    }
+    Ok(roots)
+}
+
+pub(crate) fn fleet_runtime_write_roots(task_spec: &FleetTaskSpec) -> Result<Vec<String>> {
+    let mut roots = Vec::new();
+    for path in task_spec
+        .workspace
+        .as_ref()
+        .into_iter()
+        .flat_map(|workspace| &workspace.writable_paths)
+    {
+        let normalized =
+            normalize_fleet_relative_path(path, &task_spec.id, "workspace.writable_paths")?;
+        if !roots.contains(&normalized) {
+            roots.push(normalized);
+        }
+    }
+    Ok(roots)
+}
+
+fn normalize_fleet_relative_path(
+    path: &std::path::Path,
+    task_id: &str,
+    field: &str,
+) -> Result<String> {
+    let raw = path.to_string_lossy().replace('\\', "/");
+    if raw.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n'))
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        bail!(
+            "fleet task '{task_id}' {field} path '{}' must be one repo-relative line and cannot escape the workspace",
+            path.display()
+        );
+    }
+    let mut segments = Vec::new();
+    for segment in raw.split('/') {
+        match segment {
+            "" | "." => {}
+            ".." => {
+                bail!(
+                    "fleet task '{task_id}' {field} path '{}' cannot contain parent traversal",
+                    path.display()
+                );
+            }
+            value => segments.push(value),
+        }
+    }
+    Ok(if segments.is_empty() {
+        ".".to_string()
+    } else {
+        segments.join("/")
+    })
+}
+
+fn fleet_coordination_contracts(task_spec: &FleetTaskSpec) -> Result<Vec<String>> {
+    let Some(value) = task_spec.metadata.get("coordination_contracts") else {
+        return Ok(Vec::new());
+    };
+    let Some(values) = value.as_array() else {
+        bail!(
+            "fleet task '{}' metadata.coordination_contracts must be an array of strings",
+            task_spec.id
+        );
+    };
+    if values.len() > 16 {
+        bail!(
+            "fleet task '{}' metadata.coordination_contracts accepts at most 16 entries",
+            task_spec.id
+        );
+    }
+    let mut contracts = Vec::new();
+    for value in values {
+        let Some(value) = value.as_str() else {
+            bail!(
+                "fleet task '{}' metadata.coordination_contracts must contain only strings",
+                task_spec.id
+            );
+        };
+        let value = value.trim();
+        if value.is_empty()
+            || value.chars().count() > 128
+            || value.chars().any(|ch| matches!(ch, '\0' | '\r' | '\n'))
+        {
+            bail!(
+                "fleet task '{}' coordination contracts must be one non-empty line of at most 128 characters",
+                task_spec.id
+            );
+        }
+        if !contracts.iter().any(|contract| contract == value) {
+            contracts.push(value.to_string());
+        }
+    }
+    Ok(contracts)
 }
 
 /// Mint a [`FleetResolvedRoute`] snapshot for a fleet task (#3154).
@@ -660,30 +814,30 @@ fn fleet_route_model_selector_with_source(
     }
 }
 
-/// Map a fleet role name to a `SubAgentType`. Unknown roles default to `General`.
-pub(crate) fn fleet_role_to_agent_type(role: Option<&str>) -> SubAgentType {
+/// Map a fleet role name to a `FleetRole`. Unknown roles default to `General`.
+pub(crate) fn fleet_role_to_agent_type(role: Option<&str>) -> FleetRole {
     match role {
-        Some("smoke-runner") => SubAgentType::Verifier,
-        Some("scout") => SubAgentType::Explore,
-        Some("read-only") => SubAgentType::Explore,
-        Some("reviewer") => SubAgentType::Review,
-        Some("builder") => SubAgentType::Implementer,
-        Some("verifier") | Some("tester") => SubAgentType::Verifier,
-        Some("planner") => SubAgentType::Plan,
-        Some("explorer") => SubAgentType::Explore,
+        Some("smoke-runner") => FleetRole::Verifier,
+        Some("scout") => FleetRole::Scout,
+        Some("read-only") => FleetRole::Scout,
+        Some("reviewer") => FleetRole::Reviewer,
+        Some("builder") => FleetRole::Builder,
+        Some("verifier") | Some("tester") => FleetRole::Verifier,
+        Some("planner") => FleetRole::Planner,
+        Some("explorer") => FleetRole::Scout,
         // Coordination happens through delegation, which needs the full
         // General surface (#fleet-roster cutover (v0.8.67)). The operator is
         // the helm of the whole operation (it assigns managers to workflows);
         // the manager is the middle manager of one workflow. Both coordinate,
         // so both get the General surface — explicitly, not by fall-through.
-        Some("manager") | Some("coordinator") | Some("operator") => SubAgentType::General,
+        Some("manager") | Some("coordinator") | Some("operator") => FleetRole::Worker,
         // Synthesis is read-only, no shell: it must never fall through to
         // General's full-write posture (#fleet-roster cutover (v0.8.67)).
-        Some("synthesizer") | Some("summarizer") | Some("reducer") => SubAgentType::Plan,
-        Some("general") | None => SubAgentType::General,
+        Some("synthesizer") | Some("summarizer") | Some("reducer") => FleetRole::Planner,
+        Some("general") | None => FleetRole::Worker,
         Some(other) => {
-            // Try parsing as a SubAgentType directly
-            SubAgentType::from_str(other).unwrap_or(SubAgentType::General)
+            // Try parsing as a FleetRole directly
+            FleetRole::from_str(other).unwrap_or(FleetRole::Worker)
         }
     }
 }
@@ -691,7 +845,7 @@ pub(crate) fn fleet_role_to_agent_type(role: Option<&str>) -> SubAgentType {
 /// Runtime agent type for a roster member: role name first, falling back to
 /// the org-chart slot name when the role name is empty (#fleet-roster cutover
 /// (v0.8.67)).
-pub(crate) fn roster_member_agent_type(member: &AgentProfile) -> SubAgentType {
+pub(crate) fn roster_member_agent_type(member: &AgentProfile) -> FleetRole {
     let role_name = member.profile.role.name.trim();
     if role_name.is_empty() {
         fleet_role_to_agent_type(Some(member.profile.slot.as_str()))
@@ -709,7 +863,7 @@ fn fleet_tool_profile(profile: Option<&FleetTaskWorkerProfile>) -> AgentWorkerTo
 }
 
 fn fleet_worker_runtime_profile(
-    agent_type: &SubAgentType,
+    agent_type: &FleetRole,
     tool_profile: &AgentWorkerToolProfile,
     model: &str,
     spawn_depth: u32,
@@ -731,7 +885,7 @@ fn fleet_worker_runtime_profile(
 }
 
 fn fleet_worker_runtime_profile_for_loadout(
-    agent_type: &SubAgentType,
+    agent_type: &FleetRole,
     tool_profile: &AgentWorkerToolProfile,
     model: &str,
     spawn_depth: u32,
@@ -917,7 +1071,8 @@ fn filter_tool_profile(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use codewhale_protocol::fleet::FleetHostSpec;
+    use codewhale_protocol::fleet::{FleetHostSpec, FleetWorkspaceRequirements};
+    use std::path::{Path, PathBuf};
 
     fn fleet_task(id: &str, worker: Option<FleetTaskWorkerProfile>) -> FleetTaskSpec {
         FleetTaskSpec {
@@ -927,7 +1082,12 @@ mod tests {
             objective: Some(format!("Complete {id}")),
             instructions: format!("do {id}"),
             worker,
-            workspace: None,
+            workspace: Some(FleetWorkspaceRequirements {
+                root: Some(PathBuf::from(".")),
+                required_files: Vec::new(),
+                writable_paths: vec![PathBuf::from(".")],
+                environment: None,
+            }),
             input_files: Vec::new(),
             context: Vec::new(),
             budget: None,
@@ -939,6 +1099,157 @@ mod tests {
             timeout_seconds: None,
             metadata: Default::default(),
         }
+    }
+
+    #[test]
+    fn write_capable_fleet_worker_requires_and_persists_a_bounded_claim() {
+        let worker = FleetWorkerSpec {
+            id: "worker-1".to_string(),
+            name: "Worker".to_string(),
+            host: FleetHostSpec::Local,
+            trust_level: None,
+            labels: Default::default(),
+            capabilities: vec![],
+            max_concurrent_tasks: None,
+        };
+        let mut unscoped = fleet_task("write", None);
+        unscoped.workspace = None;
+        let error = fleet_task_to_worker_spec_with_profiles(
+            "worker-1",
+            "run-1",
+            &unscoped,
+            &worker,
+            "auto",
+            Path::new("/tmp"),
+            &[],
+            None,
+        )
+        .expect_err("unscoped Fleet writer must fail before registration");
+        assert!(error.to_string().contains("declares no"), "{error:#}");
+
+        let scoped = fleet_task_to_worker_spec_with_profiles(
+            "worker-1",
+            "run-1",
+            &fleet_task("write", None),
+            &worker,
+            "auto",
+            Path::new("/tmp"),
+            &[],
+            None,
+        )
+        .expect("bounded Fleet writer");
+        let manifest = scoped.launch_manifest.expect("launch manifest");
+        assert_eq!(manifest.child_id, "worker-1");
+        assert_eq!(manifest.writable_roots, ["."]);
+        assert_eq!(manifest.prompt, scoped.objective);
+    }
+
+    #[test]
+    fn fleet_claim_roots_share_one_manager_workspace_namespace() {
+        let worker = FleetWorkerSpec {
+            id: "worker-1".to_string(),
+            name: "Worker".to_string(),
+            host: FleetHostSpec::Local,
+            trust_level: None,
+            labels: Default::default(),
+            capabilities: vec![],
+            max_concurrent_tasks: None,
+        };
+        let mut nested = fleet_task("nested", None);
+        nested.workspace = Some(FleetWorkspaceRequirements {
+            root: Some(PathBuf::from("pkg-a")),
+            writable_paths: vec![PathBuf::from("src")],
+            ..FleetWorkspaceRequirements::default()
+        });
+        let mut root = fleet_task("root", None);
+        root.workspace = Some(FleetWorkspaceRequirements {
+            root: Some(PathBuf::from(".")),
+            writable_paths: vec![PathBuf::from("pkg-a/src")],
+            ..FleetWorkspaceRequirements::default()
+        });
+
+        let nested_spec = fleet_task_to_worker_spec_with_profiles(
+            "worker-1",
+            "run-1",
+            &nested,
+            &worker,
+            "auto",
+            Path::new("/repo/pkg-a"),
+            &[],
+            None,
+        )
+        .unwrap();
+        let root_spec = fleet_task_to_worker_spec_with_profiles(
+            "worker-2",
+            "run-1",
+            &root,
+            &worker,
+            "auto",
+            Path::new("/repo"),
+            &[],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            nested_spec.launch_manifest.unwrap().writable_roots,
+            ["pkg-a/src"]
+        );
+        assert_eq!(
+            root_spec.launch_manifest.unwrap().writable_roots,
+            ["pkg-a/src"]
+        );
+        assert_eq!(fleet_runtime_write_roots(&nested).unwrap(), ["src"]);
+    }
+
+    #[test]
+    fn fleet_manifest_rejects_control_characters_before_lease() {
+        let worker = FleetWorkerSpec {
+            id: "worker-1".to_string(),
+            name: "Worker".to_string(),
+            host: FleetHostSpec::Local,
+            trust_level: None,
+            labels: Default::default(),
+            capabilities: vec![],
+            max_concurrent_tasks: None,
+        };
+        let mut bad_contract = fleet_task("bad-contract", None);
+        bad_contract.metadata.insert(
+            "coordination_contracts".to_string(),
+            serde_json::json!(["api\ncontract"]),
+        );
+        assert!(
+            fleet_task_to_worker_spec_with_profiles(
+                "worker-1",
+                "run-1",
+                &bad_contract,
+                &worker,
+                "auto",
+                Path::new("/repo"),
+                &[],
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("one non-empty line")
+        );
+
+        let mut bad_path = fleet_task("bad-path", None);
+        bad_path.workspace.as_mut().unwrap().writable_paths = vec![PathBuf::from("src\nother")];
+        assert!(
+            fleet_task_to_worker_spec_with_profiles(
+                "worker-1",
+                "run-1",
+                &bad_path,
+                &worker,
+                "auto",
+                Path::new("/repo"),
+                &[],
+                None,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("one repo-relative line")
+        );
     }
 
     fn worker_profile(
@@ -994,7 +1305,7 @@ mod tests {
     fn fleet_role_smoke_runner_maps_to_verifier() {
         assert_eq!(
             fleet_role_to_agent_type(Some("smoke-runner")),
-            SubAgentType::Verifier
+            FleetRole::Verifier
         );
     }
 
@@ -1002,7 +1313,7 @@ mod tests {
     fn fleet_role_read_only_maps_to_explore() {
         assert_eq!(
             fleet_role_to_agent_type(Some("read-only")),
-            SubAgentType::Explore
+            FleetRole::Scout
         );
     }
 
@@ -1010,7 +1321,7 @@ mod tests {
     fn fleet_role_reviewer_maps_to_review() {
         assert_eq!(
             fleet_role_to_agent_type(Some("reviewer")),
-            SubAgentType::Review
+            FleetRole::Reviewer
         );
     }
 
@@ -1018,24 +1329,21 @@ mod tests {
     fn fleet_role_builder_maps_to_implementer() {
         assert_eq!(
             fleet_role_to_agent_type(Some("builder")),
-            SubAgentType::Implementer
+            FleetRole::Builder
         );
     }
 
     #[test]
     fn fleet_role_none_maps_to_general() {
-        assert_eq!(fleet_role_to_agent_type(None), SubAgentType::General);
+        assert_eq!(fleet_role_to_agent_type(None), FleetRole::Worker);
     }
 
     #[test]
     fn fleet_role_manager_and_coordinator_map_to_general() {
-        assert_eq!(
-            fleet_role_to_agent_type(Some("manager")),
-            SubAgentType::General
-        );
+        assert_eq!(fleet_role_to_agent_type(Some("manager")), FleetRole::Worker);
         assert_eq!(
             fleet_role_to_agent_type(Some("coordinator")),
-            SubAgentType::General
+            FleetRole::Worker
         );
     }
 
@@ -1046,7 +1354,7 @@ mod tests {
         // match arm, not the unknown-role fall-through.
         assert_eq!(
             fleet_role_to_agent_type(Some("operator")),
-            SubAgentType::General
+            FleetRole::Worker
         );
     }
 
@@ -1057,7 +1365,7 @@ mod tests {
         for role in ["synthesizer", "summarizer", "reducer"] {
             assert_eq!(
                 fleet_role_to_agent_type(Some(role)),
-                SubAgentType::Plan,
+                FleetRole::Planner,
                 "role {role}"
             );
         }
@@ -1071,7 +1379,7 @@ mod tests {
             None,
             codewhale_config::FleetLoadout::Fast,
         );
-        assert_eq!(roster_member_agent_type(&member), SubAgentType::Plan);
+        assert_eq!(roster_member_agent_type(&member), FleetRole::Planner);
 
         let mut slot_only = agent_profile(
             "custom-summarizer",
@@ -1084,14 +1392,14 @@ mod tests {
             slot_only.profile.slot,
             codewhale_config::FleetSlot::Summarizer
         );
-        assert_eq!(roster_member_agent_type(&slot_only), SubAgentType::Plan);
+        assert_eq!(roster_member_agent_type(&slot_only), FleetRole::Planner);
     }
 
     #[test]
     fn unknown_role_maps_to_general() {
         assert_eq!(
             fleet_role_to_agent_type(Some("nonexistent-role")),
-            SubAgentType::General
+            FleetRole::Worker
         );
     }
 
@@ -1326,7 +1634,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(spec.role.as_deref(), Some("reviewer"));
-        assert_eq!(spec.agent_type, SubAgentType::Review);
+        assert_eq!(spec.agent_type, FleetRole::Reviewer);
         assert!(
             spec.objective
                 .contains("summoned as a Codewhale Fleet member (reviewer)")
@@ -1336,7 +1644,7 @@ mod tests {
             spec.objective
                 .contains("Focus on regressions and missing tests.")
         );
-        assert_eq!(spec.runtime_profile.role, SubAgentType::Review);
+        assert_eq!(spec.runtime_profile.role, FleetRole::Reviewer);
         assert_eq!(spec.runtime_profile.model, ModelRoute::Auto);
 
         let permissions = fleet_effective_permissions_for_task(&task, &profiles, &spec);
@@ -2016,7 +2324,7 @@ mod tests {
             capabilities: vec![],
             max_concurrent_tasks: None,
         };
-        let mut parent = WorkerRuntimeProfile::for_role(SubAgentType::General);
+        let mut parent = WorkerRuntimeProfile::for_role(FleetRole::Worker);
         parent.provider = Some("deepseek".to_string());
         parent.reasoning_effort = Some("low".to_string());
         parent.max_spawn_depth = 3;
@@ -2178,7 +2486,7 @@ mod tests {
             capabilities: vec![],
             max_concurrent_tasks: None,
         };
-        let mut parent = WorkerRuntimeProfile::for_role(SubAgentType::Explore);
+        let mut parent = WorkerRuntimeProfile::for_role(FleetRole::Scout);
         parent.tools = ToolScope::Explicit(vec!["read_file".to_string()]);
         parent.max_spawn_depth = 2;
 
@@ -2194,7 +2502,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(spec.agent_type, SubAgentType::Implementer);
+        assert_eq!(spec.agent_type, FleetRole::Builder);
         assert!(!spec.runtime_profile.permissions.write);
         assert!(!spec.runtime_profile.permissions.network);
         assert_eq!(
@@ -2227,7 +2535,16 @@ mod tests {
             description: None,
             objective: None,
             instructions: "Do the task.".to_string(),
-            worker: None,
+            worker: Some(FleetTaskWorkerProfile {
+                agent_profile: None,
+                role: Some("reviewer".to_string()),
+                loadout: None,
+                model_class: None,
+                model: None,
+                tool_profile: Some("read-only".to_string()),
+                tools: Vec::new(),
+                capabilities: Vec::new(),
+            }),
             workspace: None,
             input_files: vec![],
             context: vec![],
@@ -2303,7 +2620,7 @@ mod tests {
             (
                 "scout",
                 "deepseek-v4-flash",
-                SubAgentType::Explore,
+                FleetRole::Scout,
                 AgentWorkerToolProfile::Explicit(vec![
                     "read_file".to_string(),
                     "grep_files".to_string(),
@@ -2312,7 +2629,7 @@ mod tests {
             (
                 "builder",
                 "deepseek-v4-pro",
-                SubAgentType::Implementer,
+                FleetRole::Builder,
                 AgentWorkerToolProfile::Explicit(vec![
                     "read_file".to_string(),
                     "apply_patch".to_string(),
@@ -2321,7 +2638,7 @@ mod tests {
             (
                 "verifier",
                 "deepseek-v4-pro",
-                SubAgentType::Verifier,
+                FleetRole::Verifier,
                 AgentWorkerToolProfile::Explicit(vec![
                     "exec_shell".to_string(),
                     "read_file".to_string(),
@@ -2351,7 +2668,14 @@ mod tests {
                     },
                     capabilities: vec![],
                 }),
-                workspace: None,
+                workspace: matches!(&expected_type, FleetRole::Builder).then(|| {
+                    FleetWorkspaceRequirements {
+                        root: Some(PathBuf::from(".")),
+                        required_files: Vec::new(),
+                        writable_paths: vec![PathBuf::from(".")],
+                        environment: None,
+                    }
+                }),
                 input_files: vec![],
                 context: vec![],
                 budget: None,
@@ -2485,17 +2809,18 @@ mod tests {
             session_name: None,
             objective: "test".to_string(),
             role: None,
-            agent_type: SubAgentType::General,
+            agent_type: FleetRole::Worker,
             model: "auto".to_string(),
             workspace: std::path::PathBuf::from("/tmp"),
             git_branch: None,
             context_mode: "fresh".to_string(),
             fork_context: false,
             tool_profile: AgentWorkerToolProfile::Inherited,
-            runtime_profile: WorkerRuntimeProfile::for_role(SubAgentType::General),
+            runtime_profile: WorkerRuntimeProfile::for_role(FleetRole::Worker),
             max_steps: 1000,
             spawn_depth: 0,
             max_spawn_depth: 0,
+            launch_manifest: None,
         };
         let exec = codewhale_config::FleetExecConfig {
             max_turns: 50,
@@ -2514,17 +2839,18 @@ mod tests {
             session_name: None,
             objective: "test".to_string(),
             role: None,
-            agent_type: SubAgentType::General,
+            agent_type: FleetRole::Worker,
             model: "auto".to_string(),
             workspace: std::path::PathBuf::from("/tmp"),
             git_branch: None,
             context_mode: "fresh".to_string(),
             fork_context: false,
             tool_profile: AgentWorkerToolProfile::Inherited,
-            runtime_profile: WorkerRuntimeProfile::for_role(SubAgentType::General),
+            runtime_profile: WorkerRuntimeProfile::for_role(FleetRole::Worker),
             max_steps: 1000,
             spawn_depth: 0,
             max_spawn_depth: 0,
+            launch_manifest: None,
         };
 
         let exec = codewhale_config::FleetExecConfig {
@@ -2619,17 +2945,18 @@ mod tests {
             session_name: None,
             objective: "do the thing".to_string(),
             role: None,
-            agent_type: SubAgentType::General,
+            agent_type: FleetRole::Worker,
             model: "auto".to_string(),
             workspace: std::path::PathBuf::from("/tmp"),
             git_branch: None,
             context_mode: "fresh".to_string(),
             fork_context: false,
             tool_profile: AgentWorkerToolProfile::Inherited,
-            runtime_profile: WorkerRuntimeProfile::for_role(SubAgentType::General),
+            runtime_profile: WorkerRuntimeProfile::for_role(FleetRole::Worker),
             max_steps: 100,
             spawn_depth: 0,
             max_spawn_depth: 0,
+            launch_manifest: None,
         };
         let exec = codewhale_config::FleetExecConfig {
             append_system_prompt: "never push to main".to_string(),

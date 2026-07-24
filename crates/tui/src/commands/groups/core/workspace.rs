@@ -2,14 +2,14 @@
 
 use crate::commands::traits::{CommandInfo, RegisterCommand};
 use crate::localization::MessageId;
-use crate::tui::app::App;
+use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
 
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "workspace",
     aliases: &["cwd"],
-    usage: "/workspace [path]",
+    usage: "/workspace [path|worktrees]",
     description_id: MessageId::CmdWorkspaceDescription,
 };
 
@@ -21,6 +21,11 @@ impl RegisterCommand for WorkspaceCmd {
     }
 
     fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
-        super::core::workspace_switch(app, arg)
+        match arg.map(str::trim).filter(|a| !a.is_empty()) {
+            Some("worktrees" | "worktree" | "wt") => {
+                CommandResult::action(AppAction::OpenWorktreeManager)
+            }
+            other => super::core::workspace_switch(app, other),
+        }
     }
 }

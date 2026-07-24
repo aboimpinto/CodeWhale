@@ -22,8 +22,8 @@ intentional:
 |------|--------|----------|
 | 0 | `$skill` compatibility | `$name` is resolved as `/skill name` before slash parsing. |
 | 1 | User commands | `user_registry::try_dispatch()` checks workspace and global markdown commands first, so user commands can shadow built-ins. |
-| 2 | Permanent compatibility aliases | `/jihua` and `/zidong` route through config mode dispatch; `/slop` and `/canzha` dispatch directly to `/debt`. All predate the group-owned registry and bypass the built-in `CommandRegistry`. |
-| 3 | Built-in registry | `CommandRegistry` resolves group-owned built-in commands by canonical name or alias. |
+| 2 | Permanent mode compatibility aliases | `/jihua` and `/zidong` route through config mode dispatch so each selects its fixed legacy mode. They remain registered aliases for discovery, but bypass normal `/mode` execution. |
+| 3 | Built-in registry | `CommandRegistry` resolves group-owned built-in commands by canonical name or alias, including `/slop` and `/canzha` as aliases of `/debt`. |
 | 4 | Legacy migration hints | Retired commands such as `/set` and `/deepseek` return targeted replacement guidance. |
 | 5 | Skills fallback | If no command matches, a skill with the same name may run before unknown-command suggestions are shown. |
 
@@ -50,7 +50,7 @@ intentional:
 | `plugins` | Read-only bundle discovery/validation plus explicit trust, enable, disable, revoke, and reload lifecycle commands; legacy executable tools remain separate. |
 | `project` | Project initialization, sharing, LSP, and goal/hunt commands. |
 | `session` | Rename, save, fork/new/load sessions, compaction, purge, relay, and export. |
-| `skills` | Skill listing, execution, review, and restore. |
+| `skills` | Skills Manager (`/skills`), text inspect/remote/sync paths, activation (`/skill`), and managed install/update/uninstall/trust. |
 | `utility` | Attachments, tasks/jobs, MCP, and network. |
 
 ## User Commands
@@ -69,12 +69,52 @@ Supported frontmatter fields:
 
 | Field | Meaning |
 |-------|---------|
+| `name` | Canonical slash-command name. It is normalized without a leading slash and replaces the filename-derived default. |
 | `description` | Work objective and UI description. |
-| `argument-hint` | Palette/completion hint for expected arguments. |
+| `usage` | Preferred user-facing invocation syntax shown in the palette and slash completion. |
+| `arguments` | Argument synopsis and a signal that selection should leave the composer open for input. It does not impose runtime validation. |
+| `argument-hint` | Backward-compatible palette/completion hint for expected arguments. It remains the display fallback when `usage` is absent. |
 | `allowed-tools` | Restricts command execution tools. An explicit empty value blocks all tools. |
 | `pausable` | Marks the command as pause/resume capable. |
 | `alias` / `aliases` | Additional user-command names that can shadow built-in aliases. |
 | `hidden` | Hides the command from palette/completion while allowing direct dispatch. |
+
+The canonical name defaults to the normalized markdown filename. A valid
+frontmatter `name` replaces that default; the filename is not retained as an
+implicit alias, so a renamed command must list the old filename under `alias`
+or `aliases` if both spellings should dispatch. A configured name may include
+one leading slash for readability, but after normalization it must be one
+non-empty slash-command token with no whitespace or embedded `/`. An invalid
+configured name is a recoverable error attached to the filename-derived
+command, preventing silent fallthrough to a built-in.
+
+Source precedence is resolved before frontmatter naming: a higher-precedence
+directory wins when the same filename exists in more than one location. Files
+inside each directory are ordered by normalized filename. If distinct files
+then resolve to the same frontmatter `name`, the first file in that stable
+directory-and-filename order wins and the losing file records a recoverable
+load error. Aliases cannot replace any canonical user-command name; duplicate
+aliases also use first-wins order. Errors on a losing duplicate never poison a
+valid winning definition.
+
+Presentation metadata has an explicit fallback order: non-empty `usage`, then
+non-empty legacy `argument-hint`, then non-empty `arguments`. `arguments` and
+`argument-hint` also cause palette/menu selection to append a space; `usage`
+does so when it describes more than the bare command name. These fields do not
+parse, require, or reject invocation arguments. Runtime expansion remains
+backwards-compatible: `$ARGUMENTS` receives the complete argument tail and
+`$1`, `$2`, and so on receive whitespace-separated positional values.
+
+Malformed files remain registered under their resolved name with a
+dispatch-time error, so they cannot silently fall through to a built-in. Their
+errors are isolated per file: valid siblings still load, appear, and dispatch.
+Hidden commands participate in shadowing and remain directly dispatchable, but
+are removed from palette and slash-completion discovery.
+
+Explicit `/help <name>` topics and unknown-command typo suggestions resolve
+through the same user-command precedence as execution. When a user command
+owns a built-in name or alias, help shows the user command's metadata and typo
+suggestions point to its canonical name rather than the shadowed built-in.
 
 Dispatch through `user_registry` resets stale command state before sending the
 new command body: hunt objective fields, token/time counters, continuation
@@ -84,7 +124,7 @@ count, allowed tools, pause state, todos, and plan state.
 
 | Exception | Rationale |
 |-----------|-----------|
-| `/jihua`, `/zidong`, `/slop`, `/canzha` | Backward-compatible dispatch aliases that predate the group-owned registry. `/jihua` and `/zidong` route through config mode dispatch; `/slop` and `/canzha` dispatch directly to `/debt`. |
+| `/jihua`, `/zidong` | Backward-compatible mode aliases that predate the group-owned registry. They route through config mode dispatch to preserve their fixed mode selection. |
 | `/set` and `/deepseek` migration hints | Retired commands kept only as direct typed guidance. They are excluded from registry and autocomplete. |
 | `#[allow(clippy::module_inception)]` in matching group modules | Group directories intentionally contain same-named child modules such as `core/core.rs`. |
 | `user_commands.rs` lower layer | The registry owns runtime behavior, while this module remains the shared filesystem and parser layer. |

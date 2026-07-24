@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use ratatui::{
     Frame,
     layout::Rect,
@@ -8,14 +10,13 @@ use ratatui::{
 };
 use unicode_width::UnicodeWidthStr;
 
+use crate::localization::MessageId;
 use crate::tui::app::{App, SidebarHoverRow, SidebarHoverSection};
 use crate::tui::ui_text::truncate_line_to_width;
 
-use super::model::{WorkHitbox, WorkRow, WorkSurfacePlacement, WorkTone, project};
+use super::model::{WorkHitbox, WorkRow, WorkSurfacePlacement, WorkTone, project_visible};
 
 const SIDE_RAIL_MIN_HOST_WIDTH: u16 = 72;
-const SIDE_RAIL_MIN_WIDTH: u16 = 26;
-const SIDE_RAIL_MAX_WIDTH: u16 = 40;
 const SIDE_RAIL_MIN_CHAT_WIDTH: u16 = 40;
 
 fn effective_placement(
@@ -33,7 +34,9 @@ fn effective_placement(
 /// Responsive work-surface height. The component owns a bounded window; long
 /// work lists scroll instead of consuming the transcript.
 pub fn height(app: &mut App, width: u16, terminal_height: u16, classic_shell: bool) -> u16 {
-    let rows = project(app);
+    app.work_surface.effective_placement =
+        effective_placement(app.work_surface.placement, width, classic_shell);
+    let rows = project_visible(app);
     if rows.is_empty() {
         app.work_surface.focused = false;
         app.work_surface.selected = None;
@@ -45,25 +48,29 @@ pub fn height(app: &mut App, width: u16, terminal_height: u16, classic_shell: bo
         app.work_surface.visible_rows = 0;
         app.work_surface.total_rows = 0;
         app.work_surface.scroll_offset = 0;
+        app.work_surface.resizing = false;
+        app.work_surface.divider_hovered = false;
         return 0;
     }
-    app.work_surface.effective_placement =
-        effective_placement(app.work_surface.placement, width, classic_shell);
     if app.work_surface.effective_placement != WorkSurfacePlacement::Top {
         return 0;
     }
-    let cap = match terminal_height {
-        0..=12 => 3,
-        13..=16 => 5,
-        17..=23 => 6,
-        _ => 8,
-    };
-    // Reserve only the rows the projection can actually paint, plus the
-    // panel-owned divider. The old fixed cap left three or four empty rows
-    // behind a small/completed Fleet, taking transcript space without adding
-    // any information (especially visible in an 89x50 Cursor terminal).
-    let content_height = u16::try_from(rows.len()).unwrap_or(u16::MAX);
-    content_height.saturating_add(1).min(cap)
+    // The strip auto-fits its content: the literal selectable list plus the
+    // pinned progress receipt and the divider row. `top_height` (drag-resize
+    // / settings) and half the terminal act as caps, so a two-step plan
+    // takes two rows while an eight-step plan grows to show all eight —
+    // never a fixed-height band of blank water.
+    let terminal_cap = terminal_height
+        .saturating_div(2)
+        .clamp(super::model::TOP_HEIGHT_MIN, super::model::TOP_HEIGHT_MAX);
+    let cap = app.work_surface.top_height.min(terminal_cap);
+    let selectable = rows.iter().filter(|row| row.selectable).count();
+    let progress = u16::from(top_todo_progress(app, &rows).is_some());
+    let desired = u16::try_from(selectable)
+        .unwrap_or(u16::MAX)
+        .saturating_add(progress)
+        .saturating_add(1);
+    desired.clamp(super::model::TOP_HEIGHT_MIN, cap)
 }
 
 /// Split the transcript slot for a side rail. Top placement consumes its own
@@ -76,11 +83,12 @@ pub fn split_chat(app: &mut App, area: Rect, classic_shell: bool) -> (Rect, Opti
         return (area, None);
     }
 
-    let proportional = area.width.saturating_mul(30) / 100;
-    let rail_width = proportional
-        .clamp(SIDE_RAIL_MIN_WIDTH, SIDE_RAIL_MAX_WIDTH)
+    let rail_width = app
+        .work_surface
+        .side_width
+        .clamp(super::model::SIDE_WIDTH_MIN, super::model::SIDE_WIDTH_MAX)
         .min(area.width.saturating_sub(SIDE_RAIL_MIN_CHAT_WIDTH));
-    if rail_width < SIDE_RAIL_MIN_WIDTH {
+    if rail_width < super::model::SIDE_WIDTH_MIN {
         app.work_surface.effective_placement = WorkSurfacePlacement::Top;
         return (area, None);
     }
@@ -142,35 +150,39 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         },
     };
 
-    let mut rows = project(app);
-    if body_area.height <= 2 && rows.len() > usize::from(body_area.height) {
-        // Compact fallback spends its two content rows on the first actionable
-        // Task and To-do/worker objects instead of section chrome.
-        let mut compact = Vec::new();
-        for prefix in ["task:", "todo:", "worker:"] {
-            if let Some(row) = rows.iter().find(|row| row.id.0.starts_with(prefix)) {
-                compact.push(row.clone());
-            }
-        }
-        for row in rows.iter().filter(|row| row.selectable) {
-            if !compact.iter().any(|candidate| candidate.id == row.id) {
-                compact.push(row.clone());
-            }
-        }
-        rows = compact;
+    let mut rows = project_visible(app);
+    if placement == WorkSurfacePlacement::Top {
+        // The top bar is the literal list: to-dos first, then sub-agents.
+        // Section summaries belong to the optional side/detail surface and
+        // must not spend scarce transcript rows on generic chrome.
+        rows.retain(|row| row.selectable);
     }
-    let body_height = usize::from(body_area.height);
+    let todo_ordinals = if placement == WorkSurfacePlacement::Top {
+        todo_ordinals(&rows)
+    } else {
+        HashMap::new()
+    };
+    let ordinal_width = todo_ordinals.len().max(1).to_string().len();
+    let todo_progress = (placement == WorkSurfacePlacement::Top)
+        .then(|| top_todo_progress(app, &rows))
+        .flatten();
+    // At the minimum two-row surface, preserve the one usable content row and
+    // the divider. Taller surfaces pin the authoritative progress receipt
+    // above the scrollable/selectable rows.
+    let progress_height = u16::from(todo_progress.is_some() && body_area.height >= 2);
+    let list_height = body_area.height.saturating_sub(progress_height);
+    let body_height = usize::from(list_height);
     let overflow = rows.len() > body_height;
     let inset = u16::from(body_area.width >= 60);
     let rail_width = u16::from(overflow);
     let content_area = Rect {
         x: body_area.x.saturating_add(inset),
-        y: body_area.y,
+        y: body_area.y.saturating_add(progress_height),
         width: body_area
             .width
             .saturating_sub(inset.saturating_mul(2))
             .saturating_sub(rail_width),
-        height: body_area.height,
+        height: list_height,
     };
 
     app.work_surface.visible_rows = body_height;
@@ -185,6 +197,25 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     Block::default()
         .style(Style::default().bg(app.ui_theme.surface_bg))
         .render(area, frame.buffer_mut());
+
+    if let Some(progress) = todo_progress.filter(|_| progress_height > 0) {
+        let progress = truncate_line_to_width(&progress, usize::from(content_area.width));
+        Paragraph::new(Line::from(Span::styled(
+            progress,
+            Style::default()
+                .fg(app.ui_theme.accent_primary)
+                .bg(app.ui_theme.surface_bg)
+                .add_modifier(Modifier::BOLD),
+        )))
+        .render(
+            Rect {
+                y: body_area.y,
+                height: 1,
+                ..content_area
+            },
+            frame.buffer_mut(),
+        );
+    }
 
     let start = app.work_surface.scroll_offset;
     let visible = rows
@@ -202,14 +233,10 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         let hovered = app.work_surface.hovered.as_ref() == Some(&row.id);
         let opened = app.work_surface.opened.as_ref() == Some(&row.id);
         let style = row_style(app, row, selected, hovered, opened);
-        let compact_owner = if body_area.height <= 2 {
-            row.id
-                .0
-                .split_once(':')
-                .map(|(kind, _)| match kind {
-                    "graph" => "Work · ".to_string(),
-                    _ => String::new(),
-                })
+        let compact_owner = if placement == WorkSurfacePlacement::Top {
+            todo_ordinals
+                .get(&row.id.0)
+                .map(|ordinal| format!("{ordinal:>ordinal_width$} · "))
                 .unwrap_or_default()
         } else {
             String::new()
@@ -224,21 +251,25 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         } else {
             format!("{compact_owner}{mark} ")
         };
-        let detail = if row.tone != WorkTone::Heading && content_area.width >= 44 {
+        let detail_candidate = if row.tone != WorkTone::Heading && content_area.width >= 44 {
             format!("  {}", row.detail)
         } else {
             String::new()
         };
+        let prefix_width = UnicodeWidthStr::width(prefix.as_str());
+        let row_width = usize::from(content_area.width);
+        let label_budget = row_width.saturating_sub(prefix_width).max(1);
+        let label = truncate_line_to_width(&row.label, label_budget);
+        let detail_budget =
+            row_width.saturating_sub(prefix_width + UnicodeWidthStr::width(label.as_str()));
+        let detail = if detail_budget >= 4 {
+            truncate_line_to_width(&detail_candidate, detail_budget)
+        } else {
+            String::new()
+        };
         let detail_width = UnicodeWidthStr::width(detail.as_str());
-        let label_width = usize::from(content_area.width)
-            .saturating_sub(UnicodeWidthStr::width(prefix.as_str()) + detail_width)
-            .max(1);
-        let label = truncate_line_to_width(&row.label, label_width);
-        let gap = usize::from(content_area.width).saturating_sub(
-            UnicodeWidthStr::width(prefix.as_str())
-                + UnicodeWidthStr::width(label.as_str())
-                + detail_width,
-        );
+        let gap = usize::from(content_area.width)
+            .saturating_sub(prefix_width + UnicodeWidthStr::width(label.as_str()) + detail_width);
         let display = format!("{prefix}{label}{}{detail}", " ".repeat(gap));
         lines.push(Line::from(Span::styled(display.clone(), style)));
 
@@ -253,7 +284,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
                 display_text: display,
                 full_text: format!("{} · {}", row.label, row.detail),
                 detail: Some(row.detail.clone()),
-                is_truncated: label != row.label || detail.is_empty(),
+                is_truncated: label != row.label || detail != detail_candidate,
                 click_action: row.primary_action.clone(),
                 stop_action: None,
                 stop_zone_start_col: None,
@@ -267,7 +298,12 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
     if overflow {
         render_scrollbar(
             frame,
-            body_area,
+            Rect {
+                x: body_area.right().saturating_sub(1),
+                y: content_area.y,
+                width: 1,
+                height: content_area.height,
+            },
             app.work_surface.scroll_offset,
             body_height,
             rows.len(),
@@ -282,6 +318,38 @@ pub fn render(frame: &mut Frame, area: Rect, app: &mut App) {
         lines: visible.iter().map(|row| row.label.clone()).collect(),
         rows: hover_rows,
     });
+}
+
+fn todo_ordinals(rows: &[WorkRow]) -> HashMap<String, usize> {
+    rows.iter()
+        .filter(|row| row.id.0.starts_with("graph:"))
+        .enumerate()
+        .map(|(index, row)| (row.id.0.clone(), index.saturating_add(1)))
+        .collect()
+}
+
+fn top_todo_progress(app: &App, rows: &[WorkRow]) -> Option<String> {
+    let todos = rows
+        .iter()
+        .filter(|row| row.id.0.starts_with("graph:"))
+        .collect::<Vec<_>>();
+    let total = todos.len();
+    if total == 0 {
+        return None;
+    }
+    let completed = todos
+        .iter()
+        .filter(|row| row.tone == WorkTone::Success)
+        .count();
+    let remaining = total.saturating_sub(completed);
+    let label = format!("{} ·", app.tr(MessageId::SidebarTodoLabel));
+    Some(
+        app.tr(MessageId::WorkSurfaceTodoProgress)
+            .replace("{label}", &label)
+            .replace("{completed}", &completed.to_string())
+            .replace("{total}", &total.to_string())
+            .replace("{remaining}", &remaining.to_string()),
+    )
 }
 
 fn row_style(app: &App, row: &WorkRow, selected: bool, hovered: bool, opened: bool) -> Style {
@@ -315,13 +383,19 @@ fn row_style(app: &App, row: &WorkRow, selected: bool, hovered: bool, opened: bo
 }
 
 fn render_divider(frame: &mut Frame, area: Rect, placement: WorkSurfacePlacement, app: &App) {
+    let active = app.work_surface.resizing || app.work_surface.divider_hovered;
+    let color = if active {
+        app.ui_theme.accent_primary
+    } else {
+        app.ui_theme.border
+    };
     match placement {
         WorkSurfacePlacement::Top => {
             let y = area.bottom().saturating_sub(1);
             for x in area.left()..area.right() {
                 frame.buffer_mut()[(x, y)]
-                    .set_symbol("─")
-                    .set_fg(app.ui_theme.border)
+                    .set_symbol(if active { "━" } else { "─" })
+                    .set_fg(color)
                     .set_bg(app.ui_theme.surface_bg);
             }
         }
@@ -333,8 +407,8 @@ fn render_divider(frame: &mut Frame, area: Rect, placement: WorkSurfacePlacement
             };
             for y in area.top()..area.bottom() {
                 frame.buffer_mut()[(x, y)]
-                    .set_symbol("│")
-                    .set_fg(app.ui_theme.border)
+                    .set_symbol(if active { "┃" } else { "│" })
+                    .set_fg(color)
                     .set_bg(app.ui_theme.surface_bg);
             }
         }

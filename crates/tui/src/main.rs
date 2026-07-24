@@ -45,6 +45,7 @@ mod core;
 mod cost_status;
 mod deepseek_theme;
 mod dependencies;
+mod elapsed;
 mod error_taxonomy;
 mod eval;
 mod execpolicy;
@@ -101,7 +102,6 @@ mod runtime_log;
 mod runtime_threads;
 mod sandbox;
 mod scorecard;
-mod seam_manager;
 #[allow(dead_code)]
 mod session_diagnostics;
 #[allow(dead_code)]
@@ -412,6 +412,9 @@ struct ExecArgs {
     /// Extra text appended to the system prompt for this run.
     #[arg(long)]
     append_system_prompt: Option<String>,
+    /// Internal Fleet worker authority envelope. Non-secret, versioned JSON.
+    #[arg(long, value_name = "JSON", hide = true)]
+    tool_authority_json: Option<String>,
     /// Prompt to send to the model
     #[arg(
         value_name = "PROMPT",
@@ -932,12 +935,12 @@ struct SpeechArgs {
     #[arg(value_name = "TEXT")]
     text: String,
 
-    /// Output audio path. Defaults to speech.<format> in --output-dir,
-    /// [speech].output_dir, or the current directory.
+    /// Output audio path. Defaults to `speech.<format>` in `--output-dir`,
+    /// `[speech].output_dir`, or the current directory.
     #[arg(short, long, value_name = "FILE")]
     output: Option<PathBuf>,
 
-    /// Directory for the default speech.<format> output file when -o/--output is omitted.
+    /// Directory for the default `speech.<format>` output file when `-o`/`--output` is omitted.
     #[arg(long = "output-dir", value_name = "DIR")]
     output_dir: Option<PathBuf>,
 
@@ -1493,7 +1496,13 @@ async fn run_async_main(
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
                 });
                 let mut config = config.clone();
-                merge_user_workspace_config(&mut config, cli.config.clone(), &workspace);
+                // #4641: `--no-project-config` skips the workspace-specific
+                // `[workspace]`/`[projects]` user-config overlay so a headless
+                // launch (e.g. a future Verifiers harness) sees a reproducible
+                // config surface that depends only on the explicit `--config`.
+                if !cli.no_project_config {
+                    merge_user_workspace_config(&mut config, cli.config.clone(), &workspace);
+                }
                 if let Some(sandbox) = args.sandbox.as_deref() {
                     let _ = parse_sandbox_policy(sandbox, true, Vec::new(), false, false)?;
                     config.sandbox_mode = Some(sandbox.to_ascii_lowercase());
@@ -1535,6 +1544,10 @@ async fn run_async_main(
                 }
                 let prompt = join_prompt_parts(&args.prompt);
                 let resume_session_id = resolve_exec_resume_session_id(&args, &workspace)?;
+                validate_exec_tool_authority_resume(
+                    args.tool_authority_json.as_deref(),
+                    resume_session_id.is_some(),
+                )?;
                 let resume_session = resume_session_id
                     .as_deref()
                     .map(load_exec_resume_session)
@@ -1572,6 +1585,7 @@ async fn run_async_main(
                     || args.allowed_tools.is_some()
                     || args.disallowed_tools.is_some()
                     || args.append_system_prompt.is_some()
+                    || args.tool_authority_json.is_some()
                     || args.sandbox.is_some()
                     || args.allow_sandbox_elevation
                     || env_tool_surface.is_some();
@@ -1607,6 +1621,7 @@ async fn run_async_main(
                         allowed_tools,
                         disallowed_tools,
                         args.append_system_prompt.clone(),
+                        args.tool_authority_json.clone(),
                         std::sync::Arc::clone(&plugin_registry),
                     )
                     .await
@@ -2514,11 +2529,24 @@ async fn run_fleet_command(workspace: &Path, config: &Config, args: FleetArgs) -
     }
 
     let fleet_config = config.fleet_config();
+    let provider = config.api_provider();
+    let max_subagents = config.max_subagents_for_provider(provider);
+    let coordination_manager = crate::tools::subagent::new_shared_subagent_manager_with_timeout(
+        workspace.to_path_buf(),
+        max_subagents,
+        config
+            .max_admitted_subagents_for_provider(provider)
+            .max(max_subagents),
+        Duration::from_secs(config.subagent_heartbeat_timeout_secs_for_provider(provider)),
+        config.launch_concurrency_for_provider(provider),
+        config.subagent_token_budget_for_provider(provider),
+    );
     // The configured route is the operator: fleet workers without a
     // task/profile model pin inherit the session's active model.
     let manager = FleetManager::open(workspace)?
         .with_exec_config(fleet_config.exec.clone())
         .with_fleet_config(fleet_config)
+        .with_sub_agent_manager(coordination_manager)
         .with_session_model(config.default_model())
         .with_route_config(config.clone());
     match args.command {
@@ -3117,7 +3145,9 @@ fn run_setup(
         println!("    Next: run `/plugin validate`, review `example`, then trust and enable it.");
     }
 
-    let sandbox = crate::sandbox::get_platform_sandbox();
+    let sandbox = crate::sandbox::get_platform_sandbox_with_bwrap_preference(
+        config.prefer_bwrap.unwrap_or(false),
+    );
     if let Some(kind) = sandbox {
         println!("  ✓ Sandbox available: {kind}");
     } else {
@@ -3433,7 +3463,9 @@ fn run_setup_status(
         crate::utils::display_path(&plugins_dir)
     );
 
-    let sandbox = crate::sandbox::get_platform_sandbox();
+    let sandbox = crate::sandbox::get_platform_sandbox_with_bwrap_preference(
+        config.prefer_bwrap.unwrap_or(false),
+    );
     match sandbox {
         Some(kind) => println!(
             "  {} sandbox: {kind}",
@@ -4491,7 +4523,9 @@ async fn run_doctor(
     println!("  OS: {}", std::env::consts::OS);
     println!("  Arch: {}", std::env::consts::ARCH);
 
-    let sandbox = crate::sandbox::get_platform_sandbox();
+    let sandbox = crate::sandbox::get_platform_sandbox_with_bwrap_preference(
+        config.prefer_bwrap.unwrap_or(false),
+    );
     if let Some(kind) = sandbox {
         println!(
             "  {} sandbox available: {}",
@@ -5369,8 +5403,22 @@ fn doctor_runtime_default_mode() -> (String, &'static str) {
     }
 }
 
+/// TUI settings posture used when `config.approval_policy` is unset.
+/// Doctor must surface this separately so a saved Full Access baseline is not
+/// misreported as the config default `approval_policy=on-request`.
+fn doctor_runtime_permission_posture() -> (String, &'static str) {
+    match crate::settings::Settings::load_read_only() {
+        Ok(settings) => match settings.permission_posture {
+            Some(posture) => (posture, "settings"),
+            None => ("unset".to_string(), "default"),
+        },
+        Err(_) => ("unset".to_string(), "default"),
+    }
+}
+
 fn doctor_runtime_posture_line(config: &Config, workspace: &Path) -> String {
     let (default_mode, default_mode_source) = doctor_runtime_default_mode();
+    let (permission_posture, permission_posture_source) = doctor_runtime_permission_posture();
     let approval = config.approval_policy.as_deref().unwrap_or("on-request");
     let approval_source = if config.approval_policy.is_some() {
         "config"
@@ -5405,7 +5453,7 @@ fn doctor_runtime_posture_line(config: &Config, workspace: &Path) -> String {
     };
 
     format!(
-        "default_mode={default_mode} ({default_mode_source}), approval_policy={approval} ({approval_source}), allow_shell={allow_shell} ({allow_shell_source}), sandbox={sandbox} ({sandbox_source}), network.default={network} ({network_source}), trust={trust}"
+        "default_mode={default_mode} ({default_mode_source}), permission_posture={permission_posture} ({permission_posture_source}), approval_policy={approval} ({approval_source}), allow_shell={allow_shell} ({allow_shell_source}), sandbox={sandbox} ({sandbox_source}), network.default={network} ({network_source}), trust={trust}"
     )
 }
 
@@ -5611,6 +5659,7 @@ fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Va
 
     let (state, source) = doctor_setup_state(config, workspace);
     let (default_mode, default_mode_source) = doctor_runtime_default_mode();
+    let (permission_posture, permission_posture_source) = doctor_runtime_permission_posture();
     let approval_policy = config.approval_policy.as_deref().unwrap_or("on-request");
     let approval_policy_source = if config.approval_policy.is_some() {
         "config"
@@ -5677,6 +5726,10 @@ fn doctor_setup_report_json(config: &Config, workspace: &Path) -> serde_json::Va
             "default_mode": {
                 "value": default_mode,
                 "source": default_mode_source,
+            },
+            "permission_posture": {
+                "value": permission_posture,
+                "source": permission_posture_source,
             },
             "approval_policy": {
                 "value": approval_policy,
@@ -6048,7 +6101,9 @@ fn run_doctor_json(
                 "error": stash.error,
             },
         },
-        "sandbox": match crate::sandbox::get_platform_sandbox() {
+        "sandbox": match crate::sandbox::get_platform_sandbox_with_bwrap_preference(
+            config.prefer_bwrap.unwrap_or(false),
+        ) {
             Some(kind) => json!({"available": true, "kind": kind.to_string()}),
             None => json!({"available": false, "kind": null}),
         },
@@ -6173,11 +6228,15 @@ fn doctor_route_report(config: &Config) -> serde_json::Value {
         })
     });
 
+    let route_identity =
+        crate::config::moonshot_k3_route_display_name(&target.base_url, &target.model);
+
     json!({
         "provider": target.provider,
         "provider_source": doctor_provider_source(config),
         "provider_config_table": doctor_provider_config_table(config, provider),
         "model": target.model,
+        "route_identity": route_identity,
         "wire_protocol": doctor_wire_protocol(provider),
         "base_url": {
             "redacted": redacted_base_url,
@@ -8915,6 +8974,11 @@ async fn run_interactive(
     // Failures are quiet: bundled catalog rows always remain available.
     crate::models_dev_live::maybe_load_persisted_cache();
     crate::models_dev_live::spawn_background_refresh();
+    // Best-effort per-provider catalog refresh: fetches the active provider's
+    // own /v1/models endpoint and merges live rows into the provider lake
+    // alongside the Models.dev snapshot. Currently active for TelecomJS, whose
+    // model list is not covered by the Models.dev catalog.
+    crate::client::DeepSeekClient::spawn_active_provider_catalog_refresh(config);
 
     // Boot janitors — snapshot prune (7-day default), spillover prune
     // (#422), and managed-session cleanup (v0.8.44) — are best-effort disk
@@ -10161,6 +10225,18 @@ struct ExecSummary {
     error: Option<String>,
 }
 
+fn validate_exec_tool_authority_resume(
+    tool_authority_json: Option<&str>,
+    resuming: bool,
+) -> Result<()> {
+    if tool_authority_json.is_some() && resuming {
+        bail!(
+            "Fleet tool authority cannot be combined with exec --resume, --session-id, or --continue"
+        );
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_exec_agent(
     config: &Config,
@@ -10180,6 +10256,7 @@ async fn run_exec_agent(
     allowed_tools: Option<Vec<String>>,
     disallowed_tools: Option<Vec<String>>,
     append_system_prompt: Option<String>,
+    tool_authority_json: Option<String>,
     plugin_registry: std::sync::Arc<crate::plugins::PluginRegistry>,
 ) -> Result<()> {
     use crate::compaction::CompactionConfig;
@@ -10189,6 +10266,15 @@ async fn run_exec_agent(
     use crate::tools::plan::new_shared_plan_state;
     use crate::tools::todo::new_shared_todo_list;
     use crate::tui::app::AppMode;
+
+    validate_exec_tool_authority_resume(tool_authority_json.as_deref(), resume_session.is_some())?;
+    let fleet_authority_active = tool_authority_json.is_some();
+
+    if let Some(raw) = tool_authority_json.as_deref() {
+        let envelope = crate::tools::spec::ToolAuthorityEnvelope::from_json(raw)
+            .map_err(anyhow::Error::msg)?;
+        crate::tools::spec::install_process_tool_authority(envelope).map_err(anyhow::Error::msg)?;
+    }
 
     let route = resolve_cli_exec_route(config, model, prompt, force_configured_route).await?;
     let execution_config = config_for_cli_route(config, &route);
@@ -10263,16 +10349,32 @@ async fn run_exec_agent(
         crate::network_policy::NetworkPolicyDecider::with_default_audit(toml_cfg.into_runtime())
     });
 
-    let lsp_config = execution_config
-        .lsp
-        .clone()
-        .map(crate::config::LspConfigToml::into_runtime);
+    let lsp_config = (!fleet_authority_active)
+        .then(|| {
+            execution_config
+                .lsp
+                .clone()
+                .map(crate::config::LspConfigToml::into_runtime)
+        })
+        .flatten();
+    let mut engine_features = execution_config.features();
+    if fleet_authority_active {
+        engine_features
+            .disable(crate::features::Feature::ShellTool)
+            .disable(crate::features::Feature::Subagents)
+            .disable(crate::features::Feature::Mcp);
+    }
+    let engine_plugin_registry = if fleet_authority_active {
+        std::sync::Arc::new(crate::plugins::PluginRegistry::empty(&workspace))
+    } else {
+        plugin_registry
+    };
     let engine_config = EngineConfig {
         model: effective_model.clone(),
         active_route_limits,
         workspace: workspace.clone(),
-        plugin_registry: Some(plugin_registry),
-        allow_shell: auto_approve || execution_config.allow_shell(),
+        plugin_registry: Some(engine_plugin_registry),
+        allow_shell: !fleet_authority_active && (auto_approve || execution_config.allow_shell()),
         trust_mode,
         notes_path: execution_config.notes_path(),
         mcp_config_path: execution_config.mcp_config_path(),
@@ -10301,18 +10403,23 @@ async fn run_exec_agent(
             .max_admitted_subagents_for_provider(effective_provider)
             .max(max_subagents),
         launch_concurrency: execution_config.launch_concurrency_for_provider(effective_provider),
-        subagents_enabled: execution_config.subagents_enabled_for_provider(effective_provider),
-        features: execution_config.features(),
+        subagents_enabled: !fleet_authority_active
+            && execution_config.subagents_enabled_for_provider(effective_provider),
+        features: engine_features,
         auto_review_policy: execution_config.auto_review_policy(),
         compaction: compaction.clone(),
         todos: new_shared_todo_list(),
         plan_state: new_shared_plan_state(),
         goal_state: crate::tools::goal::new_shared_goal_state(),
-        max_spawn_depth: execution_config.subagent_max_spawn_depth_for_provider(effective_provider),
+        max_spawn_depth: if fleet_authority_active {
+            0
+        } else {
+            execution_config.subagent_max_spawn_depth_for_provider(effective_provider)
+        },
         subagent_token_budget: execution_config
             .subagent_token_budget_for_provider(effective_provider),
         network_policy,
-        snapshots_enabled: execution_config.snapshots_config().enabled,
+        snapshots_enabled: !fleet_authority_active && execution_config.snapshots_config().enabled,
         snapshots_max_workspace_bytes: execution_config
             .snapshots_config()
             .max_workspace_gb
@@ -10359,8 +10466,16 @@ async fn run_exec_agent(
             .search
             .as_ref()
             .and_then(|s| s.base_url.clone()),
-        tools_always_load: execution_config.tools_always_load(),
-        tools: execution_config.tools.clone(),
+        tools_always_load: if fleet_authority_active {
+            std::collections::HashSet::new()
+        } else {
+            execution_config.tools_always_load()
+        },
+        tools: if fleet_authority_active {
+            None
+        } else {
+            execution_config.tools.clone()
+        },
         verbosity: execution_config.verbosity.clone(),
         workspace_follow_symlinks: settings.workspace_follow_symlinks,
         exec_policy_engine: execution_config.exec_policy_engine.clone(),
@@ -11914,6 +12029,51 @@ mod doctor_setup_state_tests {
             "config"
         );
         assert_eq!(provider_step(&report)["result"], "deepseek/deepseek-chat");
+    }
+
+    #[test]
+    fn doctor_reports_settings_permission_posture_when_approval_policy_unset() {
+        let _guard = crate::test_support::lock_test_env();
+        let tmp = TempDir::new().expect("tempdir");
+        let (_home_guard, codewhale_home) = prepare_env(&tmp);
+        let workspace = tmp.path().join("workspace");
+        fs::create_dir_all(&workspace).expect("workspace");
+        fs::write(
+            codewhale_home.join("settings.toml"),
+            "permission_posture = \"full-access\"\n",
+        )
+        .expect("write settings.toml");
+
+        let config = Config::default();
+        assert!(config.approval_policy.is_none());
+
+        let line = doctor_runtime_posture_line(&config, &workspace);
+        assert!(
+            line.contains("permission_posture=full-access (settings)"),
+            "text doctor should report saved settings posture: {line}"
+        );
+        assert!(
+            line.contains("approval_policy=on-request (default)"),
+            "text doctor should keep unset config approval_policy default: {line}"
+        );
+
+        let report = doctor_setup_report_json(&config, &workspace);
+        assert_eq!(
+            report["runtime_posture"]["permission_posture"]["value"],
+            "full-access"
+        );
+        assert_eq!(
+            report["runtime_posture"]["permission_posture"]["source"],
+            "settings"
+        );
+        assert_eq!(
+            report["runtime_posture"]["approval_policy"]["value"],
+            "on-request"
+        );
+        assert_eq!(
+            report["runtime_posture"]["approval_policy"]["source"],
+            "default"
+        );
     }
 
     #[test]
@@ -13482,6 +13642,7 @@ mod terminal_mode_tests {
 
     #[test]
     fn exec_parses_tool_gate_and_hardening_flags() {
+        let envelope = r#"{"schema_version":1,"owner":"fleet-worker-1","authority":"read_only"}"#;
         let cli = parse_cli(&[
             "codewhale",
             "exec",
@@ -13493,6 +13654,8 @@ mod terminal_mode_tests {
             "7",
             "--append-system-prompt",
             "extra rules",
+            "--tool-authority-json",
+            envelope,
             "do the thing",
         ]);
         let Some(Commands::Exec(args)) = cli.command else {
@@ -13509,7 +13672,18 @@ mod terminal_mode_tests {
         );
         assert_eq!(args.max_turns, Some(7));
         assert_eq!(args.append_system_prompt.as_deref(), Some("extra rules"));
+        assert_eq!(args.tool_authority_json.as_deref(), Some(envelope));
         assert_eq!(args.prompt, vec!["do the thing"]);
+    }
+
+    #[test]
+    fn fleet_tool_authority_cannot_cross_an_exec_resume_boundary() {
+        assert!(validate_exec_tool_authority_resume(None, true).is_ok());
+        assert!(validate_exec_tool_authority_resume(Some("{}"), false).is_ok());
+        let error = validate_exec_tool_authority_resume(Some("{}"), true)
+            .expect_err("authority must remain bound to its fresh Fleet launch")
+            .to_string();
+        assert!(error.contains("cannot be combined with exec --resume"));
     }
 
     #[test]
@@ -14901,6 +15075,39 @@ allow_shell = true
         merge_user_workspace_config_from_doc(&mut config, &doc, &workspace);
 
         assert_eq!(config.allow_shell, Some(true));
+    }
+
+    #[test]
+    fn exec_no_project_config_skips_user_workspace_overlay() {
+        // #4641: `codewhale --no-project-config exec` must skip the
+        // workspace-specific `[workspace]`/`[projects]` overlay so a headless
+        // launch sees a reproducible config surface. This documents the overlay
+        // the `Commands::Exec` gate skips; the end-to-end wiring is proven by
+        // `tests/verifiers_harness_contract.rs`.
+        let tmp = tempdir().expect("tempdir");
+        let workspace = tmp.path().join("project");
+        fs::create_dir_all(&workspace).expect("mkdir workspace");
+        let raw = format!(
+            "[workspace.'{}']\nallow_shell = true\n",
+            workspace.display()
+        );
+        let doc: toml::Value = toml::from_str(&raw).expect("parse config");
+
+        // Default (flag off): the overlay applies.
+        let mut applied = Config::default();
+        let no_project_config = false;
+        if !no_project_config {
+            merge_user_workspace_config_from_doc(&mut applied, &doc, &workspace);
+        }
+        assert_eq!(applied.allow_shell, Some(true));
+
+        // `--no-project-config`: Exec skips the overlay, leaving config untouched.
+        let mut skipped = Config::default();
+        let no_project_config = true;
+        if !no_project_config {
+            merge_user_workspace_config_from_doc(&mut skipped, &doc, &workspace);
+        }
+        assert_eq!(skipped.allow_shell, None);
     }
 
     #[test]

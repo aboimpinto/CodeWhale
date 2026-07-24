@@ -297,12 +297,21 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
             }
             .to_string(),
         ),
+        "inline_diffs" | "inline_diff" | "diffs" => {
+            Some(app.inline_diff_mode.as_setting().to_string())
+        }
         "mode" | "default_mode" => Some(app.mode.as_setting().to_string()),
         "max_history" | "history" => Some(app.max_input_history.to_string()),
         "sidebar_width" | "sidebar" => Some(app.sidebar_width_percent.to_string()),
         "sidebar_focus" | "focus" => Some(app.sidebar_focus.as_setting().to_string()),
         "work_surface_placement" | "work_surface" | "work_rail" => {
             Some(app.work_surface.placement.as_setting().to_string())
+        }
+        "work_surface_top_height" | "work_top_height" => {
+            Some(app.work_surface.top_height.to_string())
+        }
+        "work_surface_side_width" | "work_side_width" => {
+            Some(app.work_surface.side_width.to_string())
         }
         "tool_collapse" | "tool_collapse_mode" | "collapse" => {
             Some(app.tool_collapse_mode.as_setting().to_string())
@@ -379,7 +388,17 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
     }
 }
 
-/// Show persistent settings
+/// Open the typed settings editor. `text` preserves the legacy diagnostic
+/// output for scripts and terminals that cannot render the modal.
+pub fn settings_command(app: &mut App, arg: Option<&str>) -> CommandResult {
+    match arg.map(str::trim).filter(|value| !value.is_empty()) {
+        None => CommandResult::action(AppAction::OpenConfigView),
+        Some("text" | "show" | "diagnostic" | "diagnostics") => show_settings(app),
+        Some(_) => CommandResult::error("Usage: /settings [text]"),
+    }
+}
+
+/// Show persistent settings as plain text (legacy compatibility path).
 pub fn show_settings(app: &mut App) -> CommandResult {
     match Settings::load() {
         Ok(settings) => CommandResult::message(settings.display(app.ui_locale)),
@@ -1823,6 +1842,14 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.work_surface.last_area = None;
             app.needs_redraw = true;
         }
+        "work_surface_top_height" | "work_top_height" => {
+            app.work_surface.top_height = settings.work_surface_top_height;
+            app.needs_redraw = true;
+        }
+        "work_surface_side_width" | "work_side_width" => {
+            app.work_surface.side_width = settings.work_surface_side_width;
+            app.needs_redraw = true;
+        }
         "bracketed_paste" | "paste" => {
             app.use_bracketed_paste = settings.bracketed_paste;
             app.needs_redraw = true;
@@ -1843,14 +1870,17 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             app.show_tool_details = settings.show_tool_details;
             app.mark_history_updated();
         }
+        "inline_diffs" | "inline_diff" | "diffs" => {
+            app.inline_diff_mode = crate::settings::InlineDiffMode::parse(&settings.inline_diffs);
+            app.mark_history_updated();
+            app.needs_redraw = true;
+        }
         "locale" | "language" => {
             app.ui_locale = resolve_locale(&settings.locale);
             app.mark_history_updated();
             app.needs_redraw = true;
         }
         "theme" | "ui_theme" | "background_color" | "background" | "bg" => {
-            app.theme_id = crate::palette::ThemeId::from_name(&settings.theme)
-                .unwrap_or(crate::palette::ThemeId::System);
             // Theme previews reload persisted settings for each cursor move.
             // Keep a session-only background overlay live unless this command
             // is itself updating (or clearing) the background.
@@ -1862,13 +1892,20 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
                     .as_deref()
                     .and_then(crate::palette::parse_hex_rgb_color)
             };
-            app.background_color_override = background_color_override;
             let background_setting =
                 background_color_override.and_then(crate::palette::hex_rgb_string);
-            app.ui_theme = crate::palette::ui_theme_from_settings(
+            let (_, theme_id, ui_theme) = match crate::palette::resolve_theme_setting(
                 &settings.theme,
                 background_setting.as_deref(),
-            );
+            ) {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return CommandResult::error(format!("Failed to apply theme: {error}"));
+                }
+            };
+            app.background_color_override = background_color_override;
+            app.theme_id = theme_id;
+            app.ui_theme = ui_theme;
             app.needs_redraw = true;
         }
         "cost_currency" | "currency" => {
@@ -2084,6 +2121,11 @@ pub fn switch_mode(app: &mut App, mode: AppMode) -> String {
 
 fn switch_mode_with_status(app: &mut App, mode: AppMode) -> (String, bool) {
     if app.set_mode(mode) {
+        // Persist so the mode survives across sessions (#4628).
+        if let Ok(mut settings) = crate::settings::Settings::load() {
+            settings.default_mode = app.mode.as_setting().to_string();
+            let _ = settings.save();
+        }
         (format!("Switched to {} mode.", mode.display_name()), true)
     } else {
         (format!("Already in {} mode.", mode.display_name()), false)
@@ -2097,6 +2139,14 @@ fn switch_mode_with_status(app: &mut App, mode: AppMode) -> (String, bool) {
 pub fn theme(app: &mut App, arg: Option<&str>) -> CommandResult {
     match arg.map(str::trim).filter(|s| !s.is_empty()) {
         None => CommandResult::action(AppAction::OpenThemePicker),
+        Some("schema") => CommandResult::message(crate::palette::user_theme_schema_json()),
+        Some("path") => match crate::palette::user_themes_dir() {
+            Ok(path) => CommandResult::message(format!(
+                "User themes: {}\nSelect with: /theme custom:<name>",
+                path.display()
+            )),
+            Err(error) => CommandResult::error(error),
+        },
         Some(name) => set_config_value(app, "theme", name, true),
     }
 }
@@ -2915,6 +2965,23 @@ Parse error: permissions.toml at permissions.toml could not be parsed: expected 
         let result = show_settings(&mut app);
         // Settings should load (may use defaults if file doesn't exist)
         assert!(result.message.is_some());
+    }
+
+    #[test]
+    fn settings_command_opens_typed_editor_and_preserves_text_mode() {
+        let _lock = lock_test_env();
+        let mut app = create_test_app();
+
+        let modal = settings_command(&mut app, None);
+        assert!(modal.message.is_none());
+        assert!(matches!(modal.action, Some(AppAction::OpenConfigView)));
+
+        let text = settings_command(&mut app, Some("text"));
+        let message = text.message.as_deref().expect("settings diagnostic text");
+        assert!(message.contains("Settings:"), "{message}");
+        assert!(message.contains("provider_models:"), "{message}");
+        assert!(message.contains("Config file:"), "{message}");
+        assert!(text.action.is_none());
     }
 
     #[test]

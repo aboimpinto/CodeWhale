@@ -102,6 +102,16 @@ fn append_at(app: &mut App, entry_idx: usize, text: &str, now: Instant) {
 
 /// Build the spinner-decorated placeholder shown in the thinking entry
 /// while a translation is in flight (`Thinking… (1.2s |)`).
+fn translation_placeholder_spinner_frame(app: &App, elapsed: f32) -> &'static str {
+    let animated_frame = match (elapsed.mul_add(2.0, 0.0) as usize) % 4 {
+        0 => "|",
+        1 => "/",
+        2 => "-",
+        _ => "\\",
+    };
+    app.motion_policy().spinner_glyph(animated_frame, true)
+}
+
 pub(super) fn translation_placeholder_frame(app: &App) -> String {
     let base = crate::localization::thinking_translation_placeholder(app.ui_locale);
     let elapsed = app
@@ -109,12 +119,7 @@ pub(super) fn translation_placeholder_frame(app: &App) -> String {
         .or(app.turn_started_at)
         .map(|started| started.elapsed().as_secs_f32())
         .unwrap_or_default();
-    let frame = match (elapsed.mul_add(2.0, 0.0) as usize) % 4 {
-        0 => "|",
-        1 => "/",
-        2 => "-",
-        _ => "\\",
-    };
+    let frame = translation_placeholder_spinner_frame(app, elapsed);
     format!("{base} ({elapsed:.1}s {frame})")
 }
 
@@ -326,6 +331,24 @@ mod tests {
             Some(HistoryCell::Thinking { content, .. }) => content.clone(),
             other => panic!("expected a Thinking entry at {entry_idx}, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn translation_placeholder_spinner_uses_full_motion_only() {
+        let mut app = test_app();
+        app.low_motion = false;
+        app.fancy_animations = true;
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.0), "|");
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.6), "/");
+
+        app.low_motion = true;
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.0), "⣤");
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.6), "⣤");
+
+        app.low_motion = false;
+        app.fancy_animations = false;
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.0), "›");
+        assert_eq!(translation_placeholder_spinner_frame(&app, 0.6), "›");
     }
 
     /// #1620: a burst of reasoning chunks inside one throttle window must
