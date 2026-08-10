@@ -1,8 +1,8 @@
 name: Close stale issues
 
 on:
-  schedule:
-    - cron: '17 5 * * *'   # daily, off-peak
+  # Scheduled cron trigger disabled on the aboimpinto fork (see
+  # chore/disable-scheduled-builds); manual dispatch still available.
   workflow_dispatch: {}
 
 permissions:

@@ -21,8 +21,6 @@ on:
       - 'scripts/ohos/**'
       - 'scripts/ohos-env.sh'
       - 'scripts/release/check-ohos-deps.sh'
-  schedule:
-    - cron: '47 7 * * 1'
   workflow_dispatch:
 
 permissions:

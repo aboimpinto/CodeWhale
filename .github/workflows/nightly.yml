@@ -6,8 +6,9 @@ name: Nightly
 # keeps the artifact stream fresh without burning ~28 runner-minutes per
 # merge. Use workflow_dispatch for an on-demand build.
 on:
-  schedule:
-    - cron: '17 9 * * *'
+  # Scheduled cron trigger disabled on the aboimpinto fork (see
+  # chore/disable-scheduled-builds); use workflow_dispatch for on-demand
+  # builds.
   workflow_dispatch:
 
 permissions:
