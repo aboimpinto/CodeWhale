@@ -944,9 +944,9 @@ pub trait CommandSkillGroupContext {
 // ---------------------------------------------------------------------------
 // Session lifecycle capability (FEAT-023).
 //
-// One contract-owned facet for the nine lifecycle commands (`/branch`,
-// `/compact`, `/fork`, `/load`, `/new`, `/purge`, `/save`, `/sessions`,
-// `/tree`). The shared `CommandSessionContext` above stays unchanged: it
+// One contract-owned facet for the seven host-dependent lifecycle commands;
+// `/compact` and `/purge` stay pure. The shared `CommandSessionContext` above
+// stays unchanged: it
 // serves commands outside this slice and must not gain persistence,
 // navigation, picker, or lifecycle mutation authority (D2). No concrete App,
 // SessionManager, session-journal, picker, configuration, or view-stack type
@@ -977,16 +977,23 @@ pub struct SessionBranchOutcome {
     pub journal_entries_before: usize,
 }
 
-/// `/fork` success projection for both the active-conversation fork
-/// (`fork`) and the explicit-source fork (`fork_from_session`). The handler
-/// composes `Forked session {parent} -> {fork}` and appends the
-/// ` (spawn_depth N)` suffix only for the explicit-source form, matching the
-/// baseline byte-for-byte.
+/// `/fork` success projection for an active-conversation fork. The handler
+/// composes `Forked session {parent} -> {fork}` from these required fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct SessionForkReceipt {
     pub parent_label: String,
     pub fork_label: String,
-    pub spawn_depth: Option<u64>,
+    pub sync: SessionSyncPayload,
+}
+
+/// `/fork <session_id|prefix>` success projection. Explicit-source forks
+/// always report their spawn depth, so the contract makes that field required
+/// rather than permitting an invalid missing-depth state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionForkFromReceipt {
+    pub parent_label: String,
+    pub fork_label: String,
+    pub spawn_depth: u64,
     pub sync: SessionSyncPayload,
 }
 
@@ -1072,7 +1079,7 @@ pub trait CommandSessionLifecycleContext {
     fn fork_active(&mut self) -> Result<SessionForkReceipt, String>;
 
     /// `/fork <session_id|prefix>`: explicit-source fork.
-    fn fork_from(&mut self, session_id_or_prefix: &str) -> Result<SessionForkReceipt, String>;
+    fn fork_from(&mut self, session_id_or_prefix: &str) -> Result<SessionForkFromReceipt, String>;
 
     /// `/new [--force]`: fresh-session transition. The caller has already
     /// parsed the argument and applied the transition-blocked gate; blocker,

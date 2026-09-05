@@ -214,7 +214,6 @@ impl EnvVarGuard {
         Self { key, previous }
     }
 
-    #[allow(dead_code)] // retained for tests that assert env restoration
     pub(crate) fn previous(&self) -> Option<OsString> {
         self.previous.clone()
     }

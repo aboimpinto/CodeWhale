@@ -39,9 +39,9 @@ impl CommandCapabilities {
     /// Plugin-group host data (FEAT-020 D1), appended after current main capabilities.
     pub const PLUGIN: Self = Self(1 << 12);
     /// Session-lifecycle host data (FEAT-023 D3), the next non-conflicting bit
-    /// after `PLUGIN`. Owned by the nine lifecycle commands (`/branch`,
-    /// `/compact`, `/fork`, `/load`, `/new`, `/purge`, `/save`, `/sessions`,
-    /// `/tree`); never widened by the basic session capability.
+    /// after `PLUGIN`. Required only by the seven host-dependent lifecycle
+    /// commands; `/compact` and `/purge` remain pure. Never widened by the
+    /// basic session capability.
     pub const SESSION_LIFECYCLE: Self = Self(1 << 13);
 
     pub const fn union(self, other: Self) -> Self {

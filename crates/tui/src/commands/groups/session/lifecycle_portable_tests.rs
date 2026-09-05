@@ -6,8 +6,8 @@
 //! exercised in Phase 6 and the end-to-end parity matrix in Phase 7.
 
 use codewhale_command_contract::facets::{
-    SessionArchiveReceipt, SessionBranchOutcome, SessionForkReceipt, SessionNewReceipt,
-    SessionSaveReceipt, TreeBodyProjection,
+    SessionArchiveReceipt, SessionBranchOutcome, SessionForkFromReceipt, SessionForkReceipt,
+    SessionNewReceipt, SessionSaveReceipt, TreeBodyProjection,
 };
 use codewhale_command_contract::handler::CommandContexts;
 use std::path::PathBuf;
@@ -23,13 +23,28 @@ fn missing_lifecycle() -> CommandContexts<'static> {
 // ---- /branch (Task 4.5) ----
 
 #[test]
-fn branch_missing_lifecycle_fails_safely() {
-    let result = super::branch::branch_contextual(missing_lifecycle(), Some("entry-1"));
-    assert!(result.is_error);
-    assert_eq!(
-        result.message.as_deref(),
-        Some("Error: Command capability unavailable: session_lifecycle")
-    );
+fn every_contextual_lifecycle_handler_fails_safely_without_its_facet() {
+    type Handler = fn(CommandContexts<'_>, Option<&str>) -> super::CommandResult;
+    let handlers: [(&str, Handler, Option<&str>); 7] = [
+        ("branch", super::branch::branch_contextual, Some("entry-1")),
+        ("fork", super::fork::fork_contextual, Some("session-1")),
+        ("load", super::load::load_contextual, Some("session.json")),
+        ("new", super::new::new_contextual, None),
+        ("save", super::save::save_contextual, None),
+        ("sessions", super::sessions::sessions_contextual, None),
+        ("tree", super::tree::tree_contextual, None),
+    ];
+
+    for (name, handler, arg) in handlers {
+        let result = handler(missing_lifecycle(), arg);
+        assert!(result.is_error, "/{name}: {result:?}");
+        assert_eq!(
+            result.message.as_deref(),
+            Some("Error: Command capability unavailable: session_lifecycle"),
+            "/{name}"
+        );
+        assert!(result.action.is_none(), "/{name}");
+    }
 }
 
 #[test]
@@ -87,6 +102,7 @@ fn branch_composes_exact_baseline_messages() {
         )
     );
     assert!(result.action.is_none());
+    assert_eq!(canned.branch_entries, ["entry-3"]);
 
     // Host stage error passes through unchanged.
     let mut canned = CannedLifecycle {
@@ -104,16 +120,6 @@ fn branch_composes_exact_baseline_messages() {
 // ---- /fork (Task 4.3) ----
 
 #[test]
-fn fork_missing_lifecycle_fails_safely() {
-    let result = super::fork::fork_contextual(missing_lifecycle(), Some("abc"));
-    assert!(result.is_error);
-    assert_eq!(
-        result.message.as_deref(),
-        Some("Error: Command capability unavailable: session_lifecycle")
-    );
-}
-
-#[test]
 fn fork_composes_exact_baseline_messages_and_actions() {
     // Picker aliases push the picker and return the baseline message.
     let mut canned = CannedLifecycle::default();
@@ -122,7 +128,11 @@ fn fork_composes_exact_baseline_messages_and_actions() {
         result.message.as_deref(),
         Some("Fork picker: select a session and then run `/fork <id>` to fork it.")
     );
-    assert_eq!(canned.picker, None, "bare picker has no preselection");
+    assert_eq!(
+        canned.picker_calls,
+        [None],
+        "bare picker must be opened without preselection"
+    );
 
     // Blocked active fork.
     let mut canned = CannedLifecycle {
@@ -145,7 +155,6 @@ fn fork_composes_exact_baseline_messages_and_actions() {
         fork_active: Ok(SessionForkReceipt {
             parent_label: "parent1".to_string(),
             fork_label: "child2".to_string(),
-            spawn_depth: None,
             sync: sync_payload("child2"),
         }),
         ..CannedLifecycle::default()
@@ -162,10 +171,10 @@ fn fork_composes_exact_baseline_messages_and_actions() {
 
     // Explicit fork success appends spawn_depth.
     let mut canned = CannedLifecycle {
-        fork_from: Ok(SessionForkReceipt {
+        fork_from: Ok(SessionForkFromReceipt {
             parent_label: "aaaa".to_string(),
             fork_label: "bbbb".to_string(),
-            spawn_depth: Some(2),
+            spawn_depth: 2,
             sync: sync_payload("bbbb"),
         }),
         ..CannedLifecycle::default()
@@ -175,6 +184,7 @@ fn fork_composes_exact_baseline_messages_and_actions() {
         result.message.as_deref(),
         Some("Forked session aaaa -> bbbb (spawn_depth 2)")
     );
+    assert_eq!(canned.fork_sources, ["aaaa"]);
 }
 
 // ---- /load (Task 4.3) ----
@@ -212,6 +222,7 @@ fn load_composes_exact_baseline_outcomes() {
         result.action,
         Some(AppAction::LoadSession(ref p)) if p == &PathBuf::from("/tmp/loaded.json")
     ));
+    assert_eq!(canned.load_paths, ["/tmp/loaded.json"]);
 
     let mut canned = CannedLifecycle {
         load: Err("Failed to read session file: nope".to_string()),
@@ -275,6 +286,7 @@ fn new_composes_exact_baseline_outcomes() {
         result.action,
         Some(AppAction::SyncSession { session_id: Some(ref id), .. }) if id == "new-123"
     ));
+    assert_eq!(canned.fresh_forces, [true]);
 
     // Host blocker error passes through.
     let mut canned = CannedLifecycle {
@@ -309,6 +321,7 @@ fn save_composes_exact_baseline_receipt() {
         Some("Session saved to /tmp/abc.json (ID: abc123)")
     );
     assert!(result.action.is_none());
+    assert_eq!(canned.save_paths, [Some("/tmp/abc.json".to_string())]);
 
     let mut canned = CannedLifecycle {
         save: Err("Failed to save session: boom".to_string()),
@@ -330,19 +343,20 @@ fn sessions_composes_exact_baseline_outcomes() {
     let result = super::sessions::sessions_portable(&mut canned, None);
     assert_eq!(result.message, None);
     assert_eq!(result.action, None);
-    assert_eq!(canned.picker, None);
+    assert_eq!(canned.picker_calls, [None]);
 
     // show/list/picker aliases.
     for alias in ["show", "list", "picker"] {
         let mut canned = CannedLifecycle::default();
         let result = super::sessions::sessions_portable(&mut canned, Some(alias));
         assert_eq!(result.message, None, "{alias}");
+        assert_eq!(canned.picker_calls, [None], "{alias}");
     }
 
     // open with preselection.
     let mut canned = CannedLifecycle::default();
     let _result = super::sessions::sessions_portable(&mut canned, Some("open abc123"));
-    assert_eq!(canned.picker.as_deref(), Some("abc123"));
+    assert_eq!(canned.picker_calls, [Some("abc123".to_string())]);
 
     // open without id -> usage.
     let result = super::sessions::sessions_portable(&mut canned, Some("open"));
@@ -364,6 +378,7 @@ fn sessions_composes_exact_baseline_outcomes() {
         result.message.as_deref(),
         Some("Archived session zzz (My Session)")
     );
+    assert_eq!(canned.archive_calls, [("zzz".to_string(), true)]);
     let mut canned = CannedLifecycle {
         archived: Ok(SessionArchiveReceipt {
             truncated_id: "zzz".to_string(),
@@ -376,6 +391,7 @@ fn sessions_composes_exact_baseline_outcomes() {
         result.message.as_deref(),
         Some("Restored session zzz (My Session)")
     );
+    assert_eq!(canned.archive_calls, [("zzz".to_string(), false)]);
 
     // prune parsing + messages.
     let result = super::sessions::sessions_portable(&mut canned, Some("prune"));
@@ -400,6 +416,7 @@ fn sessions_composes_exact_baseline_outcomes() {
         result.message.as_deref(),
         Some("no sessions older than 30d to prune")
     );
+    assert_eq!(canned.prune_days, [30]);
     let mut canned = CannedLifecycle {
         prune: Ok(2),
         ..CannedLifecycle::default()
@@ -409,6 +426,7 @@ fn sessions_composes_exact_baseline_outcomes() {
         result.message.as_deref(),
         Some("pruned 2 sessions older than 30d")
     );
+    assert_eq!(canned.prune_days, [30]);
 
     // Unknown subcommand.
     let result = super::sessions::sessions_portable(&mut canned, Some("teleport"));

@@ -45,11 +45,11 @@ use codewhale_command_contract::facets::{
     PluginMarketplaceState, PluginMcpServerDetail, PluginMcpTransport, PluginMutationOutcome,
     PluginMutationReceipt, PluginSuggestion, PluginSummary, ProjectGoalState, ProjectGoalStatus,
     ProjectShareProjection, RemoteRegistryOutcome, RemoteSkillEntry, ReviewOutcome,
-    SessionArchiveReceipt, SessionBranchOutcome, SessionForkReceipt, SessionNewReceipt,
-    SessionSaveReceipt, SessionSyncPayload, SkillActivationError, SkillActivationOutcome,
-    SkillBundledTier, SkillEntry, SkillMutationOutcome, SkillMutationReceipt, SkillRecommendation,
-    SkillRegistryProjection, SkillSourceKind, SkillSyncEntry, SkillSyncOutcome, SkillTargetScope,
-    SnapshotEntry, TreeBodyProjection,
+    SessionArchiveReceipt, SessionBranchOutcome, SessionForkFromReceipt, SessionForkReceipt,
+    SessionNewReceipt, SessionSaveReceipt, SessionSyncPayload, SkillActivationError,
+    SkillActivationOutcome, SkillBundledTier, SkillEntry, SkillMutationOutcome,
+    SkillMutationReceipt, SkillRecommendation, SkillRegistryProjection, SkillSourceKind,
+    SkillSyncEntry, SkillSyncOutcome, SkillTargetScope, SnapshotEntry, TreeBodyProjection,
 };
 #[cfg(test)]
 use codewhale_command_contract::handler::ContextParts;
@@ -291,10 +291,9 @@ type SharedCommandHost<'a> = Rc<CommandHost<'a>>;
 // baseline check/mutation order exactly (blocked transitions fail before I/O,
 // branching never rewrites journal history, publication failures retain their
 // post-save semantics, archive state updates atomically) and returns portable
-// receipts or the exact host-error text the baseline surfaces. The legacy
-// copies in `groups/session/session.rs` keep serving the still-legacy dispatch
-// until Phase 4 switches the nine registrations; the two paths are proven
-// identical by adapter tests here and the Phase 7 exact-parity matrix.
+// receipts or the exact host-error text the baseline surfaces. The lifecycle
+// bodies no longer live in `groups/session/session.rs`; adapter regressions and
+// portable-handler tests preserve their host and presentation contracts.
 // ---------------------------------------------------------------------------
 pub(crate) struct SessionLifecycleAdapter<'a> {
     host: SharedCommandHost<'a>,
@@ -575,7 +574,6 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         Ok(SessionForkReceipt {
             parent_label,
             fork_label,
-            spawn_depth: None,
             sync: SessionSyncPayload {
                 session_id: Some(fork_id),
                 messages: app.api_messages.clone(),
@@ -587,7 +585,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
         })
     }
 
-    fn fork_from(&mut self, session_id_or_prefix: &str) -> Result<SessionForkReceipt, String> {
+    fn fork_from(&mut self, session_id_or_prefix: &str) -> Result<SessionForkFromReceipt, String> {
         let mut app = self.host.app.borrow_mut();
         if app.session_transition_blocked() {
             return Err("Cannot fork a session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work first.".to_string());
@@ -663,10 +661,10 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
             crate::session_manager::truncate_id(&source_session.metadata.id).to_string();
         let fork_label = crate::session_manager::truncate_id(&forked.metadata.id).to_string();
         let mode = to_command_mode(app.mode);
-        Ok(SessionForkReceipt {
+        Ok(SessionForkFromReceipt {
             parent_label,
             fork_label,
-            spawn_depth: Some(forked.metadata.spawn_depth.into()),
+            spawn_depth: forked.metadata.spawn_depth.into(),
             sync: SessionSyncPayload {
                 session_id: Some(forked.metadata.id.clone()),
                 messages: forked.messages.clone(),
@@ -4325,10 +4323,30 @@ mod tests {
         assert!(parts.presentation.is_none());
         assert!(parts.media.is_none());
 
-        // Unrelated capability: memory absent.
+        // Lifecycle-only: lifecycle present and every unrelated slot absent.
+        let parts = bundle
+            .contexts(CommandCapabilities::SESSION_LIFECYCLE)
+            .into_parts();
+        assert!(parts.lifecycle.is_some());
+        assert!(parts.session.is_none());
+        assert!(parts.model.is_none());
+        assert!(parts.cost.is_none());
+        assert!(parts.mode_policy.is_none());
+        assert!(parts.system_prompt.is_none());
+        assert!(parts.skills.is_none());
+        assert!(parts.workspace.is_none());
+        assert!(parts.presentation.is_none());
+        assert!(parts.media.is_none());
+        assert!(parts.memory.is_none());
+        assert!(parts.project.is_none());
+        assert!(parts.skill_group.is_none());
+        assert!(parts.plugin.is_none());
+
+        // Unrelated capability: memory and lifecycle both absent.
         let parts = bundle.contexts(CommandCapabilities::SESSION).into_parts();
         assert!(parts.session.is_some());
         assert!(parts.memory.is_none());
+        assert!(parts.lifecycle.is_none());
     }
 
     // ─── FEAT-022 skill-group adapter tests ───────────────────────────────────
@@ -4965,7 +4983,6 @@ mod tests {
             let mut parts = bundle.parts();
             let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
             let forked = facet.fork_active().expect("fork ok");
-            assert_eq!(forked.spawn_depth, None);
             assert!(!forked.parent_label.is_empty());
             assert!(!forked.fork_label.is_empty());
             assert!(forked.sync.session_id.is_some());
@@ -5020,7 +5037,7 @@ mod tests {
             let mut parts = bundle.parts();
             let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
             let forked = facet.fork_from(&parent_id).expect("explicit fork ok");
-            assert_eq!(forked.spawn_depth, Some(1));
+            assert_eq!(forked.spawn_depth, 1);
             assert_eq!(
                 forked.parent_label,
                 crate::session_manager::truncate_id(&parent_id)

@@ -76,9 +76,7 @@ pub(in crate::commands) fn fork_portable(
             Ok(receipt) => CommandResult::with_message_and_action(
                 format!(
                     "Forked session {} -> {} (spawn_depth {})",
-                    receipt.parent_label,
-                    receipt.fork_label,
-                    receipt.spawn_depth.unwrap_or_default()
+                    receipt.parent_label, receipt.fork_label, receipt.spawn_depth
                 ),
                 super::sync_session_action(receipt.sync),
             ),

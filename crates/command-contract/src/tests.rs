@@ -1842,7 +1842,7 @@ struct FakeLifecycle {
     tree: Option<Result<TreeBodyProjection, String>>,
     save: Option<Result<SessionSaveReceipt, String>>,
     fork_active: Option<Result<SessionForkReceipt, String>>,
-    fork_from: Option<Result<SessionForkReceipt, String>>,
+    fork_from: Option<Result<SessionForkFromReceipt, String>>,
     fresh: Option<Result<SessionNewReceipt, String>>,
     load: Option<Result<PathBuf, String>>,
     picker: Option<String>,
@@ -1883,7 +1883,7 @@ impl CommandSessionLifecycleContext for FakeLifecycle {
             .clone()
             .ok_or_else(|| "unexpected fork_active() on empty fake".to_string())?
     }
-    fn fork_from(&mut self, id: &str) -> Result<SessionForkReceipt, String> {
+    fn fork_from(&mut self, id: &str) -> Result<SessionForkFromReceipt, String> {
         self.fork_from
             .clone()
             .ok_or_else(|| format!("unexpected fork_from({id}) on empty fake"))?
@@ -1957,13 +1957,12 @@ fn lifecycle_facet_is_object_safe_and_transports_every_outcome() {
         fork_active: Some(Ok(SessionForkReceipt {
             parent_label: "parent".to_string(),
             fork_label: "child".to_string(),
-            spawn_depth: None,
             sync: lifecycle_sync_payload(Some("child")),
         })),
-        fork_from: Some(Ok(SessionForkReceipt {
+        fork_from: Some(Ok(SessionForkFromReceipt {
             parent_label: "source".to_string(),
             fork_label: "sibling".to_string(),
-            spawn_depth: Some(3),
+            spawn_depth: 3,
             sync: lifecycle_sync_payload(Some("sibling")),
         })),
         fresh: Some(Ok(SessionNewReceipt {
@@ -1998,12 +1997,11 @@ fn lifecycle_facet_is_object_safe_and_transports_every_outcome() {
     let active = fake.fork_active().expect("active fork ok");
     assert_eq!(active.parent_label, "parent");
     assert_eq!(active.fork_label, "child");
-    assert_eq!(active.spawn_depth, None);
     assert_eq!(active.sync.session_id.as_deref(), Some("child"));
     assert_eq!(active.sync.messages.len(), 1);
     assert_eq!(active.sync.mode, CommandMode::Plan);
     let explicit = fake.fork_from("source").expect("explicit fork ok");
-    assert_eq!(explicit.spawn_depth, Some(3));
+    assert_eq!(explicit.spawn_depth, 3);
     assert_eq!(
         explicit.sync.workspace,
         PathBuf::from("/workspace/lifecycle")

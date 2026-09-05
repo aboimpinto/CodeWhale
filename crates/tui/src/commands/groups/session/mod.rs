@@ -125,4 +125,6 @@ pub(in crate::commands) fn sync_session_action(
 #[cfg(test)]
 mod lifecycle_portable_tests;
 #[cfg(test)]
+mod lifecycle_regression_tests;
+#[cfg(test)]
 mod lifecycle_test_support;
