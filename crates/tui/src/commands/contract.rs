@@ -4944,8 +4944,6 @@ mod tests {
         let mut app = lifecycle_test_app(&tmpdir);
         app.api_messages.push(user_message("try another path"));
 
-        let parent_id;
-        let child_id;
         let save_path = tmpdir.path().join("parent.json");
         {
             let mut bundle = app.command_contexts();
@@ -4958,7 +4956,7 @@ mod tests {
             assert!(!saved.display_path.is_empty());
             assert!(!saved.truncated_id.is_empty());
         }
-        parent_id = app
+        let parent_id = app
             .current_session_id
             .clone()
             .expect("save sets session id");
@@ -4973,11 +4971,11 @@ mod tests {
             assert!(forked.sync.session_id.is_some());
             assert_eq!(forked.sync.messages.len(), 1);
             assert_eq!(forked.sync.workspace, tmpdir.path());
-            child_id = app
-                .current_session_id
-                .clone()
-                .expect("fork switches session");
         }
+        let child_id = app
+            .current_session_id
+            .clone()
+            .expect("fork switches session");
         assert_ne!(child_id, parent_id);
 
         let manager = crate::session_manager::SessionManager::default_location().unwrap();
@@ -4998,7 +4996,6 @@ mod tests {
         let _home = lifecycle_home_guard(&tmpdir);
         let mut app = lifecycle_test_app(&tmpdir);
         app.api_messages.push(user_message("parent turn"));
-        let parent_id;
         {
             let mut bundle = app.command_contexts();
             let mut parts = bundle.parts();
@@ -5006,7 +5003,7 @@ mod tests {
             let saved = facet.save_session(None).expect("save into managed dir");
             assert!(!saved.truncated_id.is_empty());
         }
-        parent_id = app
+        let parent_id = app
             .current_session_id
             .clone()
             .expect("save sets session id");
