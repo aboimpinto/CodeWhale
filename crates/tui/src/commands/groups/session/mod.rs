@@ -30,7 +30,9 @@ mod tree;
 mod session;
 
 use crate::commands::CommandResult;
-use crate::commands::traits::{Command, CommandGroup, FunctionCommand, RegisterCommand};
+use crate::commands::traits::{
+    Command, CommandGroup, ContextualCommand, FunctionCommand, RegisterCommand,
+};
 
 pub struct SessionCommands;
 
@@ -45,46 +47,38 @@ impl CommandGroup for SessionCommands {
                 title::TitleCmd::info(),
                 title::TitleCmd::execute,
             )),
-            Box::new(FunctionCommand::new(
-                save::SaveCmd::info(),
-                save::SaveCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                fork::ForkCmd::info(),
-                fork::ForkCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                new::NewCmd::info(),
-                new::NewCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                sessions::SessionsCmd::info(),
-                sessions::SessionsCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                load::LoadCmd::info(),
-                load::LoadCmd::execute,
-            )),
+            Box::new(
+                ContextualCommand::from_contract::<save::SaveCmd>().expect("save registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<fork::ForkCmd>().expect("fork registration")
+            ),
+            Box::new(ContextualCommand::from_contract::<new::NewCmd>().expect("new registration")),
+            Box::new(
+                ContextualCommand::from_contract::<sessions::SessionsCmd>()
+                    .expect("sessions registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<load::LoadCmd>().expect("load registration")
+            ),
             Box::new(FunctionCommand::new(
                 resume::ResumeCmd::info(),
                 resume::ResumeCmd::execute,
             )),
-            Box::new(FunctionCommand::new(
-                tree::TreeCmd::info(),
-                tree::TreeCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                branch::BranchCmd::info(),
-                branch::BranchCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                compact::CompactCmd::info(),
-                compact::CompactCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                purge::PurgeCmd::info(),
-                purge::PurgeCmd::execute,
-            )),
+            Box::new(
+                ContextualCommand::from_contract::<tree::TreeCmd>().expect("tree registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<branch::BranchCmd>()
+                    .expect("branch registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<compact::CompactCmd>()
+                    .expect("compact registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<purge::PurgeCmd>().expect("purge registration")
+            ),
             Box::new(FunctionCommand::new(
                 relay::RelayCmd::info(),
                 relay::RelayCmd::execute,

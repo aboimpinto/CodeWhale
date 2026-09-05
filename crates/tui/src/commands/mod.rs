@@ -2002,6 +2002,16 @@ mod tests {
             "skill",
             "review",
             "restore",
+            // FEAT-023 session lifecycle slice.
+            "branch",
+            "compact",
+            "fork",
+            "load",
+            "new",
+            "purge",
+            "save",
+            "sessions",
+            "tree",
         ];
         for info in command_infos() {
             if info.name == "feat015ctx" || MIGRATED_GROUPS.contains(&info.name) {
@@ -2633,5 +2643,111 @@ mod tests {
                 "{command}: {result:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // FEAT-023 Phase 6 (Task 6.2): the nine lifecycle registrations dispatch
+    // through the public seam with exact capability declarations.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn feat023_lifecycle_entries_register_through_portable_bridge() {
+        use codewhale_command_contract::handler::{CommandCapabilities, CommandHandler};
+
+        for name in ["branch", "fork", "load", "new", "save", "sessions", "tree"] {
+            assert!(
+                registry().has_contextual_handler(name),
+                "/{name} must register through the portable bridge"
+            );
+            let handler = registry()
+                .get(name)
+                .expect("entry")
+                .contextual_handler()
+                .expect("contextual handler");
+            let CommandHandler::Contextual { capabilities, .. } = handler else {
+                panic!("/{name} must be contextual");
+            };
+            assert_eq!(
+                capabilities,
+                CommandCapabilities::SESSION_LIFECYCLE,
+                "/{name} declares lifecycle authority only"
+            );
+        }
+        // Pure handlers register through the bridge with no host bundle.
+        for name in ["compact", "purge"] {
+            assert!(
+                registry().has_contextual_handler(name),
+                "/{name} must register through the portable bridge"
+            );
+            let handler = registry()
+                .get(name)
+                .expect("entry")
+                .contextual_handler()
+                .expect("pure handler");
+            assert!(
+                matches!(handler, CommandHandler::Pure(_)),
+                "/{name} must be pure (no host context bundle)"
+            );
+        }
+        // Out-of-scope session commands remain legacy for FEAT-024/025/026.
+        for name in ["export", "relay", "structcopy"] {
+            assert!(
+                !registry().has_contextual_handler(name),
+                "/{name} must stay on the legacy dispatch until its owning FEAT"
+            );
+        }
+    }
+
+    #[test]
+    fn feat023_lifecycle_commands_dispatch_through_public_seam() {
+        let mut app = create_test_app();
+        app.workspace = PathBuf::from(".");
+
+        // Pure handlers need no App machinery.
+        let compact = execute("/compact the auth refactor", &mut app);
+        assert_eq!(
+            compact.message.as_deref(),
+            Some("Context compaction triggered (focus: the auth refactor)...")
+        );
+        assert!(matches!(
+            compact.action,
+            Some(AppAction::CompactContext { focus: Some(ref f) }) if f == "the auth refactor"
+        ));
+        let purge = execute("/purge", &mut app);
+        assert_eq!(
+            purge.message.as_deref(),
+            Some("Agent context purge triggered...")
+        );
+        assert!(matches!(purge.action, Some(AppAction::PurgeContext)));
+
+        // Contextual handler reaches the adapter through the seam; /tree on a
+        // bare app reports no active session.
+        let tree = execute("/tree", &mut app);
+        assert!(
+            tree.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("No active session"),
+            "{tree:?}"
+        );
+
+        // Subcommand routing and usage errors stay byte-exact.
+        let bad = execute("/sessions teleport", &mut app);
+        assert!(
+            bad.message
+                .as_deref()
+                .unwrap_or_default()
+                .contains("unknown subcommand `teleport`"),
+            "{bad:?}"
+        );
+        let branch_usage = execute("/branch", &mut app);
+        assert!(
+            branch_usage
+                .message
+                .as_deref()
+                .unwrap_or_default()
+                .starts_with("Usage: /branch <entry_id>"),
+            "{branch_usage:?}"
+        );
     }
 }

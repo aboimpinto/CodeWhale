@@ -1,4 +1,6 @@
-//! `/sessions` command.
+//! `/sessions` command — picker UI or housekeeping sub-actions.
+
+use super::CommandResult;
 
 use codewhale_command_contract::facets::CommandSessionLifecycleContext;
 use codewhale_command_contract::handler::{CommandContexts, CommandHandler};
@@ -6,30 +8,11 @@ use codewhale_command_contract::metadata::{
     CommandInfo as ContractInfo, RegisterCommand as ContractRegisterCommand,
 };
 
-use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
-use crate::tui::app::App;
-
-use super::CommandResult;
-
-pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
-    name: "sessions",
-    aliases: &[],
-    usage: "/sessions [show|open <id>|archive <id>|unarchive <id>|prune <days>]",
-    description_id: MessageId::CmdSessionsDescription,
-};
-
 pub(in crate::commands) struct SessionsCmd;
 
-impl RegisterCommand for SessionsCmd {
-    fn info() -> &'static CommandInfo {
-        &COMMAND_INFO
-    }
-
-    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
-        super::session::sessions(app, arg)
-    }
-}
+// ---------------------------------------------------------------------------
+// FEAT-023 Phase 4 (D3/D5/D6): portable contextual registration and handler.
+// ---------------------------------------------------------------------------
 
 pub(in crate::commands) const CONTRACT_INFO: ContractInfo = ContractInfo {
     name: "sessions",

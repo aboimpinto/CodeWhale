@@ -1,29 +1,8 @@
 //! `/compact` command.
 
-use crate::commands::traits::{CommandInfo, RegisterCommand};
-use crate::localization::MessageId;
-use crate::tui::app::App;
-
 use super::CommandResult;
 
-pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
-    name: "compact",
-    aliases: &["yasuo"],
-    usage: "/compact [focus]",
-    description_id: MessageId::CmdCompactDescription,
-};
-
 pub(in crate::commands) struct CompactCmd;
-
-impl RegisterCommand for CompactCmd {
-    fn info() -> &'static CommandInfo {
-        &COMMAND_INFO
-    }
-
-    fn execute(app: &mut App, arg: Option<&str>) -> CommandResult {
-        super::session::compact(app, arg)
-    }
-}
 
 // ---------------------------------------------------------------------------
 // FEAT-023 Phase 4 (D3/D6): portable pure registration. `/compact` parses and
@@ -71,30 +50,35 @@ pub(in crate::commands) fn compact_pure(arg: Option<&str>) -> CommandResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::app::AppAction;
 
     #[test]
-    fn pure_compact_is_byte_identical_to_baseline() {
-        let cases: [Option<&str>; 4] = [
-            None,
-            Some("   "),
-            Some("the auth refactor"),
-            Some("  padded  "),
-        ];
-        for arg in cases {
-            let portable = compact_pure(arg);
-            let mut app = crate::test_support::test_app_with_options(
-                crate::test_support::test_tui_options(std::path::PathBuf::from(".")),
-            );
-            let baseline = super::super::session::compact(&mut app, arg);
-            assert_eq!(
-                portable.message, baseline.message,
-                "message parity for {arg:?}"
-            );
-            assert_eq!(portable.is_error, baseline.is_error);
-            assert_eq!(
-                portable.action, baseline.action,
-                "action parity for {arg:?}"
-            );
-        }
+    fn pure_compact_matches_baseline_receipts() {
+        let none = compact_pure(None);
+        assert_eq!(
+            none.message.as_deref(),
+            Some("Context compaction triggered...")
+        );
+        assert!(matches!(
+            none.action,
+            Some(AppAction::CompactContext { focus: None })
+        ));
+        assert!(!none.is_error);
+
+        let blank = compact_pure(Some("   "));
+        assert!(matches!(
+            blank.action,
+            Some(AppAction::CompactContext { focus: None })
+        ));
+
+        let focus = compact_pure(Some("  the auth refactor  "));
+        assert_eq!(
+            focus.message.as_deref(),
+            Some("Context compaction triggered (focus: the auth refactor)...")
+        );
+        assert!(matches!(
+            focus.action,
+            Some(AppAction::CompactContext { focus: Some(ref f) }) if f == "the auth refactor"
+        ));
     }
 }
