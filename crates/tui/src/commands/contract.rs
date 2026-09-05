@@ -470,9 +470,6 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
 
     fn fork_active(&mut self) -> Result<SessionForkReceipt, String> {
         let mut app = self.host.app.borrow_mut();
-        if app.session_transition_blocked() {
-            return Err("Cannot fork a session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work first.".to_string());
-        }
         if app.api_messages.is_empty() {
             return Err("Nothing to fork. Send or load a message first.".to_string());
         }
@@ -587,9 +584,6 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
 
     fn fork_from(&mut self, session_id_or_prefix: &str) -> Result<SessionForkFromReceipt, String> {
         let mut app = self.host.app.borrow_mut();
-        if app.session_transition_blocked() {
-            return Err("Cannot fork a session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work first.".to_string());
-        }
         let manager = match crate::session_manager::SessionManager::default_location() {
             Ok(m) => m,
             Err(err) => {
@@ -681,10 +675,6 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
 
     fn fresh_session(&mut self, force: bool) -> Result<SessionNewReceipt, String> {
         let mut app = self.host.app.borrow_mut();
-        if app.session_transition_blocked() {
-            return Err("Cannot start a new session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work. `/new --force` only discards draft or queued input.".to_string());
-        }
-
         if !force {
             let mut blockers: Vec<&'static str> = Vec::new();
             if !app.input.trim().is_empty() {
@@ -735,9 +725,6 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
 
     fn load_session(&mut self, path: &str) -> Result<PathBuf, String> {
         let app = self.host.app.borrow();
-        if app.session_transition_blocked() {
-            return Err("Cannot load a session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work first.".to_string());
-        }
         let load_path = if path.contains('/') || path.contains('\\') {
             PathBuf::from(path)
         } else {
@@ -4921,37 +4908,34 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_adapter_transition_blocking_wins_over_io() {
+    fn lifecycle_dispatch_transition_blocking_wins_over_io() {
         let tmpdir = TempDir::new().unwrap();
         let _lock = crate::test_support::lock_test_env();
         let mut app = lifecycle_test_app(&tmpdir);
         app.is_loading = true;
         app.current_session_id = Some("active-session".to_string());
         app.api_messages.push(user_message("in flight"));
-        {
-            let mut bundle = app.command_contexts();
-            let mut parts = bundle.parts();
-            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
-            assert!(facet.transition_blocked());
-            let fork = facet.fork_active().expect_err("blocked fork");
-            assert!(fork.contains("runtime work is active"), "{fork}");
-            let load = facet
-                .load_session("does-not-exist.json")
-                .expect_err("blocked load");
-            assert!(load.contains("runtime work is active"), "{load}");
-            let fresh = facet.fresh_session(false).expect_err("blocked new");
-            assert!(fresh.contains("runtime work is active"), "{fresh}");
-            // `/branch` gates on the handler side via transition_blocked(); the
-            // delegate reproduces the baseline stage errors exactly (the active
-            // session was never saved in this fixture).
-            let branch = facet.branch_to("entry-1").expect_err("unsaved session");
+
+        for (command, expected) in [
+            ("/fork", "Cannot fork a session"),
+            ("/fork other-session", "Cannot fork a session"),
+            ("/load does-not-exist.json", "Cannot load a session"),
+            ("/new", "Cannot start a new session"),
+            ("/branch entry-1", "Cannot branch"),
+        ] {
+            let result = crate::commands::execute(command, &mut app);
+            assert!(result.is_error, "{command}: {result:?}");
+            assert!(result.action.is_none(), "{command}: {result:?}");
             assert!(
-                branch.contains("could not load session active-session"),
-                "{branch}"
+                result
+                    .message
+                    .as_deref()
+                    .is_some_and(|text| text.contains(expected)),
+                "{command}: {result:?}"
             );
+            assert_eq!(app.current_session_id.as_deref(), Some("active-session"));
+            assert_eq!(app.api_messages.len(), 1);
         }
-        assert_eq!(app.current_session_id.as_deref(), Some("active-session"));
-        assert_eq!(app.api_messages.len(), 1);
     }
 
     #[test]

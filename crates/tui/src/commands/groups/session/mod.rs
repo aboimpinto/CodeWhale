@@ -1,8 +1,6 @@
 //! Session command area: saving, forking, resuming, exporting, and the
 //! `/relay` session-handoff artifact.
 
-#[cfg(all(test, feature = "long-running-tests"))]
-mod acceptance;
 mod branch;
 mod compact;
 mod export;
@@ -124,7 +122,5 @@ pub(in crate::commands) fn sync_session_action(
 
 #[cfg(test)]
 mod lifecycle_portable_tests;
-#[cfg(test)]
-mod lifecycle_regression_tests;
 #[cfg(test)]
 mod lifecycle_test_support;

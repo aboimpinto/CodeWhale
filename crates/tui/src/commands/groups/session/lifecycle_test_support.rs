@@ -2,6 +2,8 @@
 //! `CommandSessionLifecycleContext` so portable handlers are unit-tested for
 //! exact message/action composition without host state.
 
+use std::cell::Cell;
+
 use codewhale_command_contract::facets::{
     CommandSessionLifecycleContext, SessionArchiveReceipt, SessionBranchOutcome,
     SessionForkFromReceipt, SessionForkReceipt, SessionNewReceipt, SessionSaveReceipt,
@@ -14,6 +16,7 @@ use std::path::PathBuf;
 /// facet call. Unconfigured result slots return a descriptive canned error.
 pub(crate) struct CannedLifecycle {
     pub blocked: bool,
+    pub transition_checks: Cell<usize>,
     pub leaf_hint: Option<String>,
     pub branch: Result<SessionBranchOutcome, String>,
     pub tree: Result<TreeBodyProjection, String>,
@@ -38,6 +41,7 @@ impl Default for CannedLifecycle {
     fn default() -> Self {
         Self {
             blocked: false,
+            transition_checks: Cell::new(0),
             leaf_hint: None,
             branch: Err("canned: branch_to not configured".to_string()),
             tree: Ok(TreeBodyProjection::NoSession),
@@ -73,6 +77,8 @@ pub(crate) fn sync_payload(session_id: &str) -> SessionSyncPayload {
 
 impl CommandSessionLifecycleContext for CannedLifecycle {
     fn transition_blocked(&self) -> bool {
+        self.transition_checks
+            .set(self.transition_checks.get().saturating_add(1));
         self.blocked
     }
     fn branch_current_leaf_hint(&self) -> Option<String> {

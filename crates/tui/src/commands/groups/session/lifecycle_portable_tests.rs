@@ -61,6 +61,8 @@ fn branch_composes_exact_baseline_messages() {
             "Error: Cannot branch while runtime work is active. Wait for the turn to finish, or cancel it first."
         )
     );
+    assert_eq!(canned.transition_checks.get(), 1);
+    assert!(canned.branch_entries.is_empty());
 
     // No-arg with an active leaf hint.
     let mut canned = CannedLifecycle {
@@ -133,6 +135,11 @@ fn fork_composes_exact_baseline_messages_and_actions() {
         [None],
         "bare picker must be opened without preselection"
     );
+    assert_eq!(
+        canned.transition_checks.get(),
+        0,
+        "picker aliases bypass the transition gate"
+    );
 
     // Blocked active fork.
     let mut canned = CannedLifecycle {
@@ -149,6 +156,7 @@ fn fork_composes_exact_baseline_messages_and_actions() {
             .contains("runtime work is active"),
         "{result:?}"
     );
+    assert_eq!(canned.transition_checks.get(), 1);
 
     // Active fork success -> message + SyncSession action from the receipt.
     let mut canned = CannedLifecycle {
@@ -168,6 +176,7 @@ fn fork_composes_exact_baseline_messages_and_actions() {
         result.action,
         Some(AppAction::SyncSession { session_id: Some(ref id), .. }) if id == "child2"
     ));
+    assert_eq!(canned.transition_checks.get(), 1);
 
     // Explicit fork success appends spawn_depth.
     let mut canned = CannedLifecycle {
@@ -185,6 +194,7 @@ fn fork_composes_exact_baseline_messages_and_actions() {
         Some("Forked session aaaa -> bbbb (spawn_depth 2)")
     );
     assert_eq!(canned.fork_sources, ["aaaa"]);
+    assert_eq!(canned.transition_checks.get(), 1);
 }
 
 // ---- /load (Task 4.3) ----
@@ -204,6 +214,8 @@ fn load_composes_exact_baseline_outcomes() {
             .unwrap_or_default()
             .contains("runtime work is active")
     );
+    assert_eq!(canned.transition_checks.get(), 1);
+    assert!(canned.load_paths.is_empty());
 
     let mut canned = CannedLifecycle::default();
     let result = super::load::load_portable(&mut canned, None);
@@ -211,6 +223,8 @@ fn load_composes_exact_baseline_outcomes() {
         result.message.as_deref(),
         Some("Error: Usage: /load <path>")
     );
+    assert_eq!(canned.transition_checks.get(), 1);
+    assert!(canned.load_paths.is_empty());
 
     let mut canned = CannedLifecycle {
         load: Ok(PathBuf::from("/tmp/loaded.json")),
@@ -223,6 +237,7 @@ fn load_composes_exact_baseline_outcomes() {
         Some(AppAction::LoadSession(ref p)) if p == &PathBuf::from("/tmp/loaded.json")
     ));
     assert_eq!(canned.load_paths, ["/tmp/loaded.json"]);
+    assert_eq!(canned.transition_checks.get(), 1);
 
     let mut canned = CannedLifecycle {
         load: Err("Failed to read session file: nope".to_string()),
@@ -251,6 +266,11 @@ fn new_composes_exact_baseline_outcomes() {
             .contains("Unknown argument: bogus"),
         "{result:?}"
     );
+    assert_eq!(
+        canned.transition_checks.get(),
+        0,
+        "argument validation precedes the transition gate"
+    );
 
     // Blocked.
     let mut canned = CannedLifecycle {
@@ -266,6 +286,8 @@ fn new_composes_exact_baseline_outcomes() {
             .unwrap_or_default()
             .contains("only discards draft or queued input")
     );
+    assert_eq!(canned.transition_checks.get(), 1);
+    assert!(canned.fresh_forces.is_empty());
 
     // Success -> message + empty SyncSession action.
     let mut canned = CannedLifecycle {
@@ -287,6 +309,7 @@ fn new_composes_exact_baseline_outcomes() {
         Some(AppAction::SyncSession { session_id: Some(ref id), .. }) if id == "new-123"
     ));
     assert_eq!(canned.fresh_forces, [true]);
+    assert_eq!(canned.transition_checks.get(), 1);
 
     // Host blocker error passes through.
     let mut canned = CannedLifecycle {

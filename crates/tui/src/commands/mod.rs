@@ -21,6 +21,13 @@ mod epic_dispatch_acceptance;
 #[path = "epic_discovery_acceptance.rs"]
 mod epic_discovery_acceptance;
 
+// TUI-hosted session acceptance and persistence regressions deliberately stay
+// outside `groups/session`, which FEAT-043 moves to `codewhale-commands`.
+#[cfg(all(test, feature = "long-running-tests"))]
+mod session_acceptance;
+#[cfg(test)]
+mod session_lifecycle_regression_tests;
+
 use std::sync::OnceLock;
 
 pub use traits::CommandInfo;
