@@ -35,19 +35,21 @@ use codewhale_command_contract::facets::{
     CommandApprovalState, CommandCostContext, CommandMediaContext, CommandMemoryContext,
     CommandModePolicyContext, CommandModelContext, CommandPluginContext,
     CommandPresentationContext, CommandProjectContext, CommandSessionContext,
-    CommandSkillGroupContext, CommandSkillsContext, CommandSystemPromptContext,
-    CommandWorkspaceContext, MediaAttachmentReceipt, MemoryDelete, MemoryDeleteScope, MemoryExport,
-    MemoryGetOutcome, MemoryHit, MemoryImportOutcome, MemoryReindex, MemoryRememberTarget,
-    MemoryRemembered, MemoryStatus, PluginDetail, PluginDiagnostic, PluginDiagnosticLevel,
-    PluginExportReceipt, PluginLegacyScan, PluginLegacyTool, PluginManagedCandidate,
-    PluginManagedScan, PluginMarketplaceAddReceipt, PluginMarketplaceCandidate,
-    PluginMarketplaceCatalog, PluginMarketplaceInstallPlan, PluginMarketplaceState,
-    PluginMcpServerDetail, PluginMcpTransport, PluginMutationOutcome, PluginMutationReceipt,
-    PluginSuggestion, PluginSummary, ProjectGoalState, ProjectGoalStatus, ProjectShareProjection,
-    RemoteRegistryOutcome, RemoteSkillEntry, ReviewOutcome, SkillActivationError,
-    SkillActivationOutcome, SkillBundledTier, SkillEntry, SkillMutationOutcome,
-    SkillMutationReceipt, SkillRecommendation, SkillRegistryProjection, SkillSourceKind,
-    SkillSyncEntry, SkillSyncOutcome, SkillTargetScope, SnapshotEntry,
+    CommandSessionLifecycleContext, CommandSkillGroupContext, CommandSkillsContext,
+    CommandSystemPromptContext, CommandWorkspaceContext, MediaAttachmentReceipt, MemoryDelete,
+    MemoryDeleteScope, MemoryExport, MemoryGetOutcome, MemoryHit, MemoryImportOutcome,
+    MemoryReindex, MemoryRememberTarget, MemoryRemembered, MemoryStatus, PluginDetail,
+    PluginDiagnostic, PluginDiagnosticLevel, PluginExportReceipt, PluginLegacyScan,
+    PluginLegacyTool, PluginManagedCandidate, PluginManagedScan, PluginMarketplaceAddReceipt,
+    PluginMarketplaceCandidate, PluginMarketplaceCatalog, PluginMarketplaceInstallPlan,
+    PluginMarketplaceState, PluginMcpServerDetail, PluginMcpTransport, PluginMutationOutcome,
+    PluginMutationReceipt, PluginSuggestion, PluginSummary, ProjectGoalState, ProjectGoalStatus,
+    ProjectShareProjection, RemoteRegistryOutcome, RemoteSkillEntry, ReviewOutcome,
+    SessionArchiveReceipt, SessionBranchOutcome, SessionForkReceipt, SessionNewReceipt,
+    SessionSaveReceipt, SessionSyncPayload, SkillActivationError, SkillActivationOutcome,
+    SkillBundledTier, SkillEntry, SkillMutationOutcome, SkillMutationReceipt, SkillRecommendation,
+    SkillRegistryProjection, SkillSourceKind, SkillSyncEntry, SkillSyncOutcome, SkillTargetScope,
+    SnapshotEntry, TreeBodyProjection,
 };
 #[cfg(test)]
 use codewhale_command_contract::handler::ContextParts;
@@ -277,6 +279,565 @@ struct CommandHost<'a> {
 }
 
 type SharedCommandHost<'a> = Rc<CommandHost<'a>>;
+
+// ---------------------------------------------------------------------------
+// Session lifecycle adapter (FEAT-023 D4)
+//
+// Sole host owner of concrete lifecycle machinery for the nine lifecycle
+// commands: App reads/mutations, SessionManager, saved-session creation,
+// journal load/branching, filesystem persistence, work-state snapshots/
+// publication, picker/view-stack construction, archive/prune, and the core
+// `reset_conversation_state` call for `/new`. Every delegate reproduces the
+// baseline check/mutation order exactly (blocked transitions fail before I/O,
+// branching never rewrites journal history, publication failures retain their
+// post-save semantics, archive state updates atomically) and returns portable
+// receipts or the exact host-error text the baseline surfaces. The legacy
+// copies in `groups/session/session.rs` keep serving the still-legacy dispatch
+// until Phase 4 switches the nine registrations; the two paths are proven
+// identical by adapter tests here and the Phase 7 exact-parity matrix.
+// ---------------------------------------------------------------------------
+pub(crate) struct SessionLifecycleAdapter<'a> {
+    host: SharedCommandHost<'a>,
+}
+
+impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
+    fn transition_blocked(&self) -> bool {
+        self.host.app.borrow().session_transition_blocked()
+    }
+
+    fn branch_current_leaf_hint(&self) -> Option<String> {
+        let app = self.host.app.borrow();
+        let session_id = app.current_session_id.as_deref()?;
+        let manager = crate::session_manager::SessionManager::default_location().ok()?;
+        let mut session = manager.load_session(session_id).ok()?;
+        session.ensure_journal();
+        session.journal.as_ref()?.leaf_id.clone()
+    }
+
+    fn branch_to(&mut self, entry_id: &str) -> Result<SessionBranchOutcome, String> {
+        let mut app = self.host.app.borrow_mut();
+        let session_id = match app.current_session_id.clone() {
+            Some(id) => id,
+            None => {
+                return Err(
+                    "No active session to branch. Resume or create a session first.".to_string(),
+                );
+            }
+        };
+        let manager = match crate::session_manager::SessionManager::default_location() {
+            Ok(m) => m,
+            Err(e) => return Err(format!("could not open sessions directory: {e}")),
+        };
+        let mut session = match manager.load_session(&session_id) {
+            Ok(s) => s,
+            Err(e) => return Err(format!("could not load session {session_id}: {e}")),
+        };
+        session.ensure_journal();
+        let journal_len_before = session
+            .journal
+            .as_ref()
+            .map(|j| j.entries.len())
+            .unwrap_or(0);
+        match session.journal_branch_to(entry_id) {
+            Ok(()) => {
+                if let Err(e) = manager.save_session(&session) {
+                    return Err(format!("branch saved but persist failed: {e}"));
+                }
+                app.api_messages = session.messages.clone();
+                let leaf_display = session
+                    .leaf_id
+                    .clone()
+                    .unwrap_or_else(|| "(none)".to_string());
+                Ok(SessionBranchOutcome {
+                    leaf_display,
+                    journal_entries_before: journal_len_before,
+                })
+            }
+            Err(e) => Err(format!(
+                "branch failed: {e}. Use `/tree` to see valid entry ids."
+            )),
+        }
+    }
+
+    fn tree_body(&self) -> Result<TreeBodyProjection, String> {
+        let app = self.host.app.borrow();
+        let manager = match crate::session_manager::SessionManager::default_location() {
+            Ok(m) => m,
+            Err(e) => return Err(format!("could not open sessions directory: {e}")),
+        };
+        if let Some(session_id) = app.current_session_id.clone() {
+            if let Ok(mut session) = manager.load_session(&session_id) {
+                session.ensure_journal();
+                if let Some(journal) = session.journal.as_ref() {
+                    let rendered = crate::session_tree::render_tree(journal);
+                    return Ok(TreeBodyProjection::Journal { rendered });
+                }
+            }
+            if app.api_messages.is_empty() {
+                return Ok(TreeBodyProjection::EmptySession);
+            }
+            let mut rendered =
+                String::from("Active branch (linear — journal will be created on save):\n");
+            for (i, msg) in app.api_messages.iter().enumerate() {
+                let snippet: String = msg
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        crate::models::ContentBlock::Text { text, .. } => Some(text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let short: String = snippet.chars().take(60).collect();
+                let marker = if i + 1 == app.api_messages.len() {
+                    "*"
+                } else {
+                    "●"
+                };
+                rendered.push_str(&format!("  {marker} [{i}] {}: {short}\n", msg.role));
+            }
+            Ok(TreeBodyProjection::Linear { rendered })
+        } else {
+            Ok(TreeBodyProjection::NoSession)
+        }
+    }
+
+    fn save_session(
+        &mut self,
+        explicit_path: Option<String>,
+    ) -> Result<SessionSaveReceipt, String> {
+        let mut app = self.host.app.borrow_mut();
+        let explicit_save_path = explicit_path.map(PathBuf::from);
+
+        let messages = app.api_messages.clone();
+        let mut session = crate::session_manager::create_saved_session_with_mode(
+            &messages,
+            &app.model,
+            &app.workspace,
+            u64::from(app.session.total_tokens),
+            app.system_prompt.as_ref(),
+            Some(app.mode.label()),
+        );
+        session
+            .metadata
+            .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
+        app.sync_cost_to_metadata(&mut session.metadata);
+        session.context_references = app.session_context_references.clone();
+        session.artifacts = app.session_artifacts.clone();
+        session.work_state = match app.work_state_snapshot() {
+            Ok(state) => state,
+            Err(err) => return Err(format!("Failed to snapshot Work state: {err}")),
+        };
+        session.last_auto_route = app.auto_route_for_persistence();
+        let save_path = explicit_save_path.unwrap_or_else(|| {
+            let dir = crate::session_manager::default_sessions_dir()
+                .unwrap_or_else(|_| app.workspace.clone());
+            dir.join(format!("{}.json", session.metadata.id))
+        });
+
+        let sessions_dir = save_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map_or_else(|| app.workspace.clone(), std::path::Path::to_path_buf);
+
+        match std::fs::create_dir_all(&sessions_dir) {
+            Ok(()) => {
+                let json = match serde_json::to_string_pretty(&session) {
+                    Ok(j) => j,
+                    Err(e) => return Err(format!("Failed to serialize session: {e}")),
+                };
+                match crate::utils::write_atomic(&save_path, json.as_bytes()) {
+                    Ok(()) => {
+                        app.current_session_id = Some(session.metadata.id.clone());
+                        app.current_session_metadata = Some(session.metadata.clone());
+                        app.session_title = Some(session.metadata.title.clone());
+                        if let Err(err) = app.publish_pending_work_state() {
+                            return Err(format!(
+                                "Session saved, but Work views were not published: {err}"
+                            ));
+                        }
+                        Ok(SessionSaveReceipt {
+                            display_path: save_path.display().to_string(),
+                            truncated_id: crate::session_manager::truncate_id(&session.metadata.id)
+                                .to_string(),
+                        })
+                    }
+                    Err(e) => Err(format!("Failed to save session: {e}")),
+                }
+            }
+            Err(e) => Err(format!("Failed to create directory: {e}")),
+        }
+    }
+
+    fn fork_active(&mut self) -> Result<SessionForkReceipt, String> {
+        let mut app = self.host.app.borrow_mut();
+        if app.session_transition_blocked() {
+            return Err("Cannot fork a session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work first.".to_string());
+        }
+        if app.api_messages.is_empty() {
+            return Err("Nothing to fork. Send or load a message first.".to_string());
+        }
+
+        let manager = match crate::session_manager::SessionManager::default_location() {
+            Ok(manager) => manager,
+            Err(err) => {
+                return Err(format!("could not open sessions directory: {err}"));
+            }
+        };
+
+        let parent_id = app
+            .current_session_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let mut parent = crate::session_manager::create_saved_session_with_id_and_mode(
+            parent_id,
+            &app.api_messages,
+            &app.model,
+            &app.workspace,
+            u64::from(app.session.total_tokens),
+            app.system_prompt.as_ref(),
+            Some(app.mode.label()),
+        );
+        parent
+            .metadata
+            .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
+        if let Some(cached) = app
+            .current_session_metadata
+            .as_ref()
+            .filter(|metadata| metadata.id == parent.metadata.id)
+        {
+            parent.metadata.created_at = cached.created_at;
+            parent.metadata.title.clone_from(&cached.title);
+            parent
+                .metadata
+                .parent_session_id
+                .clone_from(&cached.parent_session_id);
+            parent.metadata.forked_from_message_count = cached.forked_from_message_count;
+        }
+        app.sync_cost_to_metadata(&mut parent.metadata);
+        parent.context_references = app.session_context_references.clone();
+        parent.artifacts = app.session_artifacts.clone();
+        let work_state = match app.work_state_snapshot() {
+            Ok(state) => state,
+            Err(err) => return Err(format!("Failed to snapshot Work state: {err}")),
+        };
+        parent.work_state = work_state.clone();
+        parent.last_auto_route = app.auto_route_for_persistence();
+
+        if let Err(err) = manager.save_session(&parent) {
+            return Err(format!("Failed to save parent session: {err}"));
+        }
+
+        let mut forked = crate::session_manager::create_saved_session_with_mode(
+            &app.api_messages,
+            &app.model,
+            &app.workspace,
+            u64::from(app.session.total_tokens),
+            app.system_prompt.as_ref(),
+            Some(app.mode.label()),
+        );
+        forked
+            .metadata
+            .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
+        forked.metadata.copy_cost_from(&parent.metadata);
+        forked.metadata.spawn_depth = parent.metadata.spawn_depth.saturating_add(1);
+        // Ensure journal for both sessions: parent already has one from factory, bump forked's journal depth
+        if let Some(j) = forked.journal.as_mut() {
+            j.spawn_depth = forked.metadata.spawn_depth;
+        }
+        if let Some(j) = parent.journal.as_mut() {
+            j.spawn_depth = parent.metadata.spawn_depth;
+        }
+        forked.metadata.mark_forked_from(&parent.metadata);
+        forked.context_references = app.session_context_references.clone();
+        forked.artifacts = app.session_artifacts.clone();
+        forked.work_state = work_state;
+        forked.last_auto_route = app.auto_route_for_persistence();
+
+        if let Err(err) = manager.save_session(&forked) {
+            return Err(format!("Failed to save forked session: {err}"));
+        }
+        if let Err(err) = app.publish_pending_work_state() {
+            return Err(format!(
+                "Sessions saved, but Work views were not published: {err}"
+            ));
+        }
+
+        app.current_session_id = Some(forked.metadata.id.clone());
+        app.current_session_metadata = Some(forked.metadata.clone());
+        app.session_title = Some(forked.metadata.title.clone());
+        // A fork starts as its own session: no inherited tab/window title.
+        app.window_title = None;
+        let fork_id = forked.metadata.id.clone();
+        let parent_label = crate::session_manager::truncate_id(&parent.metadata.id).to_string();
+        let fork_label = crate::session_manager::truncate_id(&fork_id).to_string();
+        let mode = to_command_mode(app.mode);
+        Ok(SessionForkReceipt {
+            parent_label,
+            fork_label,
+            spawn_depth: None,
+            sync: SessionSyncPayload {
+                session_id: Some(fork_id),
+                messages: app.api_messages.clone(),
+                system_prompt: app.system_prompt.clone(),
+                model: app.model.clone(),
+                workspace: app.workspace.clone(),
+                mode,
+            },
+        })
+    }
+
+    fn fork_from(&mut self, session_id_or_prefix: &str) -> Result<SessionForkReceipt, String> {
+        let mut app = self.host.app.borrow_mut();
+        if app.session_transition_blocked() {
+            return Err("Cannot fork a session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work first.".to_string());
+        }
+        let manager = match crate::session_manager::SessionManager::default_location() {
+            Ok(m) => m,
+            Err(err) => {
+                return Err(format!("could not open sessions directory: {err}"));
+            }
+        };
+        let source = manager
+            .load_session(session_id_or_prefix)
+            .or_else(|_| manager.load_session_by_prefix(session_id_or_prefix));
+        let mut source_session = match source {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(format!(
+                    "could not load session '{}': {e}",
+                    session_id_or_prefix
+                ));
+            }
+        };
+        source_session.ensure_journal();
+        let journal = source_session.journal.clone().unwrap_or_else(|| {
+            crate::session_tree::SessionJournal::from_messages(
+                source_session.messages.clone(),
+                source_session.metadata.spawn_depth,
+            )
+        });
+        let forked_journal = journal.fork_from(None).unwrap_or_else(|_| {
+            crate::session_tree::SessionJournal::with_spawn_depth(
+                source_session.metadata.spawn_depth.saturating_add(1),
+            )
+        });
+        let messages = forked_journal.to_messages();
+        let mut forked = crate::session_manager::create_saved_session_with_id_and_mode(
+            uuid::Uuid::new_v4().to_string(),
+            &messages,
+            &source_session.metadata.model,
+            &app.workspace,
+            source_session.metadata.total_tokens,
+            source_session
+                .system_prompt
+                .as_ref()
+                .map(|s| crate::models::SystemPrompt::Text(s.clone()))
+                .as_ref(),
+            source_session.metadata.mode.as_deref(),
+        );
+        forked.journal = Some(forked_journal);
+        forked.leaf_id = forked.journal.as_ref().and_then(|j| j.leaf_id.clone());
+        forked.messages = messages;
+        forked.metadata.spawn_depth = forked.journal.as_ref().map(|j| j.spawn_depth).unwrap_or(0);
+        forked.metadata.parent_session_id = Some(source_session.metadata.id.clone());
+        forked.metadata.forked_from_message_count = Some(source_session.metadata.message_count);
+        forked.metadata.set_model_provider_route(
+            source_session.metadata.model_provider.as_str(),
+            source_session.metadata.model_provider_id.as_deref(),
+        );
+        forked.metadata.copy_cost_from(&source_session.metadata);
+        forked.context_references = source_session.context_references.clone();
+        forked.artifacts = source_session.artifacts.clone();
+        forked.work_state = source_session.work_state.clone();
+        forked.last_auto_route = source_session.last_auto_route.clone();
+        if let Err(err) = manager.save_session(&forked) {
+            return Err(format!("Failed to save forked session: {err}"));
+        }
+        app.current_session_id = Some(forked.metadata.id.clone());
+        app.current_session_metadata = Some(forked.metadata.clone());
+        app.session_title = Some(forked.metadata.title.clone());
+        // A fork starts as its own session: no inherited tab/window title.
+        app.window_title = None;
+        let parent_label =
+            crate::session_manager::truncate_id(&source_session.metadata.id).to_string();
+        let fork_label = crate::session_manager::truncate_id(&forked.metadata.id).to_string();
+        let mode = to_command_mode(app.mode);
+        Ok(SessionForkReceipt {
+            parent_label,
+            fork_label,
+            spawn_depth: Some(forked.metadata.spawn_depth.into()),
+            sync: SessionSyncPayload {
+                session_id: Some(forked.metadata.id.clone()),
+                messages: forked.messages.clone(),
+                system_prompt: forked
+                    .system_prompt
+                    .as_ref()
+                    .map(|s| crate::models::SystemPrompt::Text(s.clone())),
+                model: forked.metadata.model.clone(),
+                workspace: app.workspace.clone(),
+                mode,
+            },
+        })
+    }
+
+    fn fresh_session(&mut self, force: bool) -> Result<SessionNewReceipt, String> {
+        let mut app = self.host.app.borrow_mut();
+        if app.session_transition_blocked() {
+            return Err("Cannot start a new session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work. `/new --force` only discards draft or queued input.".to_string());
+        }
+
+        if !force {
+            let mut blockers: Vec<&'static str> = Vec::new();
+            if !app.input.trim().is_empty() {
+                blockers.push("the composer has unsent text");
+            }
+            if !app.queued_messages.is_empty() || app.queued_draft.is_some() {
+                blockers.push("queued messages are pending");
+            }
+            if !blockers.is_empty() {
+                return Err(format!(
+                    "Cannot start a new session while {}. Run `/new --force` to discard pending work and start a fresh session.",
+                    blockers.join(", ")
+                ));
+            }
+        }
+
+        let new_id = uuid::Uuid::new_v4().to_string();
+        if !crate::commands::groups::core::reset_conversation_state(&mut app) {
+            return Err(
+                "Could not start a new session because Work state is busy; retry in a moment."
+                    .to_string(),
+            );
+        }
+        app.clear_input();
+        app.session_artifacts.clear();
+        app.session_context_references.clear();
+        app.tool_evidence.clear();
+        app.current_session_id = Some(new_id.clone());
+        app.current_session_metadata = None;
+        app.session_title = Some(crate::session_manager::DEFAULT_SESSION_TITLE.to_string());
+        // A new session has no tab/window title override yet; the `title`
+        // config default still applies.
+        app.window_title = None;
+        app.scroll_to_bottom();
+        let mode = to_command_mode(app.mode);
+        Ok(SessionNewReceipt {
+            truncated_id: crate::session_manager::truncate_id(&new_id).to_string(),
+            sync: SessionSyncPayload {
+                session_id: Some(new_id),
+                messages: Vec::new(),
+                system_prompt: None,
+                model: app.model.clone(),
+                workspace: app.workspace.clone(),
+                mode,
+            },
+        })
+    }
+
+    fn load_session(&mut self, path: &str) -> Result<PathBuf, String> {
+        let app = self.host.app.borrow();
+        if app.session_transition_blocked() {
+            return Err("Cannot load a session while runtime work is active. Wait for the current turn, maintenance, and background tasks to finish, or cancel that specific work first.".to_string());
+        }
+        let load_path = if path.contains('/') || path.contains('\\') {
+            PathBuf::from(path)
+        } else {
+            app.workspace.join(path)
+        };
+
+        let content = match std::fs::read_to_string(&load_path) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(format!("Failed to read session file: {e}"));
+            }
+        };
+
+        let _session: crate::session_manager::SavedSession = match serde_json::from_str(&content) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(format!("Failed to parse session file: {e}"));
+            }
+        };
+        Ok(load_path)
+    }
+
+    fn open_picker(&mut self, preselected: Option<String>) {
+        let mut app = self.host.app.borrow_mut();
+        // Materialize the picker inputs before mutating the view stack so the
+        // `RefCell` borrow of `App` is not simultaneously mutable and shared.
+        let workspace = app.workspace.clone();
+        let ui_locale = app.ui_locale;
+        match preselected {
+            Some(session_id) => {
+                app.view_stack.push(
+                    crate::tui::session_picker::SessionPickerView::new_selecting(
+                        &workspace,
+                        ui_locale,
+                        &session_id,
+                    ),
+                );
+            }
+            None => {
+                app.view_stack
+                    .push(crate::tui::session_picker::SessionPickerView::new(
+                        &workspace, ui_locale,
+                    ));
+            }
+        }
+    }
+
+    fn set_archived(
+        &mut self,
+        session_id: &str,
+        archived: bool,
+    ) -> Result<SessionArchiveReceipt, String> {
+        let verb = if archived { "archive" } else { "unarchive" };
+        let mut app = self.host.app.borrow_mut();
+        let manager = match crate::session_manager::SessionManager::default_location() {
+            Ok(manager) => manager,
+            Err(err) => {
+                return Err(format!("could not open sessions directory: {err}"));
+            }
+        };
+        match manager.set_session_archived(
+            session_id,
+            archived,
+            crate::session_manager::SessionMutator::Owner,
+        ) {
+            Ok(metadata) => {
+                if let Some(cached) = app.current_session_metadata.as_mut()
+                    && cached.id == metadata.id
+                {
+                    cached.archived = metadata.archived;
+                }
+                Ok(SessionArchiveReceipt {
+                    truncated_id: crate::session_manager::truncate_id(&metadata.id).to_string(),
+                    title: metadata.title,
+                })
+            }
+            Err(err) => Err(format!("{verb} failed: {err}")),
+        }
+    }
+
+    fn prune_sessions(&mut self, days: u64) -> Result<usize, String> {
+        let app = self.host.app.borrow();
+        let manager = match crate::session_manager::SessionManager::default_location() {
+            Ok(m) => m,
+            Err(err) => {
+                return Err(format!("could not open sessions directory: {err}"));
+            }
+        };
+
+        let max_age = std::time::Duration::from_secs(days.saturating_mul(24 * 60 * 60));
+        // Never prune the active session, even if its timestamp is stale (a
+        // just-resumed session isn't re-saved until its first post-resume write).
+        let keep = app.current_session_id.as_deref();
+        manager
+            .prune_sessions_older_than_keeping(max_age, keep)
+            .map_err(|err| format!("prune failed: {err}"))
+    }
+}
 
 /// Session identity, messages, queue operations, and token totals.
 pub(crate) struct SessionAdapter<'a> {
@@ -2708,7 +3269,7 @@ fn default_codewhale_tools_dir() -> Option<PathBuf> {
 // Envelope construction (D1)
 // ---------------------------------------------------------------------------
 
-/// Owns twelve facet objects sharing one synchronous TUI host proxy.
+/// Owns thirteen facet objects sharing one synchronous TUI host proxy.
 ///
 /// Handlers borrow only these adapters. Every method delegates to the real App
 /// authority and releases its `RefCell` borrow before returning, so facets can
@@ -2727,6 +3288,7 @@ pub(crate) struct CommandContextBundle<'a> {
     memory: MemoryAdapter<'a>,
     skill_group: SkillGroupAdapter<'a>,
     plugin: PluginAdapter<'a>,
+    lifecycle: SessionLifecycleAdapter<'a>,
 }
 
 impl<'a> CommandContextBundle<'a> {
@@ -2772,6 +3334,9 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::PLUGIN) {
             contexts = contexts.with_plugin(&mut self.plugin);
         }
+        if capabilities.contains(CommandCapabilities::SESSION_LIFECYCLE) {
+            contexts = contexts.with_lifecycle(&mut self.lifecycle);
+        }
         contexts
     }
 
@@ -2790,7 +3355,8 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::MEMORY)
             .union(CommandCapabilities::PROJECT)
             .union(CommandCapabilities::SKILL_GROUP)
-            .union(CommandCapabilities::PLUGIN);
+            .union(CommandCapabilities::PLUGIN)
+            .union(CommandCapabilities::SESSION_LIFECYCLE);
         self.contexts(all_test_capabilities).into_parts()
     }
 }
@@ -2815,7 +3381,8 @@ impl App {
             project: ProjectAdapter { host: host.clone() },
             memory: MemoryAdapter { host: host.clone() },
             skill_group: SkillGroupAdapter { host: host.clone() },
-            plugin: PluginAdapter { host },
+            plugin: PluginAdapter { host: host.clone() },
+            lifecycle: SessionLifecycleAdapter { host },
         }
     }
 }
@@ -4300,5 +4867,388 @@ mod tests {
         let parts = bundle.contexts(CommandCapabilities::SESSION).into_parts();
         assert!(parts.session.is_some());
         assert!(parts.plugin.is_none());
+    }
+
+    // ---------------------------------------------------------------------------
+    // FEAT-023 Phase 3: SessionLifecycleAdapter tests (Tasks 3.2/3.4).
+    // Every delegate is exercised over the real App with an isolated CODEWHALE_HOME
+    // so SessionManager writes stay inside the temp directory. The bundle borrows
+    // `App` for its whole life, so each test scopes the facet and re-reads `App`
+    // only after dropping it (adapters borrow through the host `RefCell` at call
+    // time, but the bundle itself holds the `&mut App`).
+    // ---------------------------------------------------------------------------
+
+    fn lifecycle_test_app(tmpdir: &TempDir) -> App {
+        let options = crate::test_support::test_tui_options(tmpdir.path());
+        App::new(options, &crate::config::Config::default())
+    }
+
+    /// Point CODEWHALE_HOME at `tmp/home` with a pre-created sessions directory so
+    /// `SessionManager::default_location()` resolves inside the temp sandbox.
+    fn lifecycle_home_guard(tmpdir: &TempDir) -> crate::test_support::EnvVarGuard {
+        let home = tmpdir.path().join("home");
+        let sessions = home.join("sessions");
+        std::fs::create_dir_all(&sessions).expect("create sandbox sessions dir");
+        crate::test_support::EnvVarGuard::set("CODEWHALE_HOME", &home)
+    }
+
+    fn user_message(text: &str) -> Message {
+        Message {
+            role: crate::models::Role::User,
+            content: vec![crate::models::ContentBlock::Text {
+                text: text.to_string(),
+                cache_control: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn lifecycle_adapter_transition_blocking_wins_over_io() {
+        let tmpdir = TempDir::new().unwrap();
+        let _lock = crate::test_support::lock_test_env();
+        let mut app = lifecycle_test_app(&tmpdir);
+        app.is_loading = true;
+        app.current_session_id = Some("active-session".to_string());
+        app.api_messages.push(user_message("in flight"));
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            assert!(facet.transition_blocked());
+            let fork = facet.fork_active().expect_err("blocked fork");
+            assert!(fork.contains("runtime work is active"), "{fork}");
+            let load = facet
+                .load_session("does-not-exist.json")
+                .expect_err("blocked load");
+            assert!(load.contains("runtime work is active"), "{load}");
+            let fresh = facet.fresh_session(false).expect_err("blocked new");
+            assert!(fresh.contains("runtime work is active"), "{fresh}");
+            // `/branch` gates on the handler side via transition_blocked(); the
+            // delegate reproduces the baseline stage errors exactly (the active
+            // session was never saved in this fixture).
+            let branch = facet.branch_to("entry-1").expect_err("unsaved session");
+            assert!(
+                branch.contains("could not load session active-session"),
+                "{branch}"
+            );
+        }
+        assert_eq!(app.current_session_id.as_deref(), Some("active-session"));
+        assert_eq!(app.api_messages.len(), 1);
+    }
+
+    #[test]
+    fn lifecycle_adapter_save_and_fork_roundtrip_preserves_history() {
+        let tmpdir = TempDir::new().unwrap();
+        let _lock = crate::test_support::lock_test_env();
+        let _home = lifecycle_home_guard(&tmpdir);
+        let mut app = lifecycle_test_app(&tmpdir);
+        app.api_messages.push(user_message("try another path"));
+
+        let parent_id;
+        let child_id;
+        let save_path = tmpdir.path().join("parent.json");
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            let saved = facet
+                .save_session(Some(save_path.display().to_string()))
+                .expect("save ok");
+            assert!(save_path.exists());
+            assert!(!saved.display_path.is_empty());
+            assert!(!saved.truncated_id.is_empty());
+        }
+        parent_id = app
+            .current_session_id
+            .clone()
+            .expect("save sets session id");
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            let forked = facet.fork_active().expect("fork ok");
+            assert_eq!(forked.spawn_depth, None);
+            assert!(!forked.parent_label.is_empty());
+            assert!(!forked.fork_label.is_empty());
+            assert!(forked.sync.session_id.is_some());
+            assert_eq!(forked.sync.messages.len(), 1);
+            assert_eq!(forked.sync.workspace, tmpdir.path());
+            child_id = app
+                .current_session_id
+                .clone()
+                .expect("fork switches session");
+        }
+        assert_ne!(child_id, parent_id);
+
+        let manager = crate::session_manager::SessionManager::default_location().unwrap();
+        let parent = manager.load_session(&parent_id).expect("parent loadable");
+        let child = manager.load_session(&child_id).expect("child loadable");
+        assert_eq!(parent.messages.len(), 1, "parent history preserved");
+        assert_eq!(
+            child.metadata.parent_session_id.as_deref(),
+            Some(parent_id.as_str())
+        );
+        assert_eq!(child.metadata.forked_from_message_count, Some(1));
+    }
+
+    #[test]
+    fn lifecycle_adapter_explicit_fork_reports_spawn_depth_and_preserves_source() {
+        let tmpdir = TempDir::new().unwrap();
+        let _lock = crate::test_support::lock_test_env();
+        let _home = lifecycle_home_guard(&tmpdir);
+        let mut app = lifecycle_test_app(&tmpdir);
+        app.api_messages.push(user_message("parent turn"));
+        let parent_id;
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            let saved = facet.save_session(None).expect("save into managed dir");
+            assert!(!saved.truncated_id.is_empty());
+        }
+        parent_id = app
+            .current_session_id
+            .clone()
+            .expect("save sets session id");
+        let source_len = {
+            let manager = crate::session_manager::SessionManager::default_location().unwrap();
+            manager
+                .load_session(&parent_id)
+                .expect("saved parent")
+                .messages
+                .len()
+        };
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            let forked = facet.fork_from(&parent_id).expect("explicit fork ok");
+            assert_eq!(forked.spawn_depth, Some(1));
+            assert_eq!(
+                forked.parent_label,
+                crate::session_manager::truncate_id(&parent_id)
+            );
+            assert_eq!(forked.sync.messages.len(), 1);
+        }
+        let manager = crate::session_manager::SessionManager::default_location().unwrap();
+        let reloaded = manager
+            .load_session(&parent_id)
+            .expect("source still loadable");
+        assert_eq!(
+            reloaded.messages.len(),
+            source_len,
+            "source history never rewritten by forking"
+        );
+    }
+
+    #[test]
+    fn lifecycle_adapter_new_session_is_all_or_nothing_when_work_state_is_busy() {
+        let tmpdir = TempDir::new().unwrap();
+        let _lock = crate::test_support::lock_test_env();
+        let _home = lifecycle_home_guard(&tmpdir);
+        let mut app = lifecycle_test_app(&tmpdir);
+        app.current_session_id = Some("current-session".to_string());
+        app.api_messages.push(user_message("work"));
+        let todos = app.todos.clone();
+        let _held = todos.try_lock().expect("hold todos lock");
+
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            let err = facet.fresh_session(true).expect_err("busy work state");
+            assert!(err.contains("Work state is busy"), "{err}");
+        }
+        assert_eq!(app.api_messages.len(), 1);
+        assert_eq!(app.current_session_id.as_deref(), Some("current-session"));
+    }
+
+    #[test]
+    fn lifecycle_adapter_new_session_blocks_unsent_input_without_force() {
+        let tmpdir = TempDir::new().unwrap();
+        let _lock = crate::test_support::lock_test_env();
+        let _home = lifecycle_home_guard(&tmpdir);
+        let mut app = lifecycle_test_app(&tmpdir);
+        app.current_session_id = Some("old-session".to_string());
+        app.input = "draft text".to_string();
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            let err = facet.fresh_session(false).expect_err("blocker text");
+            assert!(err.contains("/new --force"), "{err}");
+        }
+        assert_eq!(app.input, "draft text");
+        assert_eq!(app.current_session_id.as_deref(), Some("old-session"));
+
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            let ok = facet.fresh_session(true).expect("force discards draft");
+            assert_ne!(app.current_session_id.as_deref(), Some("old-session"));
+            assert!(app.input.is_empty());
+            assert!(!ok.truncated_id.is_empty());
+            assert!(ok.sync.messages.is_empty());
+        }
+    }
+
+    #[test]
+    fn lifecycle_adapter_load_validates_shape_without_applying_state() {
+        let tmpdir = TempDir::new().unwrap();
+        let _lock = crate::test_support::lock_test_env();
+        let _home = lifecycle_home_guard(&tmpdir);
+        let mut app = lifecycle_test_app(&tmpdir);
+        app.api_messages.push(user_message("checkpoint"));
+        let save_path = tmpdir.path().join("checkpoint.json");
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            facet
+                .save_session(Some(save_path.display().to_string()))
+                .expect("seed session file");
+        }
+        let before = app.api_messages.clone();
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            let missing = facet
+                .load_session("does-not-exist.json")
+                .expect_err("missing file");
+            assert!(missing.contains("Failed to read session file"), "{missing}");
+            let bad = tmpdir.path().join("bad.json");
+            std::fs::write(&bad, "not json").unwrap();
+            let parse = facet
+                .load_session(bad.display().to_string().as_str())
+                .expect_err("invalid json");
+            assert!(parse.contains("Failed to parse session file"), "{parse}");
+            let resolved = facet
+                .load_session(save_path.display().to_string().as_str())
+                .expect("valid session resolves");
+            assert_eq!(resolved, save_path);
+        }
+        assert_eq!(
+            app.api_messages, before,
+            "no state applied by /load delegate"
+        );
+    }
+
+    #[test]
+    fn lifecycle_adapter_picker_archive_and_prune_behavior() {
+        let tmpdir = TempDir::new().unwrap();
+        let _lock = crate::test_support::lock_test_env();
+        let _home = lifecycle_home_guard(&tmpdir);
+        let mut app = lifecycle_test_app(&tmpdir);
+        let before_kind = app.view_stack.top_kind();
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            facet.open_picker(None);
+            facet.open_picker(Some("pick-me".to_string()));
+        }
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            facet.save_session(None).expect("seed archive target");
+        }
+        let archived_id = app.current_session_id.clone().unwrap();
+        {
+            let mut bundle = app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            let receipt = facet.set_archived(&archived_id, true).expect("archive ok");
+            assert_eq!(
+                receipt.truncated_id,
+                crate::session_manager::truncate_id(&archived_id)
+            );
+            assert!(!receipt.title.is_empty());
+            let restored = facet.set_archived(&archived_id, false).expect("restore ok");
+            assert_eq!(restored.truncated_id, receipt.truncated_id);
+            let pruned = facet.prune_sessions(36500).expect("prune runs");
+            assert_eq!(pruned, 0, "no inactive session older than the window");
+        }
+        assert_ne!(
+            app.view_stack.top_kind(),
+            before_kind,
+            "picker pushed a view"
+        );
+        let manager = crate::session_manager::SessionManager::default_location().unwrap();
+        assert!(
+            manager.load_session(&archived_id).is_ok(),
+            "active session survives pruning"
+        );
+    }
+
+    #[test]
+    fn lifecycle_adapter_tree_projections_cover_all_states() {
+        let tmpdir = TempDir::new().unwrap();
+        let _lock = crate::test_support::lock_test_env();
+        let _home = lifecycle_home_guard(&tmpdir);
+
+        // No active session.
+        let mut no_session_app = lifecycle_test_app(&tmpdir);
+        {
+            let mut bundle = no_session_app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            assert!(matches!(
+                facet.tree_body().expect("tree ok"),
+                TreeBodyProjection::NoSession
+            ));
+        }
+
+        // Active session with no messages and no saved journal.
+        let mut empty_app = lifecycle_test_app(&tmpdir);
+        empty_app.current_session_id = Some("empty-session".to_string());
+        {
+            let mut bundle = empty_app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            assert!(matches!(
+                facet.tree_body().expect("tree ok"),
+                TreeBodyProjection::EmptySession
+            ));
+        }
+
+        // Linear transcript before the journal exists.
+        let mut linear_app = lifecycle_test_app(&tmpdir);
+        linear_app.current_session_id = Some("linear-session".to_string());
+        linear_app
+            .api_messages
+            .push(user_message("first message with a long tail"));
+        {
+            let mut bundle = linear_app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            match facet.tree_body().expect("tree ok") {
+                TreeBodyProjection::Linear { rendered } => {
+                    assert!(rendered.contains("Active branch (linear"), "{rendered}");
+                    assert!(rendered.contains("[0]"), "{rendered}");
+                }
+                other => panic!("expected Linear projection, got {other:?}"),
+            }
+        }
+
+        // Journal projection once the session is saved with messages.
+        let mut journal_app = lifecycle_test_app(&tmpdir);
+        journal_app
+            .api_messages
+            .push(user_message("journaled turn"));
+        {
+            let mut bundle = journal_app.command_contexts();
+            let mut parts = bundle.parts();
+            let facet = parts.lifecycle.as_deref_mut().expect("lifecycle slot");
+            facet.save_session(None).expect("seed journaled session");
+            match facet.tree_body().expect("tree ok") {
+                TreeBodyProjection::Journal { rendered } => {
+                    assert!(!rendered.is_empty());
+                }
+                other => panic!("expected Journal projection, got {other:?}"),
+            }
+        }
     }
 }
