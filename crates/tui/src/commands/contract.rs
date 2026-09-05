@@ -97,7 +97,7 @@ pub(crate) fn to_command_mode(mode: AppMode) -> CommandMode {
     }
 }
 
-fn from_command_mode(mode: CommandMode) -> AppMode {
+pub(crate) fn from_command_mode(mode: CommandMode) -> AppMode {
     match mode {
         CommandMode::Agent => AppMode::Agent,
         CommandMode::Plan => AppMode::Plan,

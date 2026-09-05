@@ -108,3 +108,27 @@ impl CommandGroup for SessionCommands {
         ])
     }
 }
+
+// ---------------------------------------------------------------------------
+// FEAT-023 Phase 4 (D6): map a portable lifecycle sync payload into the
+// temporary `SyncSession` action. FEAT-037 owns the eventual shared outcome
+// types; until then the mapping lives here so every portable handler composes
+// the same action from the same receipt.
+// ---------------------------------------------------------------------------
+pub(in crate::commands) fn sync_session_action(
+    sync: codewhale_command_contract::facets::SessionSyncPayload,
+) -> crate::tui::app::AppAction {
+    crate::tui::app::AppAction::SyncSession {
+        session_id: sync.session_id,
+        messages: sync.messages,
+        system_prompt: sync.system_prompt,
+        model: sync.model,
+        workspace: sync.workspace,
+        mode: crate::commands::contract::from_command_mode(sync.mode),
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_portable_tests;
+#[cfg(test)]
+mod lifecycle_test_support;
