@@ -6,6 +6,14 @@ const computerParam = {
   description: "Computer id to act on. Defaults to the active computer. Providing a different registered id switches to it first (sticky).",
 };
 
+// Optional guard for keystroke tools: the app that must be frontmost.
+const inputAppRef = {
+  type: "object",
+  description: "Refuse to send the keystrokes unless this app is frontmost (name, bundle_id, or pid).",
+  properties: { pid: { type: "integer" }, name: { type: "string" }, bundle_id: { type: "string" } },
+  additionalProperties: false,
+};
+
 const targetSchema = {
   oneOf: [
     {
@@ -211,16 +219,16 @@ export const TOOLS = [
   },
   // ---- text & keyboard ----
   {
-    name: "type", description: "Type text into the focused control (unicode). Focus the field first (click/element action).",
-    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, computer: computerParam }, additionalProperties: false },
+    name: "type", description: "Type text into the focused control (unicode). Focus the field first (click/element action). Pass app_ref to refuse unless that app is frontmost; the receipt names frontmost_app either way.",
+    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, app_ref: inputAppRef, computer: computerParam }, additionalProperties: false },
   },
   {
-    name: "key", description: "Press a key or chord, e.g. 'return', 'cmd+c' (macOS), 'ctrl+c' (Linux/Windows). Repeat with `repeat`.",
-    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, repeat: { type: "integer", minimum: 1, maximum: 100 }, computer: computerParam }, additionalProperties: false },
+    name: "key", description: "Press a key or chord, e.g. 'return', 'cmd+c' (macOS), 'ctrl+c' (Linux/Windows). Repeat with `repeat`. Pass app_ref to refuse unless that app is frontmost; the receipt names frontmost_app either way.",
+    inputSchema: { type: "object", required: ["text"], properties: { text: { type: "string" }, repeat: { type: "integer", minimum: 1, maximum: 100 }, app_ref: inputAppRef, computer: computerParam }, additionalProperties: false },
   },
   {
     name: "hold_key", description: "Hold a key for `duration` seconds (0.05..30).",
-    inputSchema: { type: "object", required: ["text", "duration"], properties: { text: { type: "string" }, duration: { type: "number", minimum: 0.05, maximum: 30 }, computer: computerParam }, additionalProperties: false },
+    inputSchema: { type: "object", required: ["text", "duration"], properties: { text: { type: "string" }, duration: { type: "number", minimum: 0.05, maximum: 30 }, app_ref: inputAppRef, computer: computerParam }, additionalProperties: false },
   },
   {
     name: "set_value", description: "Set an editable element's value through the accessibility layer (background-safe, no keystrokes). Element targets only.",

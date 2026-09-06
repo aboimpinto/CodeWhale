@@ -221,7 +221,7 @@ test("darwin: CGEvent input scripts receive their payload and a real timeout (#5
   };
   const b = createDarwin({ exec: { run, runOk: run } });
   await b.key({ text: "cmd+q" });
-  const scripts = calls.filter((c) => c.cmd === "osascript");
+  const scripts = calls.filter((c) => c.cmd === "osascript" && JSON.parse(c.args.at(-1)).code !== undefined);
   assert.equal(scripts.length, 2, "one keydown and one keyup event");
   for (const c of scripts) {
     const payload = JSON.parse(c.args[c.args.length - 1]);
@@ -233,4 +233,58 @@ test("darwin: CGEvent input scripts receive their payload and a real timeout (#5
   const typed = JSON.parse(calls.at(-1).args.at(-1));
   assert.equal(typed.text, "hi");
   assert.equal(calls.at(-1).opts.timeoutMs, 15_000);
+});
+
+
+// ---------- darwin: keystrokes name and guard the app that receives them (#5927) ----------
+function darwinDesktopExec({ frontmost, calculatorFrontmost }) {
+  const calls = [];
+  const run = async (cmd, args, opts) => {
+    calls.push({ cmd, args, opts });
+    if (cmd === "open") return { code: 0, stdout: "", stderr: "" };
+    if (cmd !== "osascript") return { code: 1, stdout: "", stderr: "" };
+    const payload = JSON.parse(args.at(-1));
+    if (payload.probe === "frontmost-app") return { code: 0, stdout: JSON.stringify({ found: true, ...frontmost }), stderr: "" };
+    if (payload.name || payload.bundle_id || payload.pid != null) {
+      const isCalc = String(payload.name || "").toLowerCase() === "calculator";
+      return { code: 0, stdout: JSON.stringify(isCalc ? { found: true, name: "Calculator", pid: 2, bundle_id: "com.apple.calculator", frontmost: calculatorFrontmost } : { found: false }), stderr: "" };
+    }
+    return { code: 0, stdout: JSON.stringify({ ok: true }), stderr: "" };
+  };
+  return { run, runOk: run, calls };
+}
+const cgEventCalls = (calls) => calls.filter((c) => c.cmd === "osascript" && JSON.parse(c.args.at(-1)).code !== undefined);
+
+test("darwin: open_application with activate reports truthfully when the app never comes to the front", async () => {
+  const exec = darwinDesktopExec({ frontmost: { name: "Ghostty", pid: 1, bundle_id: "com.mitchellh.ghostty" }, calculatorFrontmost: false });
+  const b = createDarwin({ exec });
+  const r = await b.open_application({ name: "Calculator", activate: true });
+  assert.equal(r.launched, true);
+  assert.equal(r.frontmost, false);
+  assert.equal(r.pid, 2);
+  assert.match(r.note, /did not come to the front/);
+});
+
+test("darwin: a guarded key refuses when the named app is not frontmost and posts nothing", async () => {
+  const exec = darwinDesktopExec({ frontmost: { name: "Ghostty", pid: 1, bundle_id: "com.mitchellh.ghostty" }, calculatorFrontmost: false });
+  const b = createDarwin({ exec });
+  await assert.rejects(() => b.key({ text: "cmd+q", app_ref: { name: "Calculator" } }), /"Calculator" is not frontmost \("Ghostty" is\)/);
+  assert.equal(cgEventCalls(exec.calls).length, 0, "no CGEvent may be posted to the wrong app");
+});
+
+test("darwin: an unguarded key still names the app that received it", async () => {
+  const exec = darwinDesktopExec({ frontmost: { name: "Ghostty", pid: 1, bundle_id: "com.mitchellh.ghostty" }, calculatorFrontmost: false });
+  const b = createDarwin({ exec });
+  const r = await b.key({ text: "a" });
+  assert.equal(r.action_sent, true);
+  assert.deepEqual(r.frontmost_app, { name: "Ghostty", pid: 1, bundle_id: "com.mitchellh.ghostty" });
+  assert.equal(cgEventCalls(exec.calls).length, 2);
+});
+
+test("darwin: a guarded key goes through when the named app is frontmost", async () => {
+  const exec = darwinDesktopExec({ frontmost: { name: "Calculator", pid: 2, bundle_id: "com.apple.calculator" }, calculatorFrontmost: true });
+  const b = createDarwin({ exec });
+  const r = await b.type({ text: "7", app_ref: { name: "Calculator" } });
+  assert.equal(r.action_sent, true);
+  assert.equal(r.frontmost_app.name, "Calculator");
 });

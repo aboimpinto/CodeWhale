@@ -467,6 +467,33 @@ export function create({ exec }) {
     }`, {}, 25_000);
   }
 
+  // Which app owns the keyboard right now. Raw CGEvents go to it no matter
+  // what the caller meant (#5927), so every input receipt names it.
+  async function frontmostApp() {
+    const r = await jxa(`${JXA_PRELUDE}
+      var se = Application('System Events');
+      var list = se.applicationProcesses.whose({ frontmost: true })();
+      if (!list.length) return JSON.stringify({ found: false });
+      var p = list[0];
+      return JSON.stringify({ found: true, name: g(function(){ return String(p.name()); }), pid: num(function(){ return p.unixId(); }),
+        bundle_id: g(function(){ var b = p.bundleIdentifier(); return b ? String(b) : null; }) });
+    }`, { probe: "frontmost-app" }, 8_000);
+    return r && r.found ? { name: r.name, pid: r.pid, bundle_id: r.bundle_id } : null;
+  }
+
+  // Refuse to post keystrokes when the app the caller named is not the one
+  // that would receive them. Returns the frontmost app for the receipt.
+  async function guardInput(appRef) {
+    const front = await frontmostApp().catch(() => null);
+    if (!appRef) return front;
+    const target = await findProcess(appRef);
+    if (!target.found) throw new ExecError("application not found — call list_apps for exact names/pids");
+    if (!front || front.pid !== target.pid) {
+      throw new ExecError(`refusing to send input: "${target.name}" is not frontmost${front ? ` ("${front.name}" is)` : ""}; bring it forward first with open_application { activate: true } or click into it`);
+    }
+    return front;
+  }
+
   async function listWindows(appRef) {
     const p = await findProcess(appRef ?? {});
     if (!p.found) throw new ExecError("application not found — call list_apps for exact names/pids");
@@ -481,11 +508,25 @@ export function create({ exec }) {
     if (activate) args.unshift("-F");
     const r = await runL("open", args, { timeoutMs: 25_000 });
     if (r.code !== 0) throw new ExecError(`open failed: ${r.stderr.trim().slice(0, 200)}`, r);
-    await new Promise((res) => setTimeout(res, 600));
     const find = {};
     if (bid) find.bundle_id = bid; else if (pid) find.pid = pid; else find.name = String(name).replace(/\.app$/, "");
-    const p = await findProcess(find).catch(() => null);
-    return { launched: true, activate, url: urlArg ?? null, resolved: p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: p.frontmost } : null };
+    // `open -F` returns before the app is in front. Wait for the process to
+    // exist and, when activation was asked for, to actually be frontmost;
+    // otherwise the next keystroke lands in whatever app is (#5927).
+    let p = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await new Promise((res) => setTimeout(res, 300));
+      p = await findProcess(find).catch(() => null);
+      if (p?.found && (!activate || p.frontmost)) break;
+    }
+    const resolved = p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: !!p.frontmost } : null;
+    const frontmost = !!resolved?.frontmost;
+    const note = activate && !frontmost
+      ? (resolved
+        ? `"${resolved.name}" is running but did not come to the front within 3 s; keystrokes would go to another app — retry activation or click into its window before typing`
+        : `the app did not appear within 3 s of \`open\`; call list_apps to see what is running`)
+      : undefined;
+    return { launched: true, activate, frontmost, pid: resolved?.pid ?? null, url: urlArg ?? null, resolved, ...(note ? { note } : {}) };
   }
 
   // ---------- clipboard / cursor / waits ----------
@@ -663,8 +704,9 @@ function run(){
         $.CGEventPost($.kCGHIDEventTap, ev);
         return JSON.stringify({ ok: true });`, { dx, dy }).then(() => ({ action_sent: true, direction, amount }));
     },
-    type: async ({ text }) => {
+    type: async ({ text, app_ref }) => {
       if (!text) return { action_sent: false, note: "empty text" };
+      const frontmost_app = await guardInput(app_ref);
       const r = await cg(`var ev = $.CGEventCreateKeyboardEvent($(), 0, true);
         $.CGEventKeyboardSetUnicodeString(ev, P.text.length, P.text);
         $.CGEventPost($.kCGHIDEventTap, ev);
@@ -672,24 +714,26 @@ function run(){
         $.CGEventKeyboardSetUnicodeString(ev2, P.text.length, P.text);
         $.CGEventPost($.kCGHIDEventTap, ev2);
         return JSON.stringify({ ok: true, chars: P.text.length });`, { text }, 15_000);
-      return { action_sent: true, chars: text.length, strategy: "unicode-events" };
+      return { action_sent: true, chars: text.length, strategy: "unicode-events", frontmost_app };
     },
-    key: async ({ text, repeat = 1 }) => {
+    key: async ({ text, repeat = 1, app_ref }) => {
       const { flags, code, key } = parseChord(text);
+      const frontmost_app = await guardInput(app_ref);
       for (let i = 0; i < Math.max(1, Math.min(100, repeat)); i++) {
         await keyEvent(code, flags, true);
         await keyEvent(code, flags, false);
         if (i < repeat - 1) await new Promise((r) => setTimeout(r, 30));
       }
-      return { action_sent: true, key, code, repeat: Math.max(1, Math.min(100, repeat)) };
+      return { action_sent: true, key, code, repeat: Math.max(1, Math.min(100, repeat)), frontmost_app };
     },
-    hold_key: async ({ text, duration }) => {
+    hold_key: async ({ text, duration, app_ref }) => {
       const { flags, code, key } = parseChord(text);
+      const frontmost_app = await guardInput(app_ref);
       const d = Math.max(0.05, Math.min(30, Number(duration) || 1));
       await keyEvent(code, flags, true);
       await new Promise((r) => setTimeout(r, d * 1000));
       await keyEvent(code, flags, false);
-      return { action_sent: true, key, heldSec: d };
+      return { action_sent: true, key, heldSec: d, frontmost_app };
     },
     set_value: async ({ target, value }) => {
       const el = await elementAction(target.app_ref, target.windowIndex, target.path, { kind: "set_value", value });
