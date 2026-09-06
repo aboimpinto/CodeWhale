@@ -723,7 +723,20 @@ impl ToolRegistryBuilder {
     /// Add a custom tool.
     #[must_use]
     pub fn with_tool(mut self, tool: Arc<dyn ToolSpec>) -> Self {
-        self.tools.push(tool);
+        // A later builder step that supplies an existing name is an intended
+        // upgrade (`with_patch_tools` swaps the default `File` for the
+        // patch-capable one), so replace in place. `ToolRegistry::register`
+        // keeps warning about the collisions that are not planned (#5934).
+        let name = tool.name().to_string();
+        if let Some(slot) = self
+            .tools
+            .iter_mut()
+            .find(|existing| existing.name() == name)
+        {
+            *slot = tool;
+        } else {
+            self.tools.push(tool);
+        }
         self
     }
 
