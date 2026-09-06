@@ -321,10 +321,17 @@ impl McpTransport for StdioTransport {
                     }
                 };
             if bytes == 0 {
+                // Let the stderr drain task catch up before snapshotting, and
+                // name the exit status: a reviewed plugin's stderr is never
+                // retained, so the status is the only reason the operator
+                // gets when the child dies before the handshake (#5916).
+                tokio::task::yield_now().await;
+                let exit = self.child.lock().await.try_wait().ok().flatten();
+                let exit = exit.map_or_else(String::new, |status| format!(" ({status})"));
                 if let Some(stderr) = format_stderr_context(&self.stderr_tail).await {
-                    anyhow::bail!("Stdio transport closed\n{stderr}");
+                    anyhow::bail!("Stdio transport closed{exit}\n{stderr}");
                 }
-                anyhow::bail!("Stdio transport closed");
+                anyhow::bail!("Stdio transport closed{exit}");
             }
 
             let line = String::from_utf8_lossy(&line_bytes);
