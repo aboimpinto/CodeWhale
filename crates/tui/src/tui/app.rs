@@ -1878,6 +1878,10 @@ pub struct App {
     /// (Catppuccin, Tokyo Night, Dracula, Gruvbox) propagate to every
     /// render site, not just the handful that read `app.ui_theme`.
     pub theme_id: palette::ThemeId,
+    /// Normalized persisted selector, including `custom:<name>` overlays.
+    /// `theme_id` remains the resolved base theme for behavior such as the
+    /// underwater surface and color-compatibility backend.
+    pub theme_name: String,
     // Onboarding
     pub onboarding: OnboardingState,
     pub onboarding_needs_api_key: bool,

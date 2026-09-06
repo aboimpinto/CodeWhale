@@ -13,6 +13,14 @@ pub const USER_THEME_PREFIX: &str = "custom:";
 pub const USER_THEME_SCHEMA: &str = include_str!("../assets/user-theme.schema.json");
 const MAX_USER_THEME_BYTES: u64 = 64 * 1024;
 
+/// A validated user-authored overlay available to the theme picker.
+#[derive(Debug, Clone)]
+pub struct UserThemeOption {
+    pub selector: String,
+    pub base: ThemeId,
+    pub theme: UiTheme,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UserThemeFile {
@@ -165,6 +173,51 @@ pub fn resolve_user_theme(value: &str) -> Result<Option<(ThemeId, UiTheme)>, Str
     let mut theme = base.ui_theme();
     apply_colors(&mut theme, &parsed.colors)?;
     Ok(Some((base, theme)))
+}
+
+/// List valid user-authored theme overlays in stable selector order.
+///
+/// Invalid, unreadable, oversized, and symlinked entries are omitted so an
+/// optional malformed overlay cannot prevent the built-in picker from opening.
+/// Detailed validation remains centralized in [`resolve_user_theme`].
+#[must_use]
+pub fn list_user_theme_options() -> Vec<UserThemeOption> {
+    let Ok(themes_dir) = user_themes_dir() else {
+        return Vec::new();
+    };
+    let Ok(metadata) = fs::symlink_metadata(&themes_dir) else {
+        return Vec::new();
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Vec::new();
+    }
+    let Ok(entries) = fs::read_dir(&themes_dir) else {
+        return Vec::new();
+    };
+
+    let mut options = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            (path.extension().and_then(|extension| extension.to_str()) == Some("json"))
+                .then(|| path.file_stem()?.to_str().map(str::to_string))
+                .flatten()
+        })
+        .filter_map(|slug| {
+            let selector = normalize_user_theme_selector(&format!("{USER_THEME_PREFIX}{slug}"))
+                .ok()
+                .flatten()?;
+            let (base, theme) = resolve_user_theme(&selector).ok().flatten()?;
+            Some(UserThemeOption {
+                selector,
+                base,
+                theme,
+            })
+        })
+        .collect::<Vec<_>>();
+    options.sort_by(|left, right| left.selector.cmp(&right.selector));
+    options.dedup_by(|left, right| left.selector == right.selector);
+    options
 }
 
 pub fn user_themes_dir() -> Result<PathBuf, String> {
@@ -323,5 +376,30 @@ mod tests {
         fs::write(&outside, "{}").unwrap();
         symlink(&outside, themes.join("linked.json")).unwrap();
         assert!(resolve_user_theme("custom:linked").is_err());
+    }
+
+    #[test]
+    fn list_user_theme_options_keeps_only_valid_sorted_overlays() {
+        let _lock = crate::test_support::lock_test_env();
+        let temp = tempfile::tempdir().unwrap();
+        let _home = EnvVarGuard::set("CODEWHALE_HOME", temp.path());
+        let themes = temp.path().join("themes");
+        fs::create_dir(&themes).unwrap();
+        let valid = r##"{"schema_version":1,"base":"dark","colors":{}}"##;
+        fs::write(themes.join("zulu.json"), valid).unwrap();
+        fs::write(themes.join("alpha.json"), valid).unwrap();
+        fs::write(themes.join("broken.json"), "not json").unwrap();
+        fs::write(themes.join("notes.txt"), valid).unwrap();
+
+        let options = list_user_theme_options();
+
+        assert_eq!(
+            options
+                .iter()
+                .map(|option| option.selector.as_str())
+                .collect::<Vec<_>>(),
+            ["custom:alpha", "custom:zulu"]
+        );
+        assert!(options.iter().all(|option| option.base == ThemeId::Whale));
     }
 }

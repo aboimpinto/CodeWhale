@@ -1978,7 +1978,7 @@ pub(crate) async fn apply_command_result(
                     // Esc can revert through the same ConfigUpdated channel.
                     // Avoids re-reading settings.toml from disk on every
                     // `/theme` invocation.
-                    let original = app.theme_id.name().to_string();
+                    let original = app.theme_name.clone();
                     app.view_stack
                         .push_boxed(crate::tui::theme_picker::ThemePickerView::boxed(
                             original,

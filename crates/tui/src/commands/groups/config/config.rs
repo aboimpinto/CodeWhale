@@ -323,9 +323,16 @@ fn show_single_setting(app: &App, key: &str) -> CommandResult {
         )),
         "stream_chunk_timeout_secs" => Some(app.stream_chunk_timeout_secs.to_string()),
         "locale" | "language" => Some(locale_display(app.ui_locale).to_string()),
-        "theme" | "ui_theme" => {
-            Some(crate::palette::theme_label_for_mode(app.ui_theme.mode).to_string())
-        }
+        "theme" | "ui_theme" => Some(
+            if app
+                .theme_name
+                .starts_with(crate::palette::USER_THEME_PREFIX)
+            {
+                app.theme_name.clone()
+            } else {
+                crate::palette::theme_label_for_mode(app.ui_theme.mode).to_string()
+            },
+        ),
         "background_color" | "background" | "bg" => {
             crate::palette::hex_rgb_string(app.ui_theme.surface_bg)
                 .or_else(|| Some("(default)".to_string()))
@@ -2566,7 +2573,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             };
             let background_setting =
                 background_color_override.and_then(crate::palette::hex_rgb_string);
-            let (_, theme_id, ui_theme) = match crate::palette::resolve_theme_setting(
+            let (theme_name, theme_id, ui_theme) = match crate::palette::resolve_theme_setting(
                 &settings.theme,
                 background_setting.as_deref(),
             ) {
@@ -2577,6 +2584,7 @@ pub fn set_config_value(app: &mut App, key: &str, value: &str, persist: bool) ->
             };
             app.background_color_override = background_color_override;
             app.theme_id = theme_id;
+            app.theme_name = theme_name;
             app.ui_theme = ui_theme;
             app.needs_redraw = true;
         }
@@ -4989,6 +4997,37 @@ context_window = 262144
         assert_eq!(
             persisted.max_input_history, 77,
             "the theme save must not overwrite unrelated settings"
+        );
+    }
+
+    #[test]
+    fn custom_theme_selection_keeps_the_raw_selector_in_live_app_state() {
+        let temp_root = env::temp_dir().join(format!(
+            "codewhale-tui-custom-theme-selection-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        let _guard = EnvGuard::new(&temp_root);
+        let themes = temp_root.join(".codewhale").join("themes");
+        fs::create_dir_all(&themes).expect("themes dir");
+        fs::write(
+            themes.join("midnight.json"),
+            r##"{"schema_version":1,"base":"dark","colors":{"accent_primary":"#123456"}}"##,
+        )
+        .expect("theme overlay");
+
+        let mut app = create_test_app();
+        let result = set_config_value(&mut app, "theme", "custom:midnight", false);
+
+        assert!(!result.is_error, "{:?}", result.message);
+        assert_eq!(app.theme_name, "custom:midnight");
+        assert_eq!(app.theme_id, crate::palette::ThemeId::Whale);
+        assert_eq!(
+            app.ui_theme.accent_primary,
+            ratatui::style::Color::Rgb(0x12, 0x34, 0x56)
         );
     }
 

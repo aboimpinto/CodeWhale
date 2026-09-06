@@ -12,9 +12,9 @@
 //!   `ThemeSelectionUpdated{persist:false}` to restore the exact theme that
 //!   was active when the picker opened.
 //!
-//! The option list is 1:1 with [`SELECTABLE_THEMES`] — one row per theme, no
-//! modifier rows. `underwater` is an ordinary row: the painted ocean field is
-//! the theme, not a treatment beside it.
+//! The option list contains compiled themes followed by valid user overlays.
+//! `underwater` is an ordinary row: the painted ocean field is the theme, not
+//! a treatment beside it.
 
 use std::borrow::Cow;
 use std::cell::RefCell;
@@ -58,6 +58,8 @@ pub struct ThemePickerView {
     last_mouse_selected: Option<usize>,
     /// UI locale captured from the app at construction (#4057 wave 2).
     locale: Locale,
+    /// Valid user overlays loaded once when the picker opens.
+    custom_themes: Vec<crate::palette::UserThemeOption>,
 }
 
 impl ThemePickerView {
@@ -73,7 +75,7 @@ impl ThemePickerView {
         background_override: Option<Color>,
     ) -> Self {
         let normalized = original_name.trim().to_ascii_lowercase();
-        let options = theme_options(&normalized);
+        let (options, custom_themes) = theme_options(&normalized);
         let controller = SettingsPickerController::new(options, normalized.clone());
         let opening_cursor = controller.selected_source_index();
         Self {
@@ -85,6 +87,7 @@ impl ThemePickerView {
             row_hitboxes: RefCell::new(Vec::new()),
             last_mouse_selected: None,
             locale,
+            custom_themes,
         }
     }
 
@@ -104,10 +107,27 @@ impl ThemePickerView {
         ))
     }
 
-    fn current(&self) -> ThemeId {
+    fn selected_theme_name(&self) -> &str {
         self.controller
             .selected_id()
-            .and_then(ThemeId::from_name)
+            .unwrap_or(ThemeId::System.name())
+    }
+
+    fn custom_theme_for(&self, selector: &str) -> Option<UiTheme> {
+        self.custom_themes
+            .iter()
+            .find(|option| option.selector == selector)
+            .map(|option| option.theme)
+    }
+
+    #[cfg(test)]
+    fn current(&self) -> ThemeId {
+        let selected = self.selected_theme_name();
+        self.custom_themes
+            .iter()
+            .find(|option| option.selector == selected)
+            .map(|option| option.base)
+            .or_else(|| ThemeId::from_name(selected))
             .unwrap_or(ThemeId::System)
     }
 
@@ -118,11 +138,17 @@ impl ThemePickerView {
 
     /// Resolve a theme to a `UiTheme`, returning the cached `System`
     /// resolution to avoid repeated env-var reads inside `render`.
-    fn ui_theme_for(&self, id: ThemeId) -> UiTheme {
-        let theme = if matches!(id, ThemeId::System) {
-            self.system_ui_theme
+    fn ui_theme_for_selection(&self, selection: &str) -> UiTheme {
+        let theme = if let Some(custom) = self.custom_theme_for(selection) {
+            custom
+        } else if let Some(id) = ThemeId::from_name(selection) {
+            if matches!(id, ThemeId::System) {
+                self.system_ui_theme
+            } else {
+                id.ui_theme()
+            }
         } else {
-            id.ui_theme()
+            self.system_ui_theme
         };
         self.background_override
             .map_or(theme, |background| theme.with_background_color(background))
@@ -130,16 +156,15 @@ impl ThemePickerView {
 
     fn preview_event(&self) -> ViewAction {
         ViewAction::Emit(ViewEvent::ThemeSelectionUpdated {
-            theme: self.current().name().to_string(),
+            theme: self.selected_theme_name().to_string(),
             persist: false,
         })
     }
 
     fn commit_event(&self) -> ViewAction {
-        // A commit that never moved the cursor must not rewrite settings:
-        // the persisted theme may be a custom:<name> selector this list
-        // cannot express as a row, and re-committing the cursor row would
-        // silently replace it.
+        // A commit that never moved the cursor must preserve the exact
+        // opening selector. This also protects a custom:<name> selector if
+        // its file disappears or becomes invalid while the picker is open.
         if self.controller.selected_source_index() == self.opening_cursor {
             return ViewAction::EmitAndClose(ViewEvent::ThemeSelectionUpdated {
                 theme: self.original_theme_name.clone(),
@@ -147,7 +172,7 @@ impl ThemePickerView {
             });
         }
         ViewAction::EmitAndClose(ViewEvent::ThemeSelectionUpdated {
-            theme: self.current().name().to_string(),
+            theme: self.selected_theme_name().to_string(),
             persist: true,
         })
     }
@@ -179,9 +204,16 @@ impl ThemePickerView {
     }
 }
 
-fn theme_options(current_name: &str) -> Vec<SettingOption> {
+fn theme_options(current_name: &str) -> (Vec<SettingOption>, Vec<crate::palette::UserThemeOption>) {
+    theme_options_with_custom(current_name, crate::palette::list_user_theme_options())
+}
+
+fn theme_options_with_custom(
+    current_name: &str,
+    custom_themes: Vec<crate::palette::UserThemeOption>,
+) -> (Vec<SettingOption>, Vec<crate::palette::UserThemeOption>) {
     let current = current_name.trim().to_ascii_lowercase();
-    SELECTABLE_THEMES
+    let mut options = SELECTABLE_THEMES
         .iter()
         .copied()
         .map(|id| {
@@ -202,7 +234,35 @@ fn theme_options(current_name: &str) -> Vec<SettingOption> {
                 .prefer_list_when_narrow(true)
                 .build()
         })
-        .collect()
+        .collect::<Vec<_>>();
+    for custom in &custom_themes {
+        let label = custom
+            .selector
+            .strip_prefix(crate::palette::USER_THEME_PREFIX)
+            .map_or_else(|| custom.selector.clone(), |slug| format!("Custom: {slug}"));
+        options.push(
+            SettingOption::builder(custom.selector.clone(), label)
+                .summary(format!(
+                    "User overlay · based on {}",
+                    custom.base.display_name()
+                ))
+                .detail(format!(
+                    "User-authored overlay based on {}",
+                    custom.base.display_name()
+                ))
+                .help("Pick a user-authored theme overlay")
+                .values(SettingValues::new(
+                    Cow::Owned(current.clone()),
+                    Cow::Borrowed("underwater"),
+                    Cow::Owned(custom.selector.clone()),
+                ))
+                .availability(SettingAvailability::Available)
+                .tab("themes")
+                .prefer_list_when_narrow(true)
+                .build(),
+        );
+    }
+    (options, custom_themes)
 }
 
 impl ModalView for ThemePickerView {
@@ -281,8 +341,7 @@ impl ModalView for ThemePickerView {
         // the cursor moves, matching what the background will look like
         // after Enter. We keep the live `surface_bg` (not the shared ink) and
         // the bare `Clear` so the preview backdrop reads as intended.
-        let current = self.current();
-        let live = self.ui_theme_for(current);
+        let live = self.ui_theme_for_selection(self.selected_theme_name());
         let inner =
             render_underwater_surface(area, buf, tr(self.locale, MessageId::ThemeSurfaceTitle));
 
@@ -338,7 +397,6 @@ impl ModalView for ThemePickerView {
                 .options()
                 .get(source_idx)
                 .expect("visible source index must reference an option");
-            let selection = ThemeId::from_name(option.id.as_ref()).unwrap_or(ThemeId::System);
             let is_selected = visible_idx == selected_visible;
             let row_style = if is_selected {
                 menu_style::theme_selected_row_style(&live)
@@ -364,7 +422,7 @@ impl ModalView for ThemePickerView {
             // accent + panel + border colors so the picker doubles as a
             // legend. The underwater row shows its water column; use the
             // cached resolver so `System` doesn't repeat `UiTheme::detect()`.
-            let row_theme = self.ui_theme_for(selection);
+            let row_theme = self.ui_theme_for_selection(option.id.as_ref());
             let swatch_colors = match crate::tui::ocean::OceanRamp::for_theme(&row_theme) {
                 Some(ramp) => [
                     ramp.surface,
@@ -574,6 +632,46 @@ mod tests {
             selected_values(&action),
             Some(("custom:midnight", true)),
             "committing without moving the cursor must not replace the persisted selector"
+        );
+    }
+
+    #[test]
+    fn custom_theme_rows_preview_and_commit_their_selector() {
+        let mut custom_theme = ThemeId::Whale.ui_theme();
+        custom_theme.accent_primary = Color::Rgb(0x12, 0x34, 0x56);
+        let custom = crate::palette::UserThemeOption {
+            selector: "custom:midnight".to_string(),
+            base: ThemeId::Whale,
+            theme: custom_theme,
+        };
+        let (options, custom_themes) = theme_options_with_custom("custom:midnight", vec![custom]);
+        let controller = SettingsPickerController::new(options, "custom:midnight");
+        let view = ThemePickerView {
+            opening_cursor: controller.selected_source_index(),
+            controller,
+            original_theme_name: "custom:midnight".to_string(),
+            system_ui_theme: UiTheme::detect(),
+            background_override: None,
+            row_hitboxes: RefCell::new(Vec::new()),
+            last_mouse_selected: None,
+            locale: Locale::En,
+            custom_themes,
+        };
+
+        assert_eq!(view.controller.selected_id(), Some("custom:midnight"));
+        assert_eq!(view.current(), ThemeId::Whale);
+        assert_eq!(
+            view.ui_theme_for_selection("custom:midnight")
+                .accent_primary,
+            Color::Rgb(0x12, 0x34, 0x56)
+        );
+        assert_eq!(
+            selected_values(&view.preview_event()),
+            Some(("custom:midnight", false))
+        );
+        assert_eq!(
+            selected_values(&view.commit_event()),
+            Some(("custom:midnight", true))
         );
     }
 
