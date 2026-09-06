@@ -15,11 +15,9 @@ use crate::facets::{
 ///
 /// The set lives in the external contract crate so command registrations can
 /// declare least authority without naming the TUI host. The dispatcher uses
-/// the declaration to populate only those slots in [`CommandContexts`]. The
-/// 32-bit backing leaves capacity for the remaining staged group facets after
-/// FEAT-023 consumes bit 13.
+/// the declaration to populate only those slots in [`CommandContexts`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub struct CommandCapabilities(u32);
+pub struct CommandCapabilities(u16);
 
 impl CommandCapabilities {
     pub const NONE: Self = Self(0);
