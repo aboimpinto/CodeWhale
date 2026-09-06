@@ -18,8 +18,16 @@ function ps(script, opts = {}) {
   });
 }
 
-async function psJson(script, opts = {}) {
+/** ps() but truthful: timeout, nonzero exit, and spawn failure all throw. */
+async function psOk(script, opts = {}) {
   const r = await ps(script, opts);
+  if (r.timedOut) throw new ExecError(`powershell timed out after ${opts.timeoutMs ?? 25_000}ms`, r);
+  if (r.code !== 0) throw new ExecError(`powershell.exe exited ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 300)}`, r);
+  return r;
+}
+
+async function psJson(script, opts = {}) {
+  const r = await psOk(script, opts);
   const out = r.stdout.trim();
   const j = tryJson(out, null);
   if (!j) throw new ExecError(`powershell did not return JSON: ${(r.stderr || out).trim().slice(0, 300)}`, r);
@@ -65,22 +73,24 @@ const VK = {
 };
 const MODVK = { ctrl: 0x11, control: 0x11, alt: 0x12, shift: 0x10, win: 0x5b, meta: 0x5b, cmd: 0x5b };
 
+// Every action runs in a fresh powershell.exe process, so a bootstrap process
+// can never register the User32 type for later spawns. Each User32-backed
+// invocation therefore carries its own type definition via this prelude
+// (Add-Type re-definition is tolerated through -ErrorAction SilentlyContinue).
+const USER32_PRELUDE = `Add-Type -TypeDefinition @'\n${USER32}\n'@ -ErrorAction SilentlyContinue;`;
+
 export function create() {
-  const bootstrapped = (async () => {
-    await ps(`Add-Type -TypeDefinition @'\n${USER32}\n'@ -ErrorAction SilentlyContinue; [User32] | Out-Null`, { timeoutMs: 30_000 });
-  })();
   let lastRaster = null;
   let recording = null; // {id, pid, file, startedAt, mode}
 
+  /** Self-contained User32 invocation: prelude + script, fails truthfully. */
   async function withUser32(script, opts) {
-    await bootstrapped;
-    return ps(script, opts);
+    return psOk(`${USER32_PRELUDE}\n${script}`, opts);
   }
 
   return {
     platform: "win32",
     probe: async () => {
-      await bootstrapped.catch(() => {});
       let ffmpeg = true;
       try { await runOk("ffmpeg", ["-version"], { timeoutMs: 10_000 }); } catch { ffmpeg = false; }
       const psOk = await ps("Write-Output 'ok'").then((r) => r.code === 0).catch(() => false);
@@ -92,7 +102,6 @@ export function create() {
       };
     },
     list_displays: async () => {
-      await bootstrapped;
       const d = await psJson(`Add-Type -AssemblyName System.Windows.Forms;
 $out = [System.Windows.Forms.Screen]::AllScreens | ForEach-Object { [pscustomobject]@{ name = $_.DeviceName; primary = $_.Primary; x = $_.Bounds.X; y = $_.Bounds.Y; w = $_.Bounds.Width; h = $_.Bounds.Height; } } | ConvertTo-Json -Compress;
 Write-Output ('{"displays": ' + ($out -replace '^\\[','[' -replace '\\]$/',']') + '}');`, { timeoutMs: 15_000 }).catch(async () => {
@@ -105,7 +114,6 @@ Write-Output ('{"displays": ' + (ConvertTo-Json $arr -Compress) + '}');`, { time
     },
     async switch_display({ index }) { return { activeDisplay: index ?? 1, note: "windows screenshots grab the virtual screen; per-display crop applies where supported" }; },
     list_apps: async () => {
-      await bootstrapped;
       const j = await psJson(`Add-Type -AssemblyName System.Windows.Forms;
 $out = Get-Process | Where-Object { $_.MainWindowTitle } | ForEach-Object { [pscustomobject]@{ name = $_.ProcessName; pid2 = $_.Id; title = $_.MainWindowTitle } } | ConvertTo-Json -Compress;
 if (-not $out) { $out = '[]' }
@@ -113,7 +121,7 @@ Write-Output ('{"apps": ' + $out + '}');`);
       return { apps: (Array.isArray(j.apps) ? j.apps : [j.apps]).map((a) => ({ name: a.name, pid: a.pid2, title: a.title })) };
     },
     list_windows: async () => {
-      await withUser32(`Add-Type -AssemblyName System.Windows.Forms;
+      const j = await psJson(`Add-Type -AssemblyName System.Windows.Forms;
 Add-Type -TypeDefinition @'
 using System;
 using System.Text;
@@ -147,12 +155,13 @@ public static class WinEnum {
 '@;
 $json = (WinEnum::List() | ForEach-Object { $p = $_.Split('|', 2); $parts = $p[1].Split('|', 2); [pscustomobject]@{ pid2 = [int]$p[0]; geom = $parts[0]; title = $parts[1] } } | ConvertTo-Json -Compress;
 if (-not $json) { $json = '[]' }
-Write-Output ('{"windows": ' + $json + '}');`, { timeoutMs: 25_000 }).then((j) => ({
+Write-Output ('{"windows": ' + $json + '}');`, { timeoutMs: 25_000 });
+      return {
         windows: (Array.isArray(j.windows) ? j.windows : [j.windows]).map((w) => {
           const g = String(w.geom).split(",").map(Number);
           return { pid: w.pid2, title: w.title, position: { x: g[0], y: g[1] }, size: { w: g[2], h: g[3] } };
         }),
-      })).catch((e) => { throw e; });
+      };
     },
     open_application: async ({ name, bundle_id: bid, url: urlArg, activate } = {}) => {
       const target = name ?? bid;
@@ -162,7 +171,6 @@ Write-Output ('{"windows": ' + $json + '}');`, { timeoutMs: 25_000 }).then((j) =
       return { launched: true, name: target, url: urlArg ?? null, activate };
     },
     get_app_state: async ({ app_ref, detail } = {}) => {
-      await bootstrapped;
       const filter = app_ref?.name ? app_ref.name.replace(/'/g, "''") : "";
       const maxEls = detail === "full" ? 800 : 400;
       const j = await psJson(`Add-Type -AssemblyName UIAutomationClient;
@@ -197,7 +205,6 @@ Write-Output ($result | ConvertTo-Json -Depth 6 -Compress);`, { timeoutMs: 60_00
       return j;
     },
     screenshot: async ({ display, region, path: outPath } = {}) => {
-      await bootstrapped;
       const dir = recordingsDir();
       fs.mkdirSync(dir, { recursive: true });
       const file = outPath || path.join(dir, `shot-${new Date().toISOString().replace(/[:.]/g, "-")}-${crypto.randomBytes(3).toString("hex")}.png`);
@@ -256,7 +263,10 @@ Write-Output '{"ok": true}';`, { timeoutMs: 20_000 });
       return { action_sent: true, from, to };
     },
     left_mouse_down: async ({ target }) => {
-      await withUser32(target ? `[User32]::SetCursorPos(${Math.round(target.x)}, ${Math.round(target.y)}) | Out-Null;` : "" + `[User32]::mouse_event([User32]::LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero); Write-Output '{"ok": true}'`);
+      // Ternary must select ONLY the optional move prefix; the LEFTDOWN press
+      // always runs, so a targeted press both moves and presses.
+      const move = target ? `[User32]::SetCursorPos(${Math.round(target.x)}, ${Math.round(target.y)}) | Out-Null;\n` : "";
+      await withUser32(`${move}[User32]::mouse_event([User32]::LEFTDOWN, 0, 0, 0, [UIntPtr]::Zero); Write-Output '{"ok": true}'`);
       return { action_sent: true };
     },
     left_mouse_up: async () => {
@@ -276,7 +286,6 @@ Write-Output '{"ok": true}';`);
     },
     type: async ({ text }) => {
       if (!text) return { action_sent: false, note: "empty text" };
-      await bootstrapped;
       const b64 = Buffer.from(String(text), "utf16le").toString("base64");
       const script = `Add-Type -TypeDefinition @'
 using System;
@@ -337,7 +346,6 @@ Write-Output '{"ok": true}';`, { timeoutMs: Math.max(10_000, d * 1000 + 8000) })
     },
     set_value: async ({ target, value }) => {
       // UIA ValuePattern via a re-walk to target.path from the desktop root.
-      await bootstrapped;
       const b64path = Buffer.from(JSON.stringify(target.path ?? []), "utf8").toString("base64");
       const b64val = Buffer.from(String(value ?? ""), "utf16le").toString("base64");
       const j = await psJson(`Add-Type -AssemblyName UIAutomationClient; Add-Type -AssemblyName UIAutomationTypes;
@@ -365,7 +373,6 @@ try {
     },
     select_text: async () => { throw new ExecError("select_text is not implemented on the win32 backend yet — fail-closed"); },
     perform_action: async ({ target, action }) => {
-      await bootstrapped;
       const b64path = Buffer.from(JSON.stringify(target.path ?? []), "utf8").toString("base64");
       const act = String(action ?? "Invoke").replace(/'/g, "");
       const j = await psJson(`Add-Type -AssemblyName UIAutomationClient; Add-Type -AssemblyName UIAutomationTypes;
@@ -402,13 +409,13 @@ Write-Output ('{"text": ' + ($t | ConvertTo-Json -Compress) + '}');`, { timeoutM
     },
     write_clipboard: async ({ text }) => {
       const b64 = Buffer.from(String(text ?? ""), "utf16le").toString("base64");
-      await ps(`Set-Clipboard -Value ([System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${b64}')));
+      await psOk(`Set-Clipboard -Value ([System.Text.Encoding]::Unicode.GetString([Convert]::FromBase64String('${b64}')));
 Write-Output '{"ok": true}';`, { timeoutMs: 10_000 });
       return { written: String(text ?? "").length };
     },
     cursor_position: async () => {
-      await bootstrapped;
-      const j = await psJson(`$p = New-Object User32+POINT;
+      const j = await psJson(`${USER32_PRELUDE}
+$p = New-Object User32+POINT;
 [void][User32]::GetCursorPos([ref]$p);
 Write-Output ('{"x": ' + $p.X + ', "y": ' + $p.Y + '}');`);
       return { x: j.x, y: j.y };
