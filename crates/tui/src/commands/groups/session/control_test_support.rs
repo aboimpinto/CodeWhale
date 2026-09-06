@@ -7,7 +7,7 @@
 use codewhale_command_contract::facets::{
     CommandSessionControlContext, HostedWorkTarget, PlanProjection, RelayProjection, RemoteLink,
     RemoteOpenOutcome, RemoteStartInfo, ResumeImportReceipt, ResumeSource, SessionTitleReceipt,
-    TitleReport, TitleSetOutcome, TodoProjection,
+    TitleReport, TodoProjection,
 };
 use std::cell::RefCell;
 use std::path::PathBuf;
@@ -18,9 +18,11 @@ pub(crate) struct FakeControl {
     pub(crate) relay: Option<RelayProjection>,
     pub(crate) resume: Option<Result<ResumeSource, String>>,
     pub(crate) import: Option<Result<ResumeImportReceipt, String>>,
+    pub(crate) sanitized_title: Option<String>,
     pub(crate) rename: Option<Result<SessionTitleReceipt, String>>,
     pub(crate) title_report: Option<TitleReport>,
-    pub(crate) set_title: Option<Result<TitleSetOutcome, String>>,
+    pub(crate) set_title: Option<Result<(), String>>,
+    pub(crate) clear_title: Option<Result<(), String>>,
     pub(crate) remote_status: Option<String>,
     pub(crate) remote_link: Option<Option<RemoteLink>>,
     pub(crate) browser_open: Option<RemoteOpenOutcome>,
@@ -28,6 +30,14 @@ pub(crate) struct FakeControl {
     pub(crate) stop_refusal: Option<Option<String>>,
     pub(crate) hosted: Option<Option<HostedWorkTarget>>,
     pub(crate) calls: RefCell<Vec<String>>,
+}
+
+pub(crate) fn message(result: &super::CommandResult) -> &str {
+    result
+        .message
+        .as_deref()
+        .map(|message| message.strip_prefix("Error: ").unwrap_or(message))
+        .unwrap_or("")
 }
 
 impl FakeControl {
@@ -72,11 +82,17 @@ impl CommandSessionControlContext for FakeControl {
             )),
         }
     }
-    fn rename_session(&mut self, raw: &str) -> Result<SessionTitleReceipt, String> {
-        self.call("rename_session", Some(raw));
+    fn sanitize_session_title(&self, raw: &str) -> String {
+        self.call("sanitize_session_title", Some(raw));
+        self.sanitized_title
+            .clone()
+            .unwrap_or_else(|| raw.to_string())
+    }
+    fn rename_session(&mut self, title: &str) -> Result<SessionTitleReceipt, String> {
+        self.call("rename_session", Some(title));
         match self.rename.clone() {
             Some(result) => result,
-            None => Err(format!("unexpected rename_session({raw}) on empty fake")),
+            None => Err(format!("unexpected rename_session({title}) on empty fake")),
         }
     }
     fn title_report(&self) -> TitleReport {
@@ -85,14 +101,18 @@ impl CommandSessionControlContext for FakeControl {
             .clone()
             .expect("unexpected title_report()")
     }
-    fn set_window_title(&mut self, title: Option<String>) -> Result<TitleSetOutcome, String> {
-        match &title {
-            Some(value) => self.call("set_window_title", Some(value)),
-            None => self.call("set_window_title", Some("clear")),
-        }
+    fn set_window_title(&mut self, title: String) -> Result<(), String> {
+        self.call("set_window_title", Some(&title));
         match self.set_title.clone() {
             Some(result) => result,
             None => Err("unexpected set_window_title on empty fake".to_string()),
+        }
+    }
+    fn clear_window_title(&mut self) -> Result<(), String> {
+        self.call("clear_window_title", None);
+        match self.clear_title.clone() {
+            Some(result) => result,
+            None => Err("unexpected clear_window_title on empty fake".to_string()),
         }
     }
     fn remote_status(&self) -> String {

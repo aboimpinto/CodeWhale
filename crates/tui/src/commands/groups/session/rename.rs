@@ -1,9 +1,9 @@
 //! `/rename` command — portable handler over the session-control facet.
 //!
-//! The handler owns argument trimming and the usage boundary; sanitization,
-//! the 100-character limit (applied to the sanitized title as in the
-//! baseline), first-snapshot recovery, persistence, and publication stay in
-//! the atomic `rename_session` delegate so ordering cannot drift.
+//! The handler owns sanitization, blank and 100-character validation, and
+//! exact message composition. The atomic `rename_session` delegate owns only
+//! first-snapshot recovery, persistence, and publication so the policy moves
+//! with the handler while host mutation ordering cannot drift.
 
 use super::CommandResult;
 use codewhale_command_contract::facets::CommandSessionControlContext;
@@ -48,10 +48,21 @@ pub(in crate::commands) fn rename_portable(
     control: &mut dyn CommandSessionControlContext,
     arg: Option<&str>,
 ) -> CommandResult {
-    let Some(raw) = arg.map(str::trim).filter(|s| !s.is_empty()) else {
+    let Some(raw) = arg else {
         return CommandResult::error("Usage: /rename <new title>");
     };
-    match control.rename_session(raw) {
+    let sanitized = control.sanitize_session_title(raw);
+    let title = sanitized.trim();
+    if title.is_empty() {
+        return CommandResult::error("Usage: /rename <new title>");
+    }
+    if title.chars().count() > super::MAX_TITLE_LEN {
+        return CommandResult::error(format!(
+            "Title too long (max {} characters)",
+            super::MAX_TITLE_LEN
+        ));
+    }
+    match control.rename_session(title) {
         Ok(receipt) => CommandResult::message(format!("Session renamed to \"{}\"", receipt.title)),
         Err(error) => CommandResult::error(error),
     }
@@ -59,16 +70,7 @@ pub(in crate::commands) fn rename_portable(
 
 #[cfg(test)]
 mod tests {
-    /// Message with the canonical "Error: " prefix removed so exact strings
-    /// compare against the baseline text.
-    fn message(result: &super::CommandResult) -> &str {
-        result
-            .message
-            .as_deref()
-            .map(|m| m.strip_prefix("Error: ").unwrap_or(m))
-            .unwrap_or("")
-    }
-
+    use super::super::control_test_support::message;
     use super::*;
     use codewhale_command_contract::facets::SessionTitleReceipt;
 
@@ -91,6 +93,22 @@ mod tests {
         let result = rename_portable(&mut blank, Some("   "));
         assert!(result.is_error);
         assert_eq!(message(&result), "Usage: /rename <new title>");
+        assert_eq!(
+            blank.calls.borrow().as_slice(),
+            ["sanitize_session_title(   )"],
+            "sanitized blank input never reaches host mutation"
+        );
+
+        let mut oversized = control_fake();
+        oversized.sanitized_title = Some("x".repeat(super::super::MAX_TITLE_LEN + 1));
+        let result = rename_portable(&mut oversized, Some("raw"));
+        assert!(result.is_error);
+        assert_eq!(message(&result), "Title too long (max 100 characters)");
+        assert_eq!(
+            oversized.calls.borrow().as_slice(),
+            ["sanitize_session_title(raw)"],
+            "length policy runs before host mutation"
+        );
 
         let mut ok = control_fake();
         ok.rename = Some(Ok(SessionTitleReceipt {
@@ -99,7 +117,13 @@ mod tests {
         let result = rename_portable(&mut ok, Some("New Name"));
         assert!(!result.is_error);
         assert_eq!(message(&result), "Session renamed to \"New Name\"");
-        assert_eq!(ok.calls.borrow().as_slice(), ["rename_session(New Name)"]);
+        assert_eq!(
+            ok.calls.borrow().as_slice(),
+            [
+                "sanitize_session_title(New Name)",
+                "rename_session(New Name)"
+            ]
+        );
         assert!(result.action.is_none(), "/rename emits no action");
     }
 

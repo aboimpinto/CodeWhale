@@ -2156,9 +2156,11 @@ struct FakeControl {
     relay: Option<RelayProjection>,
     resume: Option<Result<ResumeSource, String>>,
     import: Option<Result<ResumeImportReceipt, String>>,
+    sanitized_title: Option<String>,
     rename: Option<Result<SessionTitleReceipt, String>>,
     title_report: Option<TitleReport>,
-    set_title: Option<Result<TitleSetOutcome, String>>,
+    set_title: Option<Result<(), String>>,
+    clear_title: Option<Result<(), String>>,
     remote_status: Option<String>,
     remote_link: Option<Option<RemoteLink>>,
     browser_open: Option<RemoteOpenOutcome>,
@@ -2191,22 +2193,32 @@ impl CommandSessionControlContext for FakeControl {
             ))
         })
     }
-    fn rename_session(&mut self, raw: &str) -> Result<SessionTitleReceipt, String> {
+    fn sanitize_session_title(&self, raw: &str) -> String {
+        self.sanitized_title
+            .clone()
+            .unwrap_or_else(|| raw.to_string())
+    }
+    fn rename_session(&mut self, title: &str) -> Result<SessionTitleReceipt, String> {
         self.rename
             .clone()
-            .unwrap_or_else(|| Err(format!("unexpected rename_session({raw}) on empty fake")))
+            .unwrap_or_else(|| Err(format!("unexpected rename_session({title}) on empty fake")))
     }
     fn title_report(&self) -> TitleReport {
         self.title_report
             .clone()
             .expect("unexpected title_report() on empty fake")
     }
-    fn set_window_title(&mut self, title: Option<String>) -> Result<TitleSetOutcome, String> {
+    fn set_window_title(&mut self, title: String) -> Result<(), String> {
         self.set_title.clone().unwrap_or_else(|| {
             Err(format!(
-                "unexpected set_window_title({title:?}) on empty fake"
+                "unexpected set_window_title({title}) on empty fake"
             ))
         })
+    }
+    fn clear_window_title(&mut self) -> Result<(), String> {
+        self.clear_title
+            .clone()
+            .unwrap_or_else(|| Err("unexpected clear_window_title() on empty fake".to_string()))
     }
     fn remote_status(&self) -> String {
         self.remote_status
@@ -2279,6 +2291,7 @@ fn control_facet_is_object_safe_and_transports_every_outcome() {
             entry_count: 12,
             leaf_display: "leaf-3".to_string(),
         })),
+        sanitized_title: Some("Renamed".to_string()),
         rename: Some(Ok(SessionTitleReceipt {
             title: "Renamed".to_string(),
         })),
@@ -2286,7 +2299,8 @@ fn control_facet_is_object_safe_and_transports_every_outcome() {
             effective: "task-7".to_string(),
             source: TitleSource::Session,
         }),
-        set_title: Some(Ok(TitleSetOutcome::Set("task-7".to_string()))),
+        set_title: Some(Ok(())),
+        clear_title: Some(Ok(())),
         remote_status: Some("live".to_string()),
         remote_link: Some(Some(RemoteLink {
             url: "https://remote.example/s".to_string(),
@@ -2337,16 +2351,14 @@ fn control_facet_is_object_safe_and_transports_every_outcome() {
     assert_eq!(imported.truncated_id, "imp-9");
     assert_eq!(imported.entry_count, 12);
     assert_eq!(imported.leaf_display, "leaf-3");
+    assert_eq!(fake.sanitize_session_title("raw"), "Renamed");
     let renamed = fake.rename_session("Renamed").expect("rename ok");
     assert_eq!(renamed.title, "Renamed");
     let report = fake.title_report();
     assert_eq!(report.effective, "task-7");
     assert!(matches!(report.source, TitleSource::Session));
-    assert!(matches!(
-        fake.set_window_title(Some("task-7".to_string()))
-            .expect("set ok"),
-        TitleSetOutcome::Set(_)
-    ));
+    fake.set_window_title("task-7".to_string()).expect("set ok");
+    fake.clear_window_title().expect("clear ok");
     assert_eq!(fake.remote_status(), "live");
     let link = fake.remote_link().expect("link present");
     assert_eq!(link.url, "https://remote.example/s");
@@ -2370,9 +2382,8 @@ fn control_error_and_empty_states_transport_exactly() {
             "File x.json is not a recognized session export".to_string()
         )),
         rename: Some(Err("Could not save session: boom".to_string())),
-        set_title: Some(Err(
-            "Title cannot be empty; use /title off to clear a session title".to_string(),
-        )),
+        set_title: Some(Err("Could not save session: boom".to_string())),
+        clear_title: Some(Err("Could not save session: boom".to_string())),
         remote_link: Some(None),
         browser_open: Some(RemoteOpenOutcome::NoLink),
         stop_refusal: Some(Some(
@@ -2396,8 +2407,12 @@ fn control_error_and_empty_states_transport_exactly() {
         "Could not save session: boom"
     );
     assert_eq!(
-        fake.set_window_title(None).unwrap_err(),
-        "Title cannot be empty; use /title off to clear a session title"
+        fake.set_window_title("task".to_string()).unwrap_err(),
+        "Could not save session: boom"
+    );
+    assert_eq!(
+        fake.clear_window_title().unwrap_err(),
+        "Could not save session: boom"
     );
     assert_eq!(fake.remote_link(), None);
     assert!(matches!(
@@ -2410,7 +2425,7 @@ fn control_error_and_empty_states_transport_exactly() {
     );
     assert_eq!(fake.resolve_hosted_work_target(), None);
 
-    // Empty-state variants: absent to-do/plan and cleared title transport.
+    // Empty-state variants: absent to-do/plan and no effective title transport.
     fake.relay = Some(RelayProjection {
         todos: TodoProjection::Absent,
         plan: PlanProjection::Absent,
@@ -2424,11 +2439,8 @@ fn control_error_and_empty_states_transport_exactly() {
         source: TitleSource::None,
     });
     assert!(matches!(fake.title_report().source, TitleSource::None));
-    fake.set_title = Some(Ok(TitleSetOutcome::Cleared));
-    assert!(matches!(
-        fake.set_window_title(None).expect("cleared"),
-        TitleSetOutcome::Cleared
-    ));
+    fake.clear_title = Some(Ok(()));
+    fake.clear_window_title().expect("cleared");
 }
 
 #[test]

@@ -1261,14 +1261,6 @@ pub enum TitleSource {
     None,
 }
 
-/// `/title` set/clear outcome. `Set` carries the sanitized persisted title;
-/// `Cleared` is the `off|clear|none` result.
-#[derive(Clone, Debug, PartialEq)]
-pub enum TitleSetOutcome {
-    Set(String),
-    Cleared,
-}
-
 /// `/rc link` structured link data.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RemoteLink {
@@ -1334,19 +1326,25 @@ pub trait CommandSessionControlContext {
     /// read/parse/import text.
     fn import_session_file(&mut self, path: PathBuf) -> Result<ResumeImportReceipt, String>;
 
-    /// `/rename <title>`: sanitize, validate the sanitized 100-character
-    /// limit, recover first-snapshot state, sync live state, persist, and
-    /// publish with baseline order. The handler already applied blank/usage
-    /// validation.
-    fn rename_session(&mut self, raw_title: &str) -> Result<SessionTitleReceipt, String>;
+    /// Apply the authoritative session-title character policy before the
+    /// portable `/rename` and `/title` handlers validate and compose output.
+    fn sanitize_session_title(&self, raw_title: &str) -> String;
+
+    /// `/rename <title>`: recover first-snapshot state, sync live state,
+    /// persist, and publish with baseline order. The handler already applied
+    /// sanitization plus blank and 100-character validation.
+    fn rename_session(&mut self, title: &str) -> Result<SessionTitleReceipt, String>;
 
     /// Bare `/title`: effective prefix and its source.
     fn title_report(&self) -> TitleReport;
 
-    /// `/title [title|off]`: set or clear the session window title with
-    /// baseline persistence/redraw semantics. The handler already applied the
-    /// 100-character validation.
-    fn set_window_title(&mut self, title: Option<String>) -> Result<TitleSetOutcome, String>;
+    /// `/title <title>`: persist an already sanitized and validated window
+    /// title with baseline save/publication/redraw semantics.
+    fn set_window_title(&mut self, title: String) -> Result<(), String>;
+
+    /// `/title off|clear|none`: clear the session window title with the same
+    /// baseline persistence/redraw semantics.
+    fn clear_window_title(&mut self) -> Result<(), String>;
 
     /// `/rc status`: current remote-control status line.
     fn remote_status(&self) -> String;

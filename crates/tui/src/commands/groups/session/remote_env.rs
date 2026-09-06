@@ -118,16 +118,7 @@ fn open_hosted_work(
 
 #[cfg(test)]
 mod tests {
-    /// Message with the canonical "Error: " prefix removed so exact strings
-    /// compare against the baseline text.
-    fn message(result: &super::CommandResult) -> &str {
-        result
-            .message
-            .as_deref()
-            .map(|m| m.strip_prefix("Error: ").unwrap_or(m))
-            .unwrap_or("")
-    }
-
+    use super::super::control_test_support::message;
     use super::*;
     use codewhale_command_contract::facets::HostedWorkTarget;
     use std::cell::RefCell;

@@ -11,7 +11,7 @@ mod new;
 mod purge;
 mod relay;
 mod remote_control;
-pub(crate) mod remote_env;
+mod remote_env;
 mod rename;
 mod resume;
 mod save;
@@ -26,6 +26,9 @@ mod tree;
 mod session;
 
 use crate::commands::CommandResult;
+
+/// Shared user-facing length policy for `/rename` and `/title`.
+pub(in crate::commands) const MAX_TITLE_LEN: usize = 100;
 use crate::commands::traits::{
     Command, CommandGroup, ContextualCommand, FunctionCommand, RegisterCommand,
 };

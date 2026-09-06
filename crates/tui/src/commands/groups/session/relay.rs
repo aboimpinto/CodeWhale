@@ -194,16 +194,7 @@ fn write_plan_list(out: &mut String, label: &str, values: &[String]) {
 
 #[cfg(test)]
 mod tests {
-    /// Message with the canonical "Error: " prefix removed so exact strings
-    /// compare against the baseline text.
-    fn message(result: &super::CommandResult) -> &str {
-        result
-            .message
-            .as_deref()
-            .map(|m| m.strip_prefix("Error: ").unwrap_or(m))
-            .unwrap_or("")
-    }
-
+    use super::super::control_test_support::message;
     use super::*;
     use codewhale_command_contract::facets::{
         PlanSections, PlanStep, RelayProjection, TodoProjection,

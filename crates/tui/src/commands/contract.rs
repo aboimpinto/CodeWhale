@@ -52,7 +52,7 @@ use codewhale_command_contract::facets::{
     SkillActivationError, SkillActivationOutcome, SkillBundledTier, SkillEntry,
     SkillMutationOutcome, SkillMutationReceipt, SkillRecommendation, SkillRegistryProjection,
     SkillSourceKind, SkillSyncEntry, SkillSyncOutcome, SkillTargetScope, SnapshotEntry,
-    TitleReport, TitleSetOutcome, TitleSource, TodoProjection, TreeBodyProjection,
+    TitleReport, TitleSource, TodoProjection, TreeBodyProjection,
 };
 #[cfg(test)]
 use codewhale_command_contract::handler::ContextParts;
@@ -1120,16 +1120,12 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
         import_foreign_file(&mut app, &path)
     }
 
-    fn rename_session(&mut self, raw_title: &str) -> Result<SessionTitleReceipt, String> {
+    fn sanitize_session_title(&self, raw_title: &str) -> String {
+        crate::session_manager::sanitize_session_title(raw_title)
+    }
+
+    fn rename_session(&mut self, new_title: &str) -> Result<SessionTitleReceipt, String> {
         let mut app = self.host.app.borrow_mut();
-        let sanitized = crate::session_manager::sanitize_session_title(raw_title);
-        let new_title = sanitized.trim();
-        if new_title.is_empty() {
-            return Err("Usage: /rename <new title>".to_string());
-        }
-        if new_title.chars().count() > MAX_TITLE_LEN {
-            return Err(format!("Title too long (max {MAX_TITLE_LEN} characters)"));
-        }
         let session_id = match &app.current_session_id {
             Some(id) => id.clone(),
             None => {
@@ -1216,88 +1212,14 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
         }
     }
 
-    fn set_window_title(&mut self, title: Option<String>) -> Result<TitleSetOutcome, String> {
+    fn set_window_title(&mut self, title: String) -> Result<(), String> {
         let mut app = self.host.app.borrow_mut();
-        let sanitized = match title {
-            Some(raw) => {
-                let cleaned = crate::session_manager::sanitize_session_title(&raw);
-                let cleaned = cleaned.trim().to_string();
-                if cleaned.is_empty() {
-                    return Err(
-                        "Title cannot be empty; use /title off to clear a session title"
-                            .to_string(),
-                    );
-                }
-                Some(cleaned)
-            }
-            None => None,
-        };
-        let session_id = match &app.current_session_id {
-            Some(id) => id.clone(),
-            None => {
-                return Err(
-                    "No active session. Send a message first to start a session.".to_string(),
-                );
-            }
-        };
-        let manager = match crate::session_manager::SessionManager::default_location() {
-            Ok(m) => m,
-            Err(e) => return Err(format!("Could not open sessions directory: {e}")),
-        };
-        let mut session = match manager.load_session(&session_id) {
-            Ok(s) => s,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                match live_session_before_first_snapshot(&manager, &session_id, &app) {
-                    Some(s) => s,
-                    None => return Err(format!("Could not load session: {err}")),
-                }
-            }
-            Err(e) => return Err(format!("Could not load session: {e}")),
-        };
-        session = crate::session_manager::update_session(
-            session,
-            &app.api_messages,
-            u64::from(app.session.total_tokens),
-            app.system_prompt.as_ref(),
-        );
-        session.work_state = match app.work_state_snapshot() {
-            Ok(state) => state,
-            Err(err) => {
-                return Err(format!(
-                    "Could not snapshot Work state before setting title: {err}"
-                ));
-            }
-        };
-        session.context_references = app.session_context_references.clone();
-        session.artifacts = app.session_artifacts.clone();
-        session.last_auto_route = app.auto_route_for_persistence();
-        session.metadata.model = app.model_selection_for_persistence();
-        session
-            .metadata
-            .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
-        session.metadata.workspace.clone_from(&app.workspace);
-        session.metadata.mode = Some(app.mode.as_setting().to_string());
-        app.sync_cost_to_metadata(&mut session.metadata);
-        session.window_title = sanitized.clone();
+        persist_window_title(&mut app, Some(title))
+    }
 
-        match manager.save_session(&session) {
-            Ok(_) => {
-                app.window_title = sanitized.clone();
-                // The render loop syncs the resolved prefix into the terminal
-                // title; force a frame so the change lands immediately.
-                app.needs_redraw = true;
-                if let Err(err) = app.publish_pending_work_state() {
-                    return Err(format!(
-                        "Window title saved, but Work views were not published: {err}"
-                    ));
-                }
-                Ok(match sanitized {
-                    Some(title) => TitleSetOutcome::Set(title),
-                    None => TitleSetOutcome::Cleared,
-                })
-            }
-            Err(e) => Err(format!("Could not save session: {e}")),
-        }
+    fn clear_window_title(&mut self) -> Result<(), String> {
+        let mut app = self.host.app.borrow_mut();
+        persist_window_title(&mut app, None)
     }
 
     fn remote_status(&self) -> String {
@@ -1347,6 +1269,73 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
     }
 }
 
+/// Persist an already sanitized window title through the baseline host path.
+/// Manager resolution intentionally precedes active-session lookup, matching
+/// the original `/title` error precedence for both set and clear operations.
+fn persist_window_title(app: &mut App, title: Option<String>) -> Result<(), String> {
+    let manager = match crate::session_manager::SessionManager::default_location() {
+        Ok(manager) => manager,
+        Err(error) => return Err(format!("Could not open sessions directory: {error}")),
+    };
+    let session_id = match &app.current_session_id {
+        Some(id) => id.clone(),
+        None => {
+            return Err("No active session. Send a message first to start a session.".to_string());
+        }
+    };
+    let mut session = match manager.load_session(&session_id) {
+        Ok(session) => session,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match live_session_before_first_snapshot(&manager, &session_id, app) {
+                Some(session) => session,
+                None => return Err(format!("Could not load session: {error}")),
+            }
+        }
+        Err(error) => return Err(format!("Could not load session: {error}")),
+    };
+    session = crate::session_manager::update_session(
+        session,
+        &app.api_messages,
+        u64::from(app.session.total_tokens),
+        app.system_prompt.as_ref(),
+    );
+    session.work_state = match app.work_state_snapshot() {
+        Ok(state) => state,
+        Err(error) => {
+            return Err(format!(
+                "Could not snapshot Work state before setting title: {error}"
+            ));
+        }
+    };
+    session.context_references = app.session_context_references.clone();
+    session.artifacts = app.session_artifacts.clone();
+    session.last_auto_route = app.auto_route_for_persistence();
+    session.metadata.model = app.model_selection_for_persistence();
+    session
+        .metadata
+        .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
+    session.metadata.workspace.clone_from(&app.workspace);
+    session.metadata.mode = Some(app.mode.as_setting().to_string());
+    app.sync_cost_to_metadata(&mut session.metadata);
+    session.window_title.clone_from(&title);
+
+    match manager.save_session(&session) {
+        Ok(_) => {
+            app.window_title = title;
+            // The render loop syncs the resolved prefix into the terminal
+            // title; force a frame so the change lands immediately.
+            app.needs_redraw = true;
+            if let Err(error) = app.publish_pending_work_state() {
+                return Err(format!(
+                    "Window title saved, but Work views were not published: {error}"
+                ));
+            }
+            Ok(())
+        }
+        Err(error) => Err(format!("Could not save session: {error}")),
+    }
+}
+
 /// Map one synchronous browser-launch attempt to its portable outcome.
 /// Split out so the delegate's success/failure branches are unit-provable
 /// without spawning a real browser (utils tests cover the launcher itself).
@@ -1357,9 +1346,6 @@ fn map_browser_open_result(url: String, launched: bool) -> RemoteOpenOutcome {
         RemoteOpenOutcome::LaunchFailed { url }
     }
 }
-
-/// Session-name/window-title length policy shared by `/rename` and `/title`.
-const MAX_TITLE_LEN: usize = 100;
 
 fn plan_snapshot_to_sections(snapshot: &crate::tools::plan::PlanSnapshot) -> PlanSections {
     PlanSections {
@@ -6148,23 +6134,16 @@ mod tests {
         let reloaded = manager.load_session("rename-1").unwrap();
         assert_eq!(reloaded.metadata.title, "Brand New Title");
 
-        // Sanitized-empty input keeps the usage error; window title untouched.
-        let empty_err = {
+        // The facet exposes the authoritative sanitizer while the portable
+        // handler owns empty and length policy.
+        let sanitized = {
             let mut bundle = app.command_contexts();
             let mut parts = bundle.parts();
             let facet = parts.control.as_deref_mut().expect("control slot");
-            facet.rename_session("\u{1b}\u{7}\u{200b}").unwrap_err()
+            facet.sanitize_session_title("\u{1b}\u{7}\u{200b}")
         };
-        assert!(empty_err.contains("Usage: /rename"));
+        assert!(sanitized.is_empty());
         assert_eq!(app.window_title, None);
-
-        let too_long = {
-            let mut bundle = app.command_contexts();
-            let mut parts = bundle.parts();
-            let facet = parts.control.as_deref_mut().expect("control slot");
-            facet.rename_session(&"a".repeat(101)).unwrap_err()
-        };
-        assert!(too_long.contains("Title too long (max 100 characters)"));
     }
 
     #[test]
@@ -6237,15 +6216,14 @@ mod tests {
         assert!(matches!(report.source, TitleSource::None));
 
         // Set a window title: session name untouched, redraw requested.
-        let outcome = {
+        {
             let mut bundle = app.command_contexts();
             let mut parts = bundle.parts();
             let facet = parts.control.as_deref_mut().expect("control slot");
             facet
-                .set_window_title(Some("parallel-task".to_string()))
-                .expect("set ok")
-        };
-        assert!(matches!(outcome, TitleSetOutcome::Set(_)));
+                .set_window_title("parallel-task".to_string())
+                .expect("set ok");
+        }
         assert_eq!(app.window_title.as_deref(), Some("parallel-task"));
         assert!(app.needs_redraw);
         assert_eq!(
@@ -6257,25 +6235,23 @@ mod tests {
         assert_eq!(reloaded.window_title.as_deref(), Some("parallel-task"));
         assert_eq!(reloaded.metadata.title, "Control Session");
 
-        // Control-char-only input keeps the empty-title error.
-        let err = {
+        // Control-char-only input is normalized to empty before the portable
+        // handler applies its exact user-facing validation message.
+        let sanitized = {
             let mut bundle = app.command_contexts();
             let mut parts = bundle.parts();
             let facet = parts.control.as_deref_mut().expect("control slot");
-            facet
-                .set_window_title(Some("\u{1b}\u{7}\u{200b}".to_string()))
-                .unwrap_err()
+            facet.sanitize_session_title("\u{1b}\u{7}\u{200b}")
         };
-        assert!(err.contains("Title cannot be empty; use /title off to clear a session title"));
+        assert!(sanitized.is_empty());
 
         // Clear removes the session-level title.
-        let cleared = {
+        {
             let mut bundle = app.command_contexts();
             let mut parts = bundle.parts();
             let facet = parts.control.as_deref_mut().expect("control slot");
-            facet.set_window_title(None).expect("clear ok")
-        };
-        assert!(matches!(cleared, TitleSetOutcome::Cleared));
+            facet.clear_window_title().expect("clear ok");
+        }
         assert_eq!(app.window_title, None);
     }
 

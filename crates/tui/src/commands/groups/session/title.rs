@@ -2,20 +2,16 @@
 //!
 //! Distinct from `/rename`: it sets the session *window/tab* title. The
 //! handler owns the bare-report branch, the `off|clear|none` synonyms, and
-//! the 100-character limit on the raw argument; the atomic
-//! `set_window_title` delegate owns sanitization, persistence, publication,
+//! the 100-character limit on the raw argument, sanitization, and exact
+//! messages; the atomic set/clear delegates own persistence, publication,
 //! and the redraw flag.
 
 use super::CommandResult;
-use codewhale_command_contract::facets::{
-    CommandSessionControlContext, TitleSetOutcome, TitleSource,
-};
+use codewhale_command_contract::facets::{CommandSessionControlContext, TitleSource};
 use codewhale_command_contract::handler::{CommandContexts, CommandHandler};
 use codewhale_command_contract::metadata::{
     CommandInfo as ContractInfo, RegisterCommand as ContractRegisterCommand,
 };
-
-const MAX_TITLE_LEN: usize = 100;
 
 pub(in crate::commands) struct TitleCmd;
 
@@ -65,46 +61,42 @@ pub(in crate::commands) fn title_portable(
     };
 
     if arg == "off" || arg == "clear" || arg == "none" {
-        return match control.set_window_title(None) {
-            Ok(TitleSetOutcome::Cleared) => CommandResult::message(
+        return match control.clear_window_title() {
+            Ok(()) => CommandResult::message(
                 "Window title cleared (the config default still applies if set)",
             ),
-            Ok(TitleSetOutcome::Set(_)) => {
-                CommandResult::error("internal title-state error".to_string())
-            }
             Err(error) => CommandResult::error(error),
         };
     }
 
-    if arg.chars().count() > MAX_TITLE_LEN {
-        return CommandResult::error(format!("Title too long (max {MAX_TITLE_LEN} characters)"));
+    if arg.chars().count() > super::MAX_TITLE_LEN {
+        return CommandResult::error(format!(
+            "Title too long (max {} characters)",
+            super::MAX_TITLE_LEN
+        ));
     }
 
-    match control.set_window_title(Some(arg.to_string())) {
-        Ok(TitleSetOutcome::Set(title)) => CommandResult::message(format!(
+    let sanitized = control.sanitize_session_title(arg);
+    let title = sanitized.trim();
+    if title.is_empty() {
+        return CommandResult::error(
+            "Title cannot be empty; use /title off to clear a session title",
+        );
+    }
+
+    match control.set_window_title(title.to_string()) {
+        Ok(()) => CommandResult::message(format!(
             "Window title set to \"{title}\" — the terminal tab now reads [\"{title}\"] …"
         )),
-        Ok(TitleSetOutcome::Cleared) => {
-            CommandResult::error("internal title-state error".to_string())
-        }
         Err(error) => CommandResult::error(error),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    /// Message with the canonical "Error: " prefix removed so exact strings
-    /// compare against the baseline text.
-    fn message(result: &super::CommandResult) -> &str {
-        result
-            .message
-            .as_deref()
-            .map(|m| m.strip_prefix("Error: ").unwrap_or(m))
-            .unwrap_or("")
-    }
-
+    use super::super::control_test_support::message;
     use super::*;
-    use codewhale_command_contract::facets::{TitleReport, TitleSetOutcome};
+    use codewhale_command_contract::facets::TitleReport;
 
     fn control_fake() -> super::super::control_test_support::FakeControl {
         super::super::control_test_support::FakeControl::default()
@@ -141,7 +133,7 @@ mod tests {
     #[test]
     fn title_synonyms_clear_and_set_messages_are_exact() {
         let mut fake = control_fake();
-        fake.set_title = Some(Ok(TitleSetOutcome::Cleared));
+        fake.clear_title = Some(Ok(()));
         for synonym in ["off", "clear", "none"] {
             let result = title_portable(&mut fake, Some(synonym));
             assert!(!result.is_error, "{synonym}");
@@ -155,16 +147,20 @@ mod tests {
             fake.calls
                 .borrow()
                 .iter()
-                .all(|call| call == "set_window_title(clear)")
+                .all(|call| call == "clear_window_title")
         );
 
         let mut fake = control_fake();
-        fake.set_title = Some(Ok(TitleSetOutcome::Set("task-7".to_string())));
+        fake.set_title = Some(Ok(()));
         let result = title_portable(&mut fake, Some("task-7"));
         assert!(!result.is_error);
         assert_eq!(
             message(&result),
             "Window title set to \"task-7\" — the terminal tab now reads [\"task-7\"] …"
+        );
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            ["sanitize_session_title(task-7)", "set_window_title(task-7)"]
         );
         assert!(result.action.is_none(), "/title emits no action");
     }
@@ -172,7 +168,10 @@ mod tests {
     #[test]
     fn title_oversized_and_host_errors_are_exact() {
         let mut fake = control_fake();
-        let result = title_portable(&mut fake, Some(&"x".repeat(MAX_TITLE_LEN + 1)));
+        let result = title_portable(
+            &mut fake,
+            Some(&"x".repeat(super::super::MAX_TITLE_LEN + 1)),
+        );
         assert!(result.is_error);
         assert!(
             result
@@ -187,15 +186,30 @@ mod tests {
         );
 
         let mut fake = control_fake();
-        fake.set_title = Some(Err(
-            "Title cannot be empty; use /title off to clear a session title".to_string(),
-        ));
+        fake.sanitized_title = Some(String::new());
         let result = title_portable(&mut fake, Some("\u{1b}\u{7}\u{200b}"));
         assert!(result.is_error);
         assert_eq!(
             message(&result),
             "Title cannot be empty; use /title off to clear a session title"
         );
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            ["sanitize_session_title(\u{1b}\u{7}\u{200b})"],
+            "sanitized-empty validation precedes host mutation"
+        );
+
+        let mut fake = control_fake();
+        fake.set_title = Some(Err("Could not save session: set failed".to_string()));
+        let result = title_portable(&mut fake, Some("task-7"));
+        assert!(result.is_error);
+        assert_eq!(message(&result), "Could not save session: set failed");
+
+        let mut fake = control_fake();
+        fake.clear_title = Some(Err("Could not save session: clear failed".to_string()));
+        let result = title_portable(&mut fake, Some("off"));
+        assert!(result.is_error);
+        assert_eq!(message(&result), "Could not save session: clear failed");
     }
 
     #[test]
