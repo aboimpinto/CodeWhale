@@ -1594,8 +1594,78 @@ mod tests {
     /// `scoped_home` (snapshot repo init shells out to git, which races
     /// against parallel-running tests). Skip it here so this smoke test
     /// stays parallel-safe.
+    ///
+    /// `/pin` is skipped on Windows only. Its handler is not a state toggle:
+    /// it drives the *host terminal window* through Win32 (see
+    /// `tui::window_control`), and the resolved `HWND` belongs to another
+    /// process. `SetWindowPos`/`ShowWindow` against a foreign window are
+    /// delivered to that window's thread and block until it pumps them, so on
+    /// a headless CI window station the call never returns — this is the
+    /// 600 s nextest timeout in #5919 (the CI breadcrumb stalled on `/pin`
+    /// and on its `/mini` alias, the same handler). On macOS and Linux
+    /// `toggle_pin()` is a compiled-out no-op, so dispatch coverage for
+    /// `/pin` is kept there.
     fn skip_in_dispatch_smoke(name: &str) -> bool {
-        name == "restore"
+        name == "restore" || (cfg!(windows) && name == "pin")
+    }
+
+    /// Upper bound on a single command dispatch in the smoke tests.
+    ///
+    /// Generous next to the millisecond each handler actually takes, and far
+    /// below nextest's 600 s test timeout, so a handler that blocks fails the
+    /// test *by name* instead of burning a ten-minute CI slot with no
+    /// attribution (#5919).
+    const DISPATCH_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(30);
+
+    /// Dispatch one command under a per-command watchdog and return the
+    /// handler's message.
+    ///
+    /// The app is built and the command executed on a dedicated thread; the
+    /// test thread waits on the result with a timeout. A handler that never
+    /// returns leaves its thread parked, but the test itself fails
+    /// immediately, naming the invocation. A handler that panics still
+    /// surfaces as that panic — the smoke tests are the repo's only
+    /// panic-in-a-handler net, so the payload is resumed rather than
+    /// swallowed.
+    fn dispatch_under_watchdog(command_name: &str, alias_or_name: &str) -> Option<String> {
+        let label = format!("/{alias_or_name}");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let name = command_name.to_string();
+        let alias = alias_or_name.to_string();
+        let handle = std::thread::Builder::new()
+            .name(format!("dispatch-smoke-{alias_or_name}"))
+            // Command handlers are deeply recursive in debug builds; match the
+            // 16 MiB the CI runner sets via RUST_MIN_STACK for the main thread.
+            .stack_size(16 * 1024 * 1024)
+            .spawn(move || {
+                let (mut app, tmpdir, _guard) = create_isolated_test_app();
+                let invocation = invocation_for(&name, &alias, tmpdir.path());
+                let result = execute(&invocation, &mut app);
+                let _ = tx.send(result.message);
+            })
+            .expect("spawn dispatch smoke thread");
+
+        let started = std::time::Instant::now();
+        match rx.recv_timeout(DISPATCH_WATCHDOG) {
+            Ok(message) => {
+                let _ = handle.join();
+                // Quiet on the common path; a handler heading for the
+                // watchdog still leaves a named breadcrumb in the log.
+                let elapsed = started.elapsed();
+                if elapsed > std::time::Duration::from_secs(1) {
+                    eprintln!("dispatch smoke: {label} took {elapsed:?}");
+                }
+                message
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "{label} did not return within {DISPATCH_WATCHDOG:?}: its handler blocks. \
+                 Fix the handler or add it to skip_in_dispatch_smoke with a reason."
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => match handle.join() {
+                Ok(()) => panic!("{label} dispatch thread ended without producing a result"),
+                Err(payload) => std::panic::resume_unwind(payload),
+            },
+        }
     }
 
     #[test]
@@ -1697,18 +1767,7 @@ mod tests {
             if skip_in_dispatch_smoke(command.name) {
                 continue;
             }
-            let (mut app, tmpdir, _guard) = create_isolated_test_app();
-            let invocation = invocation_for(command.name, command.name, tmpdir.path());
-            // Breadcrumb for a terminated run: the last line names the handler
-            // that never returned.
-            eprintln!("dispatch smoke: {invocation}");
-            let started = std::time::Instant::now();
-            let result = execute(&invocation, &mut app);
-            eprintln!(
-                "dispatch smoke: {invocation} returned in {:?}",
-                started.elapsed()
-            );
-            if let Some(msg) = &result.message {
+            if let Some(msg) = dispatch_under_watchdog(command.name, command.name) {
                 assert!(
                     !msg.contains("Unknown command"),
                     "/{} fell through to the unknown-command branch: {msg}",
@@ -1727,16 +1786,7 @@ mod tests {
                 continue;
             }
             for alias in command.aliases {
-                let (mut app, tmpdir, _guard) = create_isolated_test_app();
-                let invocation = invocation_for(command.name, alias, tmpdir.path());
-                eprintln!("dispatch smoke: {invocation}");
-                let started = std::time::Instant::now();
-                let result = execute(&invocation, &mut app);
-                eprintln!(
-                    "dispatch smoke: {invocation} returned in {:?}",
-                    started.elapsed()
-                );
-                if let Some(msg) = &result.message {
+                if let Some(msg) = dispatch_under_watchdog(command.name, alias) {
                     assert!(
                         !msg.contains("Unknown command"),
                         "/{alias} (alias of /{}) fell through to unknown: {msg}",
