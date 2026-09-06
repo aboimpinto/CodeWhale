@@ -151,3 +151,86 @@ test("remote agent answers the platform probe", async () => {
   assert.equal(reply.ok, true);
   assert.equal(reply.platform, process.platform);
 });
+
+// ---------- darwin: permission probe names the missing grant and its owner (#5917) ----------
+import { create as createDarwin } from "../src/backends/darwin.mjs";
+
+function darwinExec({ accessibility, screen_recording }) {
+  const calls = [];
+  const shell = String(process.ppid + 1);
+  const chain = {
+    [String(process.ppid)]: `${shell} /bin/zsh`,
+    [shell]: "1 /Applications/iTerm.app/Contents/MacOS/iTerm2",
+  };
+  const run = async (cmd, args) => {
+    calls.push({ cmd, args });
+    if (cmd === "osascript") return { code: 0, stdout: JSON.stringify({ accessibility, screen_recording }), stderr: "" };
+    if (cmd === "ps") {
+      const row = chain[args[args.length - 1]];
+      return row ? { code: 0, stdout: row, stderr: "" } : { code: 1, stdout: "", stderr: "" };
+    }
+    return { code: 0, stdout: "", stderr: "" };
+  };
+  return { run, runOk: run, calls };
+}
+
+test("darwin: probe reports denied TCC grants as missing capabilities and names the host app to fix", async () => {
+  const exec = darwinExec({ accessibility: false, screen_recording: false });
+  const b = createDarwin({ exec });
+  const p = await b.probe();
+  assert.deepEqual(p.missing, ["accessibility", "screen_recording"]);
+  assert.equal(p.capabilities.screenshot, false);
+  assert.equal(p.capabilities.recording, false);
+  assert.equal(p.capabilities.accessibility_tree, false);
+  assert.equal(p.capabilities.raw_input, false);
+  assert.equal(p.permissions.accessibility, "denied");
+  assert.equal(p.permissions.screen_recording, "denied");
+  assert.equal(p.host_app, "iTerm");
+  assert.match(p.how_to_fix.accessibility, /Privacy & Security → Accessibility.*"iTerm"/);
+  assert.match(p.how_to_fix.screen_recording, /Screen & System Audio Recording.*"iTerm"/);
+  assert.match(p.note, /Missing: accessibility, screen_recording/);
+});
+
+test("darwin: after a denied probe, input fails fast with the remedy instead of spawning osascript", async () => {
+  const exec = darwinExec({ accessibility: false, screen_recording: true });
+  const b = createDarwin({ exec });
+  await b.probe();
+  const before = exec.calls.filter((c) => c.cmd === "osascript").length;
+  await assert.rejects(() => b.key({ text: "a" }), /accessibility permission is not granted to "iTerm".*Privacy & Security → Accessibility/);
+  assert.equal(exec.calls.filter((c) => c.cmd === "osascript").length, before, "no osascript spawn for a known-denied grant");
+});
+
+test("darwin: granted TCC state reports every capability available and no remedy", async () => {
+  const exec = darwinExec({ accessibility: true, screen_recording: true });
+  const b = createDarwin({ exec });
+  const p = await b.probe();
+  assert.deepEqual(p.missing, []);
+  assert.deepEqual(p.how_to_fix, {});
+  assert.equal(p.permissions.accessibility, "granted");
+  assert.equal(p.permissions.screen_recording, "granted");
+  assert.equal(p.capabilities.screenshot, true);
+  assert.equal(p.capabilities.raw_input, true);
+});
+
+test("darwin: CGEvent input scripts receive their payload and a real timeout (#5917)", async () => {
+  const calls = [];
+  const run = async (cmd, args, opts) => {
+    calls.push({ cmd, args, opts });
+    if (cmd === "osascript") return { code: 0, stdout: JSON.stringify({ ok: true }), stderr: "" };
+    return { code: 1, stdout: "", stderr: "" };
+  };
+  const b = createDarwin({ exec: { run, runOk: run } });
+  await b.key({ text: "cmd+q" });
+  const scripts = calls.filter((c) => c.cmd === "osascript");
+  assert.equal(scripts.length, 2, "one keydown and one keyup event");
+  for (const c of scripts) {
+    const payload = JSON.parse(c.args[c.args.length - 1]);
+    assert.equal(payload.code, 12, "q keycode travels in the payload");
+    assert.ok(payload.flags > 0, "cmd modifier flag travels in the payload");
+    assert.equal(c.opts.timeoutMs, 10_000, "the timeout is the CGEvent default, not the payload object");
+  }
+  await b.type({ text: "hi" });
+  const typed = JSON.parse(calls.at(-1).args.at(-1));
+  assert.equal(typed.text, "hi");
+  assert.equal(calls.at(-1).opts.timeoutMs, 15_000);
+});

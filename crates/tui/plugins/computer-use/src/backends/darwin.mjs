@@ -47,8 +47,19 @@ export function create({ exec }) {
       fs.writeFileSync(file, script);
       // Payload travels as a plain argv string: osascript is spawned without a
       // shell, so JSON content can never become script syntax.
+      // Input and accessibility scripts need the Accessibility grant. When the
+      // last probe saw it denied, refuse here with the remedy instead of
+      // letting osascript hang on a TCC prompt nobody can answer (#5917).
+      if (state.tcc?.accessibility === false && /CGEventPost|System Events/.test(script)) {
+        throw new ExecError(`accessibility permission is not granted to ${await grantTarget()}: ${TCC_FIX.accessibility}`);
+      }
       const r = await runL("osascript", ["-l", "JavaScript", file, JSON.stringify(payload)], { timeoutMs });
-      if (r.timedOut) throw new ExecError("osascript timed out", r);
+      if (r.timedOut) {
+        const hint = state.tcc?.accessibility === true
+          ? ""
+          : ` (if macOS is showing a permission prompt, grant Accessibility to ${await grantTarget()}: ${TCC_FIX.accessibility})`;
+        throw new ExecError(`osascript timed out${hint}`, r);
+      }
       if (r.code !== 0) {
         const msg = (r.stderr || r.stdout).trim().split("\n")[0] || "osascript failed";
         throw new ExecError(/(not allowed assistive|assistive access|250)/i.test(r.stderr || "") || /(-25211|-1719|not allowed)/i.test(msg)
@@ -223,11 +234,16 @@ export function create({ exec }) {
   }
 
   // ---------- raw input via CGEvent ----------
-  async function cg(script, timeoutMs = 10_000) {
+  // Every caller hands its values as `payload`; the script reads them as `P`.
+  // The old `(script, timeoutMs)` shape silently swallowed the payload (so
+  // `P.code`, `P.x`, `P.text` were undefined) and coerced the object to a
+  // zero timeout, which is why every CGEvent input on macOS reported
+  // "osascript timed out" instantly (#5917).
+  async function cg(script, payload = {}, timeoutMs = 10_000) {
     return jxa(`ObjC.import('CoreGraphics');
       function run(argv){ var P = JSON.parse(argv[0]);
         ${script}
-      }`, {}, timeoutMs);
+      }`, payload, timeoutMs);
   }
 
   async function postMouseEvent(type, x, y, button, clickState) {
@@ -326,7 +342,16 @@ export function create({ exec }) {
     }
     args.push(file);
     const r = await runL("screencapture", args, { timeoutMs: 20_000 });
-    if (r.code !== 0) throw new ExecError(`screencapture exited ${r.code}: ${r.stderr.trim().slice(0, 300)}`, r);
+    if (r.code !== 0) {
+      const detail = r.stderr.trim().slice(0, 300);
+      // This is what screencapture says when the display is locked, asleep, or
+      // the session is not the console user — not a permission problem
+      // (without the Screen Recording grant it exits 0 and omits windows).
+      const remedy = /could not create image/i.test(detail)
+        ? " — the display is locked, asleep, or this session is not at the console; unlock or wake it and retry"
+        : "";
+      throw new ExecError(`screencapture exited ${r.code}: ${detail}${remedy}`, r);
+    }
     const stat = fs.statSync(file);
     const displays = await displayInfo();
     const d = displays.find((x) => x.index === (disp === "all" ? 1 : disp)) ?? displays[0];
@@ -493,20 +518,93 @@ print('{\"x\": %d, \"y\": %d}' % (l.x, l.y))`;
   }
 
   // ---------- probe ----------
-  async function probe() {
-    const caps = { screenshot: true, recording: true, accessibility_tree: true, clipboard: true, displays: true };
-    const perms = {};
-    try { await jxa(`function run(argv){ return JSON.stringify({n: Application('System Events').applicationProcesses.length}); }`, {}, 8_000); perms.accessibility = "granted"; }
-    catch (e) { perms.accessibility = "denied_or_unavailable"; caps.accessibility_tree = false; caps.raw_input = "unreliable"; }
-    try {
-      const t = os.tmpdir() + `/cu-probe-${crypto.randomBytes(3).toString("hex")}.png`;
-      const r = await runL("screencapture", ["-x", "-R0,0,2,2", "-t", "png", t], { timeoutMs: 8_000 });
-      perms.screen_capture = r.code === 0 ? "ok" : "failed";
-      try { fs.rmSync(t, { force: true }); } catch {}
-    } catch { perms.screen_capture = "failed"; }
-    const hasRecording = fs.existsSync("/usr/sbin/screencapture");
-    return { platform: "darwin", capabilities: caps, permissions: perms, note: "macOS does not expose Screen-Recording TCC state to CLI; a black/empty screenshot means Screen Recording permission is missing. Raw pointer/keyboard events go to whatever is frontmost at the target point — activate the app first for click-type actions." };
+  const TCC_FIX = {
+    accessibility: "System Settings → Privacy & Security → Accessibility → enable the host app, then relaunch it",
+    screen_recording: "System Settings → Privacy & Security → Screen & System Audio Recording → enable the host app, then relaunch it",
+  };
+  // TCC attributes grants to the .app that owns this process tree (the
+  // terminal or IDE hosting the engine), never to node or osascript. Name it so
+  // the remedy says which row to flip.
+  async function hostAppName() {
+    if (state.hostApp !== undefined) return state.hostApp;
+    // Keep the outermost bundle: framework binaries also live inside an .app
+    // (python3 runs from Python.app), but TCC holds the launching app
+    // responsible for everything under it.
+    let pid = process.ppid;
+    let found = null;
+    for (let depth = 0; depth < 12 && pid > 1; depth++) {
+      const r = await runL("ps", ["-o", "ppid=,comm=", "-p", String(pid)], { timeoutMs: 4_000 });
+      if (r.code !== 0) break;
+      const m = /^\s*(\d+)\s+(.*)$/.exec(r.stdout.trim());
+      if (!m) break;
+      const app = /([^/]+)\.app\//.exec(m[2]);
+      if (app) found = app[1];
+      pid = Number(m[1]);
+    }
+    state.hostApp = found;
+    return found;
   }
+  async function grantTarget() {
+    const host = await hostAppName().catch(() => null);
+    return host ? `"${host}"` : "the app hosting the Codewhale engine (your terminal)";
+  }
+  // Ask TCC instead of guessing from tool presence: screencapture exits 0
+  // without the grant (it just omits windows) and osascript hangs on the
+  // prompt, so probing by running them proves nothing.
+  // The JXA bridge does not expose CGPreflightScreenCaptureAccess, so the
+  // Screen Recording state is read the way TCC enforces it: without the grant,
+  // CGWindowListCopyWindowInfo strips kCGWindowName from every other
+  // process's window. No other windows on screen means the answer is unknown.
+  async function tccState() {
+    const r = await jxa(`ObjC.import('ApplicationServices'); ObjC.import('CoreGraphics'); ObjC.import('Foundation');
+function run(){
+  const out = { accessibility: !!$.AXIsProcessTrusted(), screen_recording: null };
+  const me = $.NSProcessInfo.processInfo.processIdentifier;
+  const list = $.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements, $.kCGNullWindowID);
+  const n = Number($.CFArrayGetCount(list));
+  let others = 0, named = 0;
+  for (let i = 0; i < n; i++) {
+    const d = ObjC.deepUnwrap(ObjC.castRefToObject($.CFArrayGetValueAtIndex(list, i)));
+    if (!d || d.kCGWindowOwnerPID === me || d.kCGWindowLayer !== 0) continue;
+    others++;
+    if (typeof d.kCGWindowName === 'string' && d.kCGWindowName.length) named++;
+  }
+  if (others > 0) out.screen_recording = named > 0;
+  return JSON.stringify(out);
+}`, {}, 8_000);
+    return r && typeof r === "object" ? r : {};
+  }
+  async function probe() {
+    const caps = { screenshot: true, recording: true, accessibility_tree: true, raw_input: true, clipboard: true, displays: true };
+    const perms = {};
+    const missing = [];
+    let tcc = {};
+    try { tcc = await tccState(); } catch (e) { perms.probe_error = String(e?.message || e).slice(0, 200); }
+    state.tcc = tcc;
+    const target = await grantTarget();
+    if (tcc.accessibility === false) {
+      perms.accessibility = "denied";
+      caps.accessibility_tree = false;
+      caps.raw_input = false;
+      missing.push("accessibility");
+    } else {
+      perms.accessibility = tcc.accessibility === true ? "granted" : "unknown";
+    }
+    if (tcc.screen_recording === false) {
+      perms.screen_recording = "denied";
+      caps.screenshot = false;
+      caps.recording = false;
+      missing.push("screen_recording");
+    } else {
+      perms.screen_recording = tcc.screen_recording === true ? "granted" : "unknown";
+    }
+    const how_to_fix = Object.fromEntries(missing.map((m) => [m, `${TCC_FIX[m]} — grant it to ${target}`]));
+    const note = missing.length
+      ? `Missing: ${missing.join(", ")}. Grants belong to ${target}, not to node or osascript. ${Object.values(how_to_fix).join(" ")}`
+      : "Raw pointer/keyboard events go to whatever is frontmost at the target point — activate the app first for click-type actions.";
+    return { platform: "darwin", capabilities: caps, permissions: perms, missing, how_to_fix, host_app: state.hostApp ?? null, note };
+  }
+
 
   return {
     platform: "darwin",
