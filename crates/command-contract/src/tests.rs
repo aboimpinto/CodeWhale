@@ -2450,7 +2450,10 @@ fn envelope_control_slot_is_independent_and_rejects_duplicates() {
         "lifecycle slot may coexist with control"
     );
     assert!(
-        parts.session.is_none() && parts.plugin.is_none() && parts.skill_group.is_none(),
+        parts.session.is_none()
+            && parts.plugin.is_none()
+            && parts.skill_group.is_none()
+            && parts.presentation.is_none(),
         "unrelated slots must stay absent (exact exposure)"
     );
 
