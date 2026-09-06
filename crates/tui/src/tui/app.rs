@@ -819,6 +819,19 @@ pub struct ComposerState {
     /// `selection_anchor` is the fixed end.  Both are char-indexed.
     /// `None` means no selection is active.
     pub selection_anchor: Option<usize>,
+    /// The first character typed into this composer line was `/` (#5925).
+    ///
+    /// A line that began as a command stays a command until Enter: if the
+    /// leading `/` is gone at submit time and no edit removed it, bytes were
+    /// lost between the terminal and the composer, and the line must not be
+    /// re-interpreted as a prose prompt for the model. Composer edits
+    /// re-derive the claim through
+    /// [`ComposerState::resync_command_line_claim`]; `clear_input` drops it.
+    pub(crate) line_began_with_slash: bool,
+    /// Startup consumed bytes it could not replay, so the shell cannot prove
+    /// it saw the whole line (#5925). Set once from the startup input
+    /// receipt; cleared by the first submit it holds.
+    pub(crate) startup_input_unproven: bool,
 }
 
 impl Default for ComposerState {
@@ -848,6 +861,8 @@ impl Default for ComposerState {
             vim_mode: VimMode::Normal,
             vim_pending_d: false,
             selection_anchor: None,
+            line_began_with_slash: false,
+            startup_input_unproven: false,
         }
     }
 }

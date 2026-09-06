@@ -24851,3 +24851,155 @@ fn a_scroll_burst_is_folded_into_one_frame() {
     assert_eq!(pending.len(), 1, "the non-scroll event was pushed back");
     assert!(matches!(pending.front(), Some(Event::Key(_))));
 }
+
+// ---------------------------------------------------------------------------
+// Startup type-ahead integrity (#5925).
+//
+// A line typed right after launch — while the OSC 11 / kitty / sixel probes
+// are the only readers of the tty — must reach the composer whole and
+// dispatch as what it was typed as. Before the fix the probes ate the first
+// bytes of `/plugin install …`, the survivor no longer began with `/`, and it
+// was submitted to the model as a prose prompt.
+// ---------------------------------------------------------------------------
+
+/// The carried-input buffer is process-global (one tty, one startup), so the
+/// tests that exercise it take turns.
+fn startup_input_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: Mutex<()> = Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Replay a queue of pending terminal events through the composer exactly
+/// as the event loop's key arm does: plain characters insert, Enter submits.
+fn drive_composer_events(app: &mut App, pending: &mut VecDeque<Event>) -> Option<String> {
+    let mut submitted = None;
+    while let Some(event) = pending.pop_front() {
+        let Event::Key(key) = event else { continue };
+        match key.code {
+            KeyCode::Char(c) => app.insert_char(c),
+            KeyCode::Enter => submitted = app.handle_composer_enter(),
+            KeyCode::Backspace => app.delete_char(),
+            _ => {}
+        }
+    }
+    submitted
+}
+
+#[test]
+fn startup_typeahead_dispatches_as_a_command_not_a_prompt() {
+    let _lock = startup_input_test_lock();
+    let _home = SettingsHomeGuard::new();
+    // What a startup probe consumed off the tty before the input pump existed.
+    crate::palette::osc11::carry_typed_ahead(b"/plugin list\r");
+
+    let mut pending: VecDeque<Event> = VecDeque::new();
+    let receipt = crate::tui::startup_input::replay_into(&mut pending);
+    assert!(
+        receipt.whole_line_proven(),
+        "every byte was replayable: {receipt:?}"
+    );
+    assert_eq!(receipt.replayed, "/plugin list".len() + 1, "{receipt:?}");
+
+    let mut app = App::new(create_test_options(), &Config::default());
+    app.startup_input_unproven = !receipt.whole_line_proven();
+    let submitted = drive_composer_events(&mut app, &mut pending);
+
+    let submitted = submitted.expect("the replayed Enter submitted the line");
+    assert_eq!(
+        submitted, "/plugin list",
+        "no byte was consumed or reordered"
+    );
+    assert!(
+        looks_like_slash_command_input(&submitted),
+        "the line dispatches as a command, not as a prompt for the model"
+    );
+    assert!(app.input.is_empty(), "the composer consumed the line");
+}
+
+#[test]
+fn startup_that_cannot_account_for_its_bytes_keeps_the_line_in_the_composer() {
+    let _lock = startup_input_test_lock();
+    let _home = SettingsHomeGuard::new();
+    // The pre-fix shape: a probe swallowed `/plu` (here: consumed bytes it
+    // cannot replay) and only the tail reached the composer.
+    crate::palette::osc11::note_consumed_unreplayable(b"/plu");
+    crate::palette::osc11::carry_typed_ahead(b"gin install /tmp/bundle\r");
+
+    let mut pending: VecDeque<Event> = VecDeque::new();
+    let receipt = crate::tui::startup_input::replay_into(&mut pending);
+    assert!(
+        !receipt.whole_line_proven(),
+        "dropped bytes mean the whole line is not proven: {receipt:?}"
+    );
+
+    let mut app = App::new(create_test_options(), &Config::default());
+    app.startup_input_unproven = !receipt.whole_line_proven();
+    let submitted = drive_composer_events(&mut app, &mut pending);
+
+    assert!(
+        submitted.is_none(),
+        "a line the shell cannot vouch for is never submitted to the model"
+    );
+    assert_eq!(
+        app.input, "gin install /tmp/bundle",
+        "the text stays in the composer for the user to look at"
+    );
+    assert!(
+        app.status_message
+            .as_deref()
+            .is_some_and(|message| message.contains("startup")),
+        "the hold explains itself: {:?}",
+        app.status_message
+    );
+
+    // The user has now seen it; a deliberate second Enter sends what is shown.
+    let resent = app.handle_composer_enter();
+    assert_eq!(resent.as_deref(), Some("gin install /tmp/bundle"));
+}
+
+#[test]
+fn a_command_line_that_stops_looking_like_one_is_held_not_reinterpreted() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = App::new(create_test_options(), &Config::default());
+    for ch in "/plugin install".chars() {
+        app.insert_char(ch);
+    }
+    assert!(app.command_line_claimed(), "typed `/` claims the line");
+
+    // The submit pipeline rewrites an oversized composer into a paste
+    // @-mention. That rewrite must never silently turn a command line into a
+    // prose turn for the model (#5925).
+    app.composer.pending_paste_reference = Some("@.codewhale/pastes/p.md".to_string());
+    let submitted = app.handle_composer_enter();
+    assert!(
+        submitted.is_none(),
+        "a claimed command is never re-read as a prose prompt"
+    );
+    assert_eq!(
+        app.input, "@.codewhale/pastes/p.md",
+        "the exact text that would have been sent is left on screen"
+    );
+}
+
+#[test]
+fn deleting_the_leading_slash_releases_the_command_claim() {
+    let _home = SettingsHomeGuard::new();
+    let mut app = App::new(create_test_options(), &Config::default());
+    for ch in "/plugin".chars() {
+        app.insert_char(ch);
+    }
+    assert!(app.command_line_claimed());
+
+    // A deliberate edit that removes the `/` is not lost input.
+    app.cursor_position = 1;
+    app.delete_char();
+    assert!(
+        !app.line_began_with_slash,
+        "the claim is released by an edit"
+    );
+    assert_eq!(
+        app.handle_composer_enter().as_deref(),
+        Some("plugin"),
+        "the edited line submits normally"
+    );
+}

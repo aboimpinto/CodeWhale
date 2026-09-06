@@ -734,6 +734,10 @@ impl App {
                 vim_mode: VimMode::Normal,
                 vim_pending_d: false,
                 selection_anchor: None,
+                // Seeded text was not typed, so it makes no command claim;
+                // startup integrity is decided by the replay receipt (#5925).
+                line_began_with_slash: false,
+                startup_input_unproven: false,
             },
             viewport: ViewportState::default(),
             work_surface: {

@@ -1218,8 +1218,20 @@ pub(crate) async fn run_event_loop(
     let mut last_focus_recovery = Instant::now()
         .checked_sub(Duration::from_secs(60))
         .unwrap_or_else(Instant::now);
-    let mut terminal_input = TerminalInputPump::spawn()?;
+    // #5925: the startup terminal probes (OSC 11 background, kitty graphics,
+    // sixel primary-DA) were the only readers of the tty until now, and they
+    // consumed whatever the user had already typed. Replay it into the same
+    // queue the pump feeds — and do it *before* the pump is spawned, so those
+    // keys are delivered ahead of anything still sitting in the tty rather
+    // than behind it.
     let mut pending_terminal_events: VecDeque<Event> = VecDeque::new();
+    let startup_input_receipt =
+        crate::tui::startup_input::replay_into(&mut pending_terminal_events);
+    // When startup could not account for every byte it consumed, the shell
+    // cannot prove it saw the whole line. The composer holds the next submit
+    // instead of sending text it cannot vouch for.
+    app.startup_input_unproven = !startup_input_receipt.whole_line_proven();
+    let mut terminal_input = TerminalInputPump::spawn()?;
     let mut last_terminal_input_recovery = Instant::now()
         .checked_sub(TERMINAL_INPUT_RECOVERY_COOLDOWN)
         .unwrap_or_else(Instant::now);

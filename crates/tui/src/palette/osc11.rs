@@ -115,8 +115,10 @@ fn scale_hex_channel(digits: &str) -> Option<u8> {
 ///
 /// This reads from stdin, so it must only be called while the terminal is in
 /// raw mode and before the event loop starts. Bytes that arrive during the
-/// window and are not part of the reply are discarded — at startup that window
-/// is sub-millisecond on any terminal that answers at all.
+/// window and are not part of the reply are *not* discarded: they are the
+/// user's type-ahead, and are handed to
+/// [`carry_typed_ahead`] for the event loop to
+/// replay in order (#5925).
 #[must_use]
 pub fn query_terminal_background(timeout: std::time::Duration) -> Option<(u8, u8, u8)> {
     let reply = query_terminal(OSC11_QUERY, timeout)?;
@@ -145,6 +147,221 @@ pub(crate) fn query_terminal_csi(query: &[u8], timeout: std::time::Duration) -> 
     query_terminal_inner(query, timeout, true)
 }
 
+/// Largest reply any of the three probes can produce. Past this the answer
+/// is not one of ours.
+const MAX_REPLY_BYTES: usize = 128;
+
+// ---------------------------------------------------------------------------
+// Type-ahead carried across the probe window (#5925).
+//
+// The probe readers below are the only readers of the tty between raw-mode
+// entry and the input pump, so anything the user typed at launch arrives in
+// the same stream as the replies. The reader keeps its reply and parks every
+// other byte here; `tui::startup_input` drains this and replays it into the
+// composer. The buffers live in this module rather than with the replay
+// logic because `src/palette/` is `#[path]`-included by test harnesses that
+// do not compile the `tui` module tree.
+// ---------------------------------------------------------------------------
+
+/// Upper bound on carried type-ahead. A terminal that answers a probe does
+/// so in well under a millisecond, so this only ever holds a line or two;
+/// the cap stops a wedged tty from growing the buffer without limit.
+pub const MAX_CARRIED_BYTES: usize = 4096;
+
+/// Bytes a probe consumed that were not part of its reply.
+static CARRIED_TYPE_AHEAD: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+/// Bytes a probe consumed that cannot be replayed as keystrokes.
+static CONSUMED_UNREPLAYABLE: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
+
+/// Park non-reply bytes for the event loop to replay.
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn carry_typed_ahead(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    let Ok(mut carried) = CARRIED_TYPE_AHEAD.lock() else {
+        note_consumed_unreplayable(bytes);
+        return;
+    };
+    let room = MAX_CARRIED_BYTES.saturating_sub(carried.len());
+    let (keep, overflow) = bytes.split_at(room.min(bytes.len()));
+    carried.extend_from_slice(keep);
+    drop(carried);
+    note_consumed_unreplayable(overflow);
+}
+
+/// Record bytes startup consumed and cannot hand back.
+pub fn note_consumed_unreplayable(bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    if let Ok(mut dropped) = CONSUMED_UNREPLAYABLE.lock() {
+        let room = MAX_CARRIED_BYTES.saturating_sub(dropped.len());
+        dropped.extend_from_slice(&bytes[..room.min(bytes.len())]);
+    }
+}
+
+/// Take everything parked by [`carry_typed_ahead`].
+pub fn take_carried_type_ahead() -> Vec<u8> {
+    CARRIED_TYPE_AHEAD
+        .lock()
+        .map(|mut carried| std::mem::take(&mut *carried))
+        .unwrap_or_default()
+}
+
+/// Take everything recorded by [`note_consumed_unreplayable`].
+pub fn take_consumed_unreplayable() -> Vec<u8> {
+    CONSUMED_UNREPLAYABLE
+        .lock()
+        .map(|mut dropped| std::mem::take(&mut *dropped))
+        .unwrap_or_default()
+}
+
+/// What the caller should do after feeding one byte to [`ProbeSplit`].
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProbeStep {
+    /// Keep reading.
+    Continue,
+    /// The reply is complete.
+    Done,
+    /// The reply ended with the `ESC` of an `ESC \` string terminator: read
+    /// one more byte and give it to [`ProbeSplit::finish_string_terminator`].
+    AwaitStringTerminator,
+    /// Carried type-ahead hit its cap; stop reading.
+    Overflow,
+}
+
+/// Splits one probe stream into the terminal's reply and the user's
+/// type-ahead (#5925).
+///
+/// Pure and byte-driven so the split — the actual defect in #5925, where
+/// everything that was not the reply was thrown away — is testable without a
+/// terminal. The reply always opens with the same two bytes the query did
+/// (`ESC ]` for OSC 11, `ESC _` for the kitty graphics query, `ESC [` for the
+/// sixel primary-DA query); anything before that introducer is input the user
+/// typed, and an `ESC` that does not go on to match it is theirs too.
+#[cfg_attr(not(unix), allow(dead_code))]
+#[derive(Debug)]
+pub(crate) struct ProbeSplit<'a> {
+    introducer: &'a [u8],
+    stop_at_csi_final: bool,
+    carried: Vec<u8>,
+    /// A partial introducer match, still undecided between reply and input.
+    undecided: Vec<u8>,
+    reply: Vec<u8>,
+    in_reply: bool,
+}
+
+#[cfg_attr(not(unix), allow(dead_code))]
+impl<'a> ProbeSplit<'a> {
+    /// `query` is the sequence just written; its first two bytes are the
+    /// introducer the reply will open with.
+    pub(crate) fn for_query(query: &'a [u8], stop_at_csi_final: bool) -> Self {
+        Self {
+            introducer: if query.len() >= 2 && query[0] == 0x1b {
+                &query[..2]
+            } else {
+                &[]
+            },
+            stop_at_csi_final,
+            carried: Vec::new(),
+            undecided: Vec::new(),
+            reply: Vec::new(),
+            in_reply: false,
+        }
+    }
+
+    pub(crate) fn feed(&mut self, byte: u8) -> ProbeStep {
+        if !self.in_reply {
+            self.feed_before_reply(byte);
+            if self.carried.len() >= MAX_CARRIED_BYTES {
+                return ProbeStep::Overflow;
+            }
+            return ProbeStep::Continue;
+        }
+        // BEL, or the ESC of an `ESC \` string terminator, ends the reply.
+        if byte == 0x07 {
+            return ProbeStep::Done;
+        }
+        if byte == 0x1b {
+            return ProbeStep::AwaitStringTerminator;
+        }
+        self.reply.push(byte);
+        // A CSI reply (`ESC [` …) ends at its first final byte (`@..=~`):
+        // keep the final and stop, so a DA answer never eats past itself.
+        if self.stop_at_csi_final
+            && self.reply.len() >= 3
+            && self.reply[0] == 0x1b
+            && self.reply[1] == b'['
+            && (0x40..=0x7e).contains(&byte)
+        {
+            return ProbeStep::Done;
+        }
+        if self.reply.len() >= MAX_REPLY_BYTES {
+            return ProbeStep::Overflow;
+        }
+        ProbeStep::Continue
+    }
+
+    fn feed_before_reply(&mut self, byte: u8) {
+        if self.undecided.is_empty() {
+            if byte == 0x1b && !self.introducer.is_empty() {
+                self.undecided.push(byte);
+            } else {
+                self.carried.push(byte);
+            }
+            return;
+        }
+        self.undecided.push(byte);
+        if self.introducer.starts_with(&self.undecided) {
+            if self.undecided.len() == self.introducer.len() {
+                self.in_reply = true;
+                self.reply = std::mem::take(&mut self.undecided);
+            }
+            return;
+        }
+        // Not our reply after all — an `Esc` keypress, or an escape sequence
+        // from some other source. Everything held is the user's, except a
+        // fresh `ESC` which may still open the reply we are waiting for.
+        let restarts = byte == 0x1b;
+        if restarts {
+            self.undecided.pop();
+        }
+        self.carried.append(&mut self.undecided);
+        if restarts {
+            self.undecided.push(byte);
+        }
+    }
+
+    /// The byte read after an [`ProbeStep::AwaitStringTerminator`]. The `\`
+    /// of `ESC \` belongs to the reply; anything else is the user's next
+    /// keystroke and must not vanish with the terminator.
+    pub(crate) fn finish_string_terminator(&mut self, byte: u8) {
+        if byte != b'\\' {
+            self.carried.push(byte);
+        }
+    }
+
+    /// Consume the split: `(reply, carried type-ahead)`. An undecided
+    /// introducer is input the terminal never claimed.
+    pub(crate) fn finish(mut self) -> (Vec<u8>, Vec<u8>) {
+        self.carried.append(&mut self.undecided);
+        (self.reply, self.carried)
+    }
+}
+
+/// Read a probe reply off stdin without eating the user's type-ahead.
+///
+/// The reply always opens with the same two bytes the query did (`ESC ]` for
+/// OSC 11, `ESC _` for the kitty graphics query, `ESC [` for the sixel
+/// primary-DA query), so every byte before that introducer — and the one
+/// lookahead byte after an `ESC` that turned out not to open `ESC \` — is
+/// input the user typed, not terminal chatter. Those bytes are carried to
+/// [`carry_typed_ahead`] for replay instead of being dropped on the
+/// floor (#5925). Bytes this reader consumed but cannot hand back (a reply
+/// the terminal never terminated) are recorded as dropped so the startup
+/// receipt names them.
 #[cfg(unix)]
 fn query_terminal_inner(
     query: &[u8],
@@ -174,48 +391,44 @@ fn query_terminal_inner(
     }
 
     let deadline = Instant::now() + timeout;
-    let mut reply = Vec::with_capacity(32);
+    let mut split = ProbeSplit::for_query(query, stop_at_csi_final);
     let mut stdin = stdin.lock();
     let mut byte = [0u8; 1];
-    loop {
+    let answered = loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return None;
-        }
-        if !wait_readable(in_fd, remaining) {
-            return None;
+        if remaining.is_zero() || !wait_readable(in_fd, remaining) {
+            break false;
         }
         match stdin.read(&mut byte) {
             Ok(1) => {}
-            _ => return None,
+            _ => break false,
         }
-        // BEL, or the ESC of a `ESC \` string terminator, ends the reply.
-        if byte[0] == 0x07 || (byte[0] == 0x1b && !reply.is_empty()) {
-            // Consume the `\` of an `ESC \` terminator so it cannot surface
-            // later as a keypress once the event loop owns stdin.
-            if byte[0] == 0x1b
-                && wait_readable(in_fd, std::time::Duration::from_millis(5))
-                && stdin.read(&mut byte).is_ok_and(|n| n == 1)
-                && byte[0] != b'\\'
-            {
-                reply.push(byte[0]);
+        match split.feed(byte[0]) {
+            ProbeStep::Continue => {}
+            ProbeStep::Done => break true,
+            ProbeStep::Overflow => break false,
+            ProbeStep::AwaitStringTerminator => {
+                // Consume the `\` of an `ESC \` terminator so it cannot
+                // surface later as a keypress once the event loop owns
+                // stdin. Anything else is the user's next keystroke.
+                if wait_readable(in_fd, std::time::Duration::from_millis(5))
+                    && stdin.read(&mut byte).is_ok_and(|n| n == 1)
+                {
+                    split.finish_string_terminator(byte[0]);
+                }
+                break true;
             }
-            break;
         }
-        reply.push(byte[0]);
-        // A CSI reply (`ESC [` …) ends at its first final byte (`@..=~`):
-        // keep the final and stop, so a DA answer never eats past itself.
-        if stop_at_csi_final
-            && reply.len() >= 3
-            && reply[0] == 0x1b
-            && reply[1] == b'['
-            && (0x40..=0x7e).contains(&byte[0])
-        {
-            break;
-        }
-        if reply.len() >= 128 {
-            return None;
-        }
+    };
+
+    let (reply, carried) = split.finish();
+    carry_typed_ahead(&carried);
+    if !answered {
+        // A reply we started reading and never finished cannot be replayed
+        // as keystrokes — it is terminal chatter, not typing — but it was
+        // consumed, so it belongs in the startup receipt.
+        note_consumed_unreplayable(&reply);
+        return None;
     }
 
     Some(reply)
