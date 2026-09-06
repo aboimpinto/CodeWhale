@@ -15,7 +15,9 @@ struct Fixture {
     permission_key: Option<&'static str>,
     mode: Option<(&'static str, ChromeInk)>,
     mode_key: Option<&'static str>,
+    turn_clock: Option<(&'static str, ChromeInk)>,
     counts: Vec<(String, ChromeInk)>,
+    session_clock: Option<(&'static str, ChromeInk)>,
     hint: Option<(&'static str, ChromeInk)>,
     context_percent: u8,
     right: Option<(&'static str, ChromeInk)>,
@@ -28,7 +30,9 @@ fn working() -> Fixture {
         permission_key: Some("Shift+Tab"),
         mode: Some(("work", ChromeInk::PolicyAct)),
         mode_key: Some("Tab"),
+        turn_clock: Some(("working 1m 15s", ChromeInk::Active)),
         counts: vec![("2 agents".to_string(), ChromeInk::Active)],
+        session_clock: Some(("worked 41m 12s", ChromeInk::Active)),
         hint: Some(("Esc to interrupt", ChromeInk::MetadataHint)),
         context_percent: 61,
         right: None,
@@ -41,7 +45,9 @@ impl Fixture {
             .permission_key(self.permission_key)
             .mode_chip(self.mode)
             .mode_key(self.mode_key)
+            .turn_clock(self.turn_clock)
             .counts(&self.counts)
+            .session_clock(self.session_clock)
             .hint(self.hint)
             .context_percent(self.context_percent)
             .right(self.right)
@@ -69,30 +75,34 @@ fn footer_matches_goldens_at_blocker_sizes() {
 }
 
 /// Claude Code's grammar: mark, permission chip with its cycle key, mode
-/// with its cycle key, live counts, then the one hint that applies now.
+/// with its cycle key, the working clock, live counts, then the one hint
+/// that applies now.
 #[test]
-fn posture_bar_reads_permission_mode_counts_hint() {
-    let text = draw(100, 30, &working().widget(&UI_THEME));
+fn posture_bar_reads_permission_mode_clock_counts_hint() {
+    let text = draw(120, 30, &working().widget(&UI_THEME));
     let band = text.lines().last().unwrap_or_default().trim_end();
     assert_eq!(
         band,
-        "▶▶ ask (Shift+Tab) · work (Tab) · 2 agents · Esc to interrupt"
+        "▶▶ ask (Shift+Tab) · work (Tab) · working 1m 15s · 2 agents · worked 41m 12s · Esc to interrupt"
     );
 }
 
-/// The bar carries no phase word, no elapsed, no cost and no context
-/// reading: the transcript, the roster and the metrics line own those.
+/// The bar carries no cost and no context reading: the metrics line owns
+/// both. The elapsed reading is this bar's again (#5914) — a fixed row is
+/// the only place a glancing user can find it during a multi-hour session —
+/// so it is asserted here rather than excluded.
 #[test]
-fn posture_bar_states_no_phase_cost_or_context_reading() {
+fn posture_bar_states_no_cost_or_context_reading() {
     for pct in [0u8, 12, 61, 79] {
         let mut fixture = working();
         fixture.context_percent = pct;
         let text = draw(120, 32, &fixture.widget(&UI_THEME));
         assert!(!text.contains(&format!("{pct}%")), "{pct}: {text}");
-        assert!(!text.contains("thinking"), "{text}");
         assert!(!text.contains("<·>"), "{text}");
         assert!(!text.contains('$'), "{text}");
-        assert!(!text.contains("1m 15s"), "{text}");
+        assert!(text.contains("working 1m 15s"), "{text}");
+        assert!(text.contains("worked 41m 12s"), "{text}");
+        assert!(text.contains("2 agents"), "{text}");
     }
 }
 
@@ -106,6 +116,28 @@ fn posture_bar_warns_at_eighty_percent_cap() {
     assert!(text.contains("▲ surface soon — /compact"), "{text}");
     assert!(!text.contains("Esc to interrupt"), "{text}");
     assert!(!text.contains("83%"), "{text}");
+}
+
+/// The cap warning outranks the clock: a working session that cannot start
+/// its next turn needs the instruction more than it needs the stopwatch.
+#[test]
+fn cap_warning_outranks_the_clock_when_only_one_fits() {
+    let mut fixture = working();
+    fixture.context_percent = 83;
+    let mut saw_warning_alone = false;
+    for width in 8..=160u16 {
+        let text = draw(width, 12, &fixture.widget(&UI_THEME));
+        let warning = text.contains("surface soon");
+        let clock = text.contains("worked 41m 12s");
+        assert!(
+            !(clock && !warning),
+            "width {width} kept the clock and shed the cap warning: {text}"
+        );
+        if warning && !clock {
+            saw_warning_alone = true;
+        }
+    }
+    assert!(saw_warning_alone, "no width shed the clock alone");
 }
 
 /// The right slot is the notice when one is owed, else the remote-control
@@ -131,27 +163,39 @@ fn posture_bar_pins_notice_or_remote_control_right() {
     assert!(narrow.contains("▶▶ ask"), "{narrow}");
 }
 
-/// Shed ladder, most expendable first: hint, counts, mode key, mode,
-/// permission key. The permission chip never sheds (#5796).
+/// Shed ladder, most expendable first: the turn clock, the session clock,
+/// the hint, the counts, mode key, mode, permission key. The permission chip
+/// never sheds (#5796); the clock is what a glance wants and the hint and
+/// counts are what a keystroke wants, so on a row too narrow for both the
+/// clock goes (#5914).
 #[test]
-fn posture_bar_sheds_hint_counts_mode_key_mode_then_permission_key() {
+fn posture_bar_sheds_the_clocks_then_the_hint_counts_and_posture_chips() {
     let fixture = working();
     let narrowest_showing = |needle: &str| -> u16 {
-        (8..=120u16)
+        (8..=160u16)
             .filter(|w| draw(*w, 3, &fixture.widget(&UI_THEME)).contains(needle))
             .min()
             .unwrap_or_else(|| panic!("{needle} never painted"))
     };
+    let turn_clock = narrowest_showing("working 1m 15s");
+    let session_clock = narrowest_showing("worked 41m 12s");
     let hint = narrowest_showing("Esc to interrupt");
     let counts = narrowest_showing("2 agents");
+    // `work` alone would also match `working`, so measure the mode chip by
+    // a needle only the mode paints.
     let mode_key = narrowest_showing("work (Tab)");
-    let mode = narrowest_showing("work");
+    let mode = narrowest_showing("· work ");
     let permission_key = narrowest_showing("(Shift+Tab)");
     assert!(
-        hint > counts && counts > mode_key && mode_key > mode && mode > permission_key,
-        "hint@{hint} counts@{counts} mode_key@{mode_key} mode@{mode} permission_key@{permission_key}"
+        turn_clock > session_clock
+            && session_clock > hint
+            && hint > counts
+            && counts > mode_key
+            && mode_key > mode
+            && mode > permission_key,
+        "turn_clock@{turn_clock} session_clock@{session_clock} hint@{hint} counts@{counts} mode_key@{mode_key} mode@{mode} permission_key@{permission_key}"
     );
-    for w in 8..=120u16 {
+    for w in 8..=160u16 {
         let text = draw(w, 3, &fixture.widget(&UI_THEME));
         assert!(
             text.contains("ask"),
@@ -195,8 +239,11 @@ fn posture_bar_prints_cycle_keys_only_when_live() {
     let mut fixture = working();
     fixture.mode_key = None;
     fixture.permission_key = None;
-    let text = draw(100, 30, &fixture.widget(&UI_THEME));
-    assert!(text.contains("▶▶ ask · work · 2 agents"), "{text}");
+    let text = draw(120, 30, &fixture.widget(&UI_THEME));
+    assert!(
+        text.contains("▶▶ ask · work · working 1m 15s · 2 agents · worked 41m 12s"),
+        "{text}"
+    );
     assert!(!text.contains('('), "{text}");
 }
 
@@ -378,4 +425,175 @@ fn agent_arrow_hints_show_at_zero_and_one_use_and_clear_at_two() {
 
     set_uses(&mut app, AGENT_ARROWS, 2);
     assert!(tideline_footer_from_app(&mut app, 120).hint.is_none());
+}
+
+// ---------------------------------------------------------------------------
+// The working clock (#5914). The founder watching a multi-hour operate
+// session could not find how long the thing had been working: the classic
+// footer's `worked` chip went with the legacy footer path (146ab7f756) and
+// the phase band's `working_detail` went with the 0.9.12 merged shell
+// (329960fcbf). These pin what came back — both readings, the state word
+// that says what the clock is counting, and its place in the shed ladder.
+// ---------------------------------------------------------------------------
+
+use std::time::{Duration, Instant};
+
+use super::{ShellPhase, working_clock};
+
+/// A live turn states both readings: what the session is doing now and for
+/// how long, then how long it has worked in total.
+#[test]
+fn live_turn_clock_states_the_turn_and_the_session() {
+    let mut app = session_app();
+    app.ui_locale = crate::localization::Locale::En;
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(75));
+    app.cumulative_turn_duration = Duration::from_secs(2_400);
+
+    let facts = tideline_footer_from_app(&mut app, 160);
+    let (turn, turn_ink) = facts.turn_clock.expect("a live turn states its elapsed");
+    assert_eq!(turn, "working 1m 15s");
+    assert_eq!(turn_ink, ChromeInk::Active);
+    let (session, session_ink) = facts
+        .session_clock
+        .expect("a working session states its total");
+    assert_eq!(session, "worked 41m 15s");
+    assert_eq!(session_ink, ChromeInk::Active);
+}
+
+/// The session reading is model work, not wall clock: it is the sum of
+/// finished turns plus the live one, so it never jumps at `TurnComplete`.
+#[test]
+fn session_reading_carries_finished_turns_plus_the_live_one() {
+    let mut app = session_app();
+    app.ui_locale = crate::localization::Locale::En;
+    app.cumulative_turn_duration = Duration::from_secs(3_600);
+
+    // Turn in flight: the finished total plus this turn.
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(30));
+    let (_, live) = working_clock(&app, ShellPhase::Working, "working");
+    assert_eq!(live.expect("live session clock").0, "worked 60m 30s");
+
+    // Turn done: the engine folded it into the cumulative total, so the
+    // reading is unchanged and the clock stops.
+    app.is_loading = false;
+    app.turn_started_at = None;
+    app.cumulative_turn_duration = Duration::from_secs(3_630);
+    let facts = tideline_footer_from_app(&mut app, 160);
+    assert!(facts.turn_clock.is_none(), "no turn, no turn clock");
+    let (idle, ink) = facts
+        .session_clock
+        .expect("an idle session still states its total");
+    assert_eq!(idle, "worked 60m 30s");
+    assert_eq!(ink, ChromeInk::MetadataValue, "a stopped clock reads quiet");
+}
+
+/// Actively working, waiting on a sub-agent, and waiting on you are three
+/// different readings — a bare duration cannot tell them apart.
+#[test]
+fn clock_distinguishes_working_from_waiting_on_something() {
+    let mut app = session_app();
+    app.ui_locale = crate::localization::Locale::En;
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(75));
+    app.cumulative_turn_duration = Duration::from_secs(2_400);
+
+    let working = tideline_footer_from_app(&mut app, 160)
+        .turn_clock
+        .expect("working clock");
+    assert_eq!(working.0, "working 1m 15s");
+    assert_eq!(working.1, ChromeInk::Active);
+
+    // A live sub-agent: the parent turn's clock keeps running, but the word
+    // says what it is waiting on (#5906 is the same founder session).
+    app.agent_progress
+        .insert("agent-a".to_string(), "reading".to_string());
+    let subagents = tideline_footer_from_app(&mut app, 160)
+        .turn_clock
+        .expect("sub-agent clock");
+    assert_eq!(subagents.0, "sub-agents underway 1m 15s");
+    app.agent_progress.clear();
+
+    // Waiting on the user parks the clock in the waiting ink.
+    app.pending_user_input_prompt = Some((
+        "tool-call-1".to_string(),
+        crate::tools::user_input::UserInputRequest {
+            questions: Vec::new(),
+        },
+    ));
+    let waiting = tideline_footer_from_app(&mut app, 160)
+        .turn_clock
+        .expect("waiting clock");
+    assert_eq!(waiting.0, "waiting on you 1m 15s");
+    assert_eq!(waiting.1, ChromeInk::Waiting);
+    assert_ne!(waiting.1, working.1, "waiting must not read as working");
+}
+
+/// A fresh session says nothing: no turn has run, so there is no clock to
+/// state, and a sub-minute total stays quiet rather than rendering a noisy
+/// `worked 4s` that immediately ticks.
+#[test]
+fn a_session_that_has_not_worked_states_no_clock() {
+    let mut app = session_app();
+    app.ui_locale = crate::localization::Locale::En;
+    let facts = tideline_footer_from_app(&mut app, 160);
+    assert!(facts.turn_clock.is_none());
+    assert!(facts.session_clock.is_none());
+
+    app.cumulative_turn_duration = Duration::from_secs(42);
+    assert!(
+        tideline_footer_from_app(&mut app, 160)
+            .session_clock
+            .is_none(),
+        "under a minute the session total stays quiet"
+    );
+
+    // A live turn states its own elapsed from the first second, though — the
+    // whole point is telling a stuck turn from a working one.
+    app.is_loading = true;
+    app.turn_started_at = Some(Instant::now() - Duration::from_secs(3));
+    let facts = tideline_footer_from_app(&mut app, 160);
+    assert_eq!(
+        facts.turn_clock.expect("a live turn always times itself").0,
+        "working 3s"
+    );
+    assert!(
+        facts.session_clock.is_none(),
+        "the sub-minute total is still quiet"
+    );
+}
+
+/// Narrow terminals shed both clock halves before the hint and the counts,
+/// the turn half before the session half, and neither reading is ever
+/// painted half-truncated.
+#[test]
+fn narrow_widths_shed_the_clocks_before_the_hint_and_counts() {
+    let fixture = working();
+    for w in 8..=160u16 {
+        let text = draw(w, 3, &fixture.widget(&UI_THEME));
+        let turn = text.contains("working 1m 15s");
+        let session = text.contains("worked 41m 12s");
+        assert!(
+            !turn || session,
+            "{w} kept the turn clock and dropped the session clock: {text}"
+        );
+        assert!(
+            !session || text.contains("Esc to interrupt"),
+            "{w} kept the session clock and dropped the hint: {text}"
+        );
+        assert!(
+            !text.contains("Esc to interrupt") || text.contains("2 agents"),
+            "{w} kept the hint and dropped the counts: {text}"
+        );
+        // Whole readings or none: a clipped duration is a lie.
+        assert!(
+            !text.contains("working 1m") || turn,
+            "{w} painted a half-truncated turn clock: {text}"
+        );
+        assert!(
+            !text.contains("worked 41m") || session,
+            "{w} painted a half-truncated session clock: {text}"
+        );
+    }
 }
