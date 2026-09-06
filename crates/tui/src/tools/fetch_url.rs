@@ -195,7 +195,7 @@ impl ToolSpec for FetchUrlTool {
                     };
                     let fields = match body_text.as_deref() {
                         Some(body) => {
-                            project_json_fields(body, &fetched.content_type, &requested_fields)?
+                            project_json_fields(body, &fetched.content_type, requested_fields)?
                         }
                         None => None,
                     };
