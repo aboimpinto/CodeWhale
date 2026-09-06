@@ -7,12 +7,16 @@ use std::time::{Duration, Instant};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use futures_util::StreamExt;
+use serde::Serialize;
 
 use super::cache::{self, CachedFetch};
+use super::extract::is_js_shell_error;
 use super::guard::{
     DnsPin, guarded_reqwest_client_builder, validate_fetch_target, validate_network_policy,
 };
+use crate::features::Feature;
 use crate::tools::spec::{ToolContext, ToolError};
+use crate::worker_profile::ShellPolicy;
 
 pub(crate) const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const HARD_MAX_TIMEOUT: Duration = Duration::from_secs(60);
@@ -55,13 +59,274 @@ pub(crate) struct FetchedPayload {
     pub(crate) redirects: usize,
 }
 
-pub(crate) async fn fetch(
+/// Whether one request may be answered from a cache, or must revalidate.
+///
+/// `Revalidate` bypasses the session fetch cache *and* asks every intermediary
+/// to revalidate. An edge cache can hold a prerendered variant while an origin
+/// MISS serves the client-side shell, so the same URL alternates between
+/// readable and unreadable depending on which variant answered (#5904).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CacheMode {
+    Default,
+    Revalidate,
+}
+
+impl CacheMode {
+    const fn is_revalidate(self) -> bool {
+        matches!(self, Self::Revalidate)
+    }
+}
+
+/// Response headers that explain the cache state behind a 200.
+///
+/// These are the four that distinguish "the edge served a prerendered page"
+/// from "the origin served the JavaScript shell", so both the success and the
+/// failure receipt carry whichever of them the response actually had.
+const CACHE_STATE_HEADERS: [&str; 4] = [
+    "age",
+    "cf-cache-status",
+    "x-nextjs-prerender",
+    "x-vercel-cache",
+];
+
+/// One request inside a readable-fetch sequence, as it appears on the receipt.
+#[derive(Debug, Clone, Serialize)]
+pub(crate) struct FetchAttempt {
+    /// 1-based position in the sequence.
+    pub(crate) attempt: usize,
+    pub(crate) status: u16,
+    /// Whether the session fetch cache answered this attempt.
+    pub(crate) cache_hit: bool,
+    /// Whether this attempt sent `Cache-Control: no-cache` / `Pragma: no-cache`
+    /// and skipped the session cache.
+    pub(crate) cache_busted: bool,
+    /// Whether this attempt is the one that yielded a readable document.
+    pub(crate) produced_content: bool,
+    /// `age`, `cf-cache-status`, `x-nextjs-prerender`, `x-vercel-cache` — only
+    /// those the response actually carried.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) cache_headers: BTreeMap<String, String>,
+}
+
+impl FetchAttempt {
+    fn record(payload: &FetchedPayload, attempt: usize, mode: CacheMode) -> Self {
+        Self {
+            attempt,
+            status: payload.status,
+            cache_hit: payload.cache_hit,
+            cache_busted: mode.is_revalidate(),
+            produced_content: false,
+            cache_headers: cache_state_headers(&payload.headers),
+        }
+    }
+
+    fn summarize(&self) -> String {
+        let mut facts = vec![format!("HTTP {}", self.status)];
+        if self.cache_hit {
+            facts.push("session cache hit".to_string());
+        }
+        for (name, value) in &self.cache_headers {
+            facts.push(format!("{name}={value}"));
+        }
+        let label = if self.cache_busted {
+            format!("attempt {} (Cache-Control: no-cache)", self.attempt)
+        } else {
+            format!("attempt {}", self.attempt)
+        };
+        format!("{label}: {}", facts.join(", "))
+    }
+}
+
+fn cache_state_headers(headers: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    CACHE_STATE_HEADERS
+        .iter()
+        .filter_map(|name| {
+            headers
+                .get(*name)
+                .map(|value| ((*name).to_string(), value.clone()))
+        })
+        .collect()
+}
+
+/// The extraction step [`fetch_readable`] may run against either attempt.
+///
+/// Spelled as an explicit boxed future over an *owned* payload rather than as
+/// an `AsyncFn` over a borrowed one: the callers live inside
+/// `async fn execute(&self, .., &ToolContext)` futures that must stay `Send`,
+/// and a higher-ranked borrow of the payload would force the returned future
+/// to outlive the tool context it reads.
+pub(crate) type ExtractFuture<'a, T> =
+    std::pin::Pin<Box<dyn Future<Output = Result<T, ToolError>> + Send + 'a>>;
+
+/// A fetch that produced a readable document, plus the attempts it took.
+#[derive(Debug)]
+pub(crate) struct ReadableFetch<T> {
+    pub(crate) payload: FetchedPayload,
+    pub(crate) document: T,
+    pub(crate) attempts: Vec<FetchAttempt>,
+}
+
+/// Fetch `url` and extract it, re-fetching once past every cache when a 2xx
+/// response yields no readable content.
+///
+/// This is the single place that turns the JS-shell case into either a second
+/// chance or an error the model can act on. `extract` runs against the fetched
+/// payload; only [`is_js_shell_error`] failures earn the second request, so
+/// transport failures keep the existing single-retry behavior of one request.
+pub(crate) async fn fetch_readable<'e, T, F>(
     url: &str,
     options: &FetchOptions,
     context: &ToolContext,
     tool_label: &str,
-) -> Result<FetchedPayload, ToolError> {
-    fetch_inner(url, options, context, tool_label, None).await
+    extract: F,
+) -> Result<ReadableFetch<T>, ToolError>
+where
+    F: Fn(FetchedPayload) -> ExtractFuture<'e, T>,
+{
+    fetch_readable_inner(url, options, context, tool_label, None, extract).await
+}
+
+#[cfg(test)]
+pub(crate) async fn fetch_readable_with_initial_pin<'e, T, F>(
+    url: &str,
+    options: &FetchOptions,
+    context: &ToolContext,
+    tool_label: &str,
+    initial_pin: DnsPin,
+    extract: F,
+) -> Result<ReadableFetch<T>, ToolError>
+where
+    F: Fn(FetchedPayload) -> ExtractFuture<'e, T>,
+{
+    fetch_readable_inner(
+        url,
+        options,
+        context,
+        tool_label,
+        Some(initial_pin),
+        extract,
+    )
+    .await
+}
+
+async fn fetch_readable_inner<'e, T, F>(
+    url: &str,
+    options: &FetchOptions,
+    context: &ToolContext,
+    tool_label: &str,
+    test_initial_pin: Option<DnsPin>,
+    extract: F,
+) -> Result<ReadableFetch<T>, ToolError>
+where
+    F: Fn(FetchedPayload) -> ExtractFuture<'e, T>,
+{
+    let mut attempts: Vec<FetchAttempt> = Vec::with_capacity(2);
+    for mode in [CacheMode::Default, CacheMode::Revalidate] {
+        let payload = fetch_inner(
+            url,
+            options,
+            context,
+            tool_label,
+            test_initial_pin.clone(),
+            mode,
+        )
+        .await?;
+        let mut record = FetchAttempt::record(&payload, attempts.len() + 1, mode);
+        let final_url = payload.url.clone();
+        match extract(payload.clone()).await {
+            Ok(document) => {
+                record.produced_content = true;
+                attempts.push(record);
+                return Ok(ReadableFetch {
+                    payload,
+                    document,
+                    attempts,
+                });
+            }
+            // A 2xx whose body held no readable content is the one failure a
+            // second request can fix: the first response may have been a
+            // cached client-side shell.
+            Err(error)
+                if is_js_shell_error(&error)
+                    && (200..300).contains(&payload.status)
+                    && mode == CacheMode::Default =>
+            {
+                attempts.push(record);
+            }
+            Err(error) => {
+                attempts.push(record);
+                return Err(if is_js_shell_error(&error) {
+                    js_shell_failure(&final_url, &attempts, context, tool_label)
+                } else {
+                    error
+                });
+            }
+        }
+    }
+    unreachable!("the revalidate pass either returns a document or an error");
+}
+
+/// The terminal JS-shell error, carrying the failure receipt and the recovery
+/// the *calling role* actually owns.
+fn js_shell_failure(
+    url: &str,
+    attempts: &[FetchAttempt],
+    context: &ToolContext,
+    tool_label: &str,
+) -> ToolError {
+    let receipt = attempts
+        .iter()
+        .map(FetchAttempt::summarize)
+        .collect::<Vec<_>>()
+        .join("; ");
+    ToolError::execution_failed(format!(
+        "{marker} {url} after {count} attempts, the second past every cache ({receipt}). The response parsed but held no readable body, which usually means the page renders its content with JavaScript. Recovery: {recovery}",
+        marker = super::extract::JS_SHELL_MARKER,
+        count = attempts.len(),
+        recovery = js_shell_recovery(context, tool_label),
+    ))
+}
+
+/// Whether the `web.run` browse surface is reachable from this context.
+///
+/// Both facts already exist: the web family is feature-gated, and a
+/// network-denied Fleet worker carries `network_access: Some(false)` on the
+/// authority envelope that also removes `web.run` from its registry
+/// (`fleet::role::NETWORK_TOOL_DENYLIST`). Nothing new is registered here.
+fn browser_surface_available(context: &ToolContext) -> bool {
+    context.features.enabled(Feature::WebSearch) && network_authorized(context)
+}
+
+/// Whether this role could shell out to `curl` as a last resort. Read-only and
+/// shell-less roles cannot: the read-only grammar rejects a network fetch.
+fn shell_fallback_available(context: &ToolContext) -> bool {
+    context.shell_policy == ShellPolicy::Full && network_authorized(context)
+}
+
+fn network_authorized(context: &ToolContext) -> bool {
+    context
+        .tool_authority
+        .as_deref()
+        .is_none_or(|authority| authority.network_access != Some(false))
+}
+
+fn js_shell_recovery(context: &ToolContext, tool_label: &str) -> String {
+    // `web.run` is itself the escalation, so it never names itself.
+    if tool_label != "web_run" && browser_surface_available(context) {
+        return "open this URL with the `web.run` browse surface (`web.run {\"open\": {\"url\": ...}}`), which requests it with a browser user-agent and a ten-megabyte budget and usually receives the prerendered variant.".to_string();
+    }
+    let unavailable = if tool_label == "web_run" {
+        "this is already the `web.run` browse surface, so there is no further web escalation."
+    } else {
+        "the `web.run` browse surface is not available to this role."
+    };
+    if shell_fallback_available(context) {
+        format!("{unavailable} Fall back to a shell fetch (`curl -sSL`) or a rendering tool.")
+    } else {
+        format!(
+            "{unavailable} This role is read-only and cannot fall back to a shell fetch, so report this URL as unreadable rather than substituting another source."
+        )
+    }
 }
 
 #[cfg(test)]
@@ -72,7 +337,15 @@ pub(crate) async fn fetch_with_initial_pin(
     tool_label: &str,
     initial_pin: DnsPin,
 ) -> Result<FetchedPayload, ToolError> {
-    fetch_inner(url, options, context, tool_label, Some(initial_pin)).await
+    fetch_inner(
+        url,
+        options,
+        context,
+        tool_label,
+        Some(initial_pin),
+        CacheMode::Default,
+    )
+    .await
 }
 
 async fn fetch_inner(
@@ -81,6 +354,7 @@ async fn fetch_inner(
     context: &ToolContext,
     tool_label: &str,
     test_initial_pin: Option<DnsPin>,
+    cache_mode: CacheMode,
 ) -> Result<FetchedPayload, ToolError> {
     let initial_url = reqwest::Url::parse(url)
         .map_err(|err| ToolError::invalid_input(format!("invalid URL: {err}")))?;
@@ -97,12 +371,17 @@ async fn fetch_inner(
         None => validate_fetch_target(&initial_url, context, tool_label).await?,
     };
 
-    if let Some(cached) = cache::get(
-        &context.state_namespace,
-        &initial_url,
-        options.accept,
-        options.max_bytes,
-    ) {
+    if let Some(cached) = (!cache_mode.is_revalidate())
+        .then(|| {
+            cache::get(
+                &context.state_namespace,
+                &initial_url,
+                options.accept,
+                options.max_bytes,
+            )
+        })
+        .flatten()
+    {
         let cached_url = reqwest::Url::parse(&cached.url).map_err(|err| {
             ToolError::execution_failed(format!("cached response URL was invalid: {err}"))
         })?;
@@ -130,6 +409,7 @@ async fn fetch_inner(
             tool_label,
             remaining,
             validated_initial_pin.clone(),
+            cache_mode,
         )
         .await
         {
@@ -187,6 +467,7 @@ async fn fetch_attempt(
     tool_label: &str,
     timeout: Duration,
     initial_pin: DnsPin,
+    cache_mode: CacheMode,
 ) -> Result<CachedFetch, AttemptError> {
     let mut current_url = initial_url;
     let mut redirects = 0usize;
@@ -225,10 +506,20 @@ async fn fetch_attempt(
                 "failed to build HTTP client: {err}"
             )))
         })?;
-        let response = client
+        let mut request = client
             .get(current_url.clone())
             .header("Accept", options.accept)
-            .header("Accept-Language", "en-US,en;q=0.5")
+            .header("Accept-Language", "en-US,en;q=0.5");
+        if cache_mode.is_revalidate() {
+            // `no-cache` (revalidate), not `no-store`: the shared caches still
+            // get to serve a validated copy, which is what recovers a page
+            // whose prerendered variant exists but was not the one served.
+            // `Pragma` is the HTTP/1.0 spelling some CDNs still honor.
+            request = request
+                .header("Cache-Control", "no-cache")
+                .header("Pragma", "no-cache");
+        }
+        let response = request
             .send()
             .await
             .map_err(|err| AttemptError::Transient(err.to_string()))?;
@@ -467,6 +758,229 @@ mod tests {
         assert!(!large.cache_hit);
     }
 
+    /// A Vercel-style edge that serves the client-side shell to an ordinary
+    /// request and the prerendered page to a revalidating one (#5904).
+    #[derive(Clone)]
+    struct ShellUntilRevalidated {
+        calls: Arc<AtomicUsize>,
+        always_shell: bool,
+    }
+
+    const JS_SHELL_BODY: &str = "<html><head><title>Pricing</title></head><body><div id='root'></div><script>boot()</script></body></html>";
+    const PRERENDERED_BODY: &str = "<html><head><title>Pricing</title></head><body><main><h1>Pricing</h1><p>The prerendered variant carries the full pricing table for every plan.</p></main></body></html>";
+
+    impl Respond for ShellUntilRevalidated {
+        fn respond(&self, request: &Request) -> ResponseTemplate {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let revalidating = request
+                .headers
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.contains("no-cache"));
+            if revalidating && !self.always_shell {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .insert_header("x-vercel-cache", "HIT")
+                    .insert_header("x-nextjs-prerender", "1")
+                    .insert_header("age", "12")
+                    .set_body_string(PRERENDERED_BODY)
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/html")
+                    .insert_header("x-vercel-cache", "MISS")
+                    .set_body_string(JS_SHELL_BODY)
+            }
+        }
+    }
+
+    async fn js_shell_server(always_shell: bool) -> (MockServer, Arc<AtomicUsize>) {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/pricing"))
+            .respond_with(ShellUntilRevalidated {
+                calls: Arc::clone(&calls),
+                always_shell,
+            })
+            .mount(&server)
+            .await;
+        (server, calls)
+    }
+
+    fn extract_html_document(
+        payload: FetchedPayload,
+    ) -> ExtractFuture<'static, super::super::extract::ExtractedDocument> {
+        Box::pin(async move {
+            super::super::extract::extract_document(
+                &payload.url,
+                Some(&payload.content_type),
+                &payload.bytes,
+                None,
+            )
+            .await
+        })
+    }
+
+    #[tokio::test]
+    async fn js_shell_is_refetched_past_every_cache_before_it_becomes_an_error() {
+        let (server, calls) = js_shell_server(false).await;
+        let url = format!("http://public.example:{}/pricing", server.address().port());
+        let context = context("js-shell-recovers");
+
+        let readable = fetch_readable_with_initial_pin(
+            &url,
+            &FetchOptions::new(Duration::from_secs(5), 65_536, "text/html"),
+            &context,
+            "fetch_url",
+            pin(),
+            extract_html_document,
+        )
+        .await
+        .expect("the revalidated response carries the prerendered page");
+
+        assert!(
+            readable.document.markdown.contains("full pricing table"),
+            "the second attempt's content must be what the caller receives: {}",
+            readable.document.markdown
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "exactly one extra request");
+        assert_eq!(readable.attempts.len(), 2);
+        assert!(!readable.attempts[0].cache_busted);
+        assert!(!readable.attempts[0].produced_content);
+        assert_eq!(
+            readable.attempts[0].cache_headers.get("x-vercel-cache"),
+            Some(&"MISS".to_string()),
+            "the failing attempt keeps the header that explains its cache state"
+        );
+        assert!(readable.attempts[1].cache_busted);
+        assert!(readable.attempts[1].produced_content);
+        assert_eq!(
+            readable.attempts[1].cache_headers.get("x-vercel-cache"),
+            Some(&"HIT".to_string())
+        );
+        assert_eq!(
+            readable.attempts[1].cache_headers.get("x-nextjs-prerender"),
+            Some(&"1".to_string())
+        );
+        assert_eq!(
+            readable.attempts[1].cache_headers.get("age"),
+            Some(&"12".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn two_shells_fail_with_the_escalation_the_calling_role_owns() {
+        let (server, calls) = js_shell_server(true).await;
+        let url = format!("http://public.example:{}/pricing", server.address().port());
+        let options = FetchOptions::new(Duration::from_secs(5), 65_536, "text/html");
+
+        let error = fetch_readable_with_initial_pin(
+            &url,
+            &options,
+            &context("js-shell-browser-role"),
+            "fetch_url",
+            pin(),
+            extract_html_document,
+        )
+        .await
+        .expect_err("two shells must fail");
+        let message = error.to_string();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "no third request");
+        assert!(
+            message.contains("web.run"),
+            "a role that has the browse surface must be told to use it: {message}"
+        );
+        assert!(
+            message.contains("attempt 1")
+                && message.contains("attempt 2 (Cache-Control: no-cache)"),
+            "the failure receipt names both attempts: {message}"
+        );
+        assert!(
+            message.contains("x-vercel-cache=MISS"),
+            "the failure receipt carries the cache-state headers: {message}"
+        );
+
+        // A read-only worker whose envelope denies network keeps `Web{fetch}`
+        // but loses `web.run` and any shell fallback, so the error must say so
+        // instead of naming a surface the role cannot call.
+        let mut denied = context("js-shell-read-only-role");
+        denied.shell_policy = ShellPolicy::ReadOnly;
+        denied.execution.tool_authority =
+            Some(Arc::new(crate::tools::spec::ToolAuthorityEnvelope {
+                schema_version: 1,
+                owner: "scout".to_string(),
+                authority: crate::tools::spec::ToolMutationAuthority::ReadOnly,
+                network_access: Some(false),
+                shell: crate::tools::spec::ToolShellAuthority::ReadOnly,
+                verification: crate::tools::spec::ToolVerificationAuthority::None,
+                writable_roots: Vec::new(),
+                writable_files: Vec::new(),
+                coordination_contracts: Vec::new(),
+            }));
+        let error = fetch_readable_with_initial_pin(
+            &url,
+            &options,
+            &denied,
+            "fetch_url",
+            pin(),
+            extract_html_document,
+        )
+        .await
+        .expect_err("two shells must fail");
+        let message = error.to_string();
+        assert!(
+            message.contains("not available to this role"),
+            "a role without the browse surface must be told plainly: {message}"
+        );
+        assert!(
+            message.contains("cannot fall back to a shell fetch"),
+            "read-only roles must not be sent to curl: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transport_failures_do_not_earn_a_cache_busting_refetch() {
+        let server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        Mock::given(method("GET"))
+            .and(path("/flaky"))
+            .respond_with(FailOnce {
+                calls: Arc::clone(&calls),
+            })
+            .mount(&server)
+            .await;
+        let url = format!("http://public.example:{}/flaky", server.address().port());
+        let context = context("js-shell-transport-retry");
+
+        let readable = fetch_readable_with_initial_pin(
+            &url,
+            &FetchOptions::new(Duration::from_secs(5), 1_024, "text/plain"),
+            &context,
+            "fetch_url",
+            pin(),
+            |payload: FetchedPayload| {
+                Box::pin(async move { Ok(String::from_utf8_lossy(&payload.bytes).into_owned()) })
+            },
+        )
+        .await
+        .expect("the existing transport retry still recovers");
+
+        assert_eq!(readable.document, "recovered response");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "the 503 costs the existing single transport retry and nothing more"
+        );
+        assert_eq!(
+            readable.attempts.len(),
+            1,
+            "a transport retry is not a readable-fetch attempt"
+        );
+        assert_eq!(readable.payload.retries, 1);
+        assert!(!readable.attempts[0].cache_busted);
+        assert!(readable.attempts[0].produced_content);
+    }
+
     #[test]
     fn fetch_user_agent_tracks_the_crate_version() {
         assert!(
@@ -522,11 +1036,13 @@ mod tests {
         let context =
             context("policy-cache").with_network_policy(NetworkPolicyDecider::new(policy, None));
 
-        let error = fetch(
+        let error = fetch_inner(
             url.as_str(),
             &FetchOptions::new(Duration::from_secs(1), 100, "text/plain"),
             &context,
             "fetch_url",
+            None,
+            CacheMode::Default,
         )
         .await
         .expect_err("policy must win over cache");
@@ -563,11 +1079,13 @@ mod tests {
         let context = context("redirect-policy-cache")
             .with_network_policy(NetworkPolicyDecider::new(policy, None));
 
-        let error = fetch(
+        let error = fetch_inner(
             initial_url.as_str(),
             &FetchOptions::new(Duration::from_secs(1), 100, "text/plain"),
             &context,
             "fetch_url",
+            None,
+            CacheMode::Default,
         )
         .await
         .expect_err("final redirect policy must win over cache");
