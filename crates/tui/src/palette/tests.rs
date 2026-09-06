@@ -669,7 +669,7 @@ use super::contrast::{
     theme_uses_terminal_owned_surfaces,
 };
 use super::detect::TerminalBackground;
-use super::osc11::parse_osc11_reply;
+use super::osc11::{ProbeSplit, ProbeStep, parse_osc11_reply};
 use super::tokens::{
     MODE_OPERATE, STATUS_SUCCESS, TEXT_MUTED, TEXT_SECONDARY, TEXT_SOFT, USER_BODY,
 };
@@ -994,6 +994,87 @@ fn osc11_replies_parse_across_the_shapes_terminals_emit() {
     assert_eq!(parse_osc11_reply("rgb:ff/ff/ff/ff"), None);
     assert_eq!(parse_osc11_reply("rgb:zz/zz/zz"), None);
     assert_eq!(parse_osc11_reply("#ff00"), None);
+}
+
+/// Drive a whole byte stream through the split the way the reader does,
+/// including the one-byte lookahead after an `ESC \` terminator.
+fn split_probe_stream(query: &[u8], stream: &[u8], csi: bool) -> (Vec<u8>, Vec<u8>) {
+    let mut split = ProbeSplit::for_query(query, csi);
+    let mut index = 0;
+    while index < stream.len() {
+        let byte = stream[index];
+        index += 1;
+        match split.feed(byte) {
+            ProbeStep::Continue => {}
+            ProbeStep::Done | ProbeStep::Overflow => break,
+            ProbeStep::AwaitStringTerminator => {
+                if let Some(next) = stream.get(index) {
+                    split.finish_string_terminator(*next);
+                }
+                break;
+            }
+        }
+    }
+    split.finish()
+}
+
+#[test]
+fn a_probe_reply_never_swallows_the_line_typed_before_it() {
+    // #5925: `/plugin install …` typed at launch arrived before the terminal
+    // answered the OSC 11 query. The reply is ours; every other byte is the
+    // user's and must come back out, in order.
+    let (reply, carried) = split_probe_stream(
+        b"\x1b]11;?\x1b\\",
+        b"/plugin install /tmp/bundle\r\x1b]11;rgb:ffff/ffff/ffff\x1b\\",
+        false,
+    );
+    assert_eq!(
+        parse_osc11_reply(&String::from_utf8_lossy(&reply)),
+        Some((255, 255, 255)),
+        "the reply still parses"
+    );
+    assert_eq!(
+        carried,
+        b"/plugin install /tmp/bundle\r".to_vec(),
+        "not one typed byte is consumed or reordered"
+    );
+}
+
+#[test]
+fn a_probe_that_is_never_answered_still_hands_back_what_was_typed() {
+    let (reply, carried) = split_probe_stream(b"\x1b]11;?\x1b\\", b"/plugin list\r", false);
+    assert!(reply.is_empty(), "no reply arrived");
+    assert_eq!(carried, b"/plugin list\r".to_vec());
+}
+
+#[test]
+fn an_escape_that_is_not_the_reply_is_the_users_keystroke() {
+    // A bare `Esc`, then typing, then the real reply.
+    let (reply, carried) = split_probe_stream(
+        b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\",
+        b"\x1bhi\x1b_Gi=31;OK\x1b\\",
+        false,
+    );
+    assert_eq!(reply, b"\x1b_Gi=31;OK".to_vec());
+    assert_eq!(carried, b"\x1bhi".to_vec());
+}
+
+#[test]
+fn a_keystroke_after_the_string_terminator_escape_is_kept() {
+    // The reply ends `ESC \`; if the byte after `ESC` is not `\` it belongs
+    // to the user and must not vanish with the terminator.
+    let (reply, carried) = split_probe_stream(b"\x1b]11;?\x1b\\", b"\x1b]11;rgb:0/0/0\x1bx", false);
+    assert_eq!(reply, b"\x1b]11;rgb:0/0/0".to_vec());
+    assert_eq!(carried, b"x".to_vec());
+}
+
+#[test]
+fn a_da_reply_stops_at_its_final_byte_and_keeps_the_rest_of_the_line() {
+    let (reply, carried) = split_probe_stream(b"\x1b[c", b"\x1b[?62;4c/plugin list\r", true);
+    assert_eq!(reply, b"\x1b[?62;4c".to_vec());
+    // Bytes after the DA reply were never read by the split; the reader
+    // leaves them in the tty for the input pump.
+    assert!(carried.is_empty(), "{carried:?}");
 }
 
 #[test]

@@ -104,6 +104,7 @@ pub mod slash_menu;
 pub mod sound_policy;
 pub mod spinner;
 pub mod startup_defaults;
+pub mod startup_input;
 pub mod streaming;
 pub mod streaming_thinking;
 mod subagent_routing;
