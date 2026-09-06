@@ -3709,12 +3709,33 @@ mod tests {
             &self,
             task: ExecutionTask,
             events: mpsc::Sender<TaskExecutionEvent>,
-            cancel: CancellationToken,
+            _cancel: CancellationToken,
         ) -> TaskExecutionResult {
             if task.prompt.starts_with("hang ") {
                 std::future::pending().await
             } else {
-                MockExecutor.execute(task, events, cancel).await
+                // The follow-up task must complete without a single await
+                // point: `run_task` polls the executor future before its
+                // guard can observe the (test-shortened) idle/wall budgets,
+                // so an await-free future always finishes first and an
+                // interrupt can never be recorded against it. The previous
+                // MockExecutor delegation (`send(...).await` x4 plus a 50 ms
+                // sleep) left windows where CI scheduler/storage stalls of
+                // >=150 ms tripped the idle watchdog mid-flight; the executor
+                // then observed the cancellation and returned `Canceled`,
+                // which `preserve_timeout_reason` rewrote into the timeout
+                // reason -> `Failed` (issue #5898). `try_send` keeps the
+                // released worker's event pipeline exercised without
+                // suspending this future.
+                let _ = events.try_send(TaskExecutionEvent::Status {
+                    message: format!("running after forced release {}", task.id),
+                });
+                TaskExecutionResult {
+                    status: TaskStatus::Completed,
+                    result_text: Some("done after hang".to_string()),
+                    error: None,
+                    terminal_reason: TaskTerminalReason::Completed,
+                }
             }
         }
     }
@@ -4104,14 +4125,27 @@ mod tests {
             .await?;
         let finished =
             wait_for_terminal_state(&manager, &stuck.id, Duration::from_secs(10)).await?;
-        assert_eq!(finished.terminal_reason.as_deref(), Some("idle_timeout"));
+        assert_eq!(
+            finished.terminal_reason.as_deref(),
+            Some("idle_timeout"),
+            "stuck task terminal record: {finished:?}"
+        );
 
         let next = manager
             .add_task(NewTaskRequest::from_prompt("run after hang"))
             .await?;
         let completed =
             wait_for_terminal_state(&manager, &next.id, Duration::from_secs(10)).await?;
-        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(
+            completed.status,
+            TaskStatus::Completed,
+            "follow-up task terminal record: {completed:?}"
+        );
+        assert_eq!(
+            completed.terminal_reason.as_deref(),
+            Some("completed"),
+            "follow-up task terminal record: {completed:?}"
+        );
         Ok(())
     }
 
