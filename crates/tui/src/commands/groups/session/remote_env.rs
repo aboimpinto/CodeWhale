@@ -66,12 +66,12 @@ fn remote_env_copy(locale: Locale, id: MessageId) -> String {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RemoteEnvTarget {
-    repo: String,
-    branch: String,
+pub(crate) struct RemoteEnvTarget {
+    pub(crate) repo: String,
+    pub(crate) branch: String,
 }
 
-fn resolve_target(workspace: &Path) -> Option<RemoteEnvTarget> {
+pub(crate) fn resolve_target(workspace: &Path) -> Option<RemoteEnvTarget> {
     let origin = read_git_value(
         workspace,
         &["config", "--local", "--get", "remote.origin.url"],
@@ -118,7 +118,7 @@ fn valid_branch_name(branch: &str) -> bool {
         .is_ok_and(|status| status.success())
 }
 
-fn hosted_work_url(repo: &str, branch: &str) -> String {
+pub(crate) fn hosted_work_url(repo: &str, branch: &str) -> String {
     format!(
         "{HOSTED_WORK_URL}?repo={}&branch={}",
         urlencoding::encode(repo),

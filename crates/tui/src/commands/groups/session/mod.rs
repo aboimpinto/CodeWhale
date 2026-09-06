@@ -11,7 +11,7 @@ mod new;
 mod purge;
 mod relay;
 mod remote_control;
-mod remote_env;
+pub(crate) mod remote_env;
 mod rename;
 #[cfg(test)]
 pub(crate) use rename::rename_with_manager;
