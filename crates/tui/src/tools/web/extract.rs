@@ -363,9 +363,24 @@ fn markdown_title(body: &str) -> Option<String> {
     })
 }
 
+/// Stable prefix for "the response parsed, but carried no readable body".
+///
+/// The fetch pipeline matches on this to decide whether a cache-busting
+/// re-fetch is worth one more request, and to attach the role-aware recovery
+/// text. Extraction itself has no `ToolContext`, so it cannot know which
+/// escalation the calling role actually owns; it states the fact and leaves
+/// the remedy to [`super::fetch`].
+pub(crate) const JS_SHELL_MARKER: &str = "No readable page content was found at";
+
+/// Whether `error` is the JS-shell extraction failure (a parsed response whose
+/// body held no readable content), as opposed to a transport or type failure.
+pub(crate) fn is_js_shell_error(error: &ToolError) -> bool {
+    error.to_string().contains(JS_SHELL_MARKER)
+}
+
 fn js_required_error(url: &str) -> ToolError {
     ToolError::execution_failed(format!(
-        "No readable page content was found at {url}; the page may require JavaScript. Recovery: use browser automation for this URL."
+        "{JS_SHELL_MARKER} {url}; the response parsed but its body held no readable content, so the page may require JavaScript."
     ))
 }
 
@@ -898,8 +913,19 @@ mod tests {
         .expect_err("empty app shell must fail");
 
         let message = error.to_string();
-        assert!(message.contains("may require JavaScript"));
-        assert!(message.contains("browser automation"));
+        assert!(message.contains("may require JavaScript"), "{message}");
+        assert!(
+            message.contains("https://example.com/app"),
+            "the shell failure must name the URL: {message}"
+        );
+        assert!(
+            is_js_shell_error(&error),
+            "the fetch pipeline recognizes this failure by marker: {message}"
+        );
+        assert!(
+            !is_js_shell_error(&ToolError::execution_failed("connection reset")),
+            "transport failures must not look like a JS shell"
+        );
     }
 
     #[tokio::test]

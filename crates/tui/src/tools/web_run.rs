@@ -7,10 +7,10 @@ use super::spec::{
     ApprovalRequirement, ToolCapability, ToolContext, ToolError, ToolResult, ToolSpec,
     optional_u64, required_str,
 };
-use super::web::extract::{DocumentKind, extract_document};
+use super::web::extract::{DocumentKind, ExtractedDocument, extract_document};
 #[cfg(test)]
-use super::web::fetch::fetch_with_initial_pin;
-use super::web::fetch::{FetchOptions, HARD_MAX_BYTES, fetch};
+use super::web::fetch::fetch_readable_with_initial_pin;
+use super::web::fetch::{FetchOptions, HARD_MAX_BYTES, fetch_readable};
 #[cfg(test)]
 use super::web::guard::DnsPin;
 use super::web::overflow::bound_text as bound_web_text;
@@ -1052,23 +1052,30 @@ fn page_from_search(query: &str, results: &[NormalizedSearchResult]) -> WebPage 
     }
 }
 
+fn open_fetch_options(timeout_ms: u64) -> FetchOptions {
+    FetchOptions::new(
+        Duration::from_millis(timeout_ms),
+        HARD_MAX_BYTES,
+        "text/html,text/markdown,text/plain,application/xhtml+xml,application/pdf,image/*,audio/*,video/*,*/*;q=0.5",
+    )
+}
+
 async fn fetch_page(
     url: &str,
     timeout_ms: u64,
     context: &ToolContext,
 ) -> Result<WebPage, ToolError> {
-    let payload = fetch(
+    let readable = fetch_readable(
         url,
-        &FetchOptions::new(
-            Duration::from_millis(timeout_ms),
-            HARD_MAX_BYTES,
-            "text/html,text/markdown,text/plain,application/xhtml+xml,application/pdf,image/*,audio/*,video/*,*/*;q=0.5",
-        ),
+        &open_fetch_options(timeout_ms),
         context,
         "web_run",
+        |payload: super::web::fetch::FetchedPayload| {
+            Box::pin(async move { document_from_fetched(&payload, context).await })
+        },
     )
     .await?;
-    page_from_fetched(payload, context).await
+    page_from_document(readable.payload, readable.document, context)
 }
 
 #[cfg(test)]
@@ -1078,38 +1085,48 @@ async fn fetch_page_with_initial_pin(
     context: &ToolContext,
     initial_pin: Option<DnsPin>,
 ) -> Result<WebPage, ToolError> {
-    let payload = fetch_with_initial_pin(
+    let readable = fetch_readable_with_initial_pin(
         url,
-        &FetchOptions::new(
-            Duration::from_millis(timeout_ms),
-            HARD_MAX_BYTES,
-            "text/html,text/markdown,text/plain,application/xhtml+xml,application/pdf,image/*,audio/*,video/*,*/*;q=0.5",
-        ),
+        &open_fetch_options(timeout_ms),
         context,
         "web_run",
         initial_pin.flatten(),
+        |payload: super::web::fetch::FetchedPayload| {
+            Box::pin(async move { document_from_fetched(&payload, context).await })
+        },
     )
     .await?;
-    page_from_fetched(payload, context).await
+    page_from_document(readable.payload, readable.document, context)
 }
 
-async fn page_from_fetched(
-    payload: super::web::fetch::FetchedPayload,
+/// Reject non-2xx responses, then extract one readable document.
+///
+/// Kept separate from rendering so `fetch_readable` can re-run exactly this
+/// step against a cache-busted second response (#5904).
+async fn document_from_fetched(
+    payload: &super::web::fetch::FetchedPayload,
     context: &ToolContext,
-) -> Result<WebPage, ToolError> {
+) -> Result<ExtractedDocument, ToolError> {
     if !(200..300).contains(&payload.status) {
         return Err(ToolError::execution_failed(format!(
             "Web request to {} failed: HTTP {}",
             payload.url, payload.status
         )));
     }
-    let document = extract_document(
+    extract_document(
         &payload.url,
         Some(&payload.content_type),
         &payload.bytes,
         context.cancel_token.as_ref(),
     )
-    .await?;
+    .await
+}
+
+fn page_from_document(
+    payload: super::web::fetch::FetchedPayload,
+    document: ExtractedDocument,
+    context: &ToolContext,
+) -> Result<WebPage, ToolError> {
     let content_type = Some(payload.content_type);
     match document.kind {
         DocumentKind::Html => {
@@ -1836,7 +1853,7 @@ mod tests {
         };
         let context = ToolContext::new(PathBuf::from("."));
 
-        let error = page_from_fetched(payload, &context)
+        let error = document_from_fetched(&payload, &context)
             .await
             .expect_err("non-2xx pages must not be rendered");
         let message = error.to_string();
