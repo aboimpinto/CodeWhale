@@ -1135,7 +1135,7 @@ pub struct RelayProjection {
     pub mode: String,
     pub model: String,
     pub goal_objective: Option<String>,
-    pub goal_token_budget: Option<u64>,
+    pub goal_token_budget: Option<u32>,
     pub todos: TodoProjection,
     pub plan: PlanProjection,
 }
