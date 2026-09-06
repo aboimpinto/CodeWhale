@@ -777,6 +777,81 @@ async fn write_file_tool_preserves_existing_mode() {
     assert_eq!(fs::read_to_string(&path).expect("read"), "after");
 }
 
+#[tokio::test]
+async fn write_file_over_crlf_file_preserves_crlf_line_endings() {
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("crlf.txt");
+    fs::write(&path, b"alpha\r\nbeta\r\n").expect("initial CRLF write");
+
+    WriteFileTool
+        .execute(
+            json!({"path": "crlf.txt", "content": "gamma\ndelta\n"}),
+            &ctx,
+        )
+        .await
+        .expect("execute");
+
+    let written = fs::read(&path).expect("read");
+    assert_eq!(
+        written, b"gamma\r\ndelta\r\n",
+        "write_file must preserve the existing CRLF style, like edit_file"
+    );
+}
+
+#[tokio::test]
+async fn contract_write_over_crlf_file_preserves_crlf_line_endings() {
+    // The contract `write` path (WriteFileTool::execute_contract_write) must
+    // honor the same line-ending policy as the full write_file tool.
+    let tmp = tempdir().expect("tempdir");
+    let ctx = ToolContext::new(tmp.path().to_path_buf());
+    let path = tmp.path().join("crlf.txt");
+    fs::write(&path, b"alpha\r\nbeta\r\n").expect("initial CRLF write");
+
+    WriteFileTool::execute_contract_write(
+        json!({"path": "crlf.txt", "content": "gamma\ndelta\n"}),
+        &ctx,
+    )
+    .await
+    .expect("execute");
+
+    let written = fs::read(&path).expect("read");
+    assert_eq!(
+        written, b"gamma\r\ndelta\r\n",
+        "contract write must preserve the existing CRLF style, like edit_file"
+    );
+}
+
+#[test]
+fn preserve_prior_line_endings_keeps_the_prior_style() {
+    // Existing CRLF file: incoming LF content is re-emitted as CRLF.
+    assert_eq!(
+        preserve_prior_line_endings("gamma\ndelta\n", "alpha\r\nbeta\r\n"),
+        "gamma\r\ndelta\r\n"
+    );
+    // Existing LF file: incoming CRLF content is re-emitted as LF.
+    assert_eq!(
+        preserve_prior_line_endings("gamma\r\ndelta\r\n", "alpha\nbeta\n"),
+        "gamma\ndelta\n"
+    );
+    // Brand-new file (no prior content): written verbatim, including CRLF.
+    assert_eq!(
+        preserve_prior_line_endings("gamma\r\ndelta\r\n", ""),
+        "gamma\r\ndelta\r\n"
+    );
+    assert_eq!(preserve_prior_line_endings("plain", ""), "plain");
+    // A lone CR in the incoming content is normalized like edit_file does: the
+    // bare \r becomes \n, then is re-emitted as CRLF when the prior is CRLF.
+    assert_eq!(
+        preserve_prior_line_endings("alpha\rbeta\n", "x\r\ny\r\n"),
+        "alpha\r\nbeta\r\n"
+    );
+    assert_eq!(
+        preserve_prior_line_endings("alpha\rbeta\n", "x\ny\n"),
+        "alpha\nbeta\n"
+    );
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn edit_file_tool_preserves_executable_bits() {
