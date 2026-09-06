@@ -529,16 +529,28 @@ impl ExecutionGuard {
 
         let wall_elapsed = now.saturating_duration_since(self.started_at);
         let idle_elapsed = now.saturating_duration_since(self.last_progress_at);
+        // A limit whose deadline does not fit in `Instant` can never fire.
+        let wall_deadline = self.started_at.checked_add(self.limits.wall_time);
+        let idle_deadline = self.last_progress_at.checked_add(self.limits.idle_progress);
         let pending = if shutdown {
             Some(TaskTerminalReason::Shutdown)
         } else if cancel {
             Some(TaskTerminalReason::Canceled)
-        } else if wall_elapsed >= self.limits.wall_time {
-            Some(TaskTerminalReason::WallTimeout)
-        } else if idle_elapsed >= self.limits.idle_progress {
-            Some(TaskTerminalReason::IdleTimeout)
         } else {
-            None
+            // Attribute the timeout to the limit that was crossed first, not
+            // to the one this tick happens to check first. When the watchdog
+            // is starved past both deadlines (a >=250 ms scheduler stall on a
+            // loaded CI runner is enough with the test budgets), the idle
+            // limit that expired earlier is still the truthful reason; a tie
+            // keeps the wall limit's precedence (issue #5898).
+            match (wall_deadline, idle_deadline) {
+                (Some(wall), Some(idle)) if now >= wall && wall <= idle => {
+                    Some(TaskTerminalReason::WallTimeout)
+                }
+                (_, Some(idle)) if now >= idle => Some(TaskTerminalReason::IdleTimeout),
+                (Some(wall), _) if now >= wall => Some(TaskTerminalReason::WallTimeout),
+                _ => None,
+            }
         };
         if let Some(reason) = pending {
             return GuardAction::Interrupt { reason };
@@ -3849,6 +3861,40 @@ mod tests {
     }
 
     #[test]
+    fn execution_guard_reports_the_limit_that_expired_first_when_both_elapsed() {
+        let start = Instant::now();
+        let limits = TaskExecutionLimits::short_for_tests();
+        let guard = ExecutionGuard::new(limits, start);
+        // A starved watchdog that first ticks after both budgets ran out must
+        // still report the idle limit, which expired first.
+        match guard.evaluate(
+            start + limits.wall_time + limits.idle_progress,
+            false,
+            false,
+        ) {
+            GuardAction::Interrupt { reason } => {
+                assert_eq!(reason, TaskTerminalReason::IdleTimeout);
+            }
+            other => panic!("expected idle interrupt, got {other:?}"),
+        }
+
+        // Late progress pushes the idle deadline past the wall deadline, so
+        // the same starved tick reports the wall limit instead.
+        let mut guard = ExecutionGuard::new(limits, start);
+        guard.note_progress(start + limits.wall_time - Duration::from_millis(1));
+        match guard.evaluate(
+            start + limits.wall_time + limits.idle_progress,
+            false,
+            false,
+        ) {
+            GuardAction::Interrupt { reason } => {
+                assert_eq!(reason, TaskTerminalReason::WallTimeout);
+            }
+            other => panic!("expected wall interrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn execution_guard_progress_refreshes_idle_until_wall_timeout() {
         let start = Instant::now();
         let limits = TaskExecutionLimits::short_for_tests();
@@ -3859,6 +3905,9 @@ mod tests {
             GuardAction::Run { .. } => {}
             other => panic!("progress should keep idle from firing, got {other:?}"),
         }
+        // Progress keeps arriving, so the idle deadline never expires before
+        // the wall deadline does.
+        guard.note_progress(start + limits.wall_time - (limits.idle_progress / 2));
         match guard.evaluate(start + limits.wall_time, false, false) {
             GuardAction::Interrupt { reason } => {
                 assert_eq!(reason, TaskTerminalReason::WallTimeout);
