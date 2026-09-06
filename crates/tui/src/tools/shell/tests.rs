@@ -35,6 +35,12 @@ fn shell_catalog_guidance_matches_execution() {
     assert!(tool.model_visible());
     assert!(!command.contains("action=run"));
     assert!(!tool.description().contains("background=true"));
+    assert!(
+        tool.description().contains(
+            "In Ask, after a sandbox denial, retry the exact command once with sandbox_permissions (the narrowest wider mode that suffices) and a one-sentence justification; the approval prompt asks the user."
+        ),
+        "foreground guidance must preserve the sandbox retry and approval contract"
+    );
     let legacy = BashTool::new("Bash");
     assert!(!legacy.model_visible());
     assert!(legacy.description().contains(command));
