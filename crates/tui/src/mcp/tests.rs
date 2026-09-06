@@ -1122,6 +1122,155 @@ connect_timeout = 2
 }
 
 #[cfg(target_os = "macos")]
+#[tokio::test]
+async fn reviewed_multi_file_node_mjs_plugin_launches_by_staged_path() {
+    if std::process::Command::new("node")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipping reviewed multi-file Node ESM launch test because node is unavailable");
+        return;
+    }
+
+    // The entry imports a sibling module, exactly like the computer-use
+    // bundle (#5916). Launched by descriptor, Node would resolve `./lib/...`
+    // against `/dev/` and the child would die before the handshake.
+    let dir = tempfile::tempdir().unwrap();
+    let plugins_root = dir.path().join("plugins");
+    let plugin_base = plugins_root.join("node-esm-multi");
+    fs::create_dir_all(plugin_base.join("mcp")).unwrap();
+    fs::create_dir_all(plugin_base.join("lib")).unwrap();
+    fs::write(
+        plugin_base.join("lib").join("reply.mjs"),
+        r#"import path from 'node:path';
+import url from 'node:url';
+export const TOOL = 'ready-from-sibling';
+export const ENTRY_DIR = path.basename(path.dirname(url.fileURLToPath(import.meta.url)));
+"#,
+    )
+    .unwrap();
+    fs::write(
+        plugin_base.join("mcp").join("server.mjs"),
+        r#"import readline from 'node:readline';
+import { TOOL, ENTRY_DIR } from '../lib/reply.mjs';
+const lines = readline.createInterface({ input: process.stdin });
+lines.on('line', (line) => {
+  const request = JSON.parse(line);
+  if (request.id === undefined) return;
+  let result;
+  if (request.method === 'initialize') {
+    result = {
+      protocolVersion: '2025-06-18',
+      capabilities: { tools: {} },
+      serverInfo: { name: 'node-esm-multi', version: '1.0.0' }
+    };
+  } else if (request.method === 'tools/list') {
+    result = {
+      tools: [{ name: TOOL, description: ENTRY_DIR, inputSchema: { type: 'object' } }]
+    };
+  } else {
+    result = {};
+  }
+  process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\n');
+});
+"#,
+    )
+    .unwrap();
+    fs::write(
+        plugin_base.join("plugin.toml"),
+        r#"
+schema_version = 1
+[plugin]
+name = "node-esm-multi"
+version = "1.0.0"
+
+[mcp_servers.local]
+command = "node"
+args = ["mcp/server.mjs"]
+connect_timeout = 2
+"#,
+    )
+    .unwrap();
+
+    let discovery = crate::plugins::discovery::DiscoveryConfig {
+        workspace: dir.path().join("project"),
+        user_plugins_dir: plugins_root,
+        workspace_plugins_dir: dir.path().join("workspace-plugins-unused"),
+        builtin_plugin_dirs: Vec::new(),
+        state_path: dir.path().join("plugin-state/state.json"),
+    };
+    let mut registry = crate::plugins::discovery::discover_with_config(&discovery);
+    registry.trust("node-esm-multi").unwrap();
+    registry.enable("node-esm-multi").unwrap();
+    let active = registry.active_plugins()[0].clone();
+    let authority = registry.authority_for("node-esm-multi").unwrap();
+    let merged = merge_plugin_mcp_servers_from_plugins(
+        McpConfig::default(),
+        vec![("node-esm-multi".to_string(), active, authority)],
+    )
+    .unwrap();
+    let mut pool = McpPool::new(merged);
+
+    let connection = pool
+        .get_or_connect("plugin-14-node-esm-multi-local")
+        .await
+        .unwrap();
+    assert_eq!(connection.tools().len(), 1);
+    assert_eq!(connection.tools()[0].name, "ready-from-sibling");
+    // The sibling resolved from the staged tree, not from `/dev/`.
+    assert_eq!(connection.tools()[0].description.as_deref(), Some("lib"));
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn esm_entry_with_module_siblings_keeps_its_staged_path() {
+    use std::collections::BTreeMap;
+    let staged_root = Path::new("/stage/plugin");
+    let entry = staged_root.join("mcp/server.mjs");
+    let hash = |paths: &[&str]| {
+        paths
+            .iter()
+            .map(|path| (PathBuf::from(path), "h".to_string()))
+            .collect::<BTreeMap<_, _>>()
+    };
+    // Manifests, docs, and data files are not modules.
+    assert!(!esm_entry_has_module_siblings(
+        staged_root,
+        &entry,
+        &hash(&[
+            "mcp/server.mjs",
+            "plugin.json",
+            "mcp.json",
+            "README.md",
+            "skills/a/SKILL.md"
+        ]),
+    ));
+    for sibling in [
+        "src/tools.mjs",
+        "lib/x.js",
+        "lib/x.cjs",
+        "native/x.node",
+        "wasm/x.wasm",
+    ] {
+        assert!(
+            esm_entry_has_module_siblings(
+                staged_root,
+                &entry,
+                &hash(&["mcp/server.mjs", "plugin.json", sibling]),
+            ),
+            "{sibling} must force a path launch"
+        );
+    }
+    // An entry outside the stage never qualifies.
+    assert!(!esm_entry_has_module_siblings(
+        Path::new("/elsewhere"),
+        &entry,
+        &hash(&["mcp/server.mjs", "src/tools.mjs"]),
+    ));
+}
+
+#[cfg(target_os = "macos")]
 #[test]
 fn node_esm_descriptor_launch_keeps_options_argv_shape_and_script_arguments() {
     use std::ffi::OsString;

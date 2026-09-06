@@ -679,23 +679,46 @@ impl ReviewedPluginMcpSource {
         if Path::new(command).is_absolute() {
             launch.bind_command(staged_root, Path::new(command), &validated.file_hashes)?;
         }
+        // Darwin cannot hand Node an ESM entry by descriptor when that entry
+        // imports sibling modules: `/dev/fd/N` has no directory, so every
+        // relative specifier resolves against `/dev/` (#5916). Such an entry
+        // keeps its staged path — its bytes are still hash-verified by
+        // `bind_file` below, and the siblings were always read by path.
+        #[cfg(target_os = "macos")]
+        let esm_entry_index = is_node_command(command)
+            .then(|| {
+                args.iter().position(|argument| {
+                    let path = Path::new(argument);
+                    path.is_absolute()
+                        && path.starts_with(staged_root)
+                        && path.extension().is_some_and(|extension| extension == "mjs")
+                })
+            })
+            .flatten();
+        #[cfg(target_os = "macos")]
+        let esm_entry_keeps_path = esm_entry_index.is_some_and(|index| {
+            esm_entry_has_module_siblings(
+                staged_root,
+                Path::new(&args[index]),
+                &validated.file_hashes,
+            )
+        });
         for (index, argument) in args.iter().enumerate() {
             let path = Path::new(argument);
             if path.is_absolute() && path.starts_with(staged_root) && path.is_file() {
-                launch.args[index] = launch.bind_file(staged_root, path, &validated.file_hashes)?;
+                let bound = launch.bind_file(staged_root, path, &validated.file_hashes)?;
+                #[cfg(target_os = "macos")]
+                if esm_entry_keeps_path && esm_entry_index == Some(index) {
+                    continue;
+                }
+                launch.args[index] = bound;
             }
         }
         #[cfg(target_os = "macos")]
-        if is_node_command(command) {
-            let entry_index = args.iter().position(|argument| {
-                let path = Path::new(argument);
-                path.is_absolute()
-                    && path.starts_with(staged_root)
-                    && path.extension().is_some_and(|extension| extension == "mjs")
-            });
-            if let Some(entry_index) = entry_index {
-                launch.args = node_esm_descriptor_args(&launch.args, entry_index);
-            }
+        if let Some(entry_index) = esm_entry_index
+            && !esm_entry_keeps_path
+        {
+            launch.args = node_esm_descriptor_args(&launch.args, entry_index);
         }
         if let Some(cwd) = cwd {
             if !cwd.starts_with(staged_root) {
@@ -757,6 +780,30 @@ impl ReviewedPluginMcpSource {
         )
         .is_ok()
     }
+}
+
+/// Whether a reviewed `.mjs` entry shares its stage with other module files.
+/// Such an entry must launch by path: Node resolves its relative imports
+/// against the entry's own URL, and a `/dev/fd/N` URL has no directory to
+/// resolve against (#5916). Manifests and data files do not count.
+#[cfg(target_os = "macos")]
+fn esm_entry_has_module_siblings(
+    staged_root: &Path,
+    entry: &Path,
+    file_hashes: &std::collections::BTreeMap<PathBuf, String>,
+) -> bool {
+    let Ok(entry) = entry.strip_prefix(staged_root) else {
+        return false;
+    };
+    file_hashes.keys().any(|path| {
+        path != entry
+            && path.extension().is_some_and(|extension| {
+                matches!(
+                    extension.to_string_lossy().as_ref(),
+                    "mjs" | "js" | "cjs" | "node" | "wasm"
+                )
+            })
+    })
 }
 
 #[cfg(target_os = "macos")]
