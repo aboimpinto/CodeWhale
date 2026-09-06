@@ -163,6 +163,14 @@ mod tests {
                 .as_deref()
                 .is_some_and(|m| m == "Starting account-owned web remote control…")
         );
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            [
+                "remote_start_info",
+                "remote_start_info",
+                "remote_start_info"
+            ]
+        );
     }
 
     #[test]
@@ -190,6 +198,10 @@ mod tests {
         assert_eq!(
             message(&link),
             "Remote control session: https://remote.example/s\nManage this computer: https://remote.example/c"
+        );
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            ["remote_status", "remote_link", "remote_link"]
         );
     }
 
@@ -228,6 +240,14 @@ mod tests {
             "Could not launch a browser; open https://remote.example/s manually."
         );
         assert!(failed.action.is_none());
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            [
+                "remote_browser_open",
+                "remote_browser_open",
+                "remote_browser_open"
+            ]
+        );
     }
 
     #[test]
@@ -257,6 +277,10 @@ mod tests {
         let unknown = remote_control_portable(&mut fake, Some("frobnicate"));
         assert!(unknown.is_error);
         assert_eq!(message(&unknown), "Usage: /rc [status|link|open|stop]");
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            ["remote_stop_refusal", "remote_stop_refusal"]
+        );
     }
 
     #[test]

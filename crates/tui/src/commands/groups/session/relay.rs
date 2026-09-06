@@ -3,7 +3,9 @@
 use std::fmt::Write as _;
 
 use super::CommandResult;
-use codewhale_command_contract::facets::{CommandSessionControlContext, PlanProjection};
+use codewhale_command_contract::facets::{
+    CommandSessionControlContext, PlanProjection, PlanStepStatus,
+};
 use codewhale_command_contract::handler::{CommandContexts, CommandHandler};
 use codewhale_command_contract::metadata::{
     CommandInfo as ContractInfo, RegisterCommand as ContractRegisterCommand,
@@ -140,7 +142,12 @@ fn build_relay_instruction(
                 sections.handoff_packet.as_deref(),
             );
             for item in sections.items {
-                let _ = writeln!(out, "- [{}] {}", item.status_label, item.text);
+                let _ = writeln!(
+                    out,
+                    "- [{}] {}",
+                    plan_step_status_label(item.status),
+                    item.text
+                );
             }
         }
         PlanProjection::Absent => {}
@@ -160,6 +167,14 @@ fn build_relay_instruction(
         "\nKeep it under about 900 words unless the session genuinely needs more. After writing, report the path and the single next action."
     );
     out
+}
+
+fn plan_step_status_label(status: PlanStepStatus) -> &'static str {
+    match status {
+        PlanStepStatus::Pending => "pending",
+        PlanStepStatus::InProgress => "in_progress",
+        PlanStepStatus::Completed => "completed",
+    }
 }
 
 fn write_plan_field(out: &mut String, label: &str, value: Option<&str>) {
@@ -227,6 +242,7 @@ mod tests {
                 .as_deref()
                 .is_some_and(|m| m == "Preparing session relay at .deepseek/handoff.md...")
         );
+        assert_eq!(fake.calls.borrow().as_slice(), ["relay_projection"]);
     }
 
     #[test]
@@ -272,7 +288,7 @@ mod tests {
                     explanation: Some("  because  ".to_string()),
                     sources_used: vec!["repo-a".to_string(), "  ".to_string()],
                     items: vec![PlanStep {
-                        status_label: "in_progress".to_string(),
+                        status: PlanStepStatus::InProgress,
                         text: "port relay".to_string(),
                     }],
                     ..PlanSections::default()
@@ -289,6 +305,19 @@ mod tests {
         assert!(message.contains("- Explanation: because"));
         assert!(message.contains("- Source: repo-a"));
         assert!(message.contains("- [in_progress] port relay"));
+    }
+
+    #[test]
+    fn relay_owns_every_portable_plan_status_label() {
+        assert_eq!(plan_step_status_label(PlanStepStatus::Pending), "pending");
+        assert_eq!(
+            plan_step_status_label(PlanStepStatus::InProgress),
+            "in_progress"
+        );
+        assert_eq!(
+            plan_step_status_label(PlanStepStatus::Completed),
+            "completed"
+        );
     }
 
     #[test]

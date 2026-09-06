@@ -207,6 +207,10 @@ mod tests {
             Some(crate::tui::app::AppAction::OpenExternalUrl { ref url, ref label })
                 if url == "https://app.codewhale.net/work?repo=A%2FB&branch=main" && label == "Label"
         ));
+        assert_eq!(
+            control.calls.borrow().as_slice(),
+            ["resolve_hosted_work_target"]
+        );
 
         let mut control = fake_control(None);
         let result =
@@ -224,6 +228,20 @@ mod tests {
         assert_eq!(
             message(&result),
             "Command capability unavailable: session_control"
+        );
+
+        let mut control = fake_control(None);
+        let contexts = codewhale_command_contract::handler::CommandContexts::empty()
+            .with_control(&mut control);
+        let result = remote_env_contextual(contexts, None);
+        assert!(result.is_error);
+        assert_eq!(
+            message(&result),
+            "Command capability unavailable: presentation"
+        );
+        assert!(
+            control.calls.borrow().is_empty(),
+            "translation authority is checked before command work"
         );
     }
 }

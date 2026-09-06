@@ -1186,12 +1186,20 @@ pub struct PlanSections {
     pub items: Vec<PlanStep>,
 }
 
-/// One plan checklist item. The status is already rendered to its label
-/// (`pending`/`in_progress`/`completed`) host-side so no TUI step-status type
-/// crosses the boundary.
-#[derive(Clone, Debug, PartialEq)]
+/// Portable plan-step status. The adapter maps the TUI plan status onto this
+/// semantic enum; the command handler remains the sole owner of the exact
+/// `pending`/`in_progress`/`completed` labels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanStepStatus {
+    Pending,
+    InProgress,
+    Completed,
+}
+
+/// One semantic plan checklist item.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PlanStep {
-    pub status_label: String,
+    pub status: PlanStepStatus,
     pub text: String,
 }
 
@@ -1326,9 +1334,10 @@ pub trait CommandSessionControlContext {
     /// read/parse/import text.
     fn import_session_file(&mut self, path: PathBuf) -> Result<ResumeImportReceipt, String>;
 
-    /// `/rename <title>`: sanitize, recover first-snapshot state, sync live
-    /// state, persist, and publish with baseline order. The handler already
-    /// applied blank/usage and 100-character validation.
+    /// `/rename <title>`: sanitize, validate the sanitized 100-character
+    /// limit, recover first-snapshot state, sync live state, persist, and
+    /// publish with baseline order. The handler already applied blank/usage
+    /// validation.
     fn rename_session(&mut self, raw_title: &str) -> Result<SessionTitleReceipt, String>;
 
     /// Bare `/title`: effective prefix and its source.

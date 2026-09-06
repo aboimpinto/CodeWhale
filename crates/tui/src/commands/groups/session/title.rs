@@ -150,8 +150,13 @@ mod tests {
                 "Window title cleared (the config default still applies if set)"
             );
         }
-        assert_eq!(fake.calls.len(), 3);
-        assert!(fake.calls.iter().all(|c| c == "set_window_title(clear)"));
+        assert_eq!(fake.calls.borrow().len(), 3);
+        assert!(
+            fake.calls
+                .borrow()
+                .iter()
+                .all(|call| call == "set_window_title(clear)")
+        );
 
         let mut fake = control_fake();
         fake.set_title = Some(Ok(TitleSetOutcome::Set("task-7".to_string())));
@@ -176,7 +181,10 @@ mod tests {
                 .unwrap()
                 .contains("Title too long (max 100 characters)")
         );
-        assert!(fake.calls.is_empty(), "length check precedes the delegate");
+        assert!(
+            fake.calls.borrow().is_empty(),
+            "length check precedes the delegate"
+        );
 
         let mut fake = control_fake();
         fake.set_title = Some(Err(

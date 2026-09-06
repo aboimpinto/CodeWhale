@@ -114,7 +114,11 @@ mod tests {
             message(&result),
             "Cannot resume while runtime work is active. Wait for the turn to finish, or cancel it first."
         );
-        assert!(fake.calls.is_empty(), "no route work before the gate");
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            ["transition_blocked"],
+            "the gate executes exactly once before route work"
+        );
     }
 
     #[test]
@@ -124,7 +128,10 @@ mod tests {
         assert!(!result.is_error);
         assert!(result.action.is_none());
         assert!(result.message.is_none());
-        assert_eq!(fake.calls, vec!["open_resume_picker".to_string()]);
+        assert_eq!(
+            fake.calls.borrow().as_slice(),
+            ["transition_blocked", "open_resume_picker"]
+        );
     }
 
     #[test]

@@ -39,9 +39,9 @@ use codewhale_command_contract::facets::{
     CommandSkillsContext, CommandSystemPromptContext, CommandWorkspaceContext, HostedWorkTarget,
     MediaAttachmentReceipt, MemoryDelete, MemoryDeleteScope, MemoryExport, MemoryGetOutcome,
     MemoryHit, MemoryImportOutcome, MemoryReindex, MemoryRememberTarget, MemoryRemembered,
-    MemoryStatus, PlanProjection, PlanSections, PlanStep, PluginDetail, PluginDiagnostic,
-    PluginDiagnosticLevel, PluginExportReceipt, PluginLegacyScan, PluginLegacyTool,
-    PluginManagedCandidate, PluginManagedScan, PluginMarketplaceAddReceipt,
+    MemoryStatus, PlanProjection, PlanSections, PlanStep, PlanStepStatus, PluginDetail,
+    PluginDiagnostic, PluginDiagnosticLevel, PluginExportReceipt, PluginLegacyScan,
+    PluginLegacyTool, PluginManagedCandidate, PluginManagedScan, PluginMarketplaceAddReceipt,
     PluginMarketplaceCandidate, PluginMarketplaceCatalog, PluginMarketplaceInstallPlan,
     PluginMarketplaceState, PluginMcpServerDetail, PluginMcpTransport, PluginMutationOutcome,
     PluginMutationReceipt, PluginSuggestion, PluginSummary, ProjectGoalState, ProjectGoalStatus,
@@ -831,84 +831,10 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
 // ---------------------------------------------------------------------------
 // FEAT-024 Phase 4: relocated host machinery for the control slice.
 //
-// These helpers were extracted from the legacy `/rename` and `/remote-env`
-// command bodies when those files became portable; they are host-owned and
-// stay in TUI (the future movable group never names them).
+// These helpers were extracted from the legacy `/remote-env` command body
+// when that file became portable; they are host-owned and stay in TUI (the
+// future movable group never names them).
 // ---------------------------------------------------------------------------
-
-/// `/rename`-style atomic persistence used by the picker/UI test seam and any
-/// host caller that holds an explicit `SessionManager`. Mirrors the baseline
-/// write path: sanitize, load (with first-snapshot recovery), sync live state,
-/// snapshot Work state, carry metadata, save, then publish. Returns the exact
-/// baseline messages.
-#[cfg(test)]
-pub(crate) fn rename_with_manager(
-    new_title: &str,
-    session_id: &str,
-    manager: &crate::session_manager::SessionManager,
-    app: &mut App,
-) -> crate::commands::CommandResult {
-    let sanitized = crate::session_manager::sanitize_session_title(new_title);
-    let new_title = sanitized.trim();
-    if new_title.is_empty() {
-        return crate::commands::CommandResult::error("Usage: /rename <new title>");
-    }
-    let mut session = match manager.load_session(session_id) {
-        Ok(s) => s,
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            match live_session_before_first_snapshot(manager, session_id, app) {
-                Some(s) => s,
-                None => {
-                    return crate::commands::CommandResult::error(format!(
-                        "Could not load session: {err}"
-                    ));
-                }
-            }
-        }
-        Err(e) => {
-            return crate::commands::CommandResult::error(format!("Could not load session: {e}"));
-        }
-    };
-    session = crate::session_manager::update_session(
-        session,
-        &app.api_messages,
-        u64::from(app.session.total_tokens),
-        app.system_prompt.as_ref(),
-    );
-    session.work_state = match app.work_state_snapshot() {
-        Ok(state) => state,
-        Err(err) => {
-            return crate::commands::CommandResult::error(format!(
-                "Could not snapshot Work state before rename: {err}"
-            ));
-        }
-    };
-    session.context_references = app.session_context_references.clone();
-    session.artifacts = app.session_artifacts.clone();
-    session.last_auto_route = app.auto_route_for_persistence();
-    session.metadata.model = app.model_selection_for_persistence();
-    session
-        .metadata
-        .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
-    session.metadata.workspace.clone_from(&app.workspace);
-    session.metadata.mode = Some(app.mode.as_setting().to_string());
-    app.sync_cost_to_metadata(&mut session.metadata);
-    session.metadata.title = new_title.to_string();
-
-    match manager.save_session(&session) {
-        Ok(_) => {
-            app.current_session_metadata = Some(session.metadata.clone());
-            app.session_title = Some(new_title.to_string());
-            if let Err(err) = app.publish_pending_work_state() {
-                return crate::commands::CommandResult::error(format!(
-                    "Session renamed, but Work views were not published: {err}"
-                ));
-            }
-            crate::commands::CommandResult::message(format!("Session renamed to \"{new_title}\""))
-        }
-        Err(e) => crate::commands::CommandResult::error(format!("Could not save session: {e}")),
-    }
-}
 
 const HOSTED_WORK_URL: &str = "https://app.codewhale.net/work";
 const MAX_GIT_VALUE_BYTES: usize = 4 * 1024;
@@ -1452,18 +1378,14 @@ fn plan_snapshot_to_sections(snapshot: &crate::tools::plan::PlanSnapshot) -> Pla
             .items
             .iter()
             .map(|item| PlanStep {
-                status_label: plan_status_label(&item.status).to_string(),
+                status: match &item.status {
+                    crate::tools::plan::StepStatus::Pending => PlanStepStatus::Pending,
+                    crate::tools::plan::StepStatus::InProgress => PlanStepStatus::InProgress,
+                    crate::tools::plan::StepStatus::Completed => PlanStepStatus::Completed,
+                },
                 text: item.step.clone(),
             })
             .collect(),
-    }
-}
-
-fn plan_status_label(status: &crate::tools::plan::StepStatus) -> &'static str {
-    match status {
-        crate::tools::plan::StepStatus::Pending => "pending",
-        crate::tools::plan::StepStatus::InProgress => "in_progress",
-        crate::tools::plan::StepStatus::Completed => "completed",
     }
 }
 
@@ -5083,11 +5005,43 @@ mod tests {
         assert!(parts.skill_group.is_none());
         assert!(parts.plugin.is_none());
 
-        // Unrelated capability: memory and lifecycle both absent.
+        // Control-only: control present and every unrelated slot absent.
+        let parts = bundle
+            .contexts(CommandCapabilities::SESSION_CONTROL)
+            .into_parts();
+        assert!(parts.control.is_some());
+        assert!(parts.session.is_none());
+        assert!(parts.model.is_none());
+        assert!(parts.cost.is_none());
+        assert!(parts.mode_policy.is_none());
+        assert!(parts.system_prompt.is_none());
+        assert!(parts.skills.is_none());
+        assert!(parts.workspace.is_none());
+        assert!(parts.presentation.is_none());
+        assert!(parts.media.is_none());
+        assert!(parts.memory.is_none());
+        assert!(parts.project.is_none());
+        assert!(parts.skill_group.is_none());
+        assert!(parts.plugin.is_none());
+        assert!(parts.lifecycle.is_none());
+
+        // `/remote-env`: exactly control plus presentation.
+        let parts = bundle
+            .contexts(CommandCapabilities::SESSION_CONTROL.union(CommandCapabilities::PRESENTATION))
+            .into_parts();
+        assert!(parts.control.is_some());
+        assert!(parts.presentation.is_some());
+        assert!(parts.session.is_none());
+        assert!(parts.workspace.is_none());
+        assert!(parts.lifecycle.is_none());
+        assert!(parts.plugin.is_none());
+
+        // Unrelated capability: memory, lifecycle, and control all absent.
         let parts = bundle.contexts(CommandCapabilities::SESSION).into_parts();
         assert!(parts.session.is_some());
         assert!(parts.memory.is_none());
         assert!(parts.lifecycle.is_none());
+        assert!(parts.control.is_none());
     }
 
     // ─── FEAT-022 skill-group adapter tests ───────────────────────────────────
@@ -6104,7 +6058,7 @@ mod tests {
                 PlanProjection::Sections(sections) => {
                     assert_eq!(sections.title.as_deref(), Some("Relay Plan"));
                     assert_eq!(sections.items.len(), 1);
-                    assert_eq!(sections.items[0].status_label, "in_progress");
+                    assert_eq!(sections.items[0].status, PlanStepStatus::InProgress);
                     assert_eq!(sections.items[0].text, "port the control slice");
                 }
                 other => panic!("expected Sections plan after update, got {other:?}"),

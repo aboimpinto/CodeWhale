@@ -82,7 +82,10 @@ mod tests {
         let result = rename_portable(&mut no_arg, None);
         assert!(result.is_error);
         assert_eq!(message(&result), "Usage: /rename <new title>");
-        assert!(no_arg.calls.is_empty(), "no delegate call for blank input");
+        assert!(
+            no_arg.calls.borrow().is_empty(),
+            "no delegate call for blank input"
+        );
 
         let mut blank = control_fake();
         let result = rename_portable(&mut blank, Some("   "));
@@ -96,7 +99,7 @@ mod tests {
         let result = rename_portable(&mut ok, Some("New Name"));
         assert!(!result.is_error);
         assert_eq!(message(&result), "Session renamed to \"New Name\"");
-        assert_eq!(ok.calls, vec!["rename_session(New Name)".to_string()]);
+        assert_eq!(ok.calls.borrow().as_slice(), ["rename_session(New Name)"]);
         assert!(result.action.is_none(), "/rename emits no action");
     }
 

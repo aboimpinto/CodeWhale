@@ -2252,7 +2252,7 @@ fn control_relay_projection() -> RelayProjection {
         plan: PlanProjection::Sections(PlanSections {
             title: Some("Plan title".to_string()),
             items: vec![PlanStep {
-                status_label: "in_progress".to_string(),
+                status: PlanStepStatus::InProgress,
                 text: "port the control slice".to_string(),
             }],
             ..PlanSections::default()
@@ -2315,7 +2315,7 @@ fn control_facet_is_object_safe_and_transports_every_outcome() {
         PlanProjection::Sections(sections) => {
             assert_eq!(sections.title.as_deref(), Some("Plan title"));
             assert_eq!(sections.items.len(), 1);
-            assert_eq!(sections.items[0].status_label, "in_progress");
+            assert_eq!(sections.items[0].status, PlanStepStatus::InProgress);
         }
         other => panic!("expected Sections plan, got {other:?}"),
     }

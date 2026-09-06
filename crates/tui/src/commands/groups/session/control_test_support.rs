@@ -9,6 +9,7 @@ use codewhale_command_contract::facets::{
     RemoteOpenOutcome, RemoteStartInfo, ResumeImportReceipt, ResumeSource, SessionTitleReceipt,
     TitleReport, TitleSetOutcome, TodoProjection,
 };
+use std::cell::RefCell;
 use std::path::PathBuf;
 
 #[derive(Default)]
@@ -26,27 +27,30 @@ pub(crate) struct FakeControl {
     pub(crate) start_info: Option<RemoteStartInfo>,
     pub(crate) stop_refusal: Option<Option<String>>,
     pub(crate) hosted: Option<Option<HostedWorkTarget>>,
-    pub(crate) calls: Vec<String>,
+    pub(crate) calls: RefCell<Vec<String>>,
 }
 
 impl FakeControl {
-    fn call(&mut self, name: &str, arg: Option<&str>) {
+    fn call(&self, name: &str, arg: Option<&str>) {
+        let mut calls = self.calls.borrow_mut();
         match arg {
-            Some(arg) => self.calls.push(format!("{name}({arg})")),
-            None => self.calls.push(name.to_string()),
+            Some(arg) => calls.push(format!("{name}({arg})")),
+            None => calls.push(name.to_string()),
         }
     }
 }
 
 impl CommandSessionControlContext for FakeControl {
     fn transition_blocked(&self) -> bool {
+        self.call("transition_blocked", None);
         self.blocked
     }
     fn relay_projection(&self) -> RelayProjection {
+        self.call("relay_projection", None);
         self.relay.clone().expect("unexpected relay_projection()")
     }
     fn open_resume_picker(&mut self) {
-        self.calls.push("open_resume_picker".to_string());
+        self.call("open_resume_picker", None);
     }
     fn resolve_resume_source(&mut self, raw: &str) -> Result<ResumeSource, String> {
         self.call("resolve_resume_source", Some(raw));
@@ -76,6 +80,7 @@ impl CommandSessionControlContext for FakeControl {
         }
     }
     fn title_report(&self) -> TitleReport {
+        self.call("title_report", None);
         self.title_report
             .clone()
             .expect("unexpected title_report()")
@@ -83,7 +88,7 @@ impl CommandSessionControlContext for FakeControl {
     fn set_window_title(&mut self, title: Option<String>) -> Result<TitleSetOutcome, String> {
         match &title {
             Some(value) => self.call("set_window_title", Some(value)),
-            None => self.calls.push("set_window_title(clear)".to_string()),
+            None => self.call("set_window_title", Some("clear")),
         }
         match self.set_title.clone() {
             Some(result) => result,
@@ -91,27 +96,33 @@ impl CommandSessionControlContext for FakeControl {
         }
     }
     fn remote_status(&self) -> String {
+        self.call("remote_status", None);
         self.remote_status
             .clone()
             .expect("unexpected remote_status()")
     }
     fn remote_link(&self) -> Option<RemoteLink> {
+        self.call("remote_link", None);
         self.remote_link.clone().expect("unexpected remote_link()")
     }
     fn remote_browser_open(&self) -> RemoteOpenOutcome {
+        self.call("remote_browser_open", None);
         self.browser_open
             .clone()
             .expect("unexpected browser_open()")
     }
     fn remote_start_info(&self) -> RemoteStartInfo {
+        self.call("remote_start_info", None);
         self.start_info.clone().expect("unexpected start_info()")
     }
     fn remote_stop_refusal(&self) -> Option<String> {
+        self.call("remote_stop_refusal", None);
         self.stop_refusal
             .clone()
             .expect("unexpected stop_refusal()")
     }
     fn resolve_hosted_work_target(&self) -> Option<HostedWorkTarget> {
+        self.call("resolve_hosted_work_target", None);
         self.hosted.clone().expect("unexpected hosted()")
     }
 }

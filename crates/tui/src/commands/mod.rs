@@ -26,6 +26,8 @@ mod epic_discovery_acceptance;
 #[cfg(all(test, feature = "long-running-tests"))]
 mod session_acceptance;
 #[cfg(test)]
+mod session_control_regression_tests;
+#[cfg(test)]
 mod session_lifecycle_regression_tests;
 
 use std::sync::OnceLock;
@@ -33,8 +35,6 @@ use std::sync::OnceLock;
 pub use traits::CommandInfo;
 
 // Long-standing public paths that predate the group layout.
-#[cfg(test)]
-pub(crate) use contract::rename_with_manager as rename_session_with_manager;
 /// `/fleet add` and the picker's ⇧F share these gates; the UI applies them
 /// against the live `Config`.
 pub(crate) use groups::core::fleet::{fleet_catalog_rejection, fleet_provider_rejection};
