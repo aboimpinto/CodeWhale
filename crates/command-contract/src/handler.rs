@@ -7,8 +7,8 @@
 use crate::facets::{
     CommandCostContext, CommandMediaContext, CommandMemoryContext, CommandModePolicyContext,
     CommandModelContext, CommandPluginContext, CommandPresentationContext, CommandProjectContext,
-    CommandSessionContext, CommandSkillGroupContext, CommandSkillsContext,
-    CommandSystemPromptContext, CommandWorkspaceContext,
+    CommandSessionContext, CommandSessionLifecycleContext, CommandSkillGroupContext,
+    CommandSkillsContext, CommandSystemPromptContext, CommandWorkspaceContext,
 };
 
 /// Exact host capabilities exposed to one contextual command handler.
@@ -38,6 +38,11 @@ impl CommandCapabilities {
     pub const SKILL_GROUP: Self = Self(1 << 11);
     /// Plugin-group host data (FEAT-020 D1), appended after current main capabilities.
     pub const PLUGIN: Self = Self(1 << 12);
+    /// Session-lifecycle host data (FEAT-023 D3), the next non-conflicting bit
+    /// after `PLUGIN`. Required only by the seven host-dependent lifecycle
+    /// commands; `/compact` and `/purge` remain pure. Never widened by the
+    /// basic session capability.
+    pub const SESSION_LIFECYCLE: Self = Self(1 << 13);
 
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
@@ -85,6 +90,7 @@ pub struct CommandContexts<'a> {
     project: Option<&'a mut dyn CommandProjectContext>,
     skill_group: Option<&'a mut dyn CommandSkillGroupContext>,
     plugin: Option<&'a mut dyn CommandPluginContext>,
+    lifecycle: Option<&'a mut dyn CommandSessionLifecycleContext>,
 }
 
 /// Consumed envelope used when one handler needs several independent facets.
@@ -102,6 +108,7 @@ pub struct ContextParts<'a> {
     pub project: Option<&'a mut dyn CommandProjectContext>,
     pub skill_group: Option<&'a mut dyn CommandSkillGroupContext>,
     pub plugin: Option<&'a mut dyn CommandPluginContext>,
+    pub lifecycle: Option<&'a mut dyn CommandSessionLifecycleContext>,
 }
 
 impl<'a> CommandContexts<'a> {
@@ -120,6 +127,7 @@ impl<'a> CommandContexts<'a> {
             project: None,
             skill_group: None,
             plugin: None,
+            lifecycle: None,
         }
     }
 
@@ -138,6 +146,7 @@ impl<'a> CommandContexts<'a> {
             project: self.project,
             skill_group: self.skill_group,
             plugin: self.plugin,
+            lifecycle: self.lifecycle,
         }
     }
 
@@ -238,6 +247,14 @@ impl<'a> CommandContexts<'a> {
         assert!(
             self.plugin.replace(value).is_none(),
             "plugin facet already set"
+        );
+        self
+    }
+
+    pub fn with_lifecycle(mut self, value: &'a mut dyn CommandSessionLifecycleContext) -> Self {
+        assert!(
+            self.lifecycle.replace(value).is_none(),
+            "lifecycle facet already set"
         );
         self
     }

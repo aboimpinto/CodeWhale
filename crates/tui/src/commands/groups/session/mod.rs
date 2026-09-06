@@ -1,8 +1,6 @@
 //! Session command area: saving, forking, resuming, exporting, and the
 //! `/relay` session-handoff artifact.
 
-#[cfg(all(test, feature = "long-running-tests"))]
-mod acceptance;
 mod branch;
 mod compact;
 mod export;
@@ -30,7 +28,9 @@ mod tree;
 mod session;
 
 use crate::commands::CommandResult;
-use crate::commands::traits::{Command, CommandGroup, FunctionCommand, RegisterCommand};
+use crate::commands::traits::{
+    Command, CommandGroup, ContextualCommand, FunctionCommand, RegisterCommand,
+};
 
 pub struct SessionCommands;
 
@@ -45,46 +45,38 @@ impl CommandGroup for SessionCommands {
                 title::TitleCmd::info(),
                 title::TitleCmd::execute,
             )),
-            Box::new(FunctionCommand::new(
-                save::SaveCmd::info(),
-                save::SaveCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                fork::ForkCmd::info(),
-                fork::ForkCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                new::NewCmd::info(),
-                new::NewCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                sessions::SessionsCmd::info(),
-                sessions::SessionsCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                load::LoadCmd::info(),
-                load::LoadCmd::execute,
-            )),
+            Box::new(
+                ContextualCommand::from_contract::<save::SaveCmd>().expect("save registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<fork::ForkCmd>().expect("fork registration")
+            ),
+            Box::new(ContextualCommand::from_contract::<new::NewCmd>().expect("new registration")),
+            Box::new(
+                ContextualCommand::from_contract::<sessions::SessionsCmd>()
+                    .expect("sessions registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<load::LoadCmd>().expect("load registration")
+            ),
             Box::new(FunctionCommand::new(
                 resume::ResumeCmd::info(),
                 resume::ResumeCmd::execute,
             )),
-            Box::new(FunctionCommand::new(
-                tree::TreeCmd::info(),
-                tree::TreeCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                branch::BranchCmd::info(),
-                branch::BranchCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                compact::CompactCmd::info(),
-                compact::CompactCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                purge::PurgeCmd::info(),
-                purge::PurgeCmd::execute,
-            )),
+            Box::new(
+                ContextualCommand::from_contract::<tree::TreeCmd>().expect("tree registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<branch::BranchCmd>()
+                    .expect("branch registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<compact::CompactCmd>()
+                    .expect("compact registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<purge::PurgeCmd>().expect("purge registration")
+            ),
             Box::new(FunctionCommand::new(
                 relay::RelayCmd::info(),
                 relay::RelayCmd::execute,
@@ -108,3 +100,27 @@ impl CommandGroup for SessionCommands {
         ])
     }
 }
+
+// ---------------------------------------------------------------------------
+// FEAT-023 Phase 4 (D6): map a portable lifecycle sync payload into the
+// temporary `SyncSession` action. FEAT-037 owns the eventual shared outcome
+// types; until then the mapping lives here so every portable handler composes
+// the same action from the same receipt.
+// ---------------------------------------------------------------------------
+pub(in crate::commands) fn sync_session_action(
+    sync: codewhale_command_contract::facets::SessionSyncPayload,
+) -> crate::tui::app::AppAction {
+    crate::tui::app::AppAction::SyncSession {
+        session_id: sync.session_id,
+        messages: sync.messages,
+        system_prompt: sync.system_prompt,
+        model: sync.model,
+        workspace: sync.workspace,
+        mode: crate::commands::contract::from_command_mode(sync.mode),
+    }
+}
+
+#[cfg(test)]
+mod lifecycle_portable_tests;
+#[cfg(test)]
+mod lifecycle_test_support;

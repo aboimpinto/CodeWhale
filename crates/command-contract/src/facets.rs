@@ -940,3 +940,171 @@ pub trait CommandSkillGroupContext {
     /// `/restore` trust gate posture (yolo / trust_mode).
     fn approval_state(&self) -> CommandApprovalState;
 }
+
+// ---------------------------------------------------------------------------
+// Session lifecycle capability (FEAT-023).
+//
+// One contract-owned facet for the seven host-dependent lifecycle commands;
+// `/compact` and `/purge` stay pure. The shared `CommandSessionContext` above
+// stays unchanged: it
+// serves commands outside this slice and must not gain persistence,
+// navigation, picker, or lifecycle mutation authority (D2). No concrete App,
+// SessionManager, session-journal, picker, configuration, or view-stack type
+// crosses this boundary; successful results are structured portable fields so
+// the handlers retain exact message composition (D2/D5).
+// ---------------------------------------------------------------------------
+
+/// Portable synchronization fields a lifecycle handler maps into the
+/// temporary `SyncSession` action payload. The conversation and prompt types
+/// are `codewhale-core` request types shared by the contract and the TUI
+/// (FEAT-037 will move shared outcome ownership; FEAT-023 keeps the bounded
+/// reference only for `/fork` and `/new` transitions, D6).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionSyncPayload {
+    pub session_id: Option<String>,
+    pub messages: Vec<Message>,
+    pub system_prompt: Option<SystemPrompt>,
+    pub model: String,
+    pub workspace: PathBuf,
+    pub mode: CommandMode,
+}
+
+/// `/branch` success projection (`session/branch.rs`). The handler composes
+/// the exact success line from these deterministic fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionBranchOutcome {
+    pub leaf_display: String,
+    pub journal_entries_before: usize,
+}
+
+/// `/fork` success projection for an active-conversation fork. The handler
+/// composes `Forked session {parent} -> {fork}` from these required fields.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionForkReceipt {
+    pub parent_label: String,
+    pub fork_label: String,
+    pub sync: SessionSyncPayload,
+}
+
+/// `/fork <session_id|prefix>` success projection. Explicit-source forks
+/// always report their spawn depth, so the contract makes that field required
+/// rather than permitting an invalid missing-depth state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionForkFromReceipt {
+    pub parent_label: String,
+    pub fork_label: String,
+    pub spawn_depth: u64,
+    pub sync: SessionSyncPayload,
+}
+
+/// `/save` success projection. The host performs the full baseline sequence
+/// (snapshot, serialization, atomic write, metadata application, work-state
+/// publication); the handler renders `Session saved to {display_path} (ID:
+/// {truncated_id})`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionSaveReceipt {
+    pub display_path: String,
+    pub truncated_id: String,
+}
+
+/// `/new` success projection. The handler renders
+/// `Started new session {truncated_id} (New Session). Previous sessions
+/// remain available via /resume.`
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionNewReceipt {
+    pub truncated_id: String,
+    pub sync: SessionSyncPayload,
+}
+
+/// `/sessions archive|unarchive|restore` success projection. The handler
+/// renders `Archived session {id} ({title})` or `Restored session ...` from
+/// the verb it dispatched.
+#[derive(Clone, Debug, PartialEq)]
+pub struct SessionArchiveReceipt {
+    pub truncated_id: String,
+    pub title: String,
+}
+
+/// `/tree` body projection. The body rendering source (journal tree and
+/// linear transcript) stays TUI-owned; the handler appends the exact
+/// guidance lines (D5).
+#[derive(Clone, Debug, PartialEq)]
+pub enum TreeBodyProjection {
+    /// Journal render already includes the trailing newline before guidance.
+    Journal {
+        rendered: String,
+    },
+    /// Linear pre-journal render (the marker lines).
+    Linear {
+        rendered: String,
+    },
+    EmptySession,
+    NoSession,
+}
+
+/// Lifecycle authority for the session command slice (FEAT-023 D2).
+///
+/// Operation-granular synchronous delegates over the exact minimum host work
+/// the nine commands consume. Delegates may return the explicit host-error
+/// text the baseline surfaces for a failing stage; successful results are
+/// structured portable fields so handlers retain byte-identical composition.
+pub trait CommandSessionLifecycleContext {
+    /// Live transition gate. Handlers return their own blocked-error text
+    /// before invoking any mutating delegate, matching the baseline ordering
+    /// (`/branch`, `/fork`, `/load`, `/new`). `/fork picker` and `/tree`
+    /// never consult it in the baseline, so their paths must not either.
+    fn transition_blocked(&self) -> bool;
+
+    /// `/branch` with no argument: the current leaf when an active journaled
+    /// session resolves, otherwise `None` (the baseline silently falls back
+    /// to the usage message on this path).
+    fn branch_current_leaf_hint(&self) -> Option<String>;
+
+    /// `/branch <entry_id>`: persist the leaf move and apply the branched
+    /// transcript. Errors are the exact baseline message for the failing
+    /// stage (no active session, directory open, load, persist, or branch
+    /// failure).
+    fn branch_to(&mut self, entry_id: &str) -> Result<SessionBranchOutcome, String>;
+
+    /// `/tree`: produce the journal/linear/empty/no-session projection.
+    /// Errors are the exact baseline directory-open message.
+    fn tree_body(&self) -> Result<TreeBodyProjection, String>;
+
+    /// `/save [path]`: the full baseline persistence sequence.
+    fn save_session(&mut self, explicit_path: Option<String>)
+    -> Result<SessionSaveReceipt, String>;
+
+    /// `/fork` (active conversation): the full baseline parent/child save and
+    /// switch sequence.
+    fn fork_active(&mut self) -> Result<SessionForkReceipt, String>;
+
+    /// `/fork <session_id|prefix>`: explicit-source fork.
+    fn fork_from(&mut self, session_id_or_prefix: &str) -> Result<SessionForkFromReceipt, String>;
+
+    /// `/new [--force]`: fresh-session transition. The caller has already
+    /// parsed the argument and applied the transition-blocked gate; blocker,
+    /// busy-work-state, and success handling match the baseline.
+    fn fresh_session(&mut self, force: bool) -> Result<SessionNewReceipt, String>;
+
+    /// `/load <path>`: resolve the path (separator-bearing direct vs
+    /// workspace-relative) and validate the saved-session shape without
+    /// applying state or emitting a premature success receipt.
+    fn load_session(&mut self, path: &str) -> Result<PathBuf, String>;
+
+    /// `/sessions` picker open with optional preselection (bare, `show`,
+    /// `list`, `picker`, and `open <id>` forms). Picker construction and
+    /// locale selection stay host-side.
+    fn open_picker(&mut self, preselected: Option<String>);
+
+    /// `/sessions archive|unarchive|restore <id>`: durable lifecycle state
+    /// update that also syncs the live cached metadata atomically.
+    fn set_archived(
+        &mut self,
+        session_id: &str,
+        archived: bool,
+    ) -> Result<SessionArchiveReceipt, String>;
+
+    /// `/sessions prune <days>`: prune persisted sessions older than `days`
+    /// days while protecting the active session; returns the number pruned.
+    fn prune_sessions(&mut self, days: u64) -> Result<usize, String>;
+}

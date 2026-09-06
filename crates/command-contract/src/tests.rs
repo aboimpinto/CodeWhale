@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 
-use codewhale_core::request::{Message, SystemPrompt};
+use codewhale_core::request::{ContentBlock, Message, SystemPrompt};
+use codewhale_core::role::Role;
 
 use crate::*;
 
@@ -1789,4 +1790,315 @@ fn shared_skills_facet_surface_remains_read_only_and_transportable() {
         .into_parts();
     assert!(parts.skills.is_some());
     assert!(parts.skill_group.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// FEAT-023: session lifecycle contract (D2/D3/D6).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lifecycle_capability_is_stable_distinct_and_non_conflicting() {
+    let lifecycle = CommandCapabilities::SESSION_LIFECYCLE;
+    for existing in [
+        CommandCapabilities::NONE,
+        CommandCapabilities::SESSION,
+        CommandCapabilities::MODEL,
+        CommandCapabilities::COST,
+        CommandCapabilities::MODE_POLICY,
+        CommandCapabilities::SYSTEM_PROMPT,
+        CommandCapabilities::SKILLS,
+        CommandCapabilities::WORKSPACE,
+        CommandCapabilities::PRESENTATION,
+        CommandCapabilities::MEDIA,
+        CommandCapabilities::MEMORY,
+        CommandCapabilities::PROJECT,
+        CommandCapabilities::SKILL_GROUP,
+        CommandCapabilities::PLUGIN,
+    ] {
+        assert_ne!(lifecycle, existing, "SESSION_LIFECYCLE must not collide");
+    }
+    assert!(!CommandCapabilities::NONE.contains(lifecycle));
+    assert!(lifecycle.contains(lifecycle));
+    assert!(
+        lifecycle
+            .union(CommandCapabilities::SESSION)
+            .contains(lifecycle)
+    );
+    assert!(
+        lifecycle
+            .union(CommandCapabilities::SESSION)
+            .contains(CommandCapabilities::SESSION)
+    );
+}
+
+/// Deterministic fake lifecycle facet: every delegate returns canned portable
+/// values or error text so the contract transport is exercised exactly.
+#[derive(Default)]
+struct FakeLifecycle {
+    blocked: bool,
+    leaf_hint: Option<String>,
+    branch_outcome: Option<SessionBranchOutcome>,
+    branch_error: Option<String>,
+    tree: Option<Result<TreeBodyProjection, String>>,
+    save: Option<Result<SessionSaveReceipt, String>>,
+    fork_active: Option<Result<SessionForkReceipt, String>>,
+    fork_from: Option<Result<SessionForkFromReceipt, String>>,
+    fresh: Option<Result<SessionNewReceipt, String>>,
+    load: Option<Result<PathBuf, String>>,
+    picker: Option<String>,
+    archived: Option<Result<SessionArchiveReceipt, String>>,
+    prune: Option<Result<usize, String>>,
+}
+
+impl CommandSessionLifecycleContext for FakeLifecycle {
+    fn transition_blocked(&self) -> bool {
+        self.blocked
+    }
+    fn branch_current_leaf_hint(&self) -> Option<String> {
+        self.leaf_hint.clone()
+    }
+    fn branch_to(&mut self, entry_id: &str) -> Result<SessionBranchOutcome, String> {
+        if let Some(err) = &self.branch_error {
+            return Err(err.clone());
+        }
+        self.branch_outcome
+            .clone()
+            .ok_or_else(|| format!("unexpected branch_to({entry_id}) on empty fake"))
+    }
+    fn tree_body(&self) -> Result<TreeBodyProjection, String> {
+        self.tree
+            .clone()
+            .unwrap_or(Ok(TreeBodyProjection::NoSession))
+    }
+    fn save_session(
+        &mut self,
+        explicit_path: Option<String>,
+    ) -> Result<SessionSaveReceipt, String> {
+        self.save
+            .clone()
+            .ok_or_else(|| format!("unexpected save_session({explicit_path:?}) on empty fake"))?
+    }
+    fn fork_active(&mut self) -> Result<SessionForkReceipt, String> {
+        self.fork_active
+            .clone()
+            .ok_or_else(|| "unexpected fork_active() on empty fake".to_string())?
+    }
+    fn fork_from(&mut self, id: &str) -> Result<SessionForkFromReceipt, String> {
+        self.fork_from
+            .clone()
+            .ok_or_else(|| format!("unexpected fork_from({id}) on empty fake"))?
+    }
+    fn fresh_session(&mut self, force: bool) -> Result<SessionNewReceipt, String> {
+        self.fresh
+            .clone()
+            .ok_or_else(|| format!("unexpected fresh_session({force}) on empty fake"))?
+    }
+    fn load_session(&mut self, path: &str) -> Result<PathBuf, String> {
+        self.load
+            .clone()
+            .ok_or_else(|| format!("unexpected load_session({path}) on empty fake"))?
+    }
+    fn open_picker(&mut self, preselected: Option<String>) {
+        self.picker = preselected;
+    }
+    fn set_archived(
+        &mut self,
+        session_id: &str,
+        archived: bool,
+    ) -> Result<SessionArchiveReceipt, String> {
+        self.archived.clone().ok_or_else(|| {
+            format!("unexpected set_archived({session_id}, {archived}) on empty fake")
+        })?
+    }
+    fn prune_sessions(&mut self, days: u64) -> Result<usize, String> {
+        self.prune
+            .clone()
+            .ok_or_else(|| format!("unexpected prune_sessions({days}) on empty fake"))?
+    }
+}
+
+fn lifecycle_sync_payload(session_id: Option<&str>) -> SessionSyncPayload {
+    SessionSyncPayload {
+        session_id: session_id.map(str::to_string),
+        messages: vec![Message {
+            role: Role::User,
+            content: vec![ContentBlock::Text {
+                text: "hello lifecycle".to_string(),
+                cache_control: None,
+            }],
+        }],
+        system_prompt: Some(SystemPrompt::Text("prompt".to_string())),
+        model: "lifecycle-model".to_string(),
+        workspace: PathBuf::from("/workspace/lifecycle"),
+        mode: CommandMode::Plan,
+    }
+}
+
+#[test]
+fn lifecycle_facet_is_object_safe_and_transports_every_outcome() {
+    // Object safety: usable behind a single `dyn` reference.
+    fn accepts_dyn(_: &dyn CommandSessionLifecycleContext) {}
+    fn accepts_dyn_mut(_: &mut dyn CommandSessionLifecycleContext) {}
+
+    let mut fake = FakeLifecycle {
+        blocked: true,
+        leaf_hint: Some("entry-42".to_string()),
+        branch_outcome: Some(SessionBranchOutcome {
+            leaf_display: "entry-43".to_string(),
+            journal_entries_before: 7,
+        }),
+        tree: Some(Ok(TreeBodyProjection::Journal {
+            rendered: "rendered journal".to_string(),
+        })),
+        save: Some(Ok(SessionSaveReceipt {
+            display_path: "/tmp/session.json".to_string(),
+            truncated_id: "abc123".to_string(),
+        })),
+        fork_active: Some(Ok(SessionForkReceipt {
+            parent_label: "parent".to_string(),
+            fork_label: "child".to_string(),
+            sync: lifecycle_sync_payload(Some("child")),
+        })),
+        fork_from: Some(Ok(SessionForkFromReceipt {
+            parent_label: "source".to_string(),
+            fork_label: "sibling".to_string(),
+            spawn_depth: 3,
+            sync: lifecycle_sync_payload(Some("sibling")),
+        })),
+        fresh: Some(Ok(SessionNewReceipt {
+            truncated_id: "new-id".to_string(),
+            sync: lifecycle_sync_payload(Some("new-id")),
+        })),
+        load: Some(Ok(PathBuf::from("/tmp/loaded.json"))),
+        archived: Some(Ok(SessionArchiveReceipt {
+            truncated_id: "arch-1".to_string(),
+            title: "Archive Title".to_string(),
+        })),
+        prune: Some(Ok(3)),
+        ..FakeLifecycle::default()
+    };
+    accepts_dyn(&fake);
+    accepts_dyn_mut(&mut fake);
+
+    assert!(fake.transition_blocked());
+    assert_eq!(fake.branch_current_leaf_hint().as_deref(), Some("entry-42"));
+    let branch = fake.branch_to("entry-43").expect("branch ok");
+    assert_eq!(branch.leaf_display, "entry-43");
+    assert_eq!(branch.journal_entries_before, 7);
+    match fake.tree_body().expect("tree ok") {
+        TreeBodyProjection::Journal { rendered } => assert_eq!(rendered, "rendered journal"),
+        other => panic!("expected Journal projection, got {other:?}"),
+    }
+    let save = fake
+        .save_session(Some("/tmp/session.json".to_string()))
+        .expect("save ok");
+    assert_eq!(save.display_path, "/tmp/session.json");
+    assert_eq!(save.truncated_id, "abc123");
+    let active = fake.fork_active().expect("active fork ok");
+    assert_eq!(active.parent_label, "parent");
+    assert_eq!(active.fork_label, "child");
+    assert_eq!(active.sync.session_id.as_deref(), Some("child"));
+    assert_eq!(active.sync.messages.len(), 1);
+    assert_eq!(active.sync.mode, CommandMode::Plan);
+    let explicit = fake.fork_from("source").expect("explicit fork ok");
+    assert_eq!(explicit.spawn_depth, 3);
+    assert_eq!(
+        explicit.sync.workspace,
+        PathBuf::from("/workspace/lifecycle")
+    );
+    let fresh = fake.fresh_session(true).expect("fresh ok");
+    assert_eq!(fresh.truncated_id, "new-id");
+    assert_eq!(fresh.sync.messages.len(), 1);
+    let loaded = fake.load_session("loaded.json").expect("load ok");
+    assert_eq!(loaded, PathBuf::from("/tmp/loaded.json"));
+    fake.open_picker(Some("arch-1".to_string()));
+    assert_eq!(fake.picker.as_deref(), Some("arch-1"));
+    let archived = fake.set_archived("arch-1", true).expect("archive ok");
+    assert_eq!(archived.truncated_id, "arch-1");
+    assert_eq!(archived.title, "Archive Title");
+    assert_eq!(fake.prune_sessions(30).expect("prune ok"), 3);
+}
+
+#[test]
+fn lifecycle_error_text_and_empty_states_transport_exactly() {
+    let mut fake = FakeLifecycle {
+        branch_error: Some("could not load session x: boom".to_string()),
+        tree: Some(Err("could not open sessions directory: boom".to_string())),
+        save: Some(Err("Failed to save session: boom".to_string())),
+        load: Some(Err("Failed to read session file: boom".to_string())),
+        archived: Some(Err("archive failed: boom".to_string())),
+        prune: Some(Err("prune failed: boom".to_string())),
+        ..FakeLifecycle::default()
+    };
+    assert_eq!(
+        fake.branch_to("x").unwrap_err(),
+        "could not load session x: boom"
+    );
+    assert_eq!(
+        fake.tree_body().unwrap_err(),
+        "could not open sessions directory: boom"
+    );
+    assert_eq!(
+        fake.save_session(None).unwrap_err(),
+        "Failed to save session: boom"
+    );
+    assert_eq!(
+        fake.load_session("missing.json").unwrap_err(),
+        "Failed to read session file: boom"
+    );
+    assert_eq!(
+        fake.set_archived("a", false).unwrap_err(),
+        "archive failed: boom"
+    );
+    assert_eq!(fake.prune_sessions(7).unwrap_err(), "prune failed: boom");
+
+    let mut empty = FakeLifecycle::default();
+    assert!(!empty.transition_blocked());
+    assert_eq!(empty.branch_current_leaf_hint(), None);
+    assert!(matches!(
+        empty.tree_body().expect("default tree"),
+        TreeBodyProjection::NoSession
+    ));
+    empty.open_picker(None);
+    assert_eq!(empty.picker, None);
+}
+
+#[test]
+fn envelope_lifecycle_slot_is_independent_and_rejects_duplicates() {
+    let mut first = FakeLifecycle::default();
+    let mut second = FakeLifecycle::default();
+
+    let parts = CommandContexts::empty()
+        .with_lifecycle(&mut first)
+        .into_parts();
+    assert!(
+        parts.lifecycle.is_some(),
+        "lifecycle slot must be present when declared"
+    );
+    assert!(
+        parts.session.is_none() && parts.plugin.is_none() && parts.skill_group.is_none(),
+        "unrelated slots must stay absent (exact exposure)"
+    );
+
+    let bare = CommandContexts::empty().into_parts();
+    assert!(
+        bare.lifecycle.is_none(),
+        "undeclared lifecycle stays absent"
+    );
+
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        CommandContexts::empty()
+            .with_lifecycle(&mut first)
+            .with_lifecycle(&mut second);
+    }));
+    assert!(
+        result.is_err(),
+        "duplicate lifecycle slot must assert deterministically"
+    );
+
+    // Reading through the dyn facet works after insertion.
+    first.blocked = true;
+    let inserted = CommandContexts::empty().with_lifecycle(&mut first);
+    let lifecycle = inserted.into_parts().lifecycle.expect("inserted lifecycle");
+    assert!(lifecycle.transition_blocked());
 }
