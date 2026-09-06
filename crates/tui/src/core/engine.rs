@@ -1167,6 +1167,20 @@ async fn forward_subagent_mailbox_message(
 }
 
 impl Engine {
+    /// Surface the snapshots-disabled notice a blocking snapshot task parked
+    /// (#5930). Called at turn boundaries; a workspace yields at most one.
+    pub(super) async fn emit_pending_snapshot_notices(&self) {
+        for notice in crate::core::turn::take_snapshots_disabled_notices() {
+            let _ = self
+                .tx_event
+                .send(Event::SnapshotsDisabled {
+                    workspace: notice.workspace,
+                    reason: notice.reason,
+                })
+                .await;
+        }
+    }
+
     pub(super) async fn emit_compaction_started(
         &mut self,
         id: String,
@@ -1790,6 +1804,7 @@ impl Engine {
                 route: None,
             })
             .await;
+        self.emit_pending_snapshot_notices().await;
 
         if self.config.snapshots_enabled {
             let pre_workspace = self.session.workspace.clone();
@@ -4874,6 +4889,7 @@ impl Engine {
                 route: Some(turn_route),
             })
             .await;
+        self.emit_pending_snapshot_notices().await;
 
         // Apply the host-resolved route budget before building the request.
         // The model, limits, and compaction policy arrive in one operation so

@@ -1453,6 +1453,7 @@
   "ProviderExternalOwnerPath": "Owner/path: {owner} | {path}",
   "ProviderExternalPinnedPathWarning": "Warning: ambient {owner} credential path changed; consent remains pinned to {path}.",
   "ToolProjectionWarning": "Warning: {provider} omitted incompatible tools for this request: {tools}",
+  "SnapshotsDisabledNotice": "Snapshots and /undo are off for {workspace}: {reason} Raise `{config_key}` in config.toml (or set it to 0 to remove the cap) to turn them on.",
   "ProviderExternalSemanticsRevoke": "{semantics} | revoke: {revoke}",
   "ProviderExternalRevoke": "revoke: {revoke}",
   "ProviderExternalChoiceTitle": " External credential access · {provider} ",

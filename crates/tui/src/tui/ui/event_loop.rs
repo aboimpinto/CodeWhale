@@ -2646,6 +2646,22 @@ pub(crate) async fn run_event_loop(
                             .replace("{tools}", &tools);
                         app.push_status_toast(message, StatusToastLevel::Warning, Some(12_000));
                     }
+                    EngineEvent::SnapshotsDisabled { workspace, reason } => {
+                        // Undo is silently off otherwise: the engine's stderr
+                        // notice never reaches the alternate screen (#5930).
+                        let message = app
+                            .tr(MessageId::SnapshotsDisabledNotice)
+                            .replace("{workspace}", &workspace)
+                            .replace("{reason}", &reason)
+                            .replace("{config_key}", crate::core::turn::SNAPSHOTS_CAP_CONFIG_KEY);
+                        app.push_status_toast(
+                            message.clone(),
+                            StatusToastLevel::Warning,
+                            Some(12_000),
+                        );
+                        app.add_message(HistoryCell::System { content: message });
+                        transcript_batch_updated = true;
+                    }
                     EngineEvent::McpSessionBoot {
                         generation,
                         snapshot,

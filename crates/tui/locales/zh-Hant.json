@@ -1268,6 +1268,7 @@
   "ProviderExternalOwnerPath": "所有者/路徑：{owner} | {path}",
   "ProviderExternalPinnedPathWarning": "警告：{owner} 目前的憑據路徑已更改；授權仍固定到 {path}。",
   "ToolProjectionWarning": "警告：{provider} 已在本次請求中省略不相容的工具：{tools}",
+  "SnapshotsDisabledNotice": "此工作區 {workspace} 的快照與 /undo 已關閉：{reason} 在 config.toml 中提高 `{config_key}`（或設為 0 取消上限）即可開啟。",
   "ProviderExternalReadOnlyDetail": "僅限一個確切檔案；下一步需要明確確認",
   "ProviderExternalReadOnlyLabel": "使用外部 CLI 憑證（唯讀）",
   "ProviderExternalReadOnlySemantics": "僅讀取這一確切檔案；不重新整理、不發起身份提供商或發現請求、不寫入或重寫外部檔案；向所選提供商發起的正常請求可以使用該令牌",

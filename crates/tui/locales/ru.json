@@ -1430,6 +1430,7 @@
   "ProviderExternalOwnerPath": "Владелец/путь: {owner} | {path}",
   "ProviderExternalPinnedPathWarning": "Внимание: путь учётных данных {owner} изменился; согласие остаётся привязанным к {path}.",
   "ToolProjectionWarning": "Внимание: {provider} исключил несовместимые инструменты для этого запроса: {tools}",
+  "SnapshotsDisabledNotice": "Снимки и /undo отключены для {workspace}: {reason} Увеличьте `{config_key}` в config.toml (или задайте 0, чтобы снять ограничение), чтобы включить их.",
   "ProviderExternalSemanticsRevoke": "{semantics} | отзыв: {revoke}",
   "ProviderExternalRevoke": "отзыв: {revoke}",
   "ProviderExternalChoiceTitle": " Доступ к внешним учётным данным · {provider} ",
