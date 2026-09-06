@@ -10,30 +10,6 @@ import crypto from "node:crypto";
 import { spawn } from "node:child_process";
 import { run, runOk, ExecError, tryJson } from "../exec.mjs";
 
-function ps(script, opts = {}) {
-  const encoded = Buffer.from(script, "utf16le").toString("base64");
-  return run("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
-    timeoutMs: opts.timeoutMs ?? 25_000,
-    maxBuffer: 32 * 1024 * 1024,
-  });
-}
-
-/** ps() but truthful: timeout, nonzero exit, and spawn failure all throw. */
-async function psOk(script, opts = {}) {
-  const r = await ps(script, opts);
-  if (r.timedOut) throw new ExecError(`powershell timed out after ${opts.timeoutMs ?? 25_000}ms`, r);
-  if (r.code !== 0) throw new ExecError(`powershell.exe exited ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 300)}`, r);
-  return r;
-}
-
-async function psJson(script, opts = {}) {
-  const r = await psOk(script, opts);
-  const out = r.stdout.trim();
-  const j = tryJson(out, null);
-  if (!j) throw new ExecError(`powershell did not return JSON: ${(r.stderr || out).trim().slice(0, 300)}`, r);
-  return j;
-}
-
 const USER32 = `
 using System;
 using System.Runtime.InteropServices;
@@ -79,7 +55,36 @@ const MODVK = { ctrl: 0x11, control: 0x11, alt: 0x12, shift: 0x10, win: 0x5b, me
 // (Add-Type re-definition is tolerated through -ErrorAction SilentlyContinue).
 const USER32_PRELUDE = `Add-Type -TypeDefinition @'\n${USER32}\n'@ -ErrorAction SilentlyContinue;`;
 
-export function create() {
+export function create(opts = {}) {
+  // Allow tests (and other embedders) to inject a runner so no real
+  // powershell.exe is spawned. Production uses the imported runner.
+  const injectedRun = opts.exec && typeof opts.exec.run === "function" ? opts.exec.run : null;
+  const runner = injectedRun ?? run;
+
+  async function ps(script, o = {}) {
+    const encoded = Buffer.from(script, "utf16le").toString("base64");
+    return runner("powershell.exe", ["-NoProfile", "-NonInteractive", "-EncodedCommand", encoded], {
+      timeoutMs: o.timeoutMs ?? 25_000,
+      maxBuffer: 32 * 1024 * 1024,
+    });
+  }
+
+  /** ps() but truthful: timeout, nonzero exit, and spawn failure all throw. */
+  async function psOk(script, o = {}) {
+    const r = await ps(script, o);
+    if (r.timedOut) throw new ExecError(`powershell timed out after ${o.timeoutMs ?? 25_000}ms`, r);
+    if (r.code !== 0) throw new ExecError(`powershell.exe exited ${r.code}: ${(r.stderr || r.stdout).trim().slice(0, 300)}`, r);
+    return r;
+  }
+
+  async function psJson(script, o = {}) {
+    const r = await psOk(script, o);
+    const out = r.stdout.trim();
+    const j = tryJson(out, null);
+    if (!j) throw new ExecError(`powershell did not return JSON: ${(r.stderr || out).trim().slice(0, 300)}`, r);
+    return j;
+  }
+
   let lastRaster = null;
   let recording = null; // {id, pid, file, startedAt, mode}
 
