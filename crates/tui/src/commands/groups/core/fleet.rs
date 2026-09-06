@@ -8,6 +8,11 @@
 //! `/fleet list|status|interrupt|resume` are control-plane verbs that run
 //! against the **durable** workspace ledger through the shared contract in
 //! `codewhale-lane`, exactly as `codewhale fleet …` does (#1888, #4022).
+//! #5888: the usage line presents only the prioritized core verbs — open the
+//! team, author it, switch saved teams, watch session workers, ask for help.
+//! Model-route verbs, saved-route verbs, and the durable control plane stay
+//! dispatchable and live one level deeper, documented in `/fleet help`,
+//! instead of all fourteen competing in one usage string.
 //!
 //! `/fleet status` used to show the current TUI session's sub-agents. That was
 //! a different thing wearing the same name: session sub-agents are not the
@@ -26,26 +31,41 @@ use crate::tui::app::{App, AppAction};
 
 use super::CommandResult;
 
+/// The verbs `/fleet` advertises up front (#5888): open the team, author it,
+/// switch saved teams, watch current-session workers, ask for the rest.
+/// Every other verb stays dispatchable; it is documented one level deeper in
+/// `/fleet help` instead of competing for attention in the usage line.
+const PRIMARY_VERBS: [&str; 5] = ["members", "setup", "teams", "workers", "help"];
+
+const PRIMARY_USAGE: &str = "/fleet [members|setup|teams|workers|help]";
+
 pub(in crate::commands) const COMMAND_INFO: CommandInfo = CommandInfo {
     name: "fleet",
     aliases: &[],
-    usage: "/fleet [members|models|add <provider> <model> [role…]|remove <provider> <model>|setup|teams|workers|save|save-as|list|status|runs|interrupt <worker-id>|resume <run-id>]",
+    usage: PRIMARY_USAGE,
     description_id: MessageId::CmdFleetDescription,
 };
 
 pub(in crate::commands) struct FleetCmd;
 
 fn help_text() -> String {
-    let mut out = String::from(
-        "Usage: /fleet [members|setup|teams|workers|save|save-as|list|status|runs|interrupt <worker-id>|resume <run-id>]\n\n\
-         The fleet is who is working right now. /fleet (or /fleet members) opens the roster — \
-         each member's role, model, and access. /fleet setup opens the authoring wizard. \
-         /fleet teams (or fleets/saved/manage) switches between named saved teams.\n\n\
-         /fleet list, status, interrupt, and resume act on the durable .codewhale/fleet.jsonl \
-         ledger for this workspace — the same records `codewhale fleet` reads and writes. \
-         /fleet workers (and /subagents) shows sub-agents in the current TUI session only, which \
-         is a different set: it does not include durable fleet runs. the ledger file, saved rosters, and config \
-         tables keep the Fleet name.\n",
+    let mut out = format!(
+        "Usage: {PRIMARY_USAGE}\n\n\
+         The fleet is who is working right now. The primary verbs cover the daily loop:\n\
+         /fleet (or /fleet members) opens the roster — each member's role, model, and access; \
+         Enter on a member row opens that member's editor. /fleet setup opens the authoring \
+         wizard. /fleet teams (or fleets/saved/manage) switches between named saved teams. \
+         /fleet workers (and /subagents) shows sub-agents in the current TUI session only, \
+         which is a different set: it does not include durable fleet runs.\n\n\
+         Advanced — team model routes (still typed, one level deeper):\n\
+         /fleet models lists the selected team's models. \
+         /fleet add <provider> <model> [role…] and /fleet remove <provider> <model> edit them.\n\n\
+         Advanced — saved routes:\n\
+         /fleet save persists the current session route into the selected team's operator. \
+         /fleet save-as saves it as a new team.\n\n\
+         Durable runs — these act on the durable .codewhale/fleet.jsonl ledger for this \
+         workspace, the same records `codewhale fleet` reads and writes. the ledger file, \
+         saved rosters, and config tables keep the Fleet name:\n",
     );
     for descriptor in operations_for_domain(ControlDomain::Fleet) {
         out.push_str(&format!(
@@ -282,8 +302,9 @@ impl RegisterCommand for FleetCmd {
             other => match ControlOperation::parse_verb(ControlDomain::Fleet, other) {
                 Some(operation) => run_control(app, operation, target),
                 None => CommandResult::error(format!(
-                    "Unknown /fleet target '{other}'. Use members, setup, teams, list, status, \
-                     workers, interrupt <worker-id>, or resume <run-id>.."
+                    "Unknown /fleet target '{other}'. Use {} — or /fleet help for the full \
+                     verb list.",
+                    PRIMARY_VERBS[..PRIMARY_VERBS.len() - 1].join(", ")
                 )),
             },
         }
@@ -640,7 +661,14 @@ mod tests {
         assert!(FleetCmd::info().aliases.is_empty());
         assert!(FleetCmd::info().usage.contains("teams"));
         assert!(FleetCmd::info().usage.contains("workers"));
-        assert!(FleetCmd::info().usage.contains("save-as"));
+        // #5888: the usage line is the prioritized core; advanced verbs stay
+        // dispatchable but are documented in /fleet help, not here.
+        for advanced in ["save-as", "interrupt", "resume", "models", "status"] {
+            assert!(
+                !FleetCmd::info().usage.contains(advanced),
+                "usage must not advertise {advanced}"
+            );
+        }
         assert!(!FleetCmd::info().usage.contains("pods"));
     }
 
@@ -670,9 +698,11 @@ mod tests {
         for descriptor in operations_for_domain(ControlDomain::Fleet) {
             assert_eq!(descriptor.slash_command, COMMAND_INFO.name);
             assert_eq!(descriptor.hotbar_action_id(), "slash.fleet");
+            // #5888: usage presents only the prioritized core; every durable
+            // control verb is documented one level deeper in /fleet help.
             assert!(
-                COMMAND_INFO.usage.contains(descriptor.verb) || descriptor.verb == "restart",
-                "/fleet usage must document {} or declare it CLI-only",
+                help_text().contains(&format!("/fleet {}", descriptor.verb)),
+                "/fleet help must document {} now that usage does not",
                 descriptor.verb
             );
             assert!(descriptor.offers(ControlSurface::Cli));
@@ -681,5 +711,40 @@ mod tests {
             !COMMAND_INFO.requires_required_argument(),
             "/fleet must stay directly runnable from the palette and hotbar"
         );
+    }
+
+    /// #5888: the primary surface is a small, prioritized set, and every
+    /// advanced verb remains named by `/fleet help` — nothing is
+    /// unreachable, it just lives one level deeper.
+    #[test]
+    fn fleet_usage_presents_a_prioritized_core_and_help_keeps_the_rest_reachable() {
+        let verbs: Vec<&str> = FleetCmd::info()
+            .usage
+            .trim_start_matches("/fleet [")
+            .trim_end_matches(']')
+            .split('|')
+            .collect();
+        assert_eq!(
+            verbs, PRIMARY_VERBS,
+            "the usage line is exactly the primary set"
+        );
+
+        let help = help_text();
+        for advanced in [
+            "/fleet models",
+            "/fleet add",
+            "/fleet remove",
+            "/fleet save",
+            "/fleet save-as",
+        ] {
+            assert!(help.contains(advanced), "help must name {advanced}");
+        }
+        for descriptor in operations_for_domain(ControlDomain::Fleet) {
+            assert!(
+                help.contains(&format!("/fleet {}", descriptor.verb)),
+                "help must keep {} reachable",
+                descriptor.verb
+            );
+        }
     }
 }
