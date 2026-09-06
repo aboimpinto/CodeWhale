@@ -47,8 +47,19 @@ export function create({ exec }) {
       fs.writeFileSync(file, script);
       // Payload travels as a plain argv string: osascript is spawned without a
       // shell, so JSON content can never become script syntax.
+      // Input and accessibility scripts need the Accessibility grant. When the
+      // last probe saw it denied, refuse here with the remedy instead of
+      // letting osascript hang on a TCC prompt nobody can answer (#5917).
+      if (state.tcc?.accessibility === false && /CGEventPost|System Events/.test(script)) {
+        throw new ExecError(`accessibility permission is not granted to ${await grantTarget()}: ${TCC_FIX.accessibility}`);
+      }
       const r = await runL("osascript", ["-l", "JavaScript", file, JSON.stringify(payload)], { timeoutMs });
-      if (r.timedOut) throw new ExecError("osascript timed out", r);
+      if (r.timedOut) {
+        const hint = state.tcc?.accessibility === true
+          ? ""
+          : ` (if macOS is showing a permission prompt, grant Accessibility to ${await grantTarget()}: ${TCC_FIX.accessibility})`;
+        throw new ExecError(`osascript timed out${hint}`, r);
+      }
       if (r.code !== 0) {
         const msg = (r.stderr || r.stdout).trim().split("\n")[0] || "osascript failed";
         throw new ExecError(/(not allowed assistive|assistive access|250)/i.test(r.stderr || "") || /(-25211|-1719|not allowed)/i.test(msg)
@@ -223,11 +234,16 @@ export function create({ exec }) {
   }
 
   // ---------- raw input via CGEvent ----------
-  async function cg(script, timeoutMs = 10_000) {
+  // Every caller hands its values as `payload`; the script reads them as `P`.
+  // The old `(script, timeoutMs)` shape silently swallowed the payload (so
+  // `P.code`, `P.x`, `P.text` were undefined) and coerced the object to a
+  // zero timeout, which is why every CGEvent input on macOS reported
+  // "osascript timed out" instantly (#5917).
+  async function cg(script, payload = {}, timeoutMs = 10_000) {
     return jxa(`ObjC.import('CoreGraphics');
       function run(argv){ var P = JSON.parse(argv[0]);
         ${script}
-      }`, {}, timeoutMs);
+      }`, payload, timeoutMs);
   }
 
   async function postMouseEvent(type, x, y, button, clickState) {
@@ -326,7 +342,16 @@ export function create({ exec }) {
     }
     args.push(file);
     const r = await runL("screencapture", args, { timeoutMs: 20_000 });
-    if (r.code !== 0) throw new ExecError(`screencapture exited ${r.code}: ${r.stderr.trim().slice(0, 300)}`, r);
+    if (r.code !== 0) {
+      const detail = r.stderr.trim().slice(0, 300);
+      // This is what screencapture says when the display is locked, asleep, or
+      // the session is not the console user — not a permission problem
+      // (without the Screen Recording grant it exits 0 and omits windows).
+      const remedy = /could not create image/i.test(detail)
+        ? " — the display is locked, asleep, or this session is not at the console; unlock or wake it and retry"
+        : "";
+      throw new ExecError(`screencapture exited ${r.code}: ${detail}${remedy}`, r);
+    }
     const stat = fs.statSync(file);
     const displays = await displayInfo();
     const d = displays.find((x) => x.index === (disp === "all" ? 1 : disp)) ?? displays[0];
@@ -442,6 +467,33 @@ export function create({ exec }) {
     }`, {}, 25_000);
   }
 
+  // Which app owns the keyboard right now. Raw CGEvents go to it no matter
+  // what the caller meant (#5927), so every input receipt names it.
+  async function frontmostApp() {
+    const r = await jxa(`${JXA_PRELUDE}
+      var se = Application('System Events');
+      var list = se.applicationProcesses.whose({ frontmost: true })();
+      if (!list.length) return JSON.stringify({ found: false });
+      var p = list[0];
+      return JSON.stringify({ found: true, name: g(function(){ return String(p.name()); }), pid: num(function(){ return p.unixId(); }),
+        bundle_id: g(function(){ var b = p.bundleIdentifier(); return b ? String(b) : null; }) });
+    }`, { probe: "frontmost-app" }, 8_000);
+    return r && r.found ? { name: r.name, pid: r.pid, bundle_id: r.bundle_id } : null;
+  }
+
+  // Refuse to post keystrokes when the app the caller named is not the one
+  // that would receive them. Returns the frontmost app for the receipt.
+  async function guardInput(appRef) {
+    const front = await frontmostApp().catch(() => null);
+    if (!appRef) return front;
+    const target = await findProcess(appRef);
+    if (!target.found) throw new ExecError("application not found — call list_apps for exact names/pids");
+    if (!front || front.pid !== target.pid) {
+      throw new ExecError(`refusing to send input: "${target.name}" is not frontmost${front ? ` ("${front.name}" is)` : ""}; bring it forward first with open_application { activate: true } or click into it`);
+    }
+    return front;
+  }
+
   async function listWindows(appRef) {
     const p = await findProcess(appRef ?? {});
     if (!p.found) throw new ExecError("application not found — call list_apps for exact names/pids");
@@ -456,11 +508,25 @@ export function create({ exec }) {
     if (activate) args.unshift("-F");
     const r = await runL("open", args, { timeoutMs: 25_000 });
     if (r.code !== 0) throw new ExecError(`open failed: ${r.stderr.trim().slice(0, 200)}`, r);
-    await new Promise((res) => setTimeout(res, 600));
     const find = {};
     if (bid) find.bundle_id = bid; else if (pid) find.pid = pid; else find.name = String(name).replace(/\.app$/, "");
-    const p = await findProcess(find).catch(() => null);
-    return { launched: true, activate, url: urlArg ?? null, resolved: p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: p.frontmost } : null };
+    // `open -F` returns before the app is in front. Wait for the process to
+    // exist and, when activation was asked for, to actually be frontmost;
+    // otherwise the next keystroke lands in whatever app is (#5927).
+    let p = null;
+    for (let attempt = 0; attempt < 10; attempt++) {
+      await new Promise((res) => setTimeout(res, 300));
+      p = await findProcess(find).catch(() => null);
+      if (p?.found && (!activate || p.frontmost)) break;
+    }
+    const resolved = p?.found ? { name: p.name, pid: p.pid, bundle_id: p.bundle_id, frontmost: !!p.frontmost } : null;
+    const frontmost = !!resolved?.frontmost;
+    const note = activate && !frontmost
+      ? (resolved
+        ? `"${resolved.name}" is running but did not come to the front within 3 s; keystrokes would go to another app — retry activation or click into its window before typing`
+        : `the app did not appear within 3 s of \`open\`; call list_apps to see what is running`)
+      : undefined;
+    return { launched: true, activate, frontmost, pid: resolved?.pid ?? null, url: urlArg ?? null, resolved, ...(note ? { note } : {}) };
   }
 
   // ---------- clipboard / cursor / waits ----------
@@ -493,20 +559,93 @@ print('{\"x\": %d, \"y\": %d}' % (l.x, l.y))`;
   }
 
   // ---------- probe ----------
-  async function probe() {
-    const caps = { screenshot: true, recording: true, accessibility_tree: true, clipboard: true, displays: true };
-    const perms = {};
-    try { await jxa(`function run(argv){ return JSON.stringify({n: Application('System Events').applicationProcesses.length}); }`, {}, 8_000); perms.accessibility = "granted"; }
-    catch (e) { perms.accessibility = "denied_or_unavailable"; caps.accessibility_tree = false; caps.raw_input = "unreliable"; }
-    try {
-      const t = os.tmpdir() + `/cu-probe-${crypto.randomBytes(3).toString("hex")}.png`;
-      const r = await runL("screencapture", ["-x", "-R0,0,2,2", "-t", "png", t], { timeoutMs: 8_000 });
-      perms.screen_capture = r.code === 0 ? "ok" : "failed";
-      try { fs.rmSync(t, { force: true }); } catch {}
-    } catch { perms.screen_capture = "failed"; }
-    const hasRecording = fs.existsSync("/usr/sbin/screencapture");
-    return { platform: "darwin", capabilities: caps, permissions: perms, note: "macOS does not expose Screen-Recording TCC state to CLI; a black/empty screenshot means Screen Recording permission is missing. Raw pointer/keyboard events go to whatever is frontmost at the target point — activate the app first for click-type actions." };
+  const TCC_FIX = {
+    accessibility: "System Settings → Privacy & Security → Accessibility → enable the host app, then relaunch it",
+    screen_recording: "System Settings → Privacy & Security → Screen & System Audio Recording → enable the host app, then relaunch it",
+  };
+  // TCC attributes grants to the .app that owns this process tree (the
+  // terminal or IDE hosting the engine), never to node or osascript. Name it so
+  // the remedy says which row to flip.
+  async function hostAppName() {
+    if (state.hostApp !== undefined) return state.hostApp;
+    // Keep the outermost bundle: framework binaries also live inside an .app
+    // (python3 runs from Python.app), but TCC holds the launching app
+    // responsible for everything under it.
+    let pid = process.ppid;
+    let found = null;
+    for (let depth = 0; depth < 12 && pid > 1; depth++) {
+      const r = await runL("ps", ["-o", "ppid=,comm=", "-p", String(pid)], { timeoutMs: 4_000 });
+      if (r.code !== 0) break;
+      const m = /^\s*(\d+)\s+(.*)$/.exec(r.stdout.trim());
+      if (!m) break;
+      const app = /([^/]+)\.app\//.exec(m[2]);
+      if (app) found = app[1];
+      pid = Number(m[1]);
+    }
+    state.hostApp = found;
+    return found;
   }
+  async function grantTarget() {
+    const host = await hostAppName().catch(() => null);
+    return host ? `"${host}"` : "the app hosting the Codewhale engine (your terminal)";
+  }
+  // Ask TCC instead of guessing from tool presence: screencapture exits 0
+  // without the grant (it just omits windows) and osascript hangs on the
+  // prompt, so probing by running them proves nothing.
+  // The JXA bridge does not expose CGPreflightScreenCaptureAccess, so the
+  // Screen Recording state is read the way TCC enforces it: without the grant,
+  // CGWindowListCopyWindowInfo strips kCGWindowName from every other
+  // process's window. No other windows on screen means the answer is unknown.
+  async function tccState() {
+    const r = await jxa(`ObjC.import('ApplicationServices'); ObjC.import('CoreGraphics'); ObjC.import('Foundation');
+function run(){
+  const out = { accessibility: !!$.AXIsProcessTrusted(), screen_recording: null };
+  const me = $.NSProcessInfo.processInfo.processIdentifier;
+  const list = $.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly | $.kCGWindowListExcludeDesktopElements, $.kCGNullWindowID);
+  const n = Number($.CFArrayGetCount(list));
+  let others = 0, named = 0;
+  for (let i = 0; i < n; i++) {
+    const d = ObjC.deepUnwrap(ObjC.castRefToObject($.CFArrayGetValueAtIndex(list, i)));
+    if (!d || d.kCGWindowOwnerPID === me || d.kCGWindowLayer !== 0) continue;
+    others++;
+    if (typeof d.kCGWindowName === 'string' && d.kCGWindowName.length) named++;
+  }
+  if (others > 0) out.screen_recording = named > 0;
+  return JSON.stringify(out);
+}`, {}, 8_000);
+    return r && typeof r === "object" ? r : {};
+  }
+  async function probe() {
+    const caps = { screenshot: true, recording: true, accessibility_tree: true, raw_input: true, clipboard: true, displays: true };
+    const perms = {};
+    const missing = [];
+    let tcc = {};
+    try { tcc = await tccState(); } catch (e) { perms.probe_error = String(e?.message || e).slice(0, 200); }
+    state.tcc = tcc;
+    const target = await grantTarget();
+    if (tcc.accessibility === false) {
+      perms.accessibility = "denied";
+      caps.accessibility_tree = false;
+      caps.raw_input = false;
+      missing.push("accessibility");
+    } else {
+      perms.accessibility = tcc.accessibility === true ? "granted" : "unknown";
+    }
+    if (tcc.screen_recording === false) {
+      perms.screen_recording = "denied";
+      caps.screenshot = false;
+      caps.recording = false;
+      missing.push("screen_recording");
+    } else {
+      perms.screen_recording = tcc.screen_recording === true ? "granted" : "unknown";
+    }
+    const how_to_fix = Object.fromEntries(missing.map((m) => [m, `${TCC_FIX[m]} — grant it to ${target}`]));
+    const note = missing.length
+      ? `Missing: ${missing.join(", ")}. Grants belong to ${target}, not to node or osascript. ${Object.values(how_to_fix).join(" ")}`
+      : "Raw pointer/keyboard events go to whatever is frontmost at the target point — activate the app first for click-type actions.";
+    return { platform: "darwin", capabilities: caps, permissions: perms, missing, how_to_fix, host_app: state.hostApp ?? null, note };
+  }
+
 
   return {
     platform: "darwin",
@@ -565,8 +704,9 @@ print('{\"x\": %d, \"y\": %d}' % (l.x, l.y))`;
         $.CGEventPost($.kCGHIDEventTap, ev);
         return JSON.stringify({ ok: true });`, { dx, dy }).then(() => ({ action_sent: true, direction, amount }));
     },
-    type: async ({ text }) => {
+    type: async ({ text, app_ref }) => {
       if (!text) return { action_sent: false, note: "empty text" };
+      const frontmost_app = await guardInput(app_ref);
       const r = await cg(`var ev = $.CGEventCreateKeyboardEvent($(), 0, true);
         $.CGEventKeyboardSetUnicodeString(ev, P.text.length, P.text);
         $.CGEventPost($.kCGHIDEventTap, ev);
@@ -574,24 +714,26 @@ print('{\"x\": %d, \"y\": %d}' % (l.x, l.y))`;
         $.CGEventKeyboardSetUnicodeString(ev2, P.text.length, P.text);
         $.CGEventPost($.kCGHIDEventTap, ev2);
         return JSON.stringify({ ok: true, chars: P.text.length });`, { text }, 15_000);
-      return { action_sent: true, chars: text.length, strategy: "unicode-events" };
+      return { action_sent: true, chars: text.length, strategy: "unicode-events", frontmost_app };
     },
-    key: async ({ text, repeat = 1 }) => {
+    key: async ({ text, repeat = 1, app_ref }) => {
       const { flags, code, key } = parseChord(text);
+      const frontmost_app = await guardInput(app_ref);
       for (let i = 0; i < Math.max(1, Math.min(100, repeat)); i++) {
         await keyEvent(code, flags, true);
         await keyEvent(code, flags, false);
         if (i < repeat - 1) await new Promise((r) => setTimeout(r, 30));
       }
-      return { action_sent: true, key, code, repeat: Math.max(1, Math.min(100, repeat)) };
+      return { action_sent: true, key, code, repeat: Math.max(1, Math.min(100, repeat)), frontmost_app };
     },
-    hold_key: async ({ text, duration }) => {
+    hold_key: async ({ text, duration, app_ref }) => {
       const { flags, code, key } = parseChord(text);
+      const frontmost_app = await guardInput(app_ref);
       const d = Math.max(0.05, Math.min(30, Number(duration) || 1));
       await keyEvent(code, flags, true);
       await new Promise((r) => setTimeout(r, d * 1000));
       await keyEvent(code, flags, false);
-      return { action_sent: true, key, heldSec: d };
+      return { action_sent: true, key, heldSec: d, frontmost_app };
     },
     set_value: async ({ target, value }) => {
       const el = await elementAction(target.app_ref, target.windowIndex, target.path, { kind: "set_value", value });
