@@ -154,6 +154,42 @@ pub struct PersistedWriteClaim {
     pub sequence: u64,
     #[serde(default)]
     pub isolated_worktree: bool,
+    /// Which of this claim's roots/exact files existed on disk when it was
+    /// registered (#5906).
+    ///
+    /// Recorded because "the claimed path is gone" and "the claimed path does
+    /// not exist yet" look identical from a later `exists()` call and mean
+    /// opposite things. A claim on a worktree that has since been removed
+    /// describes work nobody can be doing and must stop refusing claimants; a
+    /// claim on a directory its owner is about to create is exactly the
+    /// forward-looking reservation the ledger exists to honor, and disarming
+    /// that would let two writers into the same new tree.
+    ///
+    /// Empty for claims persisted before this field existed and for claims
+    /// that named nothing on disk at the time — both mean "no evidence of
+    /// disappearance", so neither is ever treated as stale.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub present_at_claim: Vec<String>,
+}
+
+impl PersistedWriteClaim {
+    /// Whether every path this claim was recorded as actually covering has
+    /// since disappeared from disk (#5906).
+    ///
+    /// Isolated-worktree claims are excluded because they never contend at
+    /// all — the answer would be unused, and their paths are not resolved
+    /// against the coordination root.
+    pub fn names_only_vanished_paths<F>(&self, mut path_exists: F) -> bool
+    where
+        F: FnMut(&str) -> bool,
+    {
+        !self.isolated_worktree
+            && !self.present_at_claim.is_empty()
+            && !self
+                .present_at_claim
+                .iter()
+                .any(|path| path_exists(path.as_str()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -470,6 +506,14 @@ impl CoordinationLedger {
         Ok(decision.clone())
     }
 
+    /// Register a bounded write claim.
+    ///
+    /// `owner_is_active` is the caller's whole answer to "may this existing
+    /// claim refuse a new claimant" — liveness and, since #5906, whether the
+    /// claim's recorded paths still exist. The ledger has no filesystem of its
+    /// own; [`super::SubAgentManager::admissible_coordination_owners`] resolves
+    /// both before calling, and stamps
+    /// [`PersistedWriteClaim::present_at_claim`] on the record afterwards.
     pub fn register_claim<F>(
         &mut self,
         mut claim: WriteScopeClaim,
@@ -540,11 +584,12 @@ impl CoordinationLedger {
             self.contentions.push(receipt);
             trim_front(&mut self.contentions, COORDINATION_RECORD_LIMIT);
             return Err(format!(
-                "write-scope contention with {} (roots: {:?}, files: {:?}, contracts: {:?}); serialize the work, narrow the claim, or use worktree isolation",
+                "write-scope contention with {} (roots: {:?}, files: {:?}, contracts: {:?}); serialize the work, narrow the claim, use worktree isolation, or — if that owner has already settled — clear its claim with agent(action=\"release\", agent_id=\"{}\")",
                 existing.claim.owner,
                 existing.claim.roots,
                 existing.claim.exact_files,
-                existing.claim.contracts
+                existing.claim.contracts,
+                existing.claim.owner
             ));
         }
         self.write_claims
@@ -553,6 +598,8 @@ impl CoordinationLedger {
             claim,
             sequence: self.next_sequence(),
             isolated_worktree,
+            // Stamped by the caller, which owns the filesystem.
+            present_at_claim: Vec::new(),
         };
         for contention in &mut self.contentions {
             if contention.claimant == record.claim.owner

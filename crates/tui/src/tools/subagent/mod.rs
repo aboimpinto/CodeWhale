@@ -827,6 +827,12 @@ pub struct AgentWorkerRecord {
     pub error: Option<String>,
     #[serde(default)]
     pub steps_taken: u32,
+    /// This worker settled by being *parked* at the parent's turn end, not by
+    /// asking a question (#5906). See
+    /// [`SubAgentCheckpoint::parked_at_turn_end`]; the coordination liveness
+    /// predicate reads this flag, and re-dispatching the record clears it.
+    #[serde(default)]
+    pub parked_at_turn_end: bool,
     #[serde(default)]
     pub events: VecDeque<AgentWorkerEvent>,
 }
@@ -874,6 +880,7 @@ impl AgentWorkerRecord {
             result_summary: None,
             error: None,
             steps_taken: 0,
+            parked_at_turn_end: false,
             events: VecDeque::new(),
         }
     }
@@ -1838,6 +1845,20 @@ pub struct SubAgentCheckpoint {
     /// budget. `0` for records written before v0.8.67 (serde default).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub omitted_messages: usize,
+    /// This checkpoint was written because the parent's turn ended while the
+    /// child was still working — not because the child asked anyone anything
+    /// (#5906).
+    ///
+    /// Both cases land on `AgentWorkerStatus::WaitingForUser` (the projection
+    /// keys off `continuable`), and coordination has to tell them apart: a
+    /// child that asked a question keeps its write claim, because a user can
+    /// still answer it and the child will write again. A parked child is
+    /// waiting for nothing — it is resumed as a *new* agent through
+    /// `resume_from`, which registers a claim of its own — so its claim must
+    /// stop gating peers the moment it parks. Carried on the checkpoint rather
+    /// than sniffed out of the reason string, which would be a guess.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub parked_at_turn_end: bool,
 }
 
 #[allow(clippy::trivially_copy_pass_by_ref)]
@@ -3919,11 +3940,7 @@ impl SubAgentManager {
                 claim.contracts.push(contract);
             }
         }
-        let active_owners = self.active_coordination_owners();
-        self.coordination
-            .register_claim(claim, existing.isolated_worktree, |candidate| {
-                active_owners.contains(candidate)
-            })
+        self.register_claim_with_presence(claim, existing.isolated_worktree)
     }
 
     /// Release write claims whose owner is no longer a live claimant.
@@ -4004,6 +4021,11 @@ impl SubAgentManager {
             .iter()
             .filter(|record| record.claim.owner != owner && !record.isolated_worktree)
             .filter(|record| self.is_live_coordination_owner(&record.claim.owner))
+            // A claim whose every named path is gone cannot describe a peer
+            // still writing here, so it must not gate command execution
+            // either (#5906) — the reported incident lost a whole session's
+            // shell to a claim on a deleted worktree.
+            .filter(|record| !self.claim_names_only_missing_paths(record))
             .map(|record| record.claim.owner.clone())
             .collect()
     }
@@ -4613,7 +4635,7 @@ impl SubAgentManager {
         if !isolated_worktree {
             self.ensure_coordination_process_lock()?;
         }
-        let active_owners = self.active_coordination_owners();
+        let active_owners = self.admissible_coordination_owners();
         let mut probe = self.coordination.clone();
         match probe.register_claim(claim.clone(), isolated_worktree, |owner| {
             active_owners.contains(owner)
@@ -4624,11 +4646,7 @@ impl SubAgentManager {
                 // remains visible after restart. Invalid/schema failures do
                 // not mutate either ledger.
                 let coordination_before = self.coordination.clone();
-                let _ = self
-                    .coordination
-                    .register_claim(claim, isolated_worktree, |owner| {
-                        active_owners.contains(owner)
-                    });
+                let _ = self.register_claim_with_presence(claim, isolated_worktree);
                 if let Err(persist_error) = self.persist_state_synchronously() {
                     self.coordination = coordination_before;
                     return Err(format!(
@@ -4660,11 +4678,7 @@ impl SubAgentManager {
         let previous_coordination = self.coordination.clone();
         let persisted_claim = claim
             .map(|(claim, isolated_worktree)| {
-                let active_owners = self.active_coordination_owners();
-                self.coordination
-                    .register_claim(claim, isolated_worktree, |owner| {
-                        active_owners.contains(owner)
-                    })
+                self.register_claim_with_presence(claim, isolated_worktree)
             })
             .transpose()?;
 
@@ -4756,11 +4770,102 @@ impl SubAgentManager {
                 // and the child will write again.
                 && !(record.status == AgentWorkerStatus::WaitingForUser
                     && !self.agents.contains_key(id))
+                // A child parked at its parent's turn end is not a child that
+                // asked a question (#5906). Nothing will answer it: the
+                // recovery path is `resume_from`, which starts a *new* agent
+                // that registers its own claim. Counting the parked record
+                // live left its claim standing forever — refusing the resume
+                // itself, every later write-capable spawn overlapping the
+                // scope, and (through the shared-checkout peer gate) all
+                // command execution for those peers.
+                && !record.parked_at_turn_end
                 && !self
                     .agents
                     .get(id)
                     .is_some_and(|agent| self.is_from_prior_session(agent))
         })
+    }
+
+    /// Resolve a normalized claim path against this manager's coordination
+    /// root. The ledger owns no workspace, so it asks through this.
+    fn coordination_claim_path_exists(workspace: &Path, path: &str) -> bool {
+        // `.` is the coordination root itself and is always present.
+        path == "." || workspace.join(path).exists()
+    }
+
+    /// Whether a standing claim's every recorded path is gone from disk.
+    ///
+    /// A claim on a deleted worktree cannot describe work anyone is still
+    /// doing, yet it kept refusing every overlapping claimant (#5906): the
+    /// reported incident claimed a worktree later removed with
+    /// `git worktree remove`, and the claim outlived the checkout it named.
+    /// See [`PersistedWriteClaim::present_at_claim`] for why the answer is
+    /// "vanished since", not "absent now".
+    fn claim_names_only_missing_paths(&self, record: &PersistedWriteClaim) -> bool {
+        record.names_only_vanished_paths(|path| {
+            Self::coordination_claim_path_exists(&self.workspace, path)
+        })
+    }
+
+    /// Register a write claim against the live admission set and stamp which
+    /// of its paths existed at that moment.
+    ///
+    /// The one door every production claim goes through, so the admission
+    /// answer and the presence stamp cannot drift apart: the ledger has no
+    /// filesystem, and a record registered without the stamp would silently
+    /// opt out of vanished-path staleness forever (#5906).
+    fn register_claim_with_presence(
+        &mut self,
+        claim: WriteScopeClaim,
+        isolated_worktree: bool,
+    ) -> Result<PersistedWriteClaim, String> {
+        let admissible = self.admissible_coordination_owners();
+        let mut record = self
+            .coordination
+            .register_claim(claim, isolated_worktree, |owner| admissible.contains(owner))?;
+        let owner = record.claim.owner.clone();
+        if !isolated_worktree {
+            record.present_at_claim = record
+                .claim
+                .roots
+                .iter()
+                .chain(record.claim.exact_files.iter())
+                .filter(|path| Self::coordination_claim_path_exists(&self.workspace, path))
+                .cloned()
+                .collect();
+        }
+        if let Some(persisted) = self
+            .coordination
+            .write_claims
+            .iter_mut()
+            .find(|persisted| persisted.claim.owner == owner)
+        {
+            persisted
+                .present_at_claim
+                .clone_from(&record.present_at_claim);
+        }
+        Ok(record)
+    }
+
+    /// The owners whose standing claims may refuse a new claimant: live by
+    /// [`Self::is_live_coordination_owner`] *and* still naming something that
+    /// exists on disk.
+    ///
+    /// Admission only. [`Self::active_coordination_owners`] stays the answer
+    /// for `coordinate release`, which *deletes* records — a live owner whose
+    /// tree is merely not created yet must not lose its claim permanently to
+    /// a sweep it never asked for.
+    fn admissible_coordination_owners(&self) -> std::collections::HashSet<String> {
+        let mut owners = self.active_coordination_owners();
+        owners.retain(|owner| {
+            !self
+                .coordination
+                .write_claims
+                .iter()
+                .filter(|record| record.claim.owner == *owner)
+                .any(|record| self.claim_names_only_missing_paths(record))
+        });
+        owners
     }
 
     // Worker records carry no boot id of their own, so the per-id predicate
@@ -5201,6 +5306,19 @@ impl SubAgentManager {
         {
             record.started_at_ms = Some(now_ms);
         }
+        // A worker that is executing again is not parked, whatever it was
+        // before. Re-dispatch under the same id therefore restores its claim's
+        // standing without a second authority deciding that (#5906).
+        if matches!(
+            status,
+            AgentWorkerStatus::Queued
+                | AgentWorkerStatus::Starting
+                | AgentWorkerStatus::Running
+                | AgentWorkerStatus::ModelWait
+                | AgentWorkerStatus::RunningTool
+        ) {
+            record.parked_at_turn_end = false;
+        }
         if matches!(
             status,
             AgentWorkerStatus::Completed
@@ -5252,6 +5370,12 @@ impl SubAgentManager {
         if let Some(record) = self.worker_records.get_mut(worker_id) {
             record.result_summary = result.result.clone();
             record.steps_taken = result.steps_taken;
+            // #5906: carry the park/ask distinction from the checkpoint onto
+            // the durable record, which is what coordination reads.
+            record.parked_at_turn_end = result
+                .checkpoint
+                .as_ref()
+                .is_some_and(|checkpoint| checkpoint.parked_at_turn_end);
             if let SubAgentStatus::Failed(err) = &result.status {
                 record.error = Some(err.clone());
             }
@@ -5279,7 +5403,14 @@ impl SubAgentManager {
                 .agents
                 .get(&agent_id)
                 .ok_or_else(|| anyhow!("Agent {agent_id} not found"))?;
-            if agent.status != SubAgentStatus::Running || agent.completion_claimed {
+            if agent.status != SubAgentStatus::Running {
+                let snapshot = agent.snapshot();
+                return Ok(self.terminalize_settled_worker_on_cancel(&agent_id, snapshot));
+            }
+            if agent.completion_claimed {
+                // Still running, with its terminal transition already claimed:
+                // mid-flight, not settled. Stealing it here would record a
+                // second terminal outcome for one child.
                 return Ok(agent.snapshot());
             }
             agent.snapshot()
@@ -5291,6 +5422,48 @@ impl SubAgentManager {
             return self.get_result(&agent_id);
         }
         self.get_result(&agent_id)
+    }
+
+    /// Terminalize a child that already left `Running` but whose worker record
+    /// never reached a terminal status — a child parked at the parent's turn
+    /// end, or one waiting on an answer the parent has now decided not to give
+    /// (#5906).
+    ///
+    /// Cancel is the release path the contention refusal names, and before
+    /// this it was a no-op on exactly the records that leak: `cancel_agent`
+    /// returned the snapshot untouched because the agent was no longer
+    /// `Running`, so the non-terminal worker record kept the write claim
+    /// standing and every overlapping spawn stayed refused. Terminalizing the
+    /// record releases the claim through the one liveness predicate rather
+    /// than reaching into the ledger behind its back.
+    fn terminalize_settled_worker_on_cancel(
+        &mut self,
+        agent_id: &str,
+        snapshot: SubAgentResult,
+    ) -> SubAgentResult {
+        let already_terminal = self
+            .worker_records
+            .get(agent_id)
+            .is_none_or(|record| record.status.is_terminal());
+        if already_terminal {
+            return snapshot;
+        }
+        if let Some(agent) = self.agents.get_mut(agent_id) {
+            // The question is withdrawn with the work: leaving it would keep
+            // offering a resume the operator just declined.
+            agent.needs_input = None;
+        }
+        self.record_worker_event(
+            agent_id,
+            AgentWorkerStatus::Cancelled,
+            Some("cancelled by parent while parked or awaiting input".to_string()),
+            None,
+            None,
+        );
+        self.persist_state_best_effort();
+        self.agents
+            .get(agent_id)
+            .map_or(snapshot, |agent| agent.snapshot())
     }
 
     pub(crate) fn cancel_agent_for_session(
@@ -6382,11 +6555,7 @@ impl SubAgentManager {
                             claim,
                         )?
                     };
-                    let active_owners = self.active_coordination_owners();
-                    self.coordination
-                        .register_claim(claim, options.isolated_worktree, |owner| {
-                            active_owners.contains(owner)
-                        })
+                    self.register_claim_with_presence(claim, options.isolated_worktree)
                 })
                 .transpose()
         } else {
@@ -8082,6 +8251,15 @@ enum AgentToolAction {
     /// so retiring that tool from the catalog without this action would have
     /// left fail-closed write enforcement with no in-band way to satisfy it.
     Claim,
+    /// Clear write claims whose owner is no longer a live claimant (#5906).
+    ///
+    /// The contention refusal and the shared-checkout peer gate both told the
+    /// caller to run `agents/coordinate action=release`, a tool that is no
+    /// longer in any catalog — so the one remediation named by the only error
+    /// that needs it was unreachable from the surface that raised it. Like
+    /// `claim`, this adds no authority: `release_stale_write_claims` never
+    /// removes a live claimant's claim, whoever asks.
+    Release,
 }
 
 fn parse_agent_tool_action(input: &Value) -> Result<AgentToolAction, ToolError> {
@@ -8099,8 +8277,9 @@ fn parse_agent_tool_action(input: &Value) -> Result<AgentToolAction, ToolError> 
         "wait" | "join" | "await" | "block" => Ok(AgentToolAction::Wait),
         "cancel" | "stop" | "abort" => Ok(AgentToolAction::Cancel),
         "claim" => Ok(AgentToolAction::Claim),
+        "release" | "release_claim" => Ok(AgentToolAction::Release),
         other => Err(ToolError::invalid_input(format!(
-            "Invalid agent action '{other}'. Use start, roster, status, peek, message, followup, interrupt, wait, claim, or cancel."
+            "Invalid agent action '{other}'. Use start, roster, status, peek, message, followup, interrupt, wait, claim, release, or cancel."
         ))),
     }
 }
@@ -8225,6 +8404,7 @@ impl ToolSpec for AgentTool {
             "Prefer type=builder for write work and type=verifier (or the Run tool with action=\"verifiers\") after writes settle — dispatch is not completion. ",
             "Coordinate through this same tool: action=message queues a note without waking the child; action=followup delivers queued notes and wakes a running child for its next user-provenance turn; action=interrupt stops the current child turn while preserving its checkpoint; action=wait blocks without changing child state, and until=\"all\" joins a whole fan-out in one call. ",
             "action=claim widens your own enforced write scope: pass write_roots (and optionally exact_files, coordination_contracts) before mutating anything a fail-closed write refusal named. It records a durable claim receipt and fails on contention with a peer claim; it never touches another agent's scope. ",
+            "action=release clears write claims whose owner is no longer running — the fix a write-scope contention or blocking-peers refusal names. Pass agent_id for one, omit it to sweep; a live claim is never removed. ",
             "Action contract: start requires prompt; message/followup require a target and message; peek/interrupt/cancel require a target; claim requires at least one scope entry; roster, status, and wait are unscoped. ",
             "This is the whole model-facing sub-agent surface; there is no second transport. ",
             "In Operate, use detached=true only for independent or long work that must outlive the active turn; a write-capable root start defaults write scope to the parent workspace unless narrowed with write_roots; arbitrary shell remains gated. ",
@@ -8256,8 +8436,8 @@ impl ToolSpec for AgentTool {
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["start", "roster", "status", "peek", "message", "followup", "interrupt", "wait", "claim", "cancel"],
-                    "description": "start launches a turn-owned worker and returns immediately. roster lists the Fleet roles and their descriptions. status/peek inspect running or retained workers. message queues a note without waking a running child. followup delivers queued notes and wakes a running child for its next user-provenance model turn. interrupt stops the current turn while preserving the child checkpoint. wait only observes; see until. claim widens your own enforced write scope (see write_roots). cancel permanently cancels a running child."
+                    "enum": ["start", "roster", "status", "peek", "message", "followup", "interrupt", "wait", "claim", "release", "cancel"],
+                    "description": "start launches a turn-owned worker and returns immediately. roster lists the Fleet roles and their descriptions. status/peek inspect running or retained workers. message queues a note without waking a running child. followup delivers queued notes and wakes a running child for its next user-provenance model turn. interrupt stops the current turn while preserving the child checkpoint. wait only observes; see until. claim widens your own enforced write scope (see write_roots). release clears write claims whose owner is no longer running — the remediation a write-scope contention refusal names; pass agent_id to clear one, omit it to sweep. cancel permanently cancels a running child."
                 },
                 "until": {
                     "type": "string",
@@ -8359,6 +8539,14 @@ impl ToolSpec for AgentTool {
                             "properties": {"action": {"const": "claim"}}
                         },
                         {
+                            // `release` names no *required* target: with
+                            // `agent_id` it clears that one stale claim, and
+                            // without it sweeps every claim whose owner is no
+                            // longer live. Neither form can touch a live
+                            // claimant's claim.
+                            "properties": {"action": {"const": "release"}}
+                        },
+                        {
                             "properties": {"action": {"const": "cancel"}},
                             "anyOf": target_required
                         }
@@ -8407,6 +8595,11 @@ impl ToolSpec for AgentTool {
             // Authority is unchanged: `claim` can only widen the *caller's
             // own* scope, and contention with a peer claim still fails.
             Ok(AgentToolAction::Claim) => ApprovalRequirement::Auto,
+            // Same reasoning, and the same bounded authority: `release` only
+            // drops claims whose owner is already not a live claimant, and a
+            // child that is refused every write until a dead claim clears
+            // cannot raise a modal in a parent UI nobody is watching (#5906).
+            Ok(AgentToolAction::Release) => ApprovalRequirement::Auto,
             _ => ApprovalRequirement::Required,
         }
     }
@@ -8523,6 +8716,28 @@ impl ToolSpec for AgentTool {
                     self.runtime.parent_agent_id.clone(),
                 )
                 .execute(agent_claim_coordinate_input(&input)?, context)
+                .await;
+            }
+            AgentToolAction::Release => {
+                let mut coordinate_input = json!({"action": "release"});
+                if let Some(agent_ref) = parse_agent_ref(&input)? {
+                    // Targeted release accepts a session name like every other
+                    // targeted action; the ledger keys claims by agent id, and
+                    // a headless worker id that resolves to no agent row is
+                    // passed through unchanged.
+                    let owner = {
+                        let manager = self.manager.read().await;
+                        manager
+                            .resolve_agent_ref(&agent_ref)
+                            .unwrap_or_else(|_| agent_ref.clone())
+                    };
+                    coordinate_input["owner"] = json!(owner);
+                }
+                return AgentsCoordinateTool::new(
+                    self.manager.clone(),
+                    self.runtime.parent_agent_id.clone(),
+                )
+                .execute(coordinate_input, context)
                 .await;
             }
         }
@@ -10582,6 +10797,7 @@ fn build_subagent_checkpoint(
         created_at_ms,
         messages: bounded_messages,
         omitted_messages,
+        parked_at_turn_end: false,
     }
 }
 
@@ -11008,7 +11224,10 @@ fn subagent_cancellation_projection(
         let reason = format!(
             "Parent turn ended before this turn-owned child settled. Work was parked instead of discarded; resume with agent(action=\"start\", prompt=\"Continue the parked assignment.\", resume_from=\"{agent_id}\")."
         );
-        let checkpoint = build_subagent_checkpoint(agent_id, &reason, messages, steps, true);
+        let mut checkpoint = build_subagent_checkpoint(agent_id, &reason, messages, steps, true);
+        // Parked, not asking: nothing will answer this child, and its write
+        // claim must stop gating peers immediately (#5906).
+        checkpoint.parked_at_turn_end = true;
         let needs_input = SubAgentNeedsInput {
             question: format!(
                 "Resume this parked child with agent(action=\"start\", prompt=\"Continue the parked assignment.\", resume_from=\"{agent_id}\")."
@@ -14657,7 +14876,10 @@ impl SubAgentToolRegistry {
     /// action, so a ceiling written against `agents/coordinate` keeps meaning
     /// what it meant.
     fn agent_action_permitted(&self, action: &str) -> bool {
-        if action != "claim" {
+        // `release` (#5906) carried the same `agents/coordinate` authority as
+        // `claim` and is gated identically: a read-only role has no write
+        // scope, so no contention refusal to remediate.
+        if !matches!(action, "claim" | "release") {
             return true;
         }
         !self.write_is_denied() && !self.is_tool_denied("agents/coordinate")
@@ -14992,7 +15214,7 @@ impl SubAgentToolRegistry {
                     manager.live_peer_shared_write_claim_owners(&self.owner_agent_id);
                 if !blocking_peers.is_empty() {
                     return Err(anyhow!(
-                        "Tool {name} cannot prove a bounded file target, and another child is writing in this shared checkout (blocking peers: {}). Wait for the peer to finish, ask the parent to cancel it, run agents/coordinate action=release to clear a stale claim, or relaunch the children with worktree isolation.",
+                        "Tool {name} cannot prove a bounded file target, and another child is writing in this shared checkout (blocking peers: {}). Wait for the peer to finish, ask the parent to cancel it with agent(action=\"cancel\", agent_id=\"<peer>\"), run agent(action=\"release\") to clear a stale claim, or relaunch the children with worktree isolation.",
                         blocking_peers.join(", ")
                     ));
                 }

@@ -2381,6 +2381,7 @@ async fn agent_runs_runtime_api_exposes_persisted_worker_receipts() -> Result<()
         result_summary: Some("receipt complete".to_string()),
         error: None,
         steps_taken: 2,
+        parked_at_turn_end: false,
         events: VecDeque::from([AgentWorkerEvent {
             seq: 1,
             worker_id: "agent_receipt".to_string(),

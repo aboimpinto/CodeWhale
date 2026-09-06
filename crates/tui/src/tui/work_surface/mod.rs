@@ -502,6 +502,7 @@ mod tests {
                 },
                 sequence: 1,
                 isolated_worktree: false,
+                present_at_claim: Vec::new(),
             }],
             reconciliations: Vec::new(),
             context_projections: Vec::new(),

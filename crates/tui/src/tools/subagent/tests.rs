@@ -11339,9 +11339,24 @@ async fn contended_shared_writer_refusal_names_blocking_peer_and_remediation() {
         err.contains("agent_b"),
         "refusal must name the blocking peer: {err}"
     );
+    // #5906: the remediation must name a surface that exists from here.
+    // `agents/coordinate` left the catalog, so the refusal pointed at a tool
+    // the refused child could not reach.
     assert!(
-        err.contains("agents/coordinate action=release") && err.contains("worktree isolation"),
+        err.contains(r#"agent(action="release")"#) && err.contains("worktree isolation"),
         "refusal must state concrete remediation: {err}"
+    );
+    assert!(
+        AgentTool::new(
+            new_shared_subagent_manager(tmp.path().to_path_buf(), 1),
+            stub_runtime(),
+        )
+        .input_schema()["properties"]["action"]["enum"]
+            .as_array()
+            .expect("action enum")
+            .iter()
+            .any(|action| action == "release"),
+        "the remediation the refusal names must be a real action on this tool"
     );
     assert!(
         !tmp.path().join("src/a2.txt").exists(),
@@ -11471,6 +11486,214 @@ fn waiting_for_user_headless_worker_is_not_a_live_coordination_owner() {
         manager.is_live_coordination_owner(&paired),
         "an interactive child waiting on the user stays live"
     );
+}
+
+/// Register a shared-checkout write claim for `owner` the way production does,
+/// so the presence stamp (#5906) is recorded rather than defaulted away.
+fn claim_shared_root(manager: &mut SubAgentManager, owner: &str, root: &str) -> Result<(), String> {
+    manager
+        .register_claim_with_presence(
+            WriteScopeClaim {
+                owner: owner.to_string(),
+                roots: vec![root.to_string()],
+                exact_files: Vec::new(),
+                contracts: Vec::new(),
+            },
+            false,
+        )
+        .map(|_| ())
+}
+
+/// Commit the exact terminal projection the runtime writes when a parent turn
+/// ends before a turn-owned child settles.
+fn park_child_at_turn_end(manager: &mut SubAgentManager, agent_id: &str) {
+    let parking = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let messages = vec![text_message("user", "Continue the parked assignment.")];
+    let (status, reason, checkpoint, needs_input, _, _) =
+        subagent_cancellation_projection(agent_id, &messages, 0, None, Some(&parking));
+    let mut terminal = manager.get_result(agent_id).expect("running child");
+    terminal.status = status;
+    terminal.result = reason;
+    terminal.checkpoint = checkpoint;
+    terminal.needs_input = needs_input;
+    assert!(
+        manager.finish_terminal_result(agent_id, terminal, true, false),
+        "the parked projection must own the terminal transition"
+    );
+}
+
+/// #5906: a child parked because its parent's turn ended is not a child that
+/// asked a question. Nothing will answer it — the recovery path starts a *new*
+/// agent through `resume_from` — so holding its write claim open refused the
+/// resume itself and every later writer overlapping the scope.
+#[tokio::test]
+async fn a_parked_child_stops_holding_its_write_claim() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().canonicalize().expect("canonical workspace");
+    std::fs::create_dir_all(workspace.join("src/shared")).expect("claimed tree");
+    let mut manager = SubAgentManager::new(workspace.clone(), 8);
+
+    let parked = manager.insert_test_running_agent("parked", &workspace);
+    claim_shared_root(&mut manager, &parked, "src/shared").expect("initial claim");
+    assert!(
+        manager.is_live_coordination_owner(&parked),
+        "a running writer holds its claim"
+    );
+    claim_shared_root(&mut manager, "agent_resume", "src/shared")
+        .expect_err("a live writer's overlapping scope must still contend");
+
+    park_child_at_turn_end(&mut manager, &parked);
+
+    let record = manager.get_worker_record(&parked).expect("worker record");
+    assert_eq!(
+        record.status,
+        AgentWorkerStatus::WaitingForUser,
+        "the parked projection is unchanged; only coordination learns to read it"
+    );
+    assert!(
+        record.parked_at_turn_end,
+        "the record must carry the park/ask distinction rather than have it guessed"
+    );
+    assert!(
+        !manager.is_live_coordination_owner(&parked),
+        "a parked child must not gate peers as a live writer"
+    );
+    assert!(
+        !manager.admissible_coordination_owners().contains(&parked),
+        "admission and the liveness predicate share one answer"
+    );
+
+    // The exact refusal from the report: resuming the same work under a new
+    // agent id must be admitted.
+    claim_shared_root(&mut manager, "agent_resume", "src/shared")
+        .expect("a resume of parked work must not be refused by the parked claim");
+    assert!(
+        manager
+            .live_peer_shared_write_claim_owners("agent_resume")
+            .is_empty(),
+        "and the parked owner must not keep gating the resumed child's shell"
+    );
+
+    // Re-dispatch under the same id clears the flag, so a claim that becomes
+    // live again is honoured without a second authority deciding that.
+    manager.record_worker_event(&parked, AgentWorkerStatus::Running, None, None, None);
+    assert!(
+        !manager
+            .get_worker_record(&parked)
+            .expect("worker record")
+            .parked_at_turn_end
+    );
+}
+
+/// #5906: `cancel` is the release path the contention refusal names, and it was
+/// a no-op on exactly the records that leak — `cancel_agent` returned early
+/// because the child had already left `Running`, leaving a non-terminal worker
+/// record holding the claim.
+#[tokio::test]
+async fn cancelling_a_settled_waiting_child_terminalizes_it_and_releases_its_claim() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().canonicalize().expect("canonical workspace");
+    std::fs::create_dir_all(workspace.join("src/shared")).expect("claimed tree");
+    let mut manager = SubAgentManager::new(workspace.clone(), 8);
+
+    let waiting = manager.insert_test_running_agent("waiting", &workspace);
+    claim_shared_root(&mut manager, &waiting, "src/shared").expect("initial claim");
+    // A paired child that genuinely asked the user something: still live,
+    // because the user can answer and the child will write again.
+    manager.agents.get_mut(&waiting).expect("agent").status =
+        SubAgentStatus::Interrupted("awaiting user input".to_string());
+    manager.agents.get_mut(&waiting).expect("agent").needs_input = Some(SubAgentNeedsInput {
+        question: "which branch?".to_string(),
+    });
+    manager
+        .worker_records
+        .get_mut(&waiting)
+        .expect("worker record")
+        .status = AgentWorkerStatus::WaitingForUser;
+    assert!(
+        manager.is_live_coordination_owner(&waiting),
+        "an unanswered question is not a leak"
+    );
+    claim_shared_root(&mut manager, "agent_peer", "src/shared")
+        .expect_err("its claim legitimately blocks while the question stands");
+
+    manager.cancel_agent(&waiting).expect("cancel");
+
+    assert!(
+        manager
+            .get_worker_record(&waiting)
+            .expect("worker record")
+            .status
+            .is_terminal(),
+        "cancel must terminalize a settled child's worker record"
+    );
+    assert!(
+        manager
+            .agents
+            .get(&waiting)
+            .expect("agent")
+            .needs_input
+            .is_none(),
+        "the withdrawn question must not keep offering a resume"
+    );
+    assert!(
+        !manager.is_live_coordination_owner(&waiting),
+        "and the claim releases through the one liveness predicate"
+    );
+    claim_shared_root(&mut manager, "agent_peer", "src/shared")
+        .expect("the cancelled child's claim must stop refusing the peer");
+}
+
+/// #5906: the reported claim named a worktree that had since been deleted with
+/// `git worktree remove` and kept refusing every claimant anyway. "Gone" and
+/// "not created yet" must not be confused: a forward-looking claim on a tree
+/// its owner is about to create is the reservation the ledger exists to honor.
+#[test]
+fn a_claim_whose_paths_vanished_stops_blocking_but_a_future_tree_still_does() {
+    let tmp = tempdir().expect("tempdir");
+    let workspace = tmp.path().canonicalize().expect("canonical workspace");
+    let mut manager = SubAgentManager::new(workspace.clone(), 8);
+    let doomed = workspace.join("worktrees/cw-gone");
+    std::fs::create_dir_all(&doomed).expect("worktree checkout");
+
+    manager
+        .register_worker_with_coordination(make_write_worker_spec(
+            "worker-worktree",
+            workspace.clone(),
+            "worktrees/cw-gone",
+        ))
+        .expect("headless worker registration");
+    assert!(
+        manager.is_live_coordination_owner("worker-worktree"),
+        "the owner stays live throughout: only the path changes"
+    );
+    claim_shared_root(&mut manager, "agent_next", "worktrees/cw-gone")
+        .expect_err("an existing claimed checkout must still contend");
+
+    std::fs::remove_dir_all(&doomed).expect("git worktree remove");
+
+    assert!(
+        !manager
+            .admissible_coordination_owners()
+            .contains("worker-worktree"),
+        "a claim on a checkout that no longer exists cannot block admission"
+    );
+    assert!(
+        manager
+            .live_peer_shared_write_claim_owners("agent_next")
+            .is_empty(),
+        "nor gate a peer's command execution"
+    );
+    claim_shared_root(&mut manager, "agent_next", "worktrees/cw-gone")
+        .expect("the vanished claim must not refuse the next writer");
+
+    // The other half: a claim on a tree that never existed is a reservation,
+    // not a leak, and two writers must not both be admitted to it.
+    let mut fresh = SubAgentManager::new(workspace.clone(), 8);
+    let planner = fresh.insert_test_running_agent("planner", &workspace);
+    claim_shared_root(&mut fresh, &planner, "crates/not-created-yet").expect("forward claim");
+    claim_shared_root(&mut fresh, "agent_other", "crates/not-created-yet")
+        .expect_err("a not-yet-created tree is still exclusively claimed");
 }
 
 #[tokio::test]
