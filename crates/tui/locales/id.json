@@ -1430,6 +1430,7 @@
   "ProviderExternalOwnerPath": "Pemilik/path: {owner} | {path}",
   "ProviderExternalPinnedPathWarning": "Peringatan: path kredensial ambient {owner} berubah; persetujuan tetap terkunci pada {path}.",
   "ToolProjectionWarning": "Peringatan: {provider} menghilangkan alat yang tidak kompatibel untuk permintaan ini: {tools}",
+  "SnapshotsDisabledNotice": "Snapshot dan /undo nonaktif untuk {workspace}: {reason} Naikkan `{config_key}` di config.toml (atau setel 0 untuk menghapus batas) untuk mengaktifkannya.",
   "ProviderExternalSemanticsRevoke": "{semantics} | cabut: {revoke}",
   "ProviderExternalRevoke": "cabut: {revoke}",
   "ProviderExternalChoiceTitle": " Akses kredensial eksternal · {provider} ",

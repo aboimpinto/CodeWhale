@@ -171,6 +171,11 @@ pub enum Event {
         omitted_tool_names: Vec<String>,
         omitted_tool_count: usize,
     },
+
+    /// Workspace snapshots (undo) could not be enabled for this workspace.
+    /// Emitted once per workspace per process so the operator sees why undo
+    /// is missing and which config key turns it back on (#5930).
+    SnapshotsDisabled { workspace: String, reason: String },
     // === Streaming Events ===
     /// A new message block has started
     MessageStarted { index: usize },

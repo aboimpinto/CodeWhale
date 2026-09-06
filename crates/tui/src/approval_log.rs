@@ -179,7 +179,7 @@ impl ApprovalReceiptStore {
         Ok(trimmed)
     }
 
-    fn log_path(&self, session_id: &str) -> io::Result<PathBuf> {
+    pub(crate) fn log_path(&self, session_id: &str) -> io::Result<PathBuf> {
         let session_id = Self::validated_session_id(session_id)?;
         Ok(self.sessions_dir.join(session_id).join(APPROVAL_LOG_FILE))
     }

@@ -66,6 +66,10 @@ impl Engine {
             )
         })?;
         let session_id = self.session.id.clone();
+        let log_path = store
+            .log_path(&session_id)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|_| "<unresolvable approval log path>".to_string());
         let write = tokio::task::spawn_blocking(move || store.append(&session_id, &receipt))
             .await
             .map_err(|error| {
@@ -80,14 +84,23 @@ impl Engine {
                 )
             })?;
         write.map_err(|error| {
+            // Name the file and the reason: an InvalidData here means the
+            // on-disk approval log no longer replays (a half-written line or
+            // a receipt for an unknown call), and the operator needs to know
+            // which file to inspect or move aside (#5931).
             tracing::warn!(
                 target: "approval",
                 error_kind = ?error.kind(),
+                %error,
+                path = %log_path,
                 "approval receipt write failed"
             );
-            ToolError::execution_failed(
-                "Approval evidence could not be committed; tool execution was blocked.".to_string(),
-            )
+            ToolError::execution_failed(format!(
+                "Approval evidence could not be committed; tool execution was blocked. \
+                 Approval log {log_path} refused the receipt ({kind:?}: {error}). \
+                 If the log is corrupt, move it aside and retry; the session keeps running.",
+                kind = error.kind(),
+            ))
         })
     }
 

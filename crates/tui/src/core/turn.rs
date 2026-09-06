@@ -451,23 +451,66 @@ fn snapshot_with_label(
             id
         }
         Err(e) => {
-            tracing::warn!(target: "snapshot", "snapshot repo init failed: {e}");
-            maybe_notify_snapshots_disabled_once(workspace, &e);
+            // The first failure per workspace is the operator's notice; every
+            // later turn hits the same gate and only needs a debug line (#5930).
+            if maybe_notify_snapshots_disabled_once(workspace, &e) {
+                tracing::warn!(target: "snapshot", "snapshot repo init failed: {e}");
+            } else {
+                tracing::debug!(target: "snapshot", "snapshot repo init still failing: {e}");
+            }
             None
         }
     }
 }
 
+/// A snapshots-disabled notice waiting for the engine to surface it as
+/// [`crate::core::Event::SnapshotsDisabled`]. Snapshot attempts run on
+/// blocking tasks without an event channel, so the once-per-workspace notice
+/// is parked here and drained at the next turn boundary (#5930).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotsDisabledNotice {
+    pub workspace: String,
+    pub reason: String,
+}
+
+/// The config key that lifts the size gate; named in every surface of the
+/// notice so the remedy travels with the failure.
+pub const SNAPSHOTS_CAP_CONFIG_KEY: &str = "[snapshots] max_workspace_gb";
+
+fn pending_snapshot_notices() -> &'static std::sync::Mutex<Vec<SnapshotsDisabledNotice>> {
+    static PENDING: std::sync::OnceLock<std::sync::Mutex<Vec<SnapshotsDisabledNotice>>> =
+        std::sync::OnceLock::new();
+    PENDING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+/// Drain the notices parked by [`maybe_notify_snapshots_disabled_once`] for
+/// one workspace. Each workspace produces at most one per process lifetime,
+/// and an engine only takes its own so two sessions (or two tests) in one
+/// process never see each other's notice.
+pub fn take_snapshots_disabled_notices(workspace: &Path) -> Vec<SnapshotsDisabledNotice> {
+    let key = workspace.to_string_lossy();
+    let Ok(mut guard) = pending_snapshot_notices().lock() else {
+        return Vec::new();
+    };
+    let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *guard)
+        .into_iter()
+        .partition(|notice| notice.workspace == key);
+    *guard = others;
+    mine
+}
+
 // The stderr print is deliberate: headless/CLI stderr is the user surface for
 // this once-per-workspace warning, matching the pre-TUI notices in
-// runtime_log.rs.
+// runtime_log.rs. The TUI gets the same notice through the parked
+// `SnapshotsDisabledNotice`, because its alternate screen never shows stderr.
+// Returns whether this call was the workspace's first notice.
 #[allow(clippy::print_stderr)]
-fn maybe_notify_snapshots_disabled_once(workspace: &Path, error: &std::io::Error) {
+fn maybe_notify_snapshots_disabled_once(workspace: &Path, error: &std::io::Error) -> bool {
     let message = error.to_string();
     if !(message.contains("workspace too large for snapshots")
         || message.contains("workspace snapshots are disabled"))
     {
-        return;
+        return true;
     }
     use std::collections::HashSet;
     use std::sync::{Mutex, OnceLock};
@@ -475,10 +518,16 @@ fn maybe_notify_snapshots_disabled_once(workspace: &Path, error: &std::io::Error
     let key = workspace.to_string_lossy().into_owned();
     let set = NOTIFIED.get_or_init(|| Mutex::new(HashSet::new()));
     let Ok(mut guard) = set.lock() else {
-        return;
+        return true;
     };
-    if !guard.insert(key) {
-        return;
+    if !guard.insert(key.clone()) {
+        return false;
+    }
+    if let Ok(mut pending) = pending_snapshot_notices().lock() {
+        pending.push(SnapshotsDisabledNotice {
+            workspace: key,
+            reason: message.clone(),
+        });
     }
     // One prominent notice per workspace process lifetime — silent disable is
     // the §2.7 failure mode. Opt-in remains `[snapshots] max_workspace_gb`
@@ -486,9 +535,56 @@ fn maybe_notify_snapshots_disabled_once(workspace: &Path, error: &std::io::Error
     eprintln!(
         "warning: workspace snapshots/undo are OFF for {}
   {message}
-  raise `[snapshots] max_workspace_gb` in config.toml (or set it to 0 to disable the cap) to opt in.",
+  raise `{SNAPSHOTS_CAP_CONFIG_KEY}` in config.toml (or set it to 0 to disable the cap) to opt in.",
         workspace.display()
     );
+    true
+}
+
+#[cfg(test)]
+mod snapshot_notice_tests {
+    use super::*;
+
+    #[test]
+    fn a_workspace_over_the_cap_parks_exactly_one_notice_and_warns_once() {
+        let workspace = std::env::temp_dir().join(format!(
+            "codewhale-snapshot-notice-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let error = || {
+            std::io::Error::other(
+                "workspace too large for snapshots (over 2 GB of non-excluded content or > 200000 entries): x",
+            )
+        };
+        assert!(
+            maybe_notify_snapshots_disabled_once(&workspace, &error()),
+            "the first failure is the operator's notice"
+        );
+        assert!(
+            !maybe_notify_snapshots_disabled_once(&workspace, &error()),
+            "later turns hit the same gate silently"
+        );
+        let ours = take_snapshots_disabled_notices(&workspace);
+        assert_eq!(ours.len(), 1, "one notice per workspace: {ours:?}");
+        assert!(ours[0].reason.contains("workspace too large for snapshots"));
+        assert!(
+            take_snapshots_disabled_notices(&workspace).is_empty(),
+            "draining is destructive"
+        );
+        // Another workspace's engine never sees this one's notice.
+        let other = std::env::temp_dir().join("codewhale-snapshot-notice-other");
+        assert!(maybe_notify_snapshots_disabled_once(&other, &error()));
+        assert!(take_snapshots_disabled_notices(&workspace).is_empty());
+        assert_eq!(take_snapshots_disabled_notices(&other).len(), 1);
+    }
+
+    #[test]
+    fn unrelated_snapshot_errors_are_not_gated_notices() {
+        let workspace = std::env::temp_dir().join("codewhale-snapshot-notice-unrelated");
+        let error = std::io::Error::other("disk full");
+        assert!(maybe_notify_snapshots_disabled_once(&workspace, &error));
+        assert!(take_snapshots_disabled_notices(&workspace).is_empty());
+    }
 }
 
 #[cfg(test)]

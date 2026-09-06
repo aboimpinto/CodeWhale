@@ -295,6 +295,15 @@ pub enum EventMsg {
         omitted_tool_count: u64,
     },
 
+    /// Workspace snapshots (undo) are off for this workspace; `reason` names
+    /// the gate and the config key that lifts it.
+    SnapshotsDisabled {
+        thread_id: ThreadId,
+        session_id: SessionId,
+        workspace: String,
+        reason: String,
+    },
+
     // === Streaming ===
     MessageStarted {
         thread_id: ThreadId,
@@ -743,6 +752,7 @@ impl EventMsg {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Self::ToolProjectionWarning { .. } => "tool_projection_warning",
+            Self::SnapshotsDisabled { .. } => "snapshots_disabled",
             Self::MessageStarted { .. } => "message_started",
             Self::ResponseDelta { .. } => "response_delta",
             Self::MessageComplete { .. } => "message_complete",
@@ -794,6 +804,7 @@ impl EventMsg {
     pub fn thread_id(&self) -> &ThreadId {
         match self {
             Self::ToolProjectionWarning { thread_id, .. }
+            | Self::SnapshotsDisabled { thread_id, .. }
             | Self::MessageStarted { thread_id, .. }
             | Self::ResponseDelta { thread_id, .. }
             | Self::MessageComplete { thread_id, .. }
@@ -845,6 +856,7 @@ impl EventMsg {
     pub fn session_id(&self) -> &SessionId {
         match self {
             Self::ToolProjectionWarning { session_id, .. }
+            | Self::SnapshotsDisabled { session_id, .. }
             | Self::MessageStarted { session_id, .. }
             | Self::ResponseDelta { session_id, .. }
             | Self::MessageComplete { session_id, .. }

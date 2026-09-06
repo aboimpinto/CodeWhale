@@ -3870,6 +3870,7 @@ impl Engine {
                             crate::core::turn::pre_tool_snapshot(&ws, &tid, cap, Some(&sid))
                         })
                         .await;
+                        self.emit_pending_snapshot_notices().await;
                     }
 
                     if self.apply_pending_runtime_authority().await {
