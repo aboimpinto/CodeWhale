@@ -1155,9 +1155,14 @@ pub enum TodoProjection {
 
 /// Plan-state distinction for the relay snapshot. `Busy` reproduces the
 /// baseline `try_lock` failure branch; `Absent` reproduces an empty snapshot.
+///
+/// `PlanSections` is intentionally not boxed: the command-crate boundary gate
+/// forbids boxed storage in the contract, and the section payload is only ever
+/// built once per `/relay` dispatch.
 #[derive(Clone, Debug, PartialEq)]
+#[allow(clippy::large_enum_variant)]
 pub enum PlanProjection {
-    Sections(Box<PlanSections>),
+    Sections(PlanSections),
     Busy,
     Absent,
 }

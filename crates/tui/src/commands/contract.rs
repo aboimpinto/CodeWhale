@@ -1108,7 +1108,7 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
                 if snapshot.is_empty() {
                     PlanProjection::Absent
                 } else {
-                    PlanProjection::Sections(Box::new(plan_snapshot_to_sections(&snapshot)))
+                    PlanProjection::Sections(plan_snapshot_to_sections(&snapshot))
                 }
             }
             Err(_) => PlanProjection::Busy,

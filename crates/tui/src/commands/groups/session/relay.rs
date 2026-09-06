@@ -267,18 +267,16 @@ mod tests {
                 goal_objective: None,
                 goal_token_budget: None,
                 todos: TodoProjection::Absent,
-                plan: codewhale_command_contract::facets::PlanProjection::Sections(Box::new(
-                    PlanSections {
-                        title: Some("Relay Plan".to_string()),
-                        explanation: Some("  because  ".to_string()),
-                        sources_used: vec!["repo-a".to_string(), "  ".to_string()],
-                        items: vec![PlanStep {
-                            status_label: "in_progress".to_string(),
-                            text: "port relay".to_string(),
-                        }],
-                        ..PlanSections::default()
-                    },
-                )),
+                plan: codewhale_command_contract::facets::PlanProjection::Sections(PlanSections {
+                    title: Some("Relay Plan".to_string()),
+                    explanation: Some("  because  ".to_string()),
+                    sources_used: vec!["repo-a".to_string(), "  ".to_string()],
+                    items: vec![PlanStep {
+                        status_label: "in_progress".to_string(),
+                        text: "port relay".to_string(),
+                    }],
+                    ..PlanSections::default()
+                }),
             }),
             ..super::super::control_test_support::FakeControl::default()
         };
