@@ -66,6 +66,7 @@ use codewhale_execpolicy::ApprovalMode;
 
 use crate::commands::groups::plugins::plugin_network_policy;
 
+use crate::dependencies::ExternalTool as _;
 use crate::localization::{MessageId, tr};
 use crate::network_policy::NetworkPolicy;
 use crate::pricing::CostCurrency;
@@ -828,6 +829,253 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
 }
 
 // ---------------------------------------------------------------------------
+// FEAT-024 Phase 4: relocated host machinery for the control slice.
+//
+// These helpers were extracted from the legacy `/rename` and `/remote-env`
+// command bodies when those files became portable; they are host-owned and
+// stay in TUI (the future movable group never names them).
+// ---------------------------------------------------------------------------
+
+/// `/rename`-style atomic persistence used by the picker/UI test seam and any
+/// host caller that holds an explicit `SessionManager`. Mirrors the baseline
+/// write path: sanitize, load (with first-snapshot recovery), sync live state,
+/// snapshot Work state, carry metadata, save, then publish. Returns the exact
+/// baseline messages.
+#[cfg(test)]
+pub(crate) fn rename_with_manager(
+    new_title: &str,
+    session_id: &str,
+    manager: &crate::session_manager::SessionManager,
+    app: &mut App,
+) -> crate::commands::CommandResult {
+    let sanitized = crate::session_manager::sanitize_session_title(new_title);
+    let new_title = sanitized.trim();
+    if new_title.is_empty() {
+        return crate::commands::CommandResult::error("Usage: /rename <new title>");
+    }
+    let mut session = match manager.load_session(session_id) {
+        Ok(s) => s,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            match live_session_before_first_snapshot(manager, session_id, app) {
+                Some(s) => s,
+                None => {
+                    return crate::commands::CommandResult::error(format!(
+                        "Could not load session: {err}"
+                    ));
+                }
+            }
+        }
+        Err(e) => {
+            return crate::commands::CommandResult::error(format!("Could not load session: {e}"));
+        }
+    };
+    session = crate::session_manager::update_session(
+        session,
+        &app.api_messages,
+        u64::from(app.session.total_tokens),
+        app.system_prompt.as_ref(),
+    );
+    session.work_state = match app.work_state_snapshot() {
+        Ok(state) => state,
+        Err(err) => {
+            return crate::commands::CommandResult::error(format!(
+                "Could not snapshot Work state before rename: {err}"
+            ));
+        }
+    };
+    session.context_references = app.session_context_references.clone();
+    session.artifacts = app.session_artifacts.clone();
+    session.last_auto_route = app.auto_route_for_persistence();
+    session.metadata.model = app.model_selection_for_persistence();
+    session
+        .metadata
+        .set_model_provider_route(app.api_provider.as_str(), app.provider_id_for_persistence());
+    session.metadata.workspace.clone_from(&app.workspace);
+    session.metadata.mode = Some(app.mode.as_setting().to_string());
+    app.sync_cost_to_metadata(&mut session.metadata);
+    session.metadata.title = new_title.to_string();
+
+    match manager.save_session(&session) {
+        Ok(_) => {
+            app.current_session_metadata = Some(session.metadata.clone());
+            app.session_title = Some(new_title.to_string());
+            if let Err(err) = app.publish_pending_work_state() {
+                return crate::commands::CommandResult::error(format!(
+                    "Session renamed, but Work views were not published: {err}"
+                ));
+            }
+            crate::commands::CommandResult::message(format!("Session renamed to \"{new_title}\""))
+        }
+        Err(e) => crate::commands::CommandResult::error(format!("Could not save session: {e}")),
+    }
+}
+
+const HOSTED_WORK_URL: &str = "https://app.codewhale.net/work";
+const MAX_GIT_VALUE_BYTES: usize = 4 * 1024;
+
+/// Validated hosted-work Git target (repo slug + checked-out branch).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RemoteEnvTarget {
+    repo: String,
+    branch: String,
+}
+
+/// Resolve the hosted-work launcher target for a workspace: read the origin
+/// URL and symbolic branch, normalize the repository slug against the
+/// allowlist, and encode the launcher URL. Credentials never appear in the
+/// returned values.
+fn resolve_target(workspace: &Path) -> Option<RemoteEnvTarget> {
+    let origin = read_git_value(
+        workspace,
+        &["config", "--local", "--get", "remote.origin.url"],
+    )?;
+    let repo = normalize_repo_slug(&origin)?;
+    let branch = read_git_value(workspace, &["symbolic-ref", "--quiet", "--short", "HEAD"])?;
+    if !valid_branch_name(&branch) {
+        return None;
+    }
+    Some(RemoteEnvTarget { repo, branch })
+}
+
+fn hosted_work_url(repo: &str, branch: &str) -> String {
+    format!(
+        "{HOSTED_WORK_URL}?repo={}&branch={}",
+        urlencoding::encode(repo),
+        urlencoding::encode(branch),
+    )
+}
+
+fn read_git_value(workspace: &Path, args: &[&str]) -> Option<String> {
+    let mut command = crate::dependencies::Git::command()?;
+    let output = command.arg("-C").arg(workspace).args(args).output().ok()?;
+    if !output.status.success()
+        || output.stdout.is_empty()
+        || output.stdout.len() > MAX_GIT_VALUE_BYTES
+    {
+        return None;
+    }
+    let value = String::from_utf8(output.stdout).ok()?;
+    let value = value.trim_end_matches(&['\r', '\n'][..]);
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn valid_branch_name(branch: &str) -> bool {
+    if branch.is_empty() || branch.len() > MAX_GIT_VALUE_BYTES {
+        return false;
+    }
+    let Some(mut command) = crate::dependencies::Git::command() else {
+        return false;
+    };
+    command
+        .args(["check-ref-format", "--branch"])
+        .arg(branch)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn normalize_repo_slug(origin: &str) -> Option<String> {
+    let origin = origin.trim();
+    if origin.is_empty()
+        || origin.len() > MAX_GIT_VALUE_BYTES
+        || origin.chars().any(char::is_control)
+    {
+        return None;
+    }
+
+    let (host, path) = if starts_with_ascii_case(origin, "https://") {
+        split_url_origin(&origin["https://".len()..], UrlScheme::Https)?
+    } else if starts_with_ascii_case(origin, "ssh://") {
+        split_url_origin(&origin["ssh://".len()..], UrlScheme::Ssh)?
+    } else {
+        split_scp_origin(origin)?
+    };
+    if !matches!(
+        host.to_ascii_lowercase().as_str(),
+        "github.com" | "cnb.cool"
+    ) {
+        return None;
+    }
+    normalize_repo_path(path)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum UrlScheme {
+    Https,
+    Ssh,
+}
+
+fn starts_with_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+}
+
+fn split_url_origin(origin: &str, scheme: UrlScheme) -> Option<(&str, &str)> {
+    let (authority, path) = origin.split_once('/')?;
+    if authority.is_empty() || path.is_empty() {
+        return None;
+    }
+    let host_port = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
+    let host = match host_port.rsplit_once(':') {
+        Some((host, port))
+            if !host.is_empty()
+                && !port.is_empty()
+                && port.bytes().all(|byte| byte.is_ascii_digit())
+                && (matches!(scheme, UrlScheme::Ssh) || port == "443") =>
+        {
+            host
+        }
+        Some(_) => return None,
+        None => host_port,
+    };
+    (!host.is_empty()).then_some((host, path))
+}
+
+fn split_scp_origin(origin: &str) -> Option<(&str, &str)> {
+    let (authority, path) = origin.split_once(':')?;
+    let (_, host) = authority.rsplit_once('@')?;
+    if host.is_empty() || path.is_empty() {
+        return None;
+    }
+    Some((host, path))
+}
+
+fn normalize_repo_path(path: &str) -> Option<String> {
+    if path.chars().any(|ch| matches!(ch, '?' | '#' | '\\')) {
+        return None;
+    }
+    let path = path.trim_matches('/');
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    let mut parts = path.split('/');
+    let namespace = parts.next()?;
+    let repository = parts.next()?;
+    if parts.next().is_some()
+        || !valid_repo_component(namespace)
+        || !valid_repo_component(repository)
+    {
+        return None;
+    }
+    Some(format!("{namespace}/{repository}"))
+}
+
+fn valid_repo_component(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 255
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+// ---------------------------------------------------------------------------
 // Session control adapter (FEAT-024 D4/D5)
 //
 // Sole host owner of concrete control machinery for the six control commands:
@@ -1163,11 +1411,8 @@ impl CommandSessionControlContext for SessionControlAdapter<'_> {
 
     fn resolve_hosted_work_target(&self) -> Option<HostedWorkTarget> {
         let app = self.host.app.borrow();
-        let target = crate::commands::groups::session::remote_env::resolve_target(&app.workspace)?;
-        let url = crate::commands::groups::session::remote_env::hosted_work_url(
-            &target.repo,
-            &target.branch,
-        );
+        let target = resolve_target(&app.workspace)?;
+        let url = hosted_work_url(&target.repo, &target.branch);
         Some(HostedWorkTarget {
             url,
             repo: target.repo,
@@ -1566,6 +1811,7 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
         let Some(message_id) = key_to_utility_message_id(key)
             .or_else(|| key_to_project_message_id(key))
             .or_else(|| key_to_plugin_message_id(key))
+            .or_else(|| key_to_session_message_id(key))
         else {
             return Err("unknown translation key".to_string());
         };
@@ -1574,6 +1820,20 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
         apply_named_replacements(&template, replacements)
             .ok_or_else(|| "invalid translation replacement contract".to_string())
     }
+}
+
+/// Resolve a stable session-control message key to the current catalog id
+/// (FEAT-024 D6). Only `/remote-env` makes runtime catalog calls; the other
+/// five control commands keep their metadata-only `description_key` usage.
+pub(crate) fn key_to_session_message_id(key: &str) -> Option<MessageId> {
+    Some(match key {
+        "cmd_remote_env_overview" => MessageId::CmdRemoteEnvOverview,
+        "cmd_remote_env_opening" => MessageId::CmdRemoteEnvOpening,
+        "cmd_remote_env_unavailable" => MessageId::CmdRemoteEnvUnavailable,
+        "cmd_remote_env_source_custody_policy" => MessageId::CmdRemoteEnvSourceCustodyPolicy,
+        "cmd_remote_env_browser_label" => MessageId::CmdRemoteEnvBrowserLabel,
+        _ => return None,
+    })
 }
 
 /// Resolve a stable plugin message key to the current catalog id (FEAT-020 D5).

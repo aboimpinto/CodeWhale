@@ -33,12 +33,12 @@ use std::sync::OnceLock;
 pub use traits::CommandInfo;
 
 // Long-standing public paths that predate the group layout.
+#[cfg(test)]
+pub(crate) use contract::rename_with_manager as rename_session_with_manager;
 /// `/fleet add` and the picker's ⇧F share these gates; the UI applies them
 /// against the live `Config`.
 pub(crate) use groups::core::fleet::{fleet_catalog_rejection, fleet_provider_rejection};
 pub use groups::project::share;
-#[cfg(test)]
-pub(crate) use groups::session::rename_with_manager as rename_session_with_manager;
 
 // Voice capture plumbing shared with the hotbar and the UI event loop.
 pub use groups::core::voice;
@@ -2069,6 +2069,13 @@ mod tests {
             "save",
             "sessions",
             "tree",
+            // FEAT-024 session control slice.
+            "relay",
+            "rename",
+            "resume",
+            "rc",
+            "remote-env",
+            "title",
         ];
         for info in command_infos() {
             if info.name == "feat015ctx" || MIGRATED_GROUPS.contains(&info.name) {
@@ -2746,11 +2753,62 @@ mod tests {
                 "/{name} must be pure (no host context bundle)"
             );
         }
-        // Out-of-scope session commands remain legacy for FEAT-024/025/026.
-        for name in ["export", "relay", "structcopy"] {
+        // Out-of-scope session commands remain legacy for FEAT-025/026.
+        for name in ["export", "structcopy"] {
             assert!(
                 !registry().has_contextual_handler(name),
                 "/{name} must stay on the legacy dispatch until its owning FEAT"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------
+    // FEAT-024: session control entries register through the portable bridge
+    // (D3/D6) — five declare SESSION_CONTROL only; `/remote-env` declares
+    // control plus presentation; export/structcopy remain legacy.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn feat024_control_entries_register_through_portable_bridge() {
+        use codewhale_command_contract::handler::{CommandCapabilities, CommandHandler};
+
+        for name in ["relay", "rename", "resume", "rc", "title"] {
+            assert!(
+                registry().has_contextual_handler(name),
+                "/{name} must register through the portable bridge"
+            );
+            let handler = registry()
+                .get(name)
+                .expect("entry")
+                .contextual_handler()
+                .expect("contextual handler");
+            let CommandHandler::Contextual { capabilities, .. } = handler else {
+                panic!("/{name} must be contextual");
+            };
+            assert_eq!(
+                capabilities,
+                CommandCapabilities::SESSION_CONTROL,
+                "/{name} declares control authority only"
+            );
+        }
+        let handler = registry()
+            .get("remote-env")
+            .expect("entry")
+            .contextual_handler()
+            .expect("remote-env handler");
+        let CommandHandler::Contextual { capabilities, .. } = handler else {
+            panic!("/remote-env must be contextual");
+        };
+        assert_eq!(
+            capabilities,
+            CommandCapabilities::SESSION_CONTROL.union(CommandCapabilities::PRESENTATION),
+            "/remote-env declares control plus presentation only"
+        );
+        // FEAT-025/FEAT-026 leaves remain legacy until their owning FEATs.
+        for name in ["export", "structcopy"] {
+            assert!(
+                !registry().has_contextual_handler(name),
+                "/{name} must stay on the legacy dispatch"
             );
         }
     }

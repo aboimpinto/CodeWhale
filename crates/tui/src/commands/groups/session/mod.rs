@@ -13,8 +13,6 @@ mod relay;
 mod remote_control;
 pub(crate) mod remote_env;
 mod rename;
-#[cfg(test)]
-pub(crate) use rename::rename_with_manager;
 mod resume;
 mod save;
 mod sessions;
@@ -37,14 +35,13 @@ pub struct SessionCommands;
 impl CommandGroup for SessionCommands {
     fn commands(&self) -> &'static [Box<dyn Command>] {
         cached_command_list!(vec![
-            Box::new(FunctionCommand::new(
-                rename::RenameCmd::info(),
-                rename::RenameCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                title::TitleCmd::info(),
-                title::TitleCmd::execute,
-            )),
+            Box::new(
+                ContextualCommand::from_contract::<rename::RenameCmd>()
+                    .expect("rename registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<title::TitleCmd>().expect("title registration")
+            ),
             Box::new(
                 ContextualCommand::from_contract::<save::SaveCmd>().expect("save registration")
             ),
@@ -59,10 +56,10 @@ impl CommandGroup for SessionCommands {
             Box::new(
                 ContextualCommand::from_contract::<load::LoadCmd>().expect("load registration")
             ),
-            Box::new(FunctionCommand::new(
-                resume::ResumeCmd::info(),
-                resume::ResumeCmd::execute,
-            )),
+            Box::new(
+                ContextualCommand::from_contract::<resume::ResumeCmd>()
+                    .expect("resume registration")
+            ),
             Box::new(
                 ContextualCommand::from_contract::<tree::TreeCmd>().expect("tree registration")
             ),
@@ -77,18 +74,17 @@ impl CommandGroup for SessionCommands {
             Box::new(
                 ContextualCommand::from_contract::<purge::PurgeCmd>().expect("purge registration")
             ),
-            Box::new(FunctionCommand::new(
-                relay::RelayCmd::info(),
-                relay::RelayCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                remote_control::RemoteControlCmd::info(),
-                remote_control::RemoteControlCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                remote_env::RemoteEnvCmd::info(),
-                remote_env::RemoteEnvCmd::execute,
-            )),
+            Box::new(
+                ContextualCommand::from_contract::<relay::RelayCmd>().expect("relay registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<remote_control::RemoteControlCmd>()
+                    .expect("remote_control registration")
+            ),
+            Box::new(
+                ContextualCommand::from_contract::<remote_env::RemoteEnvCmd>()
+                    .expect("remote_env registration")
+            ),
             Box::new(FunctionCommand::new(
                 export::ExportCmd::info(),
                 export::ExportCmd::execute,
@@ -120,6 +116,8 @@ pub(in crate::commands) fn sync_session_action(
     }
 }
 
+#[cfg(test)]
+mod control_test_support;
 #[cfg(test)]
 mod lifecycle_portable_tests;
 #[cfg(test)]
