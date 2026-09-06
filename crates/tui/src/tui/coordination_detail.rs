@@ -307,6 +307,7 @@ mod tests {
                 },
                 sequence: 2,
                 isolated_worktree: false,
+                present_at_claim: Vec::new(),
             }],
             reconciliations: vec![ReconciliationReceipt {
                 reconciliation_id: "reconcile-ui".to_string(),
