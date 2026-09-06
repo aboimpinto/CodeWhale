@@ -1724,6 +1724,8 @@
   "WhaleStateWaiting": "आपकी प्रतीक्षा में",
   "WhaleStateBlocked": "अवरुद्ध",
   "WhaleStateOffline": "ऑफ़लाइन",
+  "AgentStatusParked": "रुका हुआ",
+  "AgentStatusParkedRecovery": "इसकी कोई प्रतीक्षा नहीं कर रहा; जारी रखने के लिए resume_from, हटाने के लिए cancel",
   "WhaleAnimalScout": "चोंचदार व्हेल",
   "WhaleAnimalPatch": "बंदरगाह पोरपॉइज़",
   "WhaleAnimalHarbor": "हंपबैक व्हेल",

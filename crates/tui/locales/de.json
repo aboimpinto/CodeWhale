@@ -1724,6 +1724,8 @@
   "WhaleStateWaiting": "Wartet auf dich",
   "WhaleStateBlocked": "Blockiert",
   "WhaleStateOffline": "Offline",
+  "AgentStatusParked": "geparkt",
+  "AgentStatusParkedRecovery": "niemand wartet darauf; mit resume_from fortsetzen oder mit cancel verwerfen",
   "WhaleAnimalScout": "Schnabelwal",
   "WhaleAnimalPatch": "Schweinswal",
   "WhaleAnimalHarbor": "Buckelwal",

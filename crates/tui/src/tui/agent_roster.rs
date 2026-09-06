@@ -31,6 +31,12 @@ use crate::tools::subagent::{AgentWorkerRecord, AgentWorkerStatus};
 pub enum RosterState {
     Running,
     Waiting,
+    /// Settled because the parent's turn ended before this child did (#5906).
+    ///
+    /// Distinct from `Waiting`, which means a person can answer it. Nothing
+    /// will answer a parked husk; it is continued with `resume_from` or
+    /// dismissed with `cancel`.
+    Parked,
     Done,
     Failed,
     Cancelled,
@@ -43,6 +49,8 @@ impl RosterState {
         match self {
             Self::Running => "●",
             Self::Waiting => "◐",
+            // Hollow, dotted: at rest but not finished.
+            Self::Parked => "◌",
             Self::Done => "○",
             Self::Failed => "✗",
             Self::Cancelled => "⊘",
@@ -52,6 +60,19 @@ impl RosterState {
     #[must_use]
     pub const fn is_terminal(self) -> bool {
         matches!(self, Self::Done | Self::Failed | Self::Cancelled)
+    }
+
+    /// Row state for one retained record.
+    ///
+    /// `parked_at_turn_end` is checked first and outranks the worker status:
+    /// a parked child settles as `WaitingForUser` or `Interrupted` like any
+    /// other, and only this flag separates it from a child that really asked
+    /// (#5906).
+    const fn from_record(record: &AgentWorkerRecord) -> Self {
+        if record.parked_at_turn_end {
+            return Self::Parked;
+        }
+        Self::from_worker(record.status)
     }
 
     const fn from_worker(status: AgentWorkerStatus) -> Self {
@@ -126,6 +147,11 @@ pub fn build_agent_roster(records: &[AgentWorkerRecord], now_ms: u64) -> Vec<Age
     // reorders itself as agents finish is unreadable while you are watching it.
     rows.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
     rows.sort_by_key(|row| creation_key(records, &row.worker_id));
+    // ...except parked husks, which sink below everything still live or
+    // answerable (#5906). They are the one class of row the operator is not
+    // meant to scan past to find real work, and the sort is stable so the
+    // history order survives inside each group.
+    rows.sort_by_key(|row| row.state == RosterState::Parked);
     rows
 }
 
@@ -137,7 +163,7 @@ fn creation_key(records: &[AgentWorkerRecord], worker_id: &str) -> u64 {
 }
 
 fn row_from_record(record: &AgentWorkerRecord, now_ms: u64) -> AgentRosterRow {
-    let state = RosterState::from_worker(record.status);
+    let state = RosterState::from_record(record);
     AgentRosterRow {
         worker_id: record.spec.worker_id.clone(),
         display_name: display_name(record),

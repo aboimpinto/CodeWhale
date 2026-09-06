@@ -1724,6 +1724,8 @@
   "WhaleStateWaiting": "Чекає на вас",
   "WhaleStateBlocked": "Заблоковано",
   "WhaleStateOffline": "Поза мережею",
+  "AgentStatusParked": "призупинено",
+  "AgentStatusParkedRecovery": "на нього ніхто не чекає; resume_from щоб продовжити, або cancel щоб відхилити",
   "WhaleAnimalScout": "дзьоборил",
   "WhaleAnimalPatch": "морська свиня",
   "WhaleAnimalHarbor": "горбатий кит",

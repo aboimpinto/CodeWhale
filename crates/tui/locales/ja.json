@@ -1724,6 +1724,8 @@
   "WhaleStateWaiting": "あなたの操作待ち",
   "WhaleStateBlocked": "ブロック中",
   "WhaleStateOffline": "オフライン",
+  "AgentStatusParked": "保留中",
+  "AgentStatusParkedRecovery": "誰も応答を待っていません。続行するには resume_from、破棄するには cancel",
   "WhaleAnimalScout": "アカボウクジラ",
   "WhaleAnimalPatch": "ネズミイルカ",
   "WhaleAnimalHarbor": "ザトウクジラ",

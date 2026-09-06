@@ -1531,9 +1531,15 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
             let meta = app.agent_progress_meta.get(&agent.agent_id);
             let current_activity = meta.and_then(|meta| meta.current_activity.as_ref());
             let status = current_activity
-                .map(|activity| current_activity_status_label(activity.status))
-                .or_else(|| agent.worker_status.map(worker_status_label))
-                .unwrap_or_else(|| subagent_status_label(&agent.status));
+                .map(|activity| current_activity_status_label(activity.status, app.ui_locale))
+                .or_else(|| {
+                    agent
+                        .worker_status
+                        .map(|status| std::borrow::Cow::Borrowed(worker_status_label(status)))
+                })
+                .unwrap_or_else(|| {
+                    std::borrow::Cow::Borrowed(subagent_status_label(&agent.status))
+                });
             let bucket = current_activity
                 .map(|activity| current_activity_status_bucket(activity.status))
                 .or_else(|| agent.worker_status.map(worker_status_bucket))
@@ -1649,8 +1655,8 @@ fn agent_rows(app: &App) -> Vec<RankedWorkRow> {
                 let meta = app.agent_progress_meta.get(id);
                 let current_activity = meta.and_then(|meta| meta.current_activity.as_ref());
                 let status = current_activity
-                    .map(|activity| current_activity_status_label(activity.status))
-                    .unwrap_or("running");
+                    .map(|activity| current_activity_status_label(activity.status, app.ui_locale))
+                    .unwrap_or(std::borrow::Cow::Borrowed("running"));
                 let bucket = current_activity
                     .map(|activity| current_activity_status_bucket(activity.status))
                     .unwrap_or(WorkBucket::Active);
@@ -1820,7 +1826,13 @@ fn current_activity_status_bucket(status: AgentCurrentActivityStatus) -> WorkBuc
         AgentCurrentActivityStatus::Waiting
         | AgentCurrentActivityStatus::Interrupted
         | AgentCurrentActivityStatus::Failed => WorkBucket::Attention,
-        AgentCurrentActivityStatus::Queued => WorkBucket::Ready,
+        // Not Attention (#5906): a parked husk asked nobody anything, so it
+        // must not sort above live work nor be counted in the `needs input`
+        // chip. Ready ranks below Attention and Active and stays actionable,
+        // which is what it is — resumable, or dismissable.
+        AgentCurrentActivityStatus::Parked | AgentCurrentActivityStatus::Queued => {
+            WorkBucket::Ready
+        }
         AgentCurrentActivityStatus::Done | AgentCurrentActivityStatus::Canceled => {
             WorkBucket::Recent
         }
@@ -1831,8 +1843,17 @@ fn current_activity_status_bucket(status: AgentCurrentActivityStatus) -> WorkBuc
     }
 }
 
-fn current_activity_status_label(status: AgentCurrentActivityStatus) -> &'static str {
-    match status {
+fn current_activity_status_label(
+    status: AgentCurrentActivityStatus,
+    locale: crate::localization::Locale,
+) -> std::borrow::Cow<'static, str> {
+    // `parked` is the one word here that has to be translated: it is new
+    // vocabulary a reader has never seen on this row, and the whole point is
+    // that it does not read as "waiting for input" (#5906).
+    if status == AgentCurrentActivityStatus::Parked {
+        return crate::localization::tr(locale, crate::localization::MessageId::AgentStatusParked);
+    }
+    std::borrow::Cow::Borrowed(match status {
         AgentCurrentActivityStatus::Queued => "queued",
         AgentCurrentActivityStatus::Starting => "starting",
         AgentCurrentActivityStatus::Running => "running",
@@ -1843,7 +1864,8 @@ fn current_activity_status_label(status: AgentCurrentActivityStatus) -> &'static
         AgentCurrentActivityStatus::Failed => "failed",
         AgentCurrentActivityStatus::Canceled => "cancelled",
         AgentCurrentActivityStatus::Interrupted => "interrupted",
-    }
+        AgentCurrentActivityStatus::Parked => unreachable!("handled above"),
+    })
 }
 
 fn worker_status_bucket(status: AgentWorkerStatus) -> WorkBucket {

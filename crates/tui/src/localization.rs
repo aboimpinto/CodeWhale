@@ -2039,6 +2039,11 @@ pub enum MessageId {
     WhaleStateWaiting,
     WhaleStateBlocked,
     WhaleStateOffline,
+    /// Parked-child status word and its recovery line (#5906). A child parked
+    /// at the parent's turn end is not "waiting for input": nothing will
+    /// answer it, so the surfaces name the state and the two ways out.
+    AgentStatusParked,
+    AgentStatusParkedRecovery,
     WhaleAnimalScout,
     WhaleAnimalPatch,
     WhaleAnimalHarbor,
@@ -4131,6 +4136,8 @@ pub const ALL_MESSAGE_IDS: &[MessageId] = &[
     MessageId::WhaleStateWaiting,
     MessageId::WhaleStateBlocked,
     MessageId::WhaleStateOffline,
+    MessageId::AgentStatusParked,
+    MessageId::AgentStatusParkedRecovery,
     MessageId::WhaleAnimalScout,
     MessageId::WhaleAnimalPatch,
     MessageId::WhaleAnimalHarbor,
@@ -4824,6 +4831,48 @@ mod tests {
             .skip(1)
             .filter_map(|suffix| suffix.split_once('}').map(|(name, _)| name.to_string()))
             .collect()
+    }
+
+    /// #5906: the parked-agent vocabulary is new copy on the busiest rows in
+    /// the product, so it gets the same hard parity gate coordination copy
+    /// has — and the recovery line must keep the tool tokens it names, or it
+    /// tells an operator to type a verb that does not exist.
+    #[test]
+    fn parked_agent_copy_is_translated_and_keeps_its_tool_verbs() {
+        for locale in Locale::shipped_complete() {
+            let word = tr(*locale, MessageId::AgentStatusParked);
+            assert!(
+                !word.trim().is_empty(),
+                "{} has no parked status word",
+                locale.tag()
+            );
+            let recovery = tr(*locale, MessageId::AgentStatusParkedRecovery);
+            assert!(
+                recovery.contains("resume_from"),
+                "{} lost the resume verb the agent tool exposes: {recovery}",
+                locale.tag()
+            );
+            assert!(
+                recovery.contains("cancel"),
+                "{} lost the dismiss verb: {recovery}",
+                locale.tag()
+            );
+            if *locale == Locale::En {
+                continue;
+            }
+            assert_ne!(
+                word,
+                tr(Locale::En, MessageId::AgentStatusParked),
+                "{} fell back to the English parked status word",
+                locale.tag()
+            );
+            assert_ne!(
+                recovery,
+                tr(Locale::En, MessageId::AgentStatusParkedRecovery),
+                "{} fell back to the English parked recovery line",
+                locale.tag()
+            );
+        }
     }
 
     #[test]

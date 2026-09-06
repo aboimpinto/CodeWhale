@@ -91,6 +91,32 @@ pub(super) fn active_fanout_counts(app: &App) -> Option<(usize, usize)> {
     None
 }
 
+/// True when this child settled by being *parked* at the parent's turn end
+/// rather than by asking anyone anything (#5906).
+///
+/// The runtime parks a turn-owned child with a `needs_input` note that reads
+/// like a question ("Resume this parked child with ..."), so every surface
+/// that keys off `needs_input` used to render a parked husk with the same
+/// "waiting for input" label as a child a user can actually answer. The
+/// checkpoint records which of the two it is; this is the one place the UI
+/// asks, so no surface has to sniff the reason string.
+pub(crate) fn subagent_is_parked(agent: &SubAgentResult) -> bool {
+    agent
+        .checkpoint
+        .as_ref()
+        .is_some_and(|checkpoint| checkpoint.parked_at_turn_end)
+}
+
+/// The one-line recovery a parked row shows instead of a pending question:
+/// nobody will answer it, so it names the two ways out that actually exist.
+pub(crate) fn parked_recovery_detail(app: &App) -> String {
+    crate::localization::tr(
+        app.ui_locale,
+        crate::localization::MessageId::AgentStatusParkedRecovery,
+    )
+    .into_owned()
+}
+
 pub(super) fn reconcile_subagent_activity_state(app: &mut App) {
     reconcile_subagent_activity_state_at(app, Instant::now());
 }
@@ -109,15 +135,22 @@ pub(super) fn apply_subagent_terminal_projection(
         .agent_progress_meta
         .entry(agent_id.to_string())
         .or_default();
-    let activity_status = if worker_status == AgentWorkerStatus::Interrupted
-        && meta
-            .current_activity
-            .as_ref()
-            .is_some_and(|activity| activity.status == AgentCurrentActivityStatus::Waiting)
-    {
-        AgentCurrentActivityStatus::Waiting
-    } else {
-        worker_status.into()
+    // A parked child projects as `Interrupted` here. Interrupted-over-Waiting
+    // and interrupted-over-Parked are both "the settled state the surface
+    // already established, restated" — do not downgrade either (#5906).
+    let sticky = meta
+        .current_activity
+        .as_ref()
+        .map(|activity| activity.status)
+        .filter(|status| {
+            matches!(
+                status,
+                AgentCurrentActivityStatus::Waiting | AgentCurrentActivityStatus::Parked
+            )
+        });
+    let activity_status = match sticky {
+        Some(status) if worker_status == AgentWorkerStatus::Interrupted => status,
+        _ => worker_status.into(),
     };
     let step = meta
         .current_activity
@@ -199,6 +232,7 @@ pub(super) fn reconcile_subagent_activity_state_at(app: &mut App, now: Instant) 
             .or_insert_with(|| objective.clone());
     }
 
+    let recovery_detail = parked_recovery_detail(app);
     for agent in &cached_agents {
         let meta = app
             .agent_progress_meta
@@ -212,7 +246,12 @@ pub(super) fn reconcile_subagent_activity_state_at(app: &mut App, now: Instant) 
         meta.spawn_depth = agent.spawn_depth;
 
         let existing = meta.current_activity.clone();
-        let mut structured_status = if agent.needs_input.is_some() {
+        let parked = subagent_is_parked(agent);
+        // Parked outranks `needs_input`: the park note *is* phrased as a
+        // question, and reading it as one is exactly the bug (#5906).
+        let mut structured_status = if parked {
+            AgentCurrentActivityStatus::Parked
+        } else if agent.needs_input.is_some() {
             AgentCurrentActivityStatus::Waiting
         } else if let Some(worker_status) = agent.worker_status {
             worker_status.into()
@@ -232,10 +271,14 @@ pub(super) fn reconcile_subagent_activity_state_at(app: &mut App, now: Instant) 
             structured_status = AgentCurrentActivityStatus::Waiting;
         }
 
-        let detail = agent
-            .needs_input
-            .as_ref()
-            .map(|needs_input| needs_input.question.clone())
+        let detail = parked
+            .then(|| recovery_detail.clone())
+            .or_else(|| {
+                agent
+                    .needs_input
+                    .as_ref()
+                    .map(|needs_input| needs_input.question.clone())
+            })
             .or_else(|| {
                 existing
                     .as_ref()

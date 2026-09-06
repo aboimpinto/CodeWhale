@@ -1724,6 +1724,8 @@
   "WhaleStateWaiting": "Đang chờ bạn",
   "WhaleStateBlocked": "Bị chặn",
   "WhaleStateOffline": "Ngoại tuyến",
+  "AgentStatusParked": "tạm dừng",
+  "AgentStatusParkedRecovery": "không ai đang chờ nó; dùng resume_from để tiếp tục, hoặc cancel để bỏ",
   "WhaleAnimalScout": "cá voi mõm khoằm",
   "WhaleAnimalPatch": "cá heo chuột",
   "WhaleAnimalHarbor": "cá voi lưng gù",

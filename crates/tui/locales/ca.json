@@ -1724,6 +1724,8 @@
   "WhaleStateWaiting": "Esperant-te",
   "WhaleStateBlocked": "Bloquejada",
   "WhaleStateOffline": "Fora de línia",
+  "AgentStatusParked": "en pausa",
+  "AgentStatusParkedRecovery": "ningú no l'està esperant; fes servir resume_from per continuar o cancel per descartar-lo",
   "WhaleAnimalScout": "zífid",
   "WhaleAnimalPatch": "marsopa comuna",
   "WhaleAnimalHarbor": "iubarta",

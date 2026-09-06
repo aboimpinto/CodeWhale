@@ -1724,6 +1724,8 @@
   "WhaleStateWaiting": "Vous attend",
   "WhaleStateBlocked": "Bloquée",
   "WhaleStateOffline": "Hors ligne",
+  "AgentStatusParked": "en pause",
+  "AgentStatusParkedRecovery": "personne ne l'attend ; resume_from pour continuer, ou cancel pour l'écarter",
   "WhaleAnimalScout": "baleine à bec",
   "WhaleAnimalPatch": "marsouin commun",
   "WhaleAnimalHarbor": "baleine à bosse",
