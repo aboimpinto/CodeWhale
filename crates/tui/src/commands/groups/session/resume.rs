@@ -180,7 +180,7 @@ mod tests {
         assert!(!result.is_error);
         assert!(matches!(
             result.action,
-            Some(crate::tui::app::AppAction::LoadSession(path)) if path == PathBuf::from("/tmp/sessions/abc123.json")
+            Some(crate::tui::app::AppAction::LoadSession(path)) if path == *"/tmp/sessions/abc123.json"
         ));
 
         let mut fake = control_fake();

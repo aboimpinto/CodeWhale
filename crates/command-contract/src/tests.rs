@@ -2249,14 +2249,14 @@ fn control_relay_projection() -> RelayProjection {
         goal_objective: Some("ship the slice".to_string()),
         goal_token_budget: Some(42_000),
         todos: TodoProjection::Body("- [ ] port relay".to_string()),
-        plan: PlanProjection::Sections(PlanSections {
+        plan: PlanProjection::Sections(Box::new(PlanSections {
             title: Some("Plan title".to_string()),
             items: vec![PlanStep {
                 status_label: "in_progress".to_string(),
                 text: "port the control slice".to_string(),
             }],
             ..PlanSections::default()
-        }),
+        })),
     }
 }
 
@@ -2485,8 +2485,10 @@ fn control_surface_does_not_widen_session_or_lifecycle_facets() {
     // the existing facets.
     let mut session = Session;
     let mut lifecycle = FakeLifecycle::default();
-    let mut control = FakeControl::default();
-    control.blocked = true;
+    let mut control = FakeControl {
+        blocked: true,
+        ..FakeControl::default()
+    };
 
     let mut parts = CommandContexts::empty()
         .with_session(&mut session)

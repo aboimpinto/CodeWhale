@@ -1157,7 +1157,7 @@ pub enum TodoProjection {
 /// baseline `try_lock` failure branch; `Absent` reproduces an empty snapshot.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlanProjection {
-    Sections(PlanSections),
+    Sections(Box<PlanSections>),
     Busy,
     Absent,
 }
