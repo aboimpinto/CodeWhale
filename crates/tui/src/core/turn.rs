@@ -483,13 +483,20 @@ fn pending_snapshot_notices() -> &'static std::sync::Mutex<Vec<SnapshotsDisabled
     PENDING.get_or_init(|| std::sync::Mutex::new(Vec::new()))
 }
 
-/// Drain the notices parked by [`maybe_notify_snapshots_disabled_once`].
-/// Each workspace produces at most one per process lifetime.
-pub fn take_snapshots_disabled_notices() -> Vec<SnapshotsDisabledNotice> {
-    pending_snapshot_notices()
-        .lock()
-        .map(|mut guard| std::mem::take(&mut *guard))
-        .unwrap_or_default()
+/// Drain the notices parked by [`maybe_notify_snapshots_disabled_once`] for
+/// one workspace. Each workspace produces at most one per process lifetime,
+/// and an engine only takes its own so two sessions (or two tests) in one
+/// process never see each other's notice.
+pub fn take_snapshots_disabled_notices(workspace: &Path) -> Vec<SnapshotsDisabledNotice> {
+    let key = workspace.to_string_lossy();
+    let Ok(mut guard) = pending_snapshot_notices().lock() else {
+        return Vec::new();
+    };
+    let (mine, others): (Vec<_>, Vec<_>) = std::mem::take(&mut *guard)
+        .into_iter()
+        .partition(|notice| notice.workspace == key);
+    *guard = others;
+    mine
 }
 
 // The stderr print is deliberate: headless/CLI stderr is the user surface for
@@ -549,8 +556,6 @@ mod snapshot_notice_tests {
                 "workspace too large for snapshots (over 2 GB of non-excluded content or > 200000 entries): x",
             )
         };
-        // Drain anything another test parked before asserting on ours.
-        let _ = take_snapshots_disabled_notices();
         assert!(
             maybe_notify_snapshots_disabled_once(&workspace, &error()),
             "the first failure is the operator's notice"
@@ -559,19 +564,18 @@ mod snapshot_notice_tests {
             !maybe_notify_snapshots_disabled_once(&workspace, &error()),
             "later turns hit the same gate silently"
         );
-        let notices = take_snapshots_disabled_notices();
-        let ours: Vec<_> = notices
-            .iter()
-            .filter(|notice| notice.workspace == workspace.to_string_lossy())
-            .collect();
-        assert_eq!(ours.len(), 1, "one notice per workspace: {notices:?}");
+        let ours = take_snapshots_disabled_notices(&workspace);
+        assert_eq!(ours.len(), 1, "one notice per workspace: {ours:?}");
         assert!(ours[0].reason.contains("workspace too large for snapshots"));
         assert!(
-            take_snapshots_disabled_notices()
-                .iter()
-                .all(|notice| notice.workspace != workspace.to_string_lossy()),
+            take_snapshots_disabled_notices(&workspace).is_empty(),
             "draining is destructive"
         );
+        // Another workspace's engine never sees this one's notice.
+        let other = std::env::temp_dir().join("codewhale-snapshot-notice-other");
+        assert!(maybe_notify_snapshots_disabled_once(&other, &error()));
+        assert!(take_snapshots_disabled_notices(&workspace).is_empty());
+        assert_eq!(take_snapshots_disabled_notices(&other).len(), 1);
     }
 
     #[test]
@@ -579,11 +583,7 @@ mod snapshot_notice_tests {
         let workspace = std::env::temp_dir().join("codewhale-snapshot-notice-unrelated");
         let error = std::io::Error::other("disk full");
         assert!(maybe_notify_snapshots_disabled_once(&workspace, &error));
-        assert!(
-            take_snapshots_disabled_notices()
-                .iter()
-                .all(|notice| notice.workspace != workspace.to_string_lossy())
-        );
+        assert!(take_snapshots_disabled_notices(&workspace).is_empty());
     }
 }
 

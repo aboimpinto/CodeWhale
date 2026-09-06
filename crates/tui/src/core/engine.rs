@@ -1170,7 +1170,7 @@ impl Engine {
     /// Surface the snapshots-disabled notice a blocking snapshot task parked
     /// (#5930). Called at turn boundaries; a workspace yields at most one.
     pub(super) async fn emit_pending_snapshot_notices(&self) {
-        for notice in crate::core::turn::take_snapshots_disabled_notices() {
+        for notice in crate::core::turn::take_snapshots_disabled_notices(&self.session.workspace) {
             let _ = self
                 .tx_event
                 .send(Event::SnapshotsDisabled {
