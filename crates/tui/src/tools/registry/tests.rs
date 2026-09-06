@@ -1690,3 +1690,26 @@ fn rlm_family_removes_legacy_aliases() {
         );
     }
 }
+
+#[test]
+fn a_builder_upgrade_replaces_the_tool_instead_of_registering_it_twice() {
+    // `with_patch_tools` swaps the default `File` for the patch-capable one;
+    // that used to reach `register` as a second `File` and warn on every
+    // registry rebuild (#5934).
+    let builder = ToolRegistryBuilder::new()
+        .with_file_tools()
+        .with_patch_tools();
+    let file_tools = builder
+        .tools
+        .iter()
+        .filter(|tool| tool.name() == "File")
+        .count();
+    assert_eq!(file_tools, 1, "one File tool after the upgrade");
+    assert!(
+        builder
+            .tools
+            .iter()
+            .any(|tool| tool.name() == "apply_patch"),
+        "the upgrade still adds apply_patch"
+    );
+}
