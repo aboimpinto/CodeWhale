@@ -14,6 +14,11 @@
 //! named Fleet is selected (the operator row is display-only). Switch named
 //! saved Fleets with `/fleet fleets` (`/fleet fleets` remains compatible).
 //!
+//! #5888: the default lineup folds the built-in `general` alias out of
+//! presentation — it is the same posture as `worker` and stays dispatchable
+//! (roster lookup and the identity selector both still resolve it) — so the
+//! default surface is 11 rows: the live operator plus ten members.
+//!
 //! NOTE: like `fleet_setup.rs`, the copy below is intentionally English for
 //! now (#3167 reworks Fleet UI localization); the command entry
 //! (`CmdFleetDescription`) is already localized.
@@ -191,7 +196,22 @@ impl FleetRosterView {
             members: roster
                 .members()
                 .iter()
-                .filter(|m| !m.id.trim().eq_ignore_ascii_case("operator"))
+                .filter(|m| {
+                    !m.id.trim().eq_ignore_ascii_case("operator")
+                        // #5888: `general` is the legacy alias of the `worker`
+                        // posture. The engine roster keeps it dispatchable —
+                        // Agent tool type tokens, saved configs, and replayed
+                        // transcripts resolve `general`, and the identity
+                        // selector maps the alias to the worker member — but
+                        // the default lineup presents one row per posture.
+                        // Only the untouched built-in alias folds away: a
+                        // user-authored `general` (config/personal/project
+                        // origin, including saved-team members, which carry
+                        // Personal/Workspace origin by construction) is the
+                        // user's own member and stays visible.
+                        && !(m.id.eq_ignore_ascii_case("general")
+                            && m.origin == ProfileOrigin::BuiltIn)
+                })
                 .cloned()
                 .collect(),
             shadowed: roster.shadowed().to_vec(),

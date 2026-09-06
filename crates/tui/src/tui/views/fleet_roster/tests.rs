@@ -390,7 +390,9 @@ fn built_in_party_lists_all_members_in_canonical_order() {
     let view = built_in_view();
     let ids: Vec<&str> = view.members.iter().map(|m| m.id.as_str()).collect();
     // The operator is rendered as the pinned session row, not a member
-    // (#dogfood 0.8.67), so it is intentionally absent from this list.
+    // (#dogfood 0.8.67), so it is intentionally absent from this list. The
+    // built-in `general` alias is folded out of presentation (#5888) — same
+    // posture as `worker`, still dispatchable (see the alias tests below).
     assert_eq!(
         ids,
         [
@@ -401,12 +403,56 @@ fn built_in_party_lists_all_members_in_canonical_order() {
             "verifier",
             "consultant",
             "synthesizer",
-            "general",
             "worker",
             "planner",
             "custom"
         ]
     );
+}
+
+/// #5888: the default lineup folds the legacy built-in `general` alias — the
+/// same posture as `worker` — out of presentation, while dispatch (roster
+/// lookup, identity selector alias) keeps resolving it.
+#[test]
+fn default_roster_folds_the_legacy_general_alias_out_of_presentation() {
+    let view = built_in_view();
+    let ids: Vec<&str> = view.members.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        !ids.contains(&"general"),
+        "the alias must not be presented: {ids:?}"
+    );
+    assert!(ids.contains(&"worker"), "the posture's primary name stays");
+    assert_eq!(view.row_count(), 11, "operator plus ten members");
+
+    // Engine compat is untouched: the alias still resolves for dispatch.
+    let roster = FleetRoster::built_ins_only();
+    assert!(roster.get("general").is_some(), "alias stays dispatchable");
+    assert!(roster.get("worker").is_some());
+}
+
+/// #5888: only the untouched built-in alias folds away. A `general` the user
+/// actually defined — a saved-team member carries Personal/Workspace origin,
+/// like `roster_from_fleet` produces — is the user's own member and stays
+/// visible.
+#[test]
+fn user_defined_general_member_stays_visible() {
+    let mut members: Vec<AgentProfile> = FleetRoster::built_ins_only()
+        .members()
+        .iter()
+        .filter(|m| m.id == "worker" || m.id == "general")
+        .cloned()
+        .collect();
+    for member in members.iter_mut().filter(|m| m.id == "general") {
+        member.origin = ProfileOrigin::Personal;
+        member.source = PathBuf::from("fleets/Default.toml");
+    }
+    let view = FleetRosterView::from_parts(operator(), FleetRoster::from_members(members), None);
+    let ids: Vec<&str> = view.members.iter().map(|m| m.id.as_str()).collect();
+    assert!(
+        ids.contains(&"general") && ids.contains(&"worker"),
+        "a user-defined general is presented: {ids:?}"
+    );
+    assert_eq!(view.row_count(), 3, "operator plus both members");
 }
 
 #[test]
