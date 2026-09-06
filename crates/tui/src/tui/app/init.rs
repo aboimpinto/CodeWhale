@@ -327,7 +327,7 @@ impl App {
                 settings.theme
             )
         });
-        let (_, theme_id, ui_theme) = resolved_theme.unwrap_or_else(|_| {
+        let (theme_name, theme_id, ui_theme) = resolved_theme.unwrap_or_else(|_| {
             let id = palette::ThemeId::System;
             let mut theme = id.ui_theme();
             if let Some(background) = background_color_override {
@@ -927,6 +927,7 @@ impl App {
             ui_theme,
             background_color_override,
             theme_id,
+            theme_name,
             onboarding,
             onboarding_needs_api_key: needs_api_key,
             onboarding_provider: provider,

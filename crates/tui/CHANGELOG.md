@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- The `/theme` picker now discovers valid user-authored `custom:<name>`
+  overlays, previews their colors, highlights the active overlay, and preserves
+  it when the picker is opened and committed without navigation (#5901).
+
 ## [0.9.12] - 2026-09-04
 
 Codewhale v0.9.12 puts computer use in the binary, opens two new routes —

@@ -1576,6 +1576,8 @@ Common settings keys:
   validation. `/theme schema` prints the embedded JSON Schema and `/theme path`
   shows the exact directory. An overlay names one compiled `base` theme and
   changes only listed semantic colors; it cannot include or read another file.
+  Open `/theme` to browse valid overlays, preview them live, and keep the
+  active `custom:<name>` selector when the picker is opened without moving.
 - `auto_compact` (on/off, model-aware default on for known context windows
   unless explicitly configured)
 - `auto_compact_threshold_percent` (10-100, default `80`): pre-send
