@@ -10,7 +10,9 @@ use reqwest::Url;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use rmcp::transport::AuthorizationManager;
 use rmcp::transport::AuthorizationSession;
-use rmcp::transport::auth::{AuthError, OAuthClientConfig, OAuthState, OAuthTokenResponse};
+use rmcp::transport::auth::{
+    AuthError, AuthorizationRequest, OAuthClientConfig, OAuthState, OAuthTokenResponse,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -76,6 +78,14 @@ pub fn error_text_looks_auth_required(text: &str) -> bool {
         || text.contains("unauthorized")
         || text.contains("authentication_required")
         || text.contains("invalid_grant")
+        // rmcp 3.2 collapsed several unrecoverable refresh outcomes onto
+        // `AuthError::AuthorizationRequired` (Display: "OAuth authorization
+        // required") — a stored credential with no usable refresh grant, and
+        // every refresh the server definitively rejected. In 2.2 those
+        // arrived as `TokenRefreshFailed("No refresh token available")`, which
+        // no surface recognised. The full phrase is matched so it stays
+        // anchored to rmcp's own wording.
+        || text.contains("oauth authorization required")
         || text.contains("◆ auth required")
         || text.contains("requires oauth login")
         || text.contains("requires oauth authentication")
@@ -611,9 +621,9 @@ async fn discover_streamable_http_oauth_with_headers(
         .context("building MCP OAuth discovery client")?;
     let mut manager = AuthorizationManager::new(url).await?;
     manager.with_client(client)?;
-    match manager.discover_metadata().await {
-        Ok(metadata) => Ok(Some(McpOAuthDiscovery {
-            scopes_supported: normalize_scopes(metadata.scopes_supported),
+    match manager.resolve_metadata().await {
+        Ok(resolution) => Ok(Some(McpOAuthDiscovery {
+            scopes_supported: normalize_scopes(resolution.metadata.scopes_supported),
         })),
         Err(AuthError::NoAuthorizationSupport) => Ok(None),
         Err(err) => Err(err.into()),
@@ -1344,14 +1354,18 @@ async fn start_authorization(
     let Some(client_id) = oauth_client_id.filter(|client_id| !client_id.trim().is_empty()) else {
         let mut oauth_state = OAuthState::new(server_url, Some(client)).await?;
         oauth_state
-            .start_authorization(scopes, redirect_uri, Some("Codewhale"))
+            .start_authorization(
+                AuthorizationRequest::new(redirect_uri)
+                    .with_scopes(scopes.iter().copied())
+                    .with_client_name("Codewhale"),
+            )
             .await?;
         return Ok(oauth_state);
     };
 
     let mut manager = AuthorizationManager::new(server_url).await?;
     manager.with_client(client)?;
-    let metadata = manager.discover_metadata().await?;
+    let metadata = manager.resolve_metadata().await?.metadata;
     manager.set_metadata(metadata);
     manager.configure_client(
         OAuthClientConfig::new(client_id, redirect_uri)
@@ -1676,6 +1690,15 @@ mod tests {
         assert!(error_text_looks_auth_required("wiki: ◆ auth required"));
         assert!(!error_text_looks_auth_required(
             "invalid_request: missing parameter"
+        ));
+        // rmcp's own `AuthError::AuthorizationRequired` wording: a stored
+        // credential that can no longer be refreshed is a login, not a
+        // transport failure.
+        assert!(error_text_looks_auth_required(
+            "refreshing MCP OAuth token for server wiki: OAuth authorization required"
+        ));
+        assert!(!error_text_looks_auth_required(
+            "authorization required for the requested file"
         ));
     }
 

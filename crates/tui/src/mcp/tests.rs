@@ -5986,9 +5986,16 @@ impl OAuthMcpMock {
                             .to_ascii_lowercase()
                             .contains("authorization: bearer cw-test-access");
 
-                    if method == "GET"
-                        && path_only.starts_with("/.well-known/oauth-authorization-server")
-                    {
+                    // RFC 8414: the authorization server lives at the origin
+                    // root, so it publishes its metadata only at the canonical
+                    // `/.well-known/oauth-authorization-server` and its
+                    // `issuer` is the root origin. The path-insertion
+                    // candidates rmcp probes first (`.../oauth-authorization-server/mcp`)
+                    // belong to a *different* issuer and must 404 here: rmcp
+                    // 3.2 validates the discovered `issuer` against the
+                    // discovery URL and rejects metadata served at the wrong
+                    // one.
+                    if method == "GET" && path_only == "/.well-known/oauth-authorization-server" {
                         let metadata = serde_json::json!({
                             "issuer": format!("http://{addr}"),
                             "authorization_endpoint": format!("http://{addr}/authorize"),
