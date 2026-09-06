@@ -213,15 +213,19 @@ impl SessionBootSurface {
             .filter(|row| row.state == McpServerBootState::Connecting)
             .map(|row| row.name.as_str())
             .collect();
+        // A server whose login expired is not a failure: the engine already
+        // knows the remedy (`codewhale mcp login <server>` / the login tool),
+        // so the chip counts it under the shared auth-required label and only
+        // calls the rest failed (#5926).
+        let need_login = self
+            .servers
+            .iter()
+            .filter(|row| row.state == McpServerBootState::NeedsLogin)
+            .count();
         let failed = self
             .servers
             .iter()
-            .filter(|row| {
-                matches!(
-                    row.state,
-                    McpServerBootState::Failed | McpServerBootState::NeedsLogin
-                )
-            })
+            .filter(|row| row.state == McpServerBootState::Failed)
             .count();
         let connected = self
             .servers
@@ -238,19 +242,32 @@ impl SessionBootSurface {
                 budget,
             );
         }
-        if failed > 0 {
-            return activity_notice_from_candidates(
-                SessionBootActivityLevel::Failure,
-                vec![
-                    format!(
-                        "MCP{ITEM_SEPARATOR}{connected} {}{ITEM_SEPARATOR}{failed} {}",
-                        tr(locale, MessageId::ExtensionsStateConnected),
-                        tr(locale, MessageId::PhaseFailed)
-                    ),
-                    format!("MCP{ITEM_SEPARATOR}{failed} failed"),
-                ],
-                budget,
+        if failed > 0 || need_login > 0 {
+            let auth_label = mcp_auth_required_state_label();
+            let mut full = format!(
+                "MCP{ITEM_SEPARATOR}{connected} {}",
+                tr(locale, MessageId::ExtensionsStateConnected)
             );
+            // The narrow form drops the glyph and shortens the verb so both
+            // counts survive an 80-column footer.
+            let mut compact = String::from("MCP");
+            if need_login > 0 {
+                full.push_str(&format!("{ITEM_SEPARATOR}{need_login} {auth_label}"));
+                compact.push_str(&format!("{ITEM_SEPARATOR}{need_login} login"));
+            }
+            if failed > 0 {
+                full.push_str(&format!(
+                    "{ITEM_SEPARATOR}{failed} {}",
+                    tr(locale, MessageId::PhaseFailed)
+                ));
+                compact.push_str(&format!("{ITEM_SEPARATOR}{failed} failed"));
+            }
+            let level = if failed > 0 {
+                SessionBootActivityLevel::Failure
+            } else {
+                SessionBootActivityLevel::Attention
+            };
+            return activity_notice_from_candidates(level, vec![full, compact], budget);
         }
         if self.phase == SessionBootPhase::Booting {
             let count = self.servers.len().max(self.unnamed_connecting);
@@ -644,12 +661,59 @@ mod tests {
                 .map(|row| row.state),
             Some(McpServerBootState::NeedsLogin)
         );
-        // The compact activity chip counts a needs-login server with the
-        // failure band (the receipt-line renderer this pinned moved to the
-        // chip in the Tideline boot-surface refactor).
+        // The compact activity chip names a needs-login server under the
+        // shared auth-required label, at attention level: the remedy is a
+        // login, not a repair (#5926).
         assert_eq!(surface.servers.len(), 1);
-        let chip = surface.activity_notice(Locale::En, 100);
-        assert!(chip.is_some(), "needs-login must surface on the boot chip");
+        let chip = surface
+            .activity_notice(Locale::En, 100)
+            .expect("needs-login must surface on the boot chip");
+        assert_eq!(chip.level, SessionBootActivityLevel::Attention);
+        assert_eq!(
+            chip.text,
+            format!(
+                "MCP{ITEM_SEPARATOR}0 connected{ITEM_SEPARATOR}1 {}",
+                mcp_auth_required_state_label()
+            )
+        );
+        assert!(!chip.text.contains("failed"), "{}", chip.text);
+    }
+
+    #[test]
+    fn chip_separates_expired_logins_from_real_failures() {
+        let mut expired = server("slack", true, false, Some("401 Unauthorized"));
+        expired.auth_required = true;
+        let snap = snapshot(vec![
+            server("alpha", true, true, None),
+            expired,
+            server("beta", true, false, Some("Stdio transport closed")),
+        ]);
+        let surface = SessionBootSurface::from_parts(
+            Some(&snap),
+            false,
+            &[],
+            3,
+            PluginBootSummary::default(),
+        );
+        let chip = surface
+            .activity_notice(Locale::En, 100)
+            .expect("mixed states surface on the boot chip");
+        assert_eq!(chip.level, SessionBootActivityLevel::Failure);
+        assert_eq!(
+            chip.text,
+            format!(
+                "MCP{ITEM_SEPARATOR}1 connected{ITEM_SEPARATOR}1 {}{ITEM_SEPARATOR}1 failed",
+                mcp_auth_required_state_label()
+            )
+        );
+        // Under a tight budget the compact form keeps both counts.
+        let compact = surface
+            .activity_notice(Locale::En, 30)
+            .expect("compact chip");
+        assert_eq!(
+            compact.text,
+            format!("MCP{ITEM_SEPARATOR}1 login{ITEM_SEPARATOR}1 failed")
+        );
     }
 
     #[test]
