@@ -26,6 +26,15 @@ fn frame_app() -> App {
     app.onboarding = crate::tui::app::OnboardingState::None;
     app.launch.visible = false;
     app.ui_locale = crate::localization::Locale::En;
+    // The posture bar's permission chip carries the filesystem-scope notice
+    // (`files: workspace (unenforced)`) whenever no sandbox backend can
+    // actually enforce the policy — true on default Linux and all Windows,
+    // false on macOS, which resolves seatbelt. That is 30 columns of chip
+    // that appears or not depending on which machine runs the test, and it
+    // decides what an 80-column shed ladder can still hold: these tests
+    // passed locally and failed on both CI legs until it was pinned. Force
+    // the wider, unenforced reading so every host asserts the same row.
+    app.sandbox_backend = None;
     app
 }
 
@@ -105,9 +114,13 @@ fn count_rows_containing(rows: &[String], needle: &str) -> usize {
 /// Every chrome fact paints in exactly one row of the composed default
 /// frame: the context reading, the mode and permission chips, the model,
 /// the cost, the agent count, and the help hint.
+///
+/// 160 columns joins the blocker sizes so the working clock's two halves
+/// are asserted at a width that holds both; at 80 and 120 they shed by
+/// design (#5914) and the row is asserted for what it does keep.
 #[test]
 fn composed_frame_paints_each_fact_in_exactly_one_row() {
-    for (width, height) in [(80u16, 24u16), (120, 32)] {
+    for (width, height) in [(80u16, 24u16), (120, 32), (160, 40)] {
         let mut app = working_app();
         let rows = draw(&mut app, width, height);
         let pct = super::info_context_percent(&app);
@@ -173,10 +186,34 @@ fn composed_frame_paints_each_fact_in_exactly_one_row() {
             "posture bar is row 1 under the composer"
         );
         assert_eq!(metrics, posture + 1, "metrics line is row 2");
-        // The bar carries no phase word and no elapsed; the metrics line no
-        // repository, branch or provider.
-        assert!(!rows[posture].contains("underway"), "{}", rows[posture]);
-        assert!(!rows[posture].contains("1m 15s"), "{}", rows[posture]);
+        // The scope notice is pinned on, not inherited from the host: if
+        // this ever goes quiet the widths below stop meaning what they say.
+        assert!(
+            rows[posture].contains("files: workspace (unenforced)"),
+            "{width}x{height}: the fixture must pin the scope notice: {}",
+            rows[posture]
+        );
+        // The bar carries the working clock (#5914) — how long the current
+        // turn has been doing what it is doing, and how long the session has
+        // worked. Both halves shed before the hint and the counts, so a
+        // narrow row keeps the affordances and drops the stopwatch: the
+        // session half needs 120 columns here, the turn half 160. Each
+        // paints in exactly one row wherever it paints. The metrics line
+        // carries no repository, branch or provider.
+        let clock_facts: &[(u16, &str)] =
+            &[(120, "worked 1m 15s"), (160, "sub-agents underway 1m 15s")];
+        for (needs, needle) in clock_facts {
+            if width < *needs {
+                continue;
+            }
+            assert!(rows[posture].contains(needle), "{}", rows[posture]);
+            assert_eq!(
+                count_rows_containing(&rows, needle),
+                1,
+                "{width}x{height}: {needle:?} paints in exactly one row:\n{}",
+                rows.join("\n")
+            );
+        }
         assert!(!rows[metrics].contains('⑂'), "{}", rows[metrics]);
         // No dead key hints anywhere in the frame.
         for row in &rows {
@@ -234,11 +271,9 @@ fn context_cap_warns_once_in_the_posture_bar() {
         context_tokens: Some(60),
         ..Default::default()
     });
-    // 140 columns: on a backend-less platform (linux CI) the filesystem
-    // scope notice paints `files: workspace (unenforced)` and the shed
-    // ladder drops the hint first; the width keeps the hint inside the
-    // budget with the notice present, so the warning is asserted on every
-    // platform.
+    // 140 columns: the fixture always paints the filesystem scope notice
+    // (`frame_app` pins `sandbox_backend = None`), so the width has to hold
+    // the warning with the notice present. The clock halves shed first.
     let rows = draw(&mut app, 140, 32);
     let pct = super::info_context_percent(&app);
     assert!(pct >= 80, "fixture must sit at the cap: {pct}");
@@ -256,7 +291,10 @@ fn context_cap_warns_once_in_the_posture_bar() {
     );
 }
 
-/// The double-tap window advertises itself in the posture bar's hint slot.
+/// The double-tap window advertises itself in the posture bar's hint slot,
+/// and keeps it: both halves of the working clock shed before the hint does
+/// (#5914), so the steer stays reachable on a 120-column row that cannot
+/// also hold the stopwatch.
 #[test]
 fn double_tap_window_shows_the_send_now_hint() {
     let mut app = working_app();

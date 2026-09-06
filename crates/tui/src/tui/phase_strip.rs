@@ -11,9 +11,11 @@
 //! changes text inside fixed rows and never displaces the composer.
 //!
 //! One owner per fact: the context reading and the price are the metrics
-//! line's; mode and permission are this bar's. The module name is the
-//! historical one — the phase word it painted now lives in the transcript's
-//! active row.
+//! line's; mode, permission and the working clock are this bar's. The module
+//! name is the historical one — the phase word it painted also lives in the
+//! transcript's active row, but the bar keeps its own copy beside the clock
+//! (#5914): a bare duration cannot say whether the session is producing
+//! tokens or parked waiting on a tool, a sub-agent, or you.
 
 use ratatui::{
     buffer::Buffer,
@@ -35,10 +37,6 @@ pub fn height() -> u16 {
     1
 }
 
-/// Compact working detail for the phase band: `×N` for tools or `1m 15s`
-/// while the model is thinking.
-/// Kept quieter than the classic footer's verbose tool-status line so the
-/// transcript owns the ledger and the strip only names the live pulse.
 /// Route identity for a rail or info line segment, shed field by field until it
 /// fits `budget`.
 ///
@@ -526,12 +524,21 @@ mod tests {
 //
 //   ▶▶ full access (Shift+Tab) · work (Tab) · 2 agents, 1 task · Esc to interrupt      rc connected
 //
-// permission chip first (never sheds, #5796), the mode, the live counts,
-// then the one hint that applies right now; the remote-control state or a
-// live notice pinned right. No phase word, no elapsed, no cost: the
-// transcript's active row owns the pulse, the roster owns per-agent
-// elapsed, and the metrics line owns the price. The context reading is the
-// metrics line's; this row only says what to do about it at the cap.
+// permission chip first (never sheds, #5796), the mode, the turn clock, the
+// live counts, the session clock, then the one hint that applies right now;
+// the remote-control state or a live notice pinned right. No cost: the
+// roster owns per-agent elapsed and the metrics line owns the price. The
+// context reading is the metrics line's; this row only says what to do about
+// it at the cap.
+//
+// The clock came back in #5914. It was the `worked Nm Ss` chip on the
+// classic footer until `146ab7f756` deleted that path, and the phase band's
+// `working_detail` until `329960fcbf` (the 0.9.12 mega shell) merged the
+// bands and left the elapsed reading to the transcript's active row. A
+// multi-hour operate session scrolls that row out of sight, so the founder
+// looking straight at the screen had no way to tell how long the session had
+// been working or whether the current turn was stuck. The fixed row is where
+// a glancing user looks; the clock lives here.
 // ---------------------------------------------------------------------------
 
 /// The context cap warning at ≥80% (spec §5a/§5e). The reading itself lives
@@ -557,9 +564,18 @@ pub struct TidelineFooter<'a> {
     pub mode_chip: Option<(&'a str, crate::palette::ChromeInk)>,
     /// The chord that cycles the mode, when the binding is live (`Tab`).
     pub mode_key: Option<&'a str>,
+    /// The turn half of the working clock (`working 1m 15s`): what the
+    /// session is doing right now and for how long. `None` between turns.
+    pub turn_clock: Option<(&'a str, crate::palette::ChromeInk)>,
     /// Live counts (`2 agents`, `1 task`) in their own inks, joined with
     /// `, `.
     pub counts: &'a [(String, ChromeInk)],
+    /// The session half of the working clock (`worked 41m 12s`): how long
+    /// this session has actually worked — the reading the founder went
+    /// looking for and could not find (#5914). Outlives the turn half, and
+    /// sheds before the hint and the counts. `None` until the session has
+    /// worked a minute.
+    pub session_clock: Option<(&'a str, crate::palette::ChromeInk)>,
     /// The one hint that applies right now (`Esc to interrupt`).
     pub hint: Option<(&'a str, crate::palette::ChromeInk)>,
     /// Context window percentage 0–100. The metrics line paints the reading;
@@ -584,7 +600,9 @@ impl<'a> TidelineFooter<'a> {
             permission_key: None,
             mode_chip: None,
             mode_key: None,
+            turn_clock: None,
             counts: &[],
+            session_clock: None,
             hint: None,
             context_percent: 0,
             right: None,
@@ -607,6 +625,18 @@ impl<'a> TidelineFooter<'a> {
     #[must_use]
     pub fn mode_key(mut self, key: Option<&'a str>) -> Self {
         self.mode_key = key;
+        self
+    }
+
+    #[must_use]
+    pub fn turn_clock(mut self, clock: Option<(&'a str, crate::palette::ChromeInk)>) -> Self {
+        self.turn_clock = clock;
+        self
+    }
+
+    #[must_use]
+    pub fn session_clock(mut self, clock: Option<(&'a str, crate::palette::ChromeInk)>) -> Self {
+        self.session_clock = clock;
         self
     }
 
@@ -657,11 +687,18 @@ impl<'a> TidelineFooter<'a> {
             .collect()
     }
 
+    /// Whether the context window is full enough that the bar owes the cap
+    /// warning. It replaces the hint and, unlike a hint, outranks the clock
+    /// and the counts on the shed ladder.
+    fn at_context_cap(&self) -> bool {
+        self.context_percent.clamp(0, 100) >= 80
+    }
+
     /// The hint the left run ends on: the cap warning outranks whatever the
     /// caller passed, because a full context is the one thing that stops the
     /// next turn.
     fn effective_hint(&self) -> Option<(String, ChromeInk)> {
-        if self.context_percent.clamp(0, 100) >= 80 {
+        if self.at_context_cap() {
             return Some((
                 format!("{} {}", self.sym("▲"), self.sym(DEPTH_WARN)),
                 ChromeInk::Attention,
@@ -691,10 +728,33 @@ struct PostureItem {
     count_index: Option<usize>,
 }
 
-/// Shed ladder for the left run, most expendable first: the hint, the
-/// counts, the mode key, the mode, the permission key. The permission chip
-/// itself never sheds (#5796): a silently missing `full access` is the bar
-/// under-reporting the authority the session actually holds.
+/// Shed rungs for the left run, most expendable first. The permission chip
+/// itself has no rung: it never sheds (#5796), because a silently missing
+/// `full access` is the bar under-reporting the authority the session
+/// actually holds.
+///
+/// The two halves of the working clock shed apart, and both go first
+/// (#5914). The clock is what a *glance* wants; at the narrowest widths the
+/// row's other facts are what a *keystroke* wants — the counts name work you
+/// can open, the hint names a chord you can press right now (`Esc to
+/// interrupt`, `Enter again to send now`). An 80-column row carrying the
+/// filesystem-scope notice cannot hold all of it, and losing the affordance
+/// to keep the stopwatch is the wrong trade. The turn half goes before the
+/// session half: the transcript's active row and the spinner also show the
+/// turn is alive, while the session total is stated nowhere else. Above
+/// them the context-cap warning, which is not a hint but the reason the
+/// next turn will not start at all.
+const SHED_TURN_CLOCK: u8 = 1;
+const SHED_SESSION_CLOCK: u8 = 2;
+const SHED_HINT: u8 = 3;
+const SHED_COUNTS: u8 = 4;
+const SHED_CAP_WARNING: u8 = 5;
+const SHED_MODE_KEY: u8 = 6;
+const SHED_MODE: u8 = 7;
+const SHED_PERMISSION_KEY: u8 = 8;
+/// The most-shed rung: everything gone but the permission chip.
+const MAX_SHED: u8 = SHED_PERMISSION_KEY;
+
 fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
     let chip = |text: &str, key: Option<&str>| -> String {
         match key {
@@ -705,23 +765,35 @@ fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
     let mut items = vec![PostureItem {
         text: chip(
             &footer.sym(footer.permission_chip.0),
-            footer.permission_key.filter(|_| shed < 5),
+            footer.permission_key.filter(|_| shed < SHED_PERMISSION_KEY),
         ),
         ink: footer.permission_chip.1,
         bold: true,
         joined: false,
         count_index: None,
     }];
-    if let Some((mode, ink)) = footer.mode_chip.filter(|_| shed < 4) {
+    if let Some((mode, ink)) = footer.mode_chip.filter(|_| shed < SHED_MODE) {
         items.push(PostureItem {
-            text: chip(&footer.sym(mode), footer.mode_key.filter(|_| shed < 3)),
+            text: chip(
+                &footer.sym(mode),
+                footer.mode_key.filter(|_| shed < SHED_MODE_KEY),
+            ),
             ink,
             bold: true,
             joined: false,
             count_index: None,
         });
     }
-    if shed < 2 {
+    if let Some((clock, ink)) = footer.turn_clock.filter(|_| shed < SHED_TURN_CLOCK) {
+        items.push(PostureItem {
+            text: footer.sym(clock),
+            ink,
+            bold: false,
+            joined: false,
+            count_index: None,
+        });
+    }
+    if shed < SHED_COUNTS {
         for (index, (count, ink)) in footer.counts.iter().enumerate() {
             items.push(PostureItem {
                 text: footer.sym(count),
@@ -732,7 +804,24 @@ fn posture_items(footer: &TidelineFooter<'_>, shed: u8) -> Vec<PostureItem> {
             });
         }
     }
-    if shed < 1
+    if let Some((clock, ink)) = footer.session_clock.filter(|_| shed < SHED_SESSION_CLOCK) {
+        items.push(PostureItem {
+            text: footer.sym(clock),
+            ink,
+            bold: false,
+            joined: false,
+            count_index: None,
+        });
+    }
+    // The cap warning is not a hint: it sheds after the counts and both
+    // clock halves, because a full context is the one thing that stops the
+    // next turn from starting at all.
+    let hint_rung = if footer.at_context_cap() {
+        SHED_CAP_WARNING
+    } else {
+        SHED_HINT
+    };
+    if shed < hint_rung
         && let Some((text, ink)) = footer.effective_hint()
     {
         items.push(PostureItem {
@@ -791,7 +880,7 @@ pub fn render_tideline_footer(
 
     // The permission chip alone is the floor; the right slot takes what is
     // left after it, and the rest of the left run sheds against the slot.
-    let floor = left_run_width(&mark, &posture_items(footer, 5));
+    let floor = left_run_width(&mark, &posture_items(footer, MAX_SHED));
     let right = footer.right.map(|(text, ink)| {
         let budget = width.saturating_sub(floor + 1);
         (truncate_owned(&footer.sym(text), budget), ink)
@@ -801,10 +890,10 @@ pub fn render_tideline_footer(
         .map(|(text, _)| text.width() + 1)
         .unwrap_or(0);
     let left_budget = width.saturating_sub(right_width);
-    let items = (0..=5u8)
+    let items = (0..=MAX_SHED)
         .map(|shed| posture_items(footer, shed))
         .find(|items| left_run_width(&mark, items) <= left_budget)
-        .unwrap_or_else(|| posture_items(footer, 5));
+        .unwrap_or_else(|| posture_items(footer, MAX_SHED));
 
     let permission_ink = footer.permission_chip.1;
     let mut x = usize::from(area.x);
@@ -821,12 +910,16 @@ pub fn render_tideline_footer(
     x += mark.width() + 1;
     for (index, item) in items.iter().enumerate() {
         if index > 0 {
-            let separator = separator_before(item);
+            // Projected like every other glyph on the row: an ascii-safe
+            // terminal that cannot draw `·` must not get one here either,
+            // least of all next to a clock reading whose own separator was
+            // projected.
+            let separator = footer.sym(separator_before(item));
             tput(
                 buf,
                 x as u16,
                 area.y,
-                &clip(x, separator),
+                &clip(x, &separator),
                 tchrome(theme, ChromeInk::MetadataDim),
             );
             x += separator.width();
@@ -878,7 +971,9 @@ pub(crate) struct TidelineFooterFacts {
     pub permission_key: Option<&'static str>,
     pub mode_chip: Option<(String, crate::palette::ChromeInk)>,
     pub mode_key: Option<&'static str>,
+    pub turn_clock: ClockReading,
     pub counts: Vec<(String, ChromeInk)>,
+    pub session_clock: ClockReading,
     /// The dock view each entry of `counts` opens when clicked — same
     /// length, same order.
     pub count_panels: Vec<crate::tui::work_surface::RailPanel>,
@@ -904,12 +999,76 @@ impl TidelineFooterFacts {
         .permission_key(self.permission_key)
         .mode_chip(borrow(&self.mode_chip))
         .mode_key(self.mode_key)
+        .turn_clock(borrow(&self.turn_clock))
         .counts(&self.counts)
+        .session_clock(borrow(&self.session_clock))
         .hint(borrow(&self.hint))
         .context_percent(self.context_percent)
         .right(borrow(&self.right))
         .ascii_safe(ascii_safe)
     }
+}
+
+/// The session has to have worked this long before the bar states a total.
+/// A fresh launch that says `worked 4s` is furniture, not information; the
+/// classic footer's `worked` chip used the same floor (#448).
+const CLOCK_SESSION_FLOOR_SECS: u64 = 60;
+
+/// One half of the working clock: its text and the ink that says whether the
+/// clock is running. `None` when that half has nothing true to say.
+pub(crate) type ClockReading = Option<(String, ChromeInk)>;
+
+/// The working clock (#5914), as its two halves — `(turn, session)`.
+///
+/// * the **turn** reading is `{phase_label} {elapsed}` — the phase word is
+///   the transcript's own, so `working 1m 15s` and `waiting on you 1m 15s`
+///   and `sub-agents underway 1m 15s` all say what the clock is counting.
+///   A duration alone cannot distinguish a session producing tokens from one
+///   parked on a tool, a sub-agent, or an unanswered prompt. `None` between
+///   turns: there is no turn to time.
+/// * the **session** reading is the classic `worked {elapsed}` chip (#448):
+///   `App::cumulative_turn_duration` (the sum of finished turns) plus the
+///   live turn, so it ticks continuously and never jumps at `TurnComplete`.
+///   It is model work, not wall clock since launch — an idle TUI does not
+///   claim to have been working. Quiet ink while no turn is running, because
+///   the clock is stopped.
+pub(crate) fn working_clock(
+    app: &App,
+    phase: ShellPhase,
+    phase_label: &str,
+) -> (ClockReading, ClockReading) {
+    let turn = app.turn_started_at.map(|started| started.elapsed());
+    let ink = match phase {
+        ShellPhase::Waiting | ShellPhase::Approval => ChromeInk::Waiting,
+        ShellPhase::Failed => ChromeInk::Attention,
+        _ => ChromeInk::Active,
+    };
+    let turn_clock = turn.map(|turn| {
+        (
+            format!(
+                "{phase_label} {}",
+                crate::elapsed::format_elapsed_secs(turn.as_secs())
+            ),
+            ink,
+        )
+    });
+    let worked = app
+        .cumulative_turn_duration
+        .saturating_add(turn.unwrap_or_default());
+    let session_clock = (worked.as_secs() >= CLOCK_SESSION_FLOOR_SECS).then(|| {
+        (
+            tr(app.ui_locale, MessageId::FooterWorkedChip).replace(
+                "{duration}",
+                &crate::elapsed::format_elapsed_secs(worked.as_secs()),
+            ),
+            if turn.is_some() {
+                ink
+            } else {
+                ChromeInk::MetadataValue
+            },
+        )
+    });
+    (turn_clock, session_clock)
 }
 
 /// Context window percentage — the snapshot the metrics line's reading
@@ -1091,6 +1250,7 @@ pub(crate) fn tideline_footer_from_app(app: &mut App, width: u16) -> TidelineFoo
                 .map(|word| (format!("/rc {word}"), ChromeInk::Info))
         });
 
+    let (turn_clock, session_clock) = working_clock(app, phase, &phase_label);
     let (counts, count_panels) = live_counts(app, tier);
     TidelineFooterFacts {
         permission_chip,
@@ -1107,7 +1267,9 @@ pub(crate) fn tideline_footer_from_app(app: &mut App, width: u16) -> TidelineFoo
                 crate::tui::footer_hints::MODE_CYCLE,
             )
         }),
+        turn_clock,
         counts,
+        session_clock,
         count_panels,
         hint,
         context_percent: context_percent_from_app(app),

@@ -1294,7 +1294,7 @@
   "LaunchMcpNeedsSignInMany": "{count} need sign-in",
   "PhaseIdle": "idle",
   "PhaseDraft": "draft",
-  "PhaseWorking": "in the current",
+  "PhaseWorking": "working",
   "PhaseReasoning": "reasoning",
   "PhaseReading": "reading",
   "PhaseUsingTool": "using tool",
