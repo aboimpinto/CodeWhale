@@ -1385,26 +1385,25 @@ impl WriteFileTool {
             })?;
         }
         check_file_operation_cancelled(context)?;
-        crate::utils::write_atomic_workspace(&file_path, file_content.as_bytes()).map_err(
-            |error| {
-                ToolError::execution_failed(format!(
-                    "Failed to write {}: {error}",
-                    file_path.display()
-                ))
-            },
-        )?;
+        // Preserve the existing file's line-ending style on overwrite (see
+        // `preserve_prior_line_endings`); otherwise a CRLF (Windows) file is
+        // silently rewritten with LF line endings.
+        let written = preserve_prior_line_endings(file_content, &prior_contents);
+        crate::utils::write_atomic_workspace(&file_path, written.as_bytes()).map_err(|error| {
+            ToolError::execution_failed(format!("Failed to write {}: {error}", file_path.display()))
+        })?;
         check_file_operation_cancelled(context)?;
         context.note_file_read(&file_path);
         drop(mutation_guard);
 
         let outcome = if existed_before { "updated" } else { "created" };
-        let utf16_units = file_content.encode_utf16().count();
+        let utf16_units = written.encode_utf16().count();
         Ok(contract_mutation_result(
             context,
             &file_path,
             path_str,
             prior_contents.as_ref(),
-            file_content,
+            &written,
             outcome,
             format!("Successfully wrote {utf16_units} bytes to {path_str}"),
         )
@@ -1504,17 +1503,22 @@ impl ToolSpec for WriteFileTool {
             })?;
         }
 
-        crate::utils::write_atomic_workspace(&file_path, file_content.as_bytes()).map_err(|e| {
+        // Preserve the existing file's line-ending style on overwrite (see
+        // `preserve_prior_line_endings`); a full `write_file` over a CRLF
+        // (Windows) file otherwise silently rewrites every line ending to LF.
+        let written = preserve_prior_line_endings(file_content, &prior_contents);
+
+        crate::utils::write_atomic_workspace(&file_path, written.as_bytes()).map_err(|e| {
             ToolError::execution_failed(format!("Failed to write {}: {}", file_path.display(), e))
         })?;
         context.note_file_read(&file_path);
 
         let display = file_path.display().to_string();
-        let diff = make_unified_diff(&display, &prior_contents, file_content);
+        let diff = make_unified_diff(&display, &prior_contents, &written);
         let summary = if existed_before {
-            format!("Wrote {} bytes to {}", file_content.len(), display)
+            format!("Wrote {} bytes to {}", written.len(), display)
         } else {
-            format!("Created {} ({} bytes)", display, file_content.len())
+            format!("Created {} ({} bytes)", display, written.len())
         };
         let body = if diff.is_empty() {
             format!("{summary}\n(no changes)")
@@ -1533,7 +1537,7 @@ impl ToolSpec for WriteFileTool {
         let outcome = if existed_before { "updated" } else { "created" };
         // Keep the execution-owned receipt workspace-relative even though the
         // legacy model-facing output above retains its resolved-path wording.
-        let receipt_diff = make_unified_diff(path_str, &prior_contents, file_content);
+        let receipt_diff = make_unified_diff(path_str, &prior_contents, &written);
         Ok(ToolResult::success(full_body).with_metadata(json!({
             "event": "file.mutation",
             "mutation": {
@@ -1582,6 +1586,21 @@ fn restore_contract_line_endings(text: &str, ending: &str) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// Rewrite `content` to match the line-ending style of an existing file's
+/// `prior` content, so a full-file overwrite (`write_file` / contract `write`)
+/// does not silently flip a CRLF (Windows) file to LF — the same policy
+/// `edit_file` applies. A brand-new file (no prior content) is returned
+/// verbatim: there is no style to preserve.
+fn preserve_prior_line_endings(content: &str, prior: &str) -> String {
+    if prior.is_empty() {
+        return content.to_string();
+    }
+    restore_contract_line_endings(
+        &normalize_contract_line_endings(content),
+        contract_line_ending(prior),
+    )
 }
 
 /// Fallback matching view used only after a literal match fails. It follows
