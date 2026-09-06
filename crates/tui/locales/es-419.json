@@ -1724,6 +1724,8 @@
   "WhaleStateWaiting": "Esperándote",
   "WhaleStateBlocked": "Bloqueada",
   "WhaleStateOffline": "Sin conexión",
+  "AgentStatusParked": "en pausa",
+  "AgentStatusParkedRecovery": "nadie lo está esperando; usa resume_from para continuar o cancel para descartarlo",
   "WhaleAnimalScout": "zifio",
   "WhaleAnimalPatch": "marsopa común",
   "WhaleAnimalHarbor": "ballena jorobada",

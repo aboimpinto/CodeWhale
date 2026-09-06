@@ -1724,6 +1724,8 @@
   "WhaleStateWaiting": "Aguardando você",
   "WhaleStateBlocked": "Bloqueada",
   "WhaleStateOffline": "Offline",
+  "AgentStatusParked": "em pausa",
+  "AgentStatusParkedRecovery": "ninguém está esperando por ele; use resume_from para continuar ou cancel para descartar",
   "WhaleAnimalScout": "baleia-bicuda",
   "WhaleAnimalPatch": "boto-do-porto",
   "WhaleAnimalHarbor": "baleia-jubarte",

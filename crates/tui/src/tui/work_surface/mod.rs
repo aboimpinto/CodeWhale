@@ -1761,6 +1761,172 @@ mod tests {
         assert!(row.detail.contains("step 5"), "{}", row.detail);
     }
 
+    // === #5906: a parked husk is not an agent waiting for input ==========
+
+    /// Build a child exactly the way the turn-end parking projection does:
+    /// `Interrupted` + `WaitingForUser` + a `needs_input` note phrased as a
+    /// question, distinguished from a real question only by the checkpoint's
+    /// `parked_at_turn_end` flag.
+    fn parked_worker(id: &str, objective: &str) -> SubAgentResult {
+        let mut agent = fleet_worker(
+            id,
+            "general-purpose",
+            objective,
+            753_000,
+            SubAgentStatus::Interrupted(
+                "Parent turn ended before this turn-owned child settled.".to_string(),
+            ),
+        );
+        agent.worker_status = Some(AgentWorkerStatus::WaitingForUser);
+        agent.needs_input = Some(crate::tools::subagent::SubAgentNeedsInput {
+            question: format!(
+                "Resume this parked child with agent(action=\"start\", resume_from=\"{id}\")."
+            ),
+        });
+        agent.checkpoint = Some(crate::tools::subagent::SubAgentCheckpoint {
+            checkpoint_id: format!("{id}:step:2"),
+            agent_id: id.to_string(),
+            continuation_handle: format!("agent:{id}:checkpoint"),
+            reason: "Parent turn ended before this turn-owned child settled.".to_string(),
+            continuable: true,
+            steps_taken: 2,
+            message_count: 4,
+            created_at_ms: 1_000,
+            messages: Vec::new(),
+            omitted_messages: 0,
+            parked_at_turn_end: true,
+        });
+        agent
+    }
+
+    fn asking_worker(id: &str, objective: &str) -> SubAgentResult {
+        let mut agent = fleet_worker(
+            id,
+            "general-purpose",
+            objective,
+            120_000,
+            SubAgentStatus::Running,
+        );
+        agent.worker_status = Some(AgentWorkerStatus::WaitingForUser);
+        agent.needs_input = Some(crate::tools::subagent::SubAgentNeedsInput {
+            question: "Which path should I use?".to_string(),
+        });
+        agent
+    }
+
+    fn parked_fixture() -> App {
+        let mut app = app();
+        app.current_session_id = Some(SESSION.to_string());
+        app.subagent_cache
+            .push(parked_worker("agent_parked", "Parked dead-code removal"));
+        app.subagent_cache
+            .push(asking_worker("agent_asking", "Asking about the path"));
+        app.subagent_cache.push(fleet_worker(
+            "agent_live",
+            "general-purpose",
+            "Streaming dead-code removal",
+            30_000,
+            SubAgentStatus::Running,
+        ));
+        crate::tui::subagent_routing::reconcile_subagent_activity_state(&mut app);
+        app
+    }
+
+    #[test]
+    fn a_parked_work_row_says_parked_and_names_its_recovery() {
+        let mut app = parked_fixture();
+        let rows = super::model::project(&mut app);
+
+        let parked = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_parked")
+            .expect("parked work row");
+        assert!(parked.detail.starts_with("parked"), "{}", parked.detail);
+        assert!(
+            !parked.detail.contains("waiting for input"),
+            "a parked husk must not wear the answerable label: {}",
+            parked.detail
+        );
+        // The recovery names verbs the runtime actually exposes.
+        assert!(parked.detail.contains("resume_from"), "{}", parked.detail);
+        assert!(parked.detail.contains("cancel"), "{}", parked.detail);
+        assert!(
+            !parked.detail.contains("Resume this parked child"),
+            "the parking note is not a question to replay at the operator: {}",
+            parked.detail
+        );
+
+        let asking = rows
+            .iter()
+            .find(|row| row.id.0 == "worker:agent_asking")
+            .expect("asking work row");
+        assert!(
+            asking.detail.contains("waiting for input"),
+            "a child that really asked keeps the answerable label: {}",
+            asking.detail
+        );
+        assert!(
+            asking.detail.contains("Which path should I use?"),
+            "{}",
+            asking.detail
+        );
+    }
+
+    #[test]
+    fn parked_rows_sort_below_live_work_and_leave_the_needs_input_count_alone() {
+        let mut app = parked_fixture();
+        let rows = super::model::project(&mut app);
+
+        let heading = rows
+            .iter()
+            .find(|row| row.id.0 == "section:work")
+            .expect("work heading");
+        // The attention chip counts children a person is actually blocking:
+        // one, the child that asked. Two would mean the parked husk had been
+        // counted as waiting for input all over again.
+        assert!(
+            heading.label.contains("1 blocked"),
+            "only the child that actually asked is blocked on a person: {}",
+            heading.label
+        );
+
+        let position = |id: &str| {
+            rows.iter()
+                .position(|row| row.id.0 == id)
+                .unwrap_or_else(|| panic!("{id} missing from {rows:?}"))
+        };
+        assert!(
+            position("worker:agent_parked") > position("worker:agent_live"),
+            "a parked husk must not sort above live work"
+        );
+        assert!(
+            position("worker:agent_parked") > position("worker:agent_asking"),
+            "a parked husk must not sort above a child a person can answer"
+        );
+    }
+
+    #[test]
+    fn the_parked_status_word_survives_the_narrow_row_ladder() {
+        // The status word outlives the whole receipt as the strip narrows
+        // (see the degradation test above); `parked` is the fact the row
+        // exists to carry, so it must survive the same ladder `running` does.
+        let mut app = app();
+        app.current_session_id = Some(SESSION.to_string());
+        app.subagent_cache
+            .push(parked_worker("agent_parked", "Parked dead-code removal"));
+        crate::tui::subagent_routing::reconcile_subagent_activity_state(&mut app);
+
+        for width in [96u16, 72, 56] {
+            let rows = render_rows(&mut app, width, 6);
+            let row = rows
+                .iter()
+                .find(|line| line.contains("Parked dead-code"))
+                .unwrap_or_else(|| panic!("no parked row at width {width} in {rows:?}"));
+            assert!(row.contains("parked"), "width {width}: {row}");
+            assert!(!row.contains("waiting for input"), "width {width}: {row}");
+        }
+    }
+
     #[test]
     fn agent_transcript_keyboard_mouse_and_return_selection_converge() {
         fn add_worker(app: &mut App) {

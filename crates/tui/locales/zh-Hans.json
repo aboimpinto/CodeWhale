@@ -1724,6 +1724,8 @@
   "WhaleStateWaiting": "等待你",
   "WhaleStateBlocked": "已阻塞",
   "WhaleStateOffline": "离线",
+  "AgentStatusParked": "已停放",
+  "AgentStatusParkedRecovery": "没有人在等待它；用 resume_from 继续，或用 cancel 关闭",
   "WhaleAnimalScout": "喙鲸",
   "WhaleAnimalPatch": "港湾鼠海豚",
   "WhaleAnimalHarbor": "座头鲸",

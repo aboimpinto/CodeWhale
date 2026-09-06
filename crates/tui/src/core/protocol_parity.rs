@@ -104,6 +104,7 @@ fn roster_state_str(state: RosterState) -> &'static str {
     match state {
         RosterState::Running => "running",
         RosterState::Waiting => "waiting",
+        RosterState::Parked => "parked",
         RosterState::Done => "done",
         RosterState::Failed => "failed",
         RosterState::Cancelled => "cancelled",

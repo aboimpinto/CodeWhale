@@ -1724,6 +1724,8 @@
   "WhaleStateWaiting": "Waiting for you",
   "WhaleStateBlocked": "Blocked",
   "WhaleStateOffline": "Offline",
+  "AgentStatusParked": "parked",
+  "AgentStatusParkedRecovery": "nobody is waiting on it; resume_from to continue, or cancel to dismiss",
   "WhaleAnimalScout": "beaked whale",
   "WhaleAnimalPatch": "harbor porpoise",
   "WhaleAnimalHarbor": "humpback whale",

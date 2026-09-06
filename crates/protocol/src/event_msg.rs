@@ -196,7 +196,8 @@ pub struct AgentRosterRow {
     pub worker_id: String,
     pub display_name: String,
     pub model: String,
-    /// Coarse rail state: `running | waiting | done | failed | cancelled`.
+    /// Coarse rail state:
+    /// `running | waiting | parked | done | failed | cancelled`.
     pub state: String,
     /// `AgentWorkerStatus` in snake_case.
     pub status: String,

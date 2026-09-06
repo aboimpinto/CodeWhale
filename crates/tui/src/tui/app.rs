@@ -383,6 +383,16 @@ pub enum AgentCurrentActivityStatus {
     ModelWait,
     RunningTool,
     Waiting,
+    /// Settled because the parent's turn ended before this child did, not
+    /// because it asked anyone anything (#5906).
+    ///
+    /// The runtime parks such a child with a `needs_input` note that reads
+    /// like a question, so every surface used to render it as
+    /// `waiting for input` — indistinguishable from a child a user can
+    /// actually answer. It is its own state here because the recovery is
+    /// different: nobody will answer it, and it is continued through
+    /// `resume_from` (a *new* agent) or dismissed with `cancel`.
+    Parked,
     Done,
     Failed,
     Canceled,
@@ -390,6 +400,11 @@ pub enum AgentCurrentActivityStatus {
 }
 
 impl From<AgentWorkerStatus> for AgentCurrentActivityStatus {
+    /// Never yields [`Self::Parked`]: the worker status vocabulary cannot
+    /// express it (a parked child reports `WaitingForUser` /`Interrupted`
+    /// like any other settled one). Parked is derived from the checkpoint
+    /// flag by `crate::tui::subagent_routing::subagent_is_parked` and layered
+    /// over this mapping there — the one place that distinction is made.
     fn from(status: AgentWorkerStatus) -> Self {
         match status {
             AgentWorkerStatus::Queued => Self::Queued,
