@@ -1,7 +1,7 @@
 //! FEAT-015 TUI command-boundary surface.
 //!
 //! This module holds the TUI-owned pieces of the staged command migration:
-//! the pending-frontier projection (D4), the seven capability facet adapters
+//! the pending-frontier projection (D4), the capability facet adapters
 //! (D1), boundary-value and localization-key mappings (D3/D8), the envelope
 //! construction helper (D1), and the seam helpers (D7-D9). It is deliberately
 //! the only new TUI module for the migration surface; the production
@@ -14,7 +14,7 @@
 //!
 //! ## Authoritative host-proxy design (D1)
 //!
-//! `CommandContexts` holds twelve independently borrowed facet objects, while
+//! `CommandContexts` holds fifteen independently borrowed facet objects, while
 //! important behavior (mode transitions, model invalidation, cost accounting,
 //! skill refresh) is authoritative on `App`. The adapters therefore share a
 //! synchronous TUI-owned host proxy. Each trait call borrows `App` only for the
@@ -272,7 +272,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
 
 /// Shared TUI host hidden behind the portable command facets.
 ///
-/// The envelope needs ten independently borrowed facet objects, while the
+/// The envelope needs fifteen independently borrowed facet objects, while the
 /// authoritative mutation methods live on `App`. Each adapter therefore owns
 /// an `Rc` clone of this synchronous host proxy. Trait calls borrow `App` only
 /// for the duration of one method, delegate to the real TUI authority, and
@@ -3742,7 +3742,7 @@ fn default_codewhale_tools_dir() -> Option<PathBuf> {
 // Envelope construction (D1)
 // ---------------------------------------------------------------------------
 
-/// Owns thirteen facet objects sharing one synchronous TUI host proxy.
+/// Owns fifteen facet objects sharing one synchronous TUI host proxy.
 ///
 /// Handlers borrow only these adapters. Every method delegates to the real App
 /// authority and releases its `RefCell` borrow before returning, so facets can
