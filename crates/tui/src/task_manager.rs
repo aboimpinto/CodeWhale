@@ -529,16 +529,28 @@ impl ExecutionGuard {
 
         let wall_elapsed = now.saturating_duration_since(self.started_at);
         let idle_elapsed = now.saturating_duration_since(self.last_progress_at);
+        // A limit whose deadline does not fit in `Instant` can never fire.
+        let wall_deadline = self.started_at.checked_add(self.limits.wall_time);
+        let idle_deadline = self.last_progress_at.checked_add(self.limits.idle_progress);
         let pending = if shutdown {
             Some(TaskTerminalReason::Shutdown)
         } else if cancel {
             Some(TaskTerminalReason::Canceled)
-        } else if wall_elapsed >= self.limits.wall_time {
-            Some(TaskTerminalReason::WallTimeout)
-        } else if idle_elapsed >= self.limits.idle_progress {
-            Some(TaskTerminalReason::IdleTimeout)
         } else {
-            None
+            // Attribute the timeout to the limit that was crossed first, not
+            // to the one this tick happens to check first. When the watchdog
+            // is starved past both deadlines (a >=250 ms scheduler stall on a
+            // loaded CI runner is enough with the test budgets), the idle
+            // limit that expired earlier is still the truthful reason; a tie
+            // keeps the wall limit's precedence (issue #5898).
+            match (wall_deadline, idle_deadline) {
+                (Some(wall), Some(idle)) if now >= wall && wall <= idle => {
+                    Some(TaskTerminalReason::WallTimeout)
+                }
+                (_, Some(idle)) if now >= idle => Some(TaskTerminalReason::IdleTimeout),
+                (Some(wall), _) if now >= wall => Some(TaskTerminalReason::WallTimeout),
+                _ => None,
+            }
         };
         if let Some(reason) = pending {
             return GuardAction::Interrupt { reason };
@@ -3709,12 +3721,33 @@ mod tests {
             &self,
             task: ExecutionTask,
             events: mpsc::Sender<TaskExecutionEvent>,
-            cancel: CancellationToken,
+            _cancel: CancellationToken,
         ) -> TaskExecutionResult {
             if task.prompt.starts_with("hang ") {
                 std::future::pending().await
             } else {
-                MockExecutor.execute(task, events, cancel).await
+                // The follow-up task must complete without a single await
+                // point: `run_task` polls the executor future before its
+                // guard can observe the (test-shortened) idle/wall budgets,
+                // so an await-free future always finishes first and an
+                // interrupt can never be recorded against it. The previous
+                // MockExecutor delegation (`send(...).await` x4 plus a 50 ms
+                // sleep) left windows where CI scheduler/storage stalls of
+                // >=150 ms tripped the idle watchdog mid-flight; the executor
+                // then observed the cancellation and returned `Canceled`,
+                // which `preserve_timeout_reason` rewrote into the timeout
+                // reason -> `Failed` (issue #5898). `try_send` keeps the
+                // released worker's event pipeline exercised without
+                // suspending this future.
+                let _ = events.try_send(TaskExecutionEvent::Status {
+                    message: format!("running after forced release {}", task.id),
+                });
+                TaskExecutionResult {
+                    status: TaskStatus::Completed,
+                    result_text: Some("done after hang".to_string()),
+                    error: None,
+                    terminal_reason: TaskTerminalReason::Completed,
+                }
             }
         }
     }
@@ -3828,6 +3861,40 @@ mod tests {
     }
 
     #[test]
+    fn execution_guard_reports_the_limit_that_expired_first_when_both_elapsed() {
+        let start = Instant::now();
+        let limits = TaskExecutionLimits::short_for_tests();
+        let guard = ExecutionGuard::new(limits, start);
+        // A starved watchdog that first ticks after both budgets ran out must
+        // still report the idle limit, which expired first.
+        match guard.evaluate(
+            start + limits.wall_time + limits.idle_progress,
+            false,
+            false,
+        ) {
+            GuardAction::Interrupt { reason } => {
+                assert_eq!(reason, TaskTerminalReason::IdleTimeout);
+            }
+            other => panic!("expected idle interrupt, got {other:?}"),
+        }
+
+        // Late progress pushes the idle deadline past the wall deadline, so
+        // the same starved tick reports the wall limit instead.
+        let mut guard = ExecutionGuard::new(limits, start);
+        guard.note_progress(start + limits.wall_time - Duration::from_millis(1));
+        match guard.evaluate(
+            start + limits.wall_time + limits.idle_progress,
+            false,
+            false,
+        ) {
+            GuardAction::Interrupt { reason } => {
+                assert_eq!(reason, TaskTerminalReason::WallTimeout);
+            }
+            other => panic!("expected wall interrupt, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn execution_guard_progress_refreshes_idle_until_wall_timeout() {
         let start = Instant::now();
         let limits = TaskExecutionLimits::short_for_tests();
@@ -3838,6 +3905,9 @@ mod tests {
             GuardAction::Run { .. } => {}
             other => panic!("progress should keep idle from firing, got {other:?}"),
         }
+        // Progress keeps arriving, so the idle deadline never expires before
+        // the wall deadline does.
+        guard.note_progress(start + limits.wall_time - (limits.idle_progress / 2));
         match guard.evaluate(start + limits.wall_time, false, false) {
             GuardAction::Interrupt { reason } => {
                 assert_eq!(reason, TaskTerminalReason::WallTimeout);
@@ -4104,14 +4174,27 @@ mod tests {
             .await?;
         let finished =
             wait_for_terminal_state(&manager, &stuck.id, Duration::from_secs(10)).await?;
-        assert_eq!(finished.terminal_reason.as_deref(), Some("idle_timeout"));
+        assert_eq!(
+            finished.terminal_reason.as_deref(),
+            Some("idle_timeout"),
+            "stuck task terminal record: {finished:?}"
+        );
 
         let next = manager
             .add_task(NewTaskRequest::from_prompt("run after hang"))
             .await?;
         let completed =
             wait_for_terminal_state(&manager, &next.id, Duration::from_secs(10)).await?;
-        assert_eq!(completed.status, TaskStatus::Completed);
+        assert_eq!(
+            completed.status,
+            TaskStatus::Completed,
+            "follow-up task terminal record: {completed:?}"
+        );
+        assert_eq!(
+            completed.terminal_reason.as_deref(),
+            Some("completed"),
+            "follow-up task terminal record: {completed:?}"
+        );
         Ok(())
     }
 
