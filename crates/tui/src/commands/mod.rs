@@ -13,6 +13,7 @@ mod config_main_import_host;
 #[cfg(test)]
 mod config_policy_host;
 mod contract;
+mod core_navigation_host;
 pub mod discovery;
 pub(crate) mod groups;
 
@@ -1348,6 +1349,20 @@ mod tests {
 
     #[test]
     fn command_info_resolves_canonical_names_and_aliases() {
+        for (name, expected) in [
+            ("hotbar", AppAction::OpenHotbarSetup),
+            ("transcript", AppAction::OpenLiveTranscript),
+            ("turn", AppAction::OpenTurnInspector),
+        ] {
+            let handler = registry().get(name).unwrap().contextual_handler().unwrap();
+            let codewhale_command_contract::handler::CommandHandler::Pure(run) = handler else {
+                panic!("/{name} must be pure and require no host envelope");
+            };
+            let result = run(None);
+            assert_eq!(result.action, Some(expected));
+            assert!(result.message.is_none());
+            assert!(!result.is_error);
+        }
         for command in command_infos() {
             for lookup in [command.name.to_string(), format!("/{}", command.name)] {
                 let resolved = get_command_info(&lookup)
@@ -2171,6 +2186,9 @@ mod tests {
         // register bounded portable groups/slices; every entry outside the
         // explicit list must still use the original legacy dispatcher.
         const MIGRATED_GROUPS: &[&str] = &[
+            "hotbar",
+            "transcript",
+            "turn",
             // FEAT-018 utility group.
             "attach",
             "automation",

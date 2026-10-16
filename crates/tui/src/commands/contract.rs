@@ -269,6 +269,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
         "cmd_tree_description" => MessageId::CmdTreeDescription,
         "cmd_trust_description" => MessageId::CmdTrustDescription,
         "cmd_turn_inspect_description" => MessageId::CmdTurnInspectDescription,
+        "kb_live_transcript" => MessageId::KbLiveTranscript,
         "cmd_undo_description" => MessageId::CmdUndoDescription,
         "cmd_update_description" => MessageId::CmdUpdateDescription,
         "cmd_verbose_description" => MessageId::CmdVerboseDescription,

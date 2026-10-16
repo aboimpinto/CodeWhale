@@ -22,12 +22,12 @@ mod help;
 mod hf;
 mod home;
 mod hooks;
-mod hotbar;
 mod lane;
 mod links;
 mod model;
 mod modeldb;
 mod models;
+pub(in crate::commands) mod navigation;
 mod pin;
 mod profile;
 mod provider;
@@ -37,9 +37,7 @@ pub(in crate::commands) mod router;
 mod setup;
 mod stash;
 mod subagents;
-mod transcript;
 mod translate;
-mod turn;
 pub mod util;
 pub mod voice;
 mod workflow;
@@ -136,10 +134,7 @@ impl CommandGroup for CoreCommands {
                 workflow::AutoCmd::info(),
                 workflow::AutoCmd::execute,
             )),
-            Box::new(FunctionCommand::new(
-                hotbar::HotbarCmd::info(),
-                hotbar::HotbarCmd::execute,
-            )),
+            crate::commands::core_navigation_host::registration::<0>(),
             Box::new(FunctionCommand::new(
                 setup::SetupCmd::info(),
                 setup::SetupCmd::execute,
@@ -156,14 +151,8 @@ impl CommandGroup for CoreCommands {
                 links::LinksCmd::info(),
                 links::LinksCmd::execute,
             )),
-            Box::new(FunctionCommand::new(
-                transcript::TranscriptCmd::info(),
-                transcript::TranscriptCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                turn::TurnCmd::info(),
-                turn::TurnCmd::execute,
-            )),
+            crate::commands::core_navigation_host::registration::<1>(),
+            crate::commands::core_navigation_host::registration::<2>(),
             Box::new(FunctionCommand::new(
                 feedback::FeedbackCmd::info(),
                 feedback::FeedbackCmd::execute,
