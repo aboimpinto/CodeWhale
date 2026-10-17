@@ -47,7 +47,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   including turns recorded under a shorthand. On NVIDIA NIM, OpenRouter,
   Novita, Fireworks, SiliconFlow, SGLang, vLLM, DeepInfra and Together,
   `deepseek-flash` selects that host's V4 Flash model, so the `flash`
-  shorthand keeps working there.
+  shorthand keeps working there. On OpenCode Go, `deepseek-flash` and the
+  `flash` shorthand select Go's `deepseek-v4.1-flash`; until this fix,
+  `/provider opencode-go flash` was rejected as an invalid model.
+- When `$SHELL` is zsh, the `bash` tool now runs commands with zsh's NOMATCH
+  and EQUALS options off. Common Bash idioms such as `grep --include=*.rs`
+  and `[ "$a" == "$b" ]` now run instead of failing with `no matches found`
+  or `= not found`. In 310 local DeepSeek sessions, 334 commands had failed
+  this way, which silently dropped searches the model believed it had run.
+- `task_shell_wait` is now in the first-turn toolbox. A `bash` command that
+  moves to the background now tells the model to call it directly. Before,
+  every long build or test cost a `tool_search` round trip and a tool-catalog
+  re-pin, and models often polled with `sleep` instead.
+- `codewhale exec` receipts no longer report an empty final answer when a
+  background shell finished after the model answered. This happened in 52
+  of 185 DeepSeek exec runs, and a fleet worker then recorded no answer.
+- A reasoning-only response cut off at the output limit is no longer re-sent
+  up to two more times on Responses routes such as `deepseek-flash`. It now
+  fails with the output-limit message. The engine's own check missed the
+  `incomplete:` prefix that the Responses parser adds.
+- `tool_choice: "none"` now reaches the provider on Responses routes and on
+  DeepSeek Chat routes with thinking on. Compaction and final-report
+  requests rely on it; DeepSeek documents it as valid in thinking mode.
+  `required` and named choices are still not sent while DeepSeek is
+  thinking, because that returns a 400.
+- A DeepSeek Chat response that ends with `insufficient_system_resource` or
+  `aborted` is now treated as incomplete, not as a finished answer.
+- On DeepSeek, the Auto-Review guardian now asks for low reasoning effort.
+  It used to leave thinking at DeepSeek's default (high), so the reasoning
+  could use up the guardian's 4,096-token answer budget, report the review
+  as unavailable, and stall auto-approval.
+- Durability and blocking-call fixes from the #6553 and #6555 audits:
+  - On Windows the updater syncs the staged binary, tries an atomic replace
+    first, and reports where the previous binary is if restoring it fails.
+  - Config writes sync the temp file before the rename.
+  - The task store, Fleet run and receipt reads, and session listing now
+    run off the async runtime.
+  - Worktree names that are empty, start with `-`, or contain `..`, `\` or
+    control characters are refused. `git worktree add` gets a `--`
+    separator before the path.
+  - The boot snapshot prune repairs a HEAD that names a missing commit
+    before pruning, instead of logging "bad object HEAD" (Refs #6978).
+- Typing into a terminal dock that has no sessions no longer shows the
+  "reset or lost" error. Thanks @Lstarsky0 (#7010).
+- The `/mcp` Extensions panel's detail pane grows to fit its wrapped text,
+  up to a third of the panel, so names, descriptions and details are no
+  longer cut off at 80×24. Thanks @Lstarsky0 (#7011).
 - When a `tool_search` activation pushes an earlier deferred tool out of the
   bounded conversation toolbox (8 tools, 16 KiB of schemas), the search
   result now names it under `evicted_tool_references`. Before, the tool

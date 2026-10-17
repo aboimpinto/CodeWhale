@@ -4847,7 +4847,7 @@ impl McpPool {
     /// whether a browser login is needed and, if so, start it. Only touches
     /// config, the connection map, and the token store — it returns as soon
     /// as the authorization URL exists, so a caller holding the pool lock can
-    /// release it before the (up to five minute) browser wait in
+    /// release it before the (up to 15 minute) browser wait in
     /// [`oauth::McpOAuthToolLogin::finish`]. Holding the lock across that wait
     /// would freeze every other MCP call, the `/mcp` manager, and the
     /// Extensions view for the whole sign-in.

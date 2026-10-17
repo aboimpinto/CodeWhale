@@ -88,6 +88,22 @@ fn same_path(a: &Path, b: &Path) -> bool {
     a == b
 }
 
+fn worktree_name_error(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("Enter a branch / path name")
+    } else if name.starts_with('-') {
+        Some("Name cannot start with '-'")
+    } else if name.contains("..") {
+        Some("Name cannot contain '..'")
+    } else if name.contains('\\') {
+        Some("Name cannot contain '\\'")
+    } else if name.chars().any(char::is_control) {
+        Some("Name cannot contain control characters")
+    } else {
+        None
+    }
+}
+
 impl ModalView for WorktreeManagerView {
     fn kind(&self) -> ModalKind {
         ModalKind::WorktreeManager
@@ -209,8 +225,8 @@ impl WorktreeManagerView {
             }
             KeyCode::Enter => {
                 let name = self.create_buffer.trim();
-                if name.is_empty() {
-                    self.status = Some("Enter a branch / path name".into());
+                if let Some(message) = worktree_name_error(name) {
+                    self.status = Some(message.into());
                     return ViewAction::None;
                 }
                 let path = self

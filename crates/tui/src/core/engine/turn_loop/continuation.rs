@@ -246,7 +246,7 @@ impl Engine {
                     !pending_steers.is_empty(),
                     false,
                 )
-                && !stop_reason_is_output_limit(stop_reason.as_deref())
+                && !is_output_limit_stop_reason(stop_reason.as_deref())
                 && progress.reasoning_only_reprompts < self.config.reasoning_only_max_reprompts
             {
                 // Reasoning-only, clean stop: recover instead of dead-ending
@@ -304,7 +304,7 @@ impl Engine {
                 && !has_provider_reasoning
                 && stream_errors == 0
                 && stop_reason.is_some()
-                && !stop_reason_is_output_limit(stop_reason.as_deref())
+                && !is_output_limit_stop_reason(stop_reason.as_deref())
                 && should_fail_no_sendable_content(
                     tool_uses.is_empty(),
                     progress.turn_error.is_none(),
@@ -357,7 +357,7 @@ impl Engine {
                 let message = if zero_tool_text_call {
                     "Model answered only with a tool call, and this turn offers no tools."
                         .to_string()
-                } else if stop_reason_is_output_limit(stop_reason.as_deref()) {
+                } else if is_output_limit_stop_reason(stop_reason.as_deref()) {
                     // With or without streamed reasoning: a provider that
                     // keeps its reasoning to itself still spends the
                     // allowance on it (#6889).

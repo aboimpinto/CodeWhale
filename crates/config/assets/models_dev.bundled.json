@@ -10930,6 +10930,7 @@
       "kimi-k2-6": "kimi-k2.6",
       "deepseek-v4pro": "deepseek-v4-pro",
       "deepseek-v4flash": "deepseek-v4-flash",
+      "deepseek-flash": "deepseek-v4.1-flash",
       "mimo-v2-5": "mimo-v2.5",
       "mimo-v2-5-pro": "mimo-v2.5-pro"
     },

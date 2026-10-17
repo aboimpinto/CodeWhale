@@ -1857,6 +1857,7 @@ impl SnapshotRepo {
     }
 
     fn prune_older_than_locked(&self, max_age: Duration) -> io::Result<usize> {
+        self.repair_broken_head()?;
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_err(|e| io_other(format!("clock error: {e}")))?

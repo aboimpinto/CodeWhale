@@ -103,7 +103,12 @@ pub fn is_output_limit_stop_reason(reason: Option<&str>) -> bool {
             .unwrap_or_else(|| reason.trim());
         matches!(
             reason.to_ascii_lowercase().as_str(),
-            "length" | "max_tokens" | "max_output_tokens"
+            "length"
+                | "max_tokens"
+                | "max_output_tokens"
+                | "model_length"
+                | "output_limit"
+                | "max_completion_tokens"
         )
     })
 }
@@ -147,7 +152,10 @@ pub fn is_incomplete_stop_reason(reason: Option<&str>) -> bool {
             reason.starts_with("incomplete:")
                 || matches!(
                     reason.as_str(),
-                    "content_filter" | "model_context_window_exceeded"
+                    "content_filter"
+                        | "model_context_window_exceeded"
+                        | "insufficient_system_resource"
+                        | "aborted"
                 )
         })
 }

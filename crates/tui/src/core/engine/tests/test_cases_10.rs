@@ -1,6 +1,6 @@
 #[test]
 fn default_active_contract_keeps_discovery_and_core_tools_eager() {
-    const EXPECTED_NATIVE: [&str; 12] = [
+    const EXPECTED_NATIVE: [&str; 13] = [
         "read",
         "write",
         "edit",
@@ -12,6 +12,7 @@ fn default_active_contract_keeps_discovery_and_core_tools_eager() {
         "create_goal",
         "get_goal",
         "update_goal",
+        "task_shell_wait",
         "load_skill",
     ];
     assert_eq!(
@@ -559,6 +560,7 @@ async fn runtime_contract_tool_metric_uses_canonical_mode_surfaces() {
         "create_goal",
         "get_goal",
         "update_goal",
+        "task_shell_wait",
         "edit",
         "file_search",
         "read",
@@ -589,15 +591,19 @@ async fn runtime_contract_tool_metric_uses_canonical_mode_surfaces() {
             assert!(!full.contains(hidden), "{mode} must hide {hidden}");
         }
         // #6562: `[features] code_mode` defaults on, so Act/Operate promote
-        // `execute_tools` into the request head. Plan hides it entirely.
+        // `execute_tools` into the request head. Plan hides it entirely and
+        // registers only the foreground shell surface, so Plan omits
+        // `task_shell_wait`.
         let mut expected_mode_active = expected_active.clone();
         if mode != "plan" {
             expected_mode_active.insert("execute_tools");
+        } else {
+            expected_mode_active.remove("task_shell_wait");
         }
         assert_eq!(
             metric_tool_names(&payload, mode, "active"),
             expected_mode_active,
-            "{mode} must keep the same request head including goal controls"
+            "{mode} must expose the expected request head"
         );
     }
 

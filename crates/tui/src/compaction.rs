@@ -1842,9 +1842,9 @@ fn drop_oldest_history_messages(messages: &mut Vec<Message>) -> bool {
 /// Known limit: `tool_choice: "none"` keeps the summary from executing tools.
 /// Anthropic Messages documents a `tool_choice` change as invalidating the
 /// cached *message* blocks (system and tools stay cached), so on those routes
-/// the history is still re-read uncached. The Responses (Codex) builder does
-/// not send this field; its cache effect on Chat Completions routes has not
-/// been measured live.
+/// the history is still re-read uncached. The Responses builder forwards
+/// `none` (and sends `auto` for every other choice); its cache effect on
+/// Responses and Chat Completions routes has not been measured live.
 pub(crate) fn compaction_summary_request(
     history: Vec<Message>,
     config: &CompactionConfig,

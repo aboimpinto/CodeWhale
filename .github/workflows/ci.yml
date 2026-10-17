@@ -214,7 +214,7 @@ jobs:
         with:
           fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
       - name: Check version drift
@@ -285,7 +285,7 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
       - name: Install data parser
@@ -303,7 +303,7 @@ jobs:
       - uses: actions/checkout@v7
       - name: Check Lighthouse SSH policy
         run: python3 scripts/tencent-lighthouse/test_bootstrap_ssh.py
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
       - name: Test reusable GitHub review action
@@ -381,7 +381,7 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2
@@ -414,7 +414,7 @@ jobs:
         working-directory: extensions/vscode
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           # The extension targets VS Code >=1.90, whose extension host is
           # Node 20, and its @types/node pin is ^20. Build and test on the
@@ -431,7 +431,7 @@ jobs:
         run: npm test
       # @vscode/vsce 4 is a build-only packager that requires Node >=22. The
       # extension itself still compiles and tests on Node 20 above.
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 22
       - name: Package VS Code extension
@@ -474,7 +474,7 @@ jobs:
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - uses: taiki-e/install-action@nextest
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         with:
           node-version: 24
       - name: Hermetic safety and authorization tests
@@ -927,7 +927,7 @@ jobs:
         run: |
           python3 -B scripts/test_check_command_core_navigation_proof.py
           sh scripts/check-portable-core-navigation.sh
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         # The extension-host integration tests spawn the real bundle under
         # Node >= 22.19; CODEWHALE_EXT_HOST_TESTS below makes a missing Node a
         # failure instead of a silent skip.
@@ -1330,7 +1330,7 @@ jobs:
           echo "SCCACHE_GHA_ENABLED=true" >> "${GITHUB_ENV}"
           echo "RUSTC_WRAPPER=sccache" >> "${GITHUB_ENV}"
           echo "SCCACHE_IGNORE_SERVER_IO_ERROR=1" >> "${GITHUB_ENV}"
-      - uses: actions/setup-node@v7
+      - uses: actions/setup-node@v7.1.0
         if: needs.changes.outputs.heavy == 'true' && (matrix.os != 'ubuntu-latest' || github.event_name == 'workflow_dispatch' || github.event_name == 'pull_request')
         with:
           node-version: 22

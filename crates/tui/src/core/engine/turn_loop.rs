@@ -6203,36 +6203,6 @@ fn resolve_tool_definition<'a>(
     tool_def
 }
 
-/// Decide whether a no-sendable-content provider step must fail the turn.
-///
-/// Reached when the assistant turn had no sendable content (no Text, no
-/// ToolUse — either reasoning-only or completely empty). We fail *only* when
-/// the turn is genuinely finishing: no tool uses to dispatch, no `turn_error`
-/// already surfaced for this turn, the request wasn't cancelled, AND the turn
-/// is not about to CONTINUE — there are no pending steers and we are not
-/// holding the turn open for running sub-agents. The failure must fire at the
-/// point the turn truly ends; emitting it earlier (at the persist site) would
-/// show a spurious terminal error immediately before the turn resumed for a
-/// steer or a sub-agent completion.
-/// Whether a provider stop reason names an output-length cap. Re-requesting
-/// after one only reproduces it, so those fail honestly (the user needs a
-/// larger max-tokens or a shorter turn) rather than retry.
-fn stop_reason_is_output_limit(stop_reason: Option<&str>) -> bool {
-    matches!(
-        stop_reason
-            .map(|reason| reason.trim().to_ascii_lowercase())
-            .as_deref(),
-        Some(
-            "length"
-                | "max_tokens"
-                | "max_output_tokens"
-                | "model_length"
-                | "output_limit"
-                | "max_completion_tokens"
-        )
-    )
-}
-
 /// Retries allowed after a clean terminal stop that carried no text, no
 /// reasoning and no tool call (#6310): one exact-prefix re-request, then one
 /// nudged re-request. Shared by the engine turn loop and the ACP prompt loop.
@@ -6260,6 +6230,17 @@ pub(crate) fn plan_empty_stop_retry(retries_so_far: u32) -> Option<EmptyStopRetr
     }
 }
 
+/// Decide whether a no-sendable-content provider step must fail the turn.
+///
+/// Reached when the assistant turn had no sendable content (no Text, no
+/// ToolUse — either reasoning-only or completely empty). We fail *only* when
+/// the turn is genuinely finishing: no tool uses to dispatch, no `turn_error`
+/// already surfaced for this turn, the request wasn't cancelled, AND the turn
+/// is not about to CONTINUE — there are no pending steers and we are not
+/// holding the turn open for running sub-agents. The failure must fire at the
+/// point the turn truly ends; emitting it earlier (at the persist site) would
+/// show a spurious terminal error immediately before the turn resumed for a
+/// steer or a sub-agent completion.
 fn should_fail_no_sendable_content(
     tool_uses_empty: bool,
     turn_error_is_none: bool,

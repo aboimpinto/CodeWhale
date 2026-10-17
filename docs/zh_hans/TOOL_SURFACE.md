@@ -1,7 +1,7 @@
 # 工具表面（tool surface）
 
 > 英文原文：[TOOL_SURFACE.md](../TOOL_SURFACE.md)。
-> 最后与英文同步日期（last synced with English revision）：2026-09-29。
+> 最后与英文同步日期（last synced with English revision）：2026-10-17。
 > 2026-10-06 补齐本地解释器权限与后端限制；现有 MCP 有界发现段落已核对。
 
 本文描述当前面向模型的工具（tool）契约。产生它的 v0.9.1 切换记录在
@@ -20,7 +20,7 @@
 
 ## 默认激活契约
 
-新回合开始时带有十二个预加载（eager）的原生名称，外加合成的 `tool_search`：
+新回合开始时带有十三个预加载（eager）的原生名称，外加合成的 `tool_search`：
 
 1. `read`
 2. `write`
@@ -33,14 +33,16 @@
 9. `create_goal`
 10. `get_goal`
 11. `update_goal`
-12. `load_skill`
-13. `tool_search`（合成，始终激活）
+12. `task_shell_wait`
+13. `load_skill`
+14. `tool_search`（合成，始终激活）
 
-这十二个原生名称就是 `crates/tui/src/core/engine/tool_catalog.rs` 里的
+这十三个原生名称就是 `crates/tui/src/core/engine/tool_catalog.rs` 里的
 `DEFAULT_ACTIVE_NATIVE_TOOLS`，由
 `default_active_contract_keeps_discovery_and_core_tools_eager` 固定住。
 权限边界（authority boundary）可以在子智能体达到最大深度时移除 `agent`，
-但仅凭路由大小不得改变这套核心词汇。
+Plan 只注册前台 shell 表面（因此没有 `task_shell_wait`），但仅凭路由大小不得改变
+这套核心词汇。
 
 直接 schema 刻意保持精简：
 
@@ -57,6 +59,7 @@
 | `create_goal` | 目标文本以及可选预算 | 启动本回合所追求的会话目标（goal）。 |
 | `get_goal` | 无 | 读取当前生效的目标及其进度。 |
 | `update_goal` | 终态状态 | 把目标标记为完成或受阻。 |
+| `task_shell_wait` | `task_id`，以及可选的 `wait`、`timeout_ms`、`cancel`、`gate` | 轮询或停止一个后台 shell 任务。完成结果仍会作为运行时事件到达，因此只在需要提前输出、真正的依赖屏障或闸门证据时使用。 |
 | `load_skill` | 可选的 `name`、`query` | 加载命名技能的 `SKILL.md` 正文及配套文件列表；省略 `name` 或使用 `name="list"` 列出可调用技能，也可用 `query` 搜索名称与描述。 |
 | `tool_search` | `query`、可选的匹配控制项 | 发现策略允许的延迟工具，并把选中的 schema 加入本次对话的工具箱。 |
 
@@ -212,8 +215,9 @@ SHA-256 摘要；更大的载荷保持不可用。提供商（provider）适配�
 ## 长时间运行的工作
 
 `bash` 只运行一条可取消的前台命令。它不携带 background、TTY、wait、interact
-或 cancel 动作字段。有状态的进程与终端控制属于专门功能，必须被显式发现；
-它不会扩大首回合的 shell schema。
+或 cancel 动作字段。有状态的进程与终端控制保持在 shell schema 之外：
+`task_shell_wait` 对 `bash` 启动的后台任务预加载，交互式终端控制仍需经
+`tool_search` 发现；这些控制不会扩大首回合的 shell schema。
 
 当工作本身需要可持久化的生命周期、结构化闸门、工件、可重放时间线或稳定的
 任务 id 时，请使用 `tasks`。大型工具结果应当留在有界的句柄或工件之后，
@@ -308,6 +312,6 @@ cargo test --locked -p codewhale-tui --lib core::engine::tests::print_mode_tool_
 `1 passed`（被忽略的指标测试报告 `1 passed` 只是因为 `--ignored` 选中了它）；
 `0 passed` 意味着过滤器没匹配到任何东西，检查根本没跑。
 
-不依赖提供商的回执必须报告上面列出的十二个默认激活名称。另一份仓库范围的
+不依赖提供商的回执必须报告上面列出的十三个默认激活名称。另一份仓库范围的
 工具计数可能包含延迟、动态、受特性开关控制以及仅为兼容而存在的注册；
 它不是放进首回合模型目录的工具数量。

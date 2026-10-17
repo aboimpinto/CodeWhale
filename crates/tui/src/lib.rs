@@ -14766,6 +14766,7 @@ fn exec_stream_final_answer_text(
     }
     let turn_start = messages.iter().rposition(|message| {
         message.role == Role::User
+            && !crate::runtime_handoff::is_runtime_owned_user_message(message)
             && !message
                 .content
                 .iter()

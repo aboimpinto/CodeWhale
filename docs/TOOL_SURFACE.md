@@ -19,7 +19,7 @@ Implementation sources:
 
 ## Default-active contract
 
-New turns start with twelve eager native names plus synthetic `tool_search`:
+New turns start with thirteen eager native names plus synthetic `tool_search`:
 
 1. `read`
 2. `write`
@@ -32,13 +32,15 @@ New turns start with twelve eager native names plus synthetic `tool_search`:
 9. `create_goal`
 10. `get_goal`
 11. `update_goal`
-12. `load_skill`
-13. `tool_search` (synthetic, always active)
+12. `task_shell_wait`
+13. `load_skill`
+14. `tool_search` (synthetic, always active)
 
-The twelve native names are `DEFAULT_ACTIVE_NATIVE_TOOLS` in
+The thirteen native names are `DEFAULT_ACTIVE_NATIVE_TOOLS` in
 `crates/tui/src/core/engine/tool_catalog.rs`, pinned by
 `default_active_contract_keeps_discovery_and_core_tools_eager`. An authority
-boundary may remove `agent` at the maximum child depth, but route size alone
+boundary may remove `agent` at the maximum child depth, and Plan registers only
+the foreground shell surface (so no `task_shell_wait`), but route size alone
 must not change this core vocabulary.
 
 The direct schemas deliberately stay small:
@@ -56,6 +58,7 @@ The direct schemas deliberately stay small:
 | `create_goal` | objective plus optional budget | Start the session goal the turn works toward. |
 | `get_goal` | none | Read the active goal and its progress. |
 | `update_goal` | terminal status | Mark the goal complete or blocked. |
+| `task_shell_wait` | `task_id`, optional `wait`, `timeout_ms`, `cancel`, `gate` | Poll or stop a background shell task. Completion still arrives as a runtime event, so use it for early output, true barriers, or gate evidence. |
 | `load_skill` | optional `name`, `query` | Load a named skill's `SKILL.md` body and companion-file list; omit `name` or use `name="list"` to list eligible skills, or use `query` to search names and descriptions. |
 | `tool_search` | `query`, optional matching controls | Discover policy-allowed deferred tools and add selected schemas to this conversation's toolbox. |
 
@@ -270,8 +273,9 @@ loaded through `tool_search` when needed.
 
 `bash` runs one cancellable foreground command. It does not carry background,
 TTY, wait, interact, or cancel action fields. Stateful process and terminal
-control is specialized functionality that must be discovered explicitly; it
-does not enlarge the first-turn shell schema.
+control stays out of the shell schema: `task_shell_wait` is eager for the
+background jobs `bash` starts, while interactive terminal control remains
+deferred behind `tool_search`; neither enlarges the first-turn shell schema.
 
 Use `tasks` when the work itself needs a durable lifecycle, structured gates,
 artifacts, replayable timelines, or a stable task id. Large tool results should
@@ -382,7 +386,7 @@ above must report `1 passed` (the ignored metrics test reports `1 passed`
 only because `--ignored` selects it); `0 passed` means the filter matched
 nothing and the check did not run.
 
-The provider-free receipt must report the twelve default-active names listed
+The provider-free receipt must report the thirteen default-active names listed
 above. A separate repository-wide tool count may include deferred, dynamic,
 feature-gated, and compatibility-only registrations; it is not the number of
 tools placed in the first-turn model catalog.

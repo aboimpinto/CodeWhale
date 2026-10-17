@@ -4312,70 +4312,85 @@ fn fleet_sse_event(event: &FleetRuntimeEvent) -> SseEvent {
 }
 
 async fn list_fleet_runs(State(state): State<RuntimeApiState>) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let runs: Vec<_> = ledger_state
-        .runs
-        .values()
-        .map(|run| fleet_run_summary_json(&manager, run, &ledger_state))
-        .collect::<Result<Vec<_>, _>>()?;
-    let status = manager
-        .status()
-        .map_err(|err| ApiError::internal(format!("Failed to read Fleet status: {err}")))?;
-    Ok(Json(json!({
-        "status": fleet_status_json(&status),
-        "runs": runs,
-    })))
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let runs: Vec<_> = ledger_state
+            .runs
+            .values()
+            .map(|run| fleet_run_summary_json(&manager, run, &ledger_state))
+            .collect::<Result<Vec<_>, _>>()?;
+        let status = manager
+            .status()
+            .map_err(|err| ApiError::internal(format!("Failed to read Fleet status: {err}")))?;
+        Ok::<_, ApiError>(json!({
+            "status": fleet_status_json(&status),
+            "runs": runs,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet run listing task failed: {error}")))??;
+    Ok(Json(response))
 }
 
 async fn get_fleet_run(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let run = ledger_state
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
-    Ok(Json(fleet_run_detail_json(&manager, run, &ledger_state)?))
+    let detail = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let run = ledger_state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
+        fleet_run_detail_json(&manager, run, &ledger_state)
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet run read task failed: {error}")))??;
+    Ok(Json(detail))
 }
 
 async fn list_fleet_run_workers(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let run = ledger_state
-        .runs
-        .get(&run_id)
-        .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
-    let workers = run
-        .worker_specs
-        .iter()
-        .map(|worker| {
-            manager
-                .inspect_worker(&worker.id)
-                .map(|inspection| fleet_worker_json(&inspection))
-                .map_err(|err| {
-                    ApiError::internal(format!(
-                        "Failed to inspect Fleet worker {}: {err}",
-                        worker.id
-                    ))
-                })
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(Json(json!({
-        "run_id": run_id,
-        "workers": workers,
-    })))
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let run = ledger_state
+            .runs
+            .get(&run_id)
+            .ok_or_else(|| ApiError::not_found(format!("Fleet run '{run_id}' not found")))?;
+        let workers = run
+            .worker_specs
+            .iter()
+            .map(|worker| {
+                manager
+                    .inspect_worker(&worker.id)
+                    .map(|inspection| fleet_worker_json(&inspection))
+                    .map_err(|err| {
+                        ApiError::internal(format!(
+                            "Failed to inspect Fleet worker {}: {err}",
+                            worker.id
+                        ))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok::<_, ApiError>(json!({
+            "run_id": run_id,
+            "workers": workers,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet worker listing task failed: {error}")))??;
+    Ok(Json(response))
 }
 
 async fn get_fleet_worker(
@@ -4492,104 +4507,121 @@ async fn list_fleet_run_receipts(
     State(state): State<RuntimeApiState>,
     Path(run_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    if !ledger_state.runs.contains_key(&run_id) {
-        return Err(ApiError::not_found(format!(
-            "Fleet run '{run_id}' not found"
-        )));
-    }
-    let run_id_parsed = FleetRunId::from(run_id.clone());
-    let receipts: Vec<Value> = ledger_state
-        .receipts
-        .values()
-        .filter(|r| r.run_id == run_id_parsed)
-        .map(fleet_receipt_json)
-        .collect();
-    Ok(Json(json!({
-        "run_id": run_id,
-        "receipts": receipts,
-    })))
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        if !ledger_state.runs.contains_key(&run_id) {
+            return Err(ApiError::not_found(format!(
+                "Fleet run '{run_id}' not found"
+            )));
+        }
+        let run_id_parsed = FleetRunId::from(run_id.clone());
+        let receipts: Vec<Value> = ledger_state
+            .receipts
+            .values()
+            .filter(|r| r.run_id == run_id_parsed)
+            .map(fleet_receipt_json)
+            .collect();
+        Ok::<_, ApiError>(json!({
+            "run_id": run_id,
+            "receipts": receipts,
+        }))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet receipt listing task failed: {error}")))??;
+    Ok(Json(response))
 }
 
 async fn get_fleet_run_receipt(
     State(state): State<RuntimeApiState>,
     Path((run_id, task_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let key = format!("{run_id}:{task_id}");
-    let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
-        ApiError::not_found(format!(
-            "no receipt found for run '{run_id}' task '{task_id}'"
-        ))
-    })?;
-    Ok(Json(fleet_receipt_json(receipt)))
+    let receipt = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let key = format!("{run_id}:{task_id}");
+        let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
+            ApiError::not_found(format!(
+                "no receipt found for run '{run_id}' task '{task_id}'"
+            ))
+        })?;
+        Ok::<_, ApiError>(fleet_receipt_json(receipt))
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("Fleet receipt read task failed: {error}")))??;
+    Ok(Json(receipt))
 }
 
 async fn inspect_fleet_run_receipt_evidence(
     State(state): State<RuntimeApiState>,
     Path((run_id, task_id)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
-    let manager = open_fleet_manager(&state)?;
-    let ledger_state = manager
-        .rebuild_state()
-        .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
-    let key = format!("{run_id}:{task_id}");
-    let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
-        ApiError::not_found(format!(
-            "no receipt found for run '{run_id}' task '{task_id}'"
-        ))
-    })?;
-    // Locate the most recent Receipt-kind artifact.
-    let receipt_artifact = receipt
-        .artifacts
-        .iter()
-        .rfind(|a| a.kind == FleetArtifactKind::Receipt)
-        .ok_or_else(|| {
+    let response = tokio::task::spawn_blocking(move || {
+        let manager = open_fleet_manager(&state)?;
+        let ledger_state = manager
+            .rebuild_state()
+            .map_err(|err| ApiError::internal(format!("Failed to rebuild Fleet state: {err}")))?;
+        let key = format!("{run_id}:{task_id}");
+        let receipt = ledger_state.receipts.get(&key).ok_or_else(|| {
             ApiError::not_found(format!(
-                "no verifier evidence file for run '{run_id}' task '{task_id}'"
+                "no receipt found for run '{run_id}' task '{task_id}'"
             ))
         })?;
-    // Receipt artifacts are workspace-relative paths recorded by the verifier;
-    // reject absolute paths and `..` escapes before joining onto the workspace.
-    // An EMPTY recorded path is not a path at all: joining it would resolve
-    // to the workspace directory itself and read it as a file.
-    if receipt_artifact.path.as_os_str().is_empty() {
-        return Err(ApiError::not_found(format!(
-            "no verifier evidence file recorded for run '{run_id}' task '{task_id}'"
-        )));
-    }
-    if !crate::fleet::artifacts::path_is_confined(&receipt_artifact.path) {
-        return Err(ApiError::bad_request(format!(
-            "evidence path for run '{run_id}' task '{task_id}' escapes the workspace"
-        )));
-    }
-    let (raw, size_bytes) = crate::fleet::artifacts::read_verified(
-        &state.workspace,
-        receipt_artifact,
-        MAX_RECEIPT_EVIDENCE_READ_BYTES,
-    )
-    .map_err(|err| {
-        ApiError::bad_request(format!("Receipt evidence could not be verified: {err}"))
-    })?;
-    let truncated = size_bytes > MAX_RECEIPT_EVIDENCE_READ_BYTES;
-    // Parse as JSON if possible; fall back to a raw string representation.
-    let content: Value = serde_json::from_slice(&raw)
-        .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&raw).into_owned()));
-    Ok(Json(json!({
-        "run_id": run_id,
-        "task_id": task_id,
-        "path": receipt_artifact.path,
-        "checksum": receipt_artifact.checksum,
-        "size_bytes": size_bytes,
-        "truncated": truncated,
-        "content": content,
-    })))
+        // Locate the most recent Receipt-kind artifact.
+        let receipt_artifact = receipt
+            .artifacts
+            .iter()
+            .rfind(|a| a.kind == FleetArtifactKind::Receipt)
+            .ok_or_else(|| {
+                ApiError::not_found(format!(
+                    "no verifier evidence file for run '{run_id}' task '{task_id}'"
+                ))
+            })?;
+        // Receipt artifacts are workspace-relative paths recorded by the verifier;
+        // reject absolute paths and `..` escapes before joining onto the workspace.
+        // An EMPTY recorded path is not a path at all: joining it would resolve
+        // to the workspace directory itself and read it as a file.
+        if receipt_artifact.path.as_os_str().is_empty() {
+            return Err(ApiError::not_found(format!(
+                "no verifier evidence file recorded for run '{run_id}' task '{task_id}'"
+            )));
+        }
+        if !crate::fleet::artifacts::path_is_confined(&receipt_artifact.path) {
+            return Err(ApiError::bad_request(format!(
+                "evidence path for run '{run_id}' task '{task_id}' escapes the workspace"
+            )));
+        }
+        let (raw, size_bytes) = crate::fleet::artifacts::read_verified(
+            &state.workspace,
+            receipt_artifact,
+            MAX_RECEIPT_EVIDENCE_READ_BYTES,
+        )
+        .map_err(|err| {
+            ApiError::bad_request(format!("Receipt evidence could not be verified: {err}"))
+        })?;
+        let truncated = size_bytes > MAX_RECEIPT_EVIDENCE_READ_BYTES;
+        // Parse as JSON if possible; fall back to a raw string representation.
+        let content: Value = serde_json::from_slice(&raw)
+            .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&raw).into_owned()));
+        Ok::<_, ApiError>(json!({
+            "run_id": run_id,
+            "task_id": task_id,
+            "path": receipt_artifact.path,
+            "checksum": receipt_artifact.checksum,
+            "size_bytes": size_bytes,
+            "truncated": truncated,
+            "content": content,
+        }))
+    })
+    .await
+    .map_err(|error| {
+        ApiError::internal(format!("Fleet receipt evidence read task failed: {error}"))
+    })??;
+    Ok(Json(response))
 }
 
 fn open_fleet_manager(state: &RuntimeApiState) -> Result<FleetManager, ApiError> {

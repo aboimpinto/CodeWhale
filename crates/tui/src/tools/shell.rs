@@ -5382,7 +5382,7 @@ fn finish_contract_bash_result(
         };
         let notice = promotion_notice(context, task_id, result.duration_ms / 1_000, &output);
         return Ok(ToolResult::success(format!(
-            "{notice}\n\nOutput so far:\n{so_far}\n\nCompletion will appear as a runtime event. To see more output or block until it finishes, call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id}\". To stop it, send the same call with cancel=true. It also stops when the session ends."
+            "{notice}\n\nOutput so far:\n{so_far}\n\nCompletion will appear as a runtime event. To see more output or block until it finishes, call `task_shell_wait` directly with task_id=\"{task_id}\"; do not sleep-poll with bash. To stop it, send the same call with cancel=true. It also stops when the session ends."
         )).with_metadata(metadata));
     }
     if result.status != ShellStatus::Completed {
@@ -5428,7 +5428,7 @@ impl ToolSpec for LowercaseBashTool {
             "properties": {
                 "command": { "type": "string", "description": guidance::runtime_command_guidance() },
                 "description": { "type": "string", "description": "Optional few-word summary shown to the user beside the command." },
-                "timeout": { "type": "number", "description": "Optional seconds to wait in the foreground (default 30 seconds). A command still running then is not killed: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id. Find task_shell_wait with tool_search to read more or wait for it." },
+                "timeout": { "type": "number", "description": "Optional seconds to wait in the foreground (default 30 seconds). A command still running then is not killed: it moves to the background by itself and you get its output so far, how long ago it last printed, its build phase, and a task_id. Call task_shell_wait directly with that task_id to read more or wait for it; do not sleep-poll with bash." },
                 "read_only": { "type": "boolean", "description": "Set true to run analysis code (including Python/SQLite) with mandatory native filesystem read-only isolation and no network. Available during peer writes. Refused when native enforcement is unavailable; no background, stdin, external backend, or sandbox escalation." },
                 "sandbox_permissions": {
                     "type": "string",
@@ -6509,11 +6509,11 @@ impl ToolSpec for BashTool {
                             &format!("{}{}", result.stdout, result.stderr),
                         );
                         format!(
-                            "{notice}\n\nOutput so far:\n{so_far}\n\n{completion_contract} Keep working if you can. To decide: call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" for more output or completion, or with cancel=true to stop it. It also stops when the session ends."
+                            "{notice}\n\nOutput so far:\n{so_far}\n\n{completion_contract} Keep working if you can. To decide: call `task_shell_wait` directly with task_id=\"{task_id_str}\" for more output or completion, or with cancel=true to stop it. It also stops when the session ends; do not sleep-poll with bash."
                         )
                     } else {
                         format!(
-                            "Background task started: {task_id_str}\n\nReturns immediately; {completion_contract} Codewhale terminates this task when the session exits. If a service must survive a successful headless exec, start it with background=true and persist=true. Keep working; call `tool_search` for `task_shell_wait`, then `task_shell_wait` with task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout."
+                            "Background task started: {task_id_str}\n\nReturns immediately; {completion_contract} Codewhale terminates this task when the session exits. If a service must survive a successful headless exec, start it with background=true and persist=true. Keep working; call `task_shell_wait` directly with task_id=\"{task_id_str}\" at a true dependency to block until completion or timeout. Do not sleep-poll with bash."
                         )
                     }
                 } else if result.status == ShellStatus::Killed && was_cancelled {

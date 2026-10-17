@@ -2144,8 +2144,8 @@ async fn background_shell_job_preserves_origin_identity() {
         result.content
     );
     assert!(
-        result.content.contains("`tool_search`") && result.content.contains("task_shell_wait"),
-        "owned background work must name a callable wait tool: {}",
+        result.content.contains("`task_shell_wait` directly"),
+        "owned background work must name the eager wait tool: {}",
         result.content
     );
     assert_eq!(
@@ -3277,9 +3277,9 @@ async fn test_exec_shell_foreground_can_move_to_background() {
     assert!(result.success);
     assert!(result.content.contains("moved to the background"));
     // The detach message points the model at a tool it can actually call.
-    // `Bash` is hidden; `task_shell_wait` is deferred behind `tool_search`.
+    // `Bash` is hidden; `task_shell_wait` is eager, so the message names it directly.
     assert!(
-        result.content.contains("`tool_search`") && result.content.contains("task_shell_wait"),
+        result.content.contains("`task_shell_wait` directly"),
         "{}",
         result.content
     );
@@ -3395,8 +3395,7 @@ async fn lowercase_bash_foreground_detach_is_a_successful_running_receipt() {
     assert!(
         result.content.contains("moved to the background")
             && result.content.contains("not killed")
-            && result.content.contains("`tool_search`")
-            && result.content.contains("task_shell_wait"),
+            && result.content.contains("`task_shell_wait` directly"),
         "{}",
         result.content
     );

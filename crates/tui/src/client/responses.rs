@@ -113,7 +113,12 @@ pub(super) fn build_responses_body_for_provider(
             } else {
                 json!(responses_tools)
             };
-            body["tool_choice"] = json!("auto");
+            let tool_choice = request.tool_choice.as_ref().and_then(Value::as_str);
+            body["tool_choice"] = if tool_choice == Some("none") {
+                json!("none")
+            } else {
+                json!("auto")
+            };
             // The plan preview decoder tracks one active function-call block.
             body["parallel_tool_calls"] = json!(provider != ProviderKind::OpenaiCodex);
         }

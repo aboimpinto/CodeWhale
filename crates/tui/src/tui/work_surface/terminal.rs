@@ -441,7 +441,7 @@ fn input(app: &mut App, bytes: Vec<u8>) {
                 policy: policy(app),
             },
         );
-    } else {
+    } else if !dock.sessions.is_empty() {
         app.work_surface.terminal.error = Some(app.tr(MessageId::TerminalDockLost).into_owned());
         app.needs_redraw = true;
     }

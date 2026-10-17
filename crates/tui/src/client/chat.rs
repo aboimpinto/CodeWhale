@@ -1213,9 +1213,9 @@ pub(crate) fn build_chat_wire_body(
             body["tools"] = json!(chat_tools);
         }
     }
-    if should_send_tool_choice_for_chat(provider, request.reasoning_effort.as_deref())
-        && let Some(choice) = request.tool_choice.as_ref()
+    if let Some(choice) = request.tool_choice.as_ref()
         && let Some(mapped) = map_tool_choice_for_chat(choice)
+        && should_send_tool_choice_for_chat(provider, request.reasoning_effort.as_deref(), &mapped)
     {
         if matches!(provider, crate::config::ProviderKind::Moonshot)
             && let Some(name) = mapped.pointer("/function/name").and_then(Value::as_str)
@@ -3223,11 +3223,15 @@ fn map_tool_choice_for_chat(choice: &Value) -> Option<Value> {
     }
 }
 
-fn should_send_tool_choice_for_chat(provider: ProviderKind, effort: Option<&str>) -> bool {
+fn should_send_tool_choice_for_chat(
+    provider: ProviderKind,
+    effort: Option<&str>,
+    choice: &Value,
+) -> bool {
     if !matches!(provider, ProviderKind::Deepseek) {
         return true;
     }
-    !reasoning_effort_enables_thinking(effort)
+    !reasoning_effort_enables_thinking(effort) || choice.as_str() == Some("none")
 }
 
 fn reasoning_effort_enables_thinking(effort: Option<&str>) -> bool {
@@ -4502,15 +4506,24 @@ mod stream_diagnostics_tests {
     }
 
     #[test]
-    fn deepseek_thinking_omits_tool_choice() {
+    fn deepseek_thinking_sends_only_none_tool_choice() {
+        let required = json!("required");
+        let named = json!({
+            "type": "function",
+            "function": { "name": "read_file" }
+        });
         for effort in [Some("high"), Some("max"), Some("medium"), Some("")] {
             assert!(
-                !should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort),
-                "DeepSeek thinking rejects explicit tool_choice for {effort:?}"
+                !should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort, &required),
+                "DeepSeek thinking rejects required tool_choice for {effort:?}"
             );
             assert!(
-                !should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort),
-                "DeepSeek CN thinking rejects explicit tool_choice for {effort:?}"
+                !should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort, &named),
+                "DeepSeek thinking rejects named tool_choice for {effort:?}"
+            );
+            assert!(
+                should_send_tool_choice_for_chat(ProviderKind::Deepseek, effort, &json!("none")),
+                "DeepSeek thinking accepts tool_choice none for {effort:?}"
             );
         }
 
@@ -4523,12 +4536,14 @@ mod stream_diagnostics_tests {
         ] {
             assert!(should_send_tool_choice_for_chat(
                 ProviderKind::Deepseek,
-                effort
+                effort,
+                &required
             ));
         }
         assert!(should_send_tool_choice_for_chat(
             ProviderKind::Openrouter,
-            Some("high")
+            Some("high"),
+            &required
         ));
     }
 

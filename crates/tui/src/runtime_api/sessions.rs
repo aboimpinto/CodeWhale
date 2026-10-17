@@ -154,19 +154,25 @@ pub(super) async fn list_sessions(
     State(state): State<RuntimeApiState>,
     Query(query): Query<SessionsQuery>,
 ) -> Result<Json<SessionsResponse>, ApiError> {
-    let manager = SessionManager::new(state.sessions_dir.clone())
-        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
-    let all = manager
-        .list_sessions()
-        .map_err(|e| ApiError::internal(format!("Failed to list sessions: {e}")))?;
-    // This route keeps returning full `SessionMetadata` for compatibility;
-    // `/v1/sessions/summary` is the projected shape. Membership *and* order
-    // come from the shared projection so the two routes never disagree.
-    let sessions: Vec<SessionMetadata> = project_sessions(&all, &projection_query(&query), None)
-        .into_iter()
-        .filter_map(|summary| all.iter().find(|m| m.id == summary.id).cloned())
-        .collect();
-    Ok(Json(SessionsResponse { sessions }))
+    let projection = projection_query(&query);
+    tokio::task::spawn_blocking(move || {
+        let manager = SessionManager::new(state.sessions_dir)
+            .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+        let all = manager
+            .list_sessions()
+            .map_err(|e| ApiError::internal(format!("Failed to list sessions: {e}")))?;
+        // This route keeps returning full `SessionMetadata` for compatibility;
+        // `/v1/sessions/summary` is the projected shape. Membership *and* order
+        // come from the shared projection so the two routes never disagree.
+        let sessions: Vec<SessionMetadata> = project_sessions(&all, &projection, None)
+            .into_iter()
+            .filter_map(|summary| all.iter().find(|m| m.id == summary.id).cloned())
+            .collect();
+        Ok::<_, ApiError>(SessionsResponse { sessions })
+    })
+    .await
+    .map_err(|_| ApiError::internal("session listing failed"))?
+    .map(Json)
 }
 
 /// `GET /v1/sessions/summary` — the projected row shape.
@@ -178,16 +184,18 @@ pub(super) async fn list_sessions_summary(
     State(state): State<RuntimeApiState>,
     Query(query): Query<SessionsQuery>,
 ) -> Result<Json<Vec<SessionSummary>>, ApiError> {
-    let manager = SessionManager::new(state.sessions_dir.clone())
-        .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
-    let all = manager
-        .list_sessions()
-        .map_err(|e| ApiError::internal(format!("Failed to list sessions: {e}")))?;
-    Ok(Json(project_sessions(
-        &all,
-        &projection_query(&query),
-        None,
-    )))
+    let projection = projection_query(&query);
+    tokio::task::spawn_blocking(move || {
+        let manager = SessionManager::new(state.sessions_dir)
+            .map_err(|e| ApiError::internal(format!("Failed to open sessions dir: {e}")))?;
+        let all = manager
+            .list_sessions()
+            .map_err(|e| ApiError::internal(format!("Failed to list sessions: {e}")))?;
+        Ok::<_, ApiError>(project_sessions(&all, &projection, None))
+    })
+    .await
+    .map_err(|_| ApiError::internal("session summary listing failed"))?
+    .map(Json)
 }
 
 /// `PATCH /v1/sessions/{id}` — rename and/or archive a saved session.
