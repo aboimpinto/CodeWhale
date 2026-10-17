@@ -5729,13 +5729,12 @@ fn provider_source_label(source: ProviderSource) -> String {
 }
 
 fn canonical_model_for_set(model: &str) -> &str {
-    match model.to_ascii_lowercase().as_str() {
-        "pro" | "deepseek-v4pro" => "deepseek-v4-pro",
-        "flash" | "deepseek-v4flash" => "deepseek-v4-flash",
-        "flash-vision" | "deepseek-v4flashvisionexp" => "deepseek-v4-flash-vision-exp",
-        "auto" => "auto",
-        _ => model,
+    let lower = model.to_ascii_lowercase();
+    if lower == "auto" {
+        return "auto";
     }
+    codewhale_config::catalog::reviewed::compatibility_alias("canonical_model_name", &lower)
+        .unwrap_or(model)
 }
 
 /// The provider (and its endpoint) whose model `model set` writes.
@@ -7822,10 +7821,7 @@ verbosity = "concise"
     #[test]
     fn model_set_canonicalizes_deepseek_vision_aliases() {
         for alias in ["flash-vision", "deepseek-v4flashvisionexp"] {
-            assert_eq!(
-                canonical_model_for_set(alias),
-                "deepseek-v4-flash-vision-exp"
-            );
+            assert_eq!(canonical_model_for_set(alias), "deepseek-flash");
         }
         assert_eq!(
             canonical_model_for_set("deepseek-v4-flash-vision-exp"),

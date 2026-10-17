@@ -472,7 +472,7 @@ impl ModelInventory {
                 (
                     ProviderKind::Deepseek,
                     None,
-                    "deepseek-v4-flash".to_string(),
+                    "deepseek-flash".to_string(),
                     None,
                 )
             });

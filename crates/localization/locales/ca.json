@@ -418,7 +418,7 @@
   "ConfigActionChoose": "Enter obre les opcions",
   "ConfigActionEdit": "Enter edita",
   "ConfigActionReadOnly": "només lectura",
-  "ModelPickerAutoNetworkHint": "per torn · proveïdors disponibles · petició + context recent → DeepSeek / deepseek-v4-flash",
+  "ModelPickerAutoNetworkHint": "per torn · proveïdors disponibles · petició + context recent → DeepSeek / deepseek-flash",
   "ModelPickerAutoLocalHint": "per torn · heurística local · sense petició al router",
   "ModelPickerAutoLastRoute": "última {provider} · {model}",
   "AutoRouteSelectedToast": "Auto: {provider} / {model} via {source} · Ctrl+O: detalls de la ruta",

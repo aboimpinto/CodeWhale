@@ -418,7 +418,7 @@
   "ConfigActionChoose": "Enter öffnet Auswahl",
   "ConfigActionEdit": "Enter bearbeitet",
   "ConfigActionReadOnly": "schreibgeschützt",
-  "ModelPickerAutoNetworkHint": "pro Zug · lauffähige Provider · Anfrage + letzter Kontext → DeepSeek / deepseek-v4-flash",
+  "ModelPickerAutoNetworkHint": "pro Zug · lauffähige Provider · Anfrage + letzter Kontext → DeepSeek / deepseek-flash",
   "ModelPickerAutoLocalHint": "pro Zug · lokale Heuristik · keine Router-Anfrage",
   "ModelPickerAutoLastRoute": "zuletzt {provider} · {model}",
   "AutoRouteSelectedToast": "Auto: {provider} / {model} via {source} · Ctrl+O: Routendetails",

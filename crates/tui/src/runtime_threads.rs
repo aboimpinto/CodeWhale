@@ -931,6 +931,16 @@ pub(crate) fn checkpoint_prefix_len(
     Ok(None)
 }
 
+pub(crate) fn checkpoint_covers_every_turn(
+    checkpoint: &SavedSessionCheckpoint,
+    turns: &[TurnRecord],
+) -> bool {
+    match checkpoint.covered_turn_id.as_deref() {
+        Some(id) => turns.last().is_some_and(|turn| turn.id == id),
+        None => turns.is_empty(),
+    }
+}
+
 /// A thread's saved-session binding no longer describes any readable
 /// document: the document is gone, or its prefix is not the one the thread
 /// was bound to. The thread still owns its turns, so the binding is dropped
@@ -16453,6 +16463,11 @@ impl RuntimeThreadManager {
         Ok(manager)
     }
 
+    pub(crate) async fn admit_history_execution(&self) -> Result<()> {
+        self.ensure_accepting_execution()?;
+        self.subagent_manager().await.map(drop)
+    }
+
     /// The thread's engine only when it is already live in this process.
     /// Control routes that act on in-flight work (stopping an agent run) use
     /// this: loading a cold engine cannot reach work that is not running here.
@@ -16594,7 +16609,7 @@ impl RuntimeThreadManager {
                 // The binding describes no readable document. The thread's
                 // own turns are its history; drop the dead link (keeping it
                 // in a receipt) instead of stranding the thread (#6144).
-                self.unbind_stale_session(thread, &stale.reason)?;
+                self.unbind_stale_session(thread, &stale.reason, false)?;
                 (Vec::new(), 0)
             }
         };
@@ -16603,15 +16618,22 @@ impl RuntimeThreadManager {
     }
 
     /// Drop `thread`'s saved-session binding when the stored record still
-    /// carries exactly the binding that was found stale, and record the old
-    /// binding in the session reconcile receipts.
-    fn unbind_stale_session(&self, thread: &ThreadRecord, reason: &str) -> Result<()> {
+    /// carries exactly the binding that was found stale (and, with
+    /// `pin_latest_turn`, the same latest turn), and record the old binding in
+    /// the session reconcile receipts. Returns whether the binding was dropped.
+    fn unbind_stale_session(
+        &self,
+        thread: &ThreadRecord,
+        reason: &str,
+        pin_latest_turn: bool,
+    ) -> Result<bool> {
         let _thread_mutation = self.store.thread_mutation.lock();
         let mut stored = self.store.load_thread(&thread.id)?;
         if stored.session_id != thread.session_id
             || stored.saved_session_checkpoint != thread.saved_session_checkpoint
+            || (pin_latest_turn && stored.latest_turn_id != thread.latest_turn_id)
         {
-            return Ok(());
+            return Ok(false);
         }
         crate::session_reconcile::record_thread_unbound(
             &self.session_store_binding().data_dir,
@@ -16621,18 +16643,24 @@ impl RuntimeThreadManager {
         stored.session_id = None;
         stored.saved_session_checkpoint = None;
         stored.updated_at = Utc::now();
-        self.store.save_thread(&stored)
+        self.store.save_thread(&stored)?;
+        Ok(true)
     }
 
-    /// Release a canonical holder whose saved document has moved past it, using
-    /// the same compare-and-swap unbind and reconcile receipt as a stale
-    /// binding found while restoring messages.
+    /// Release a canonical holder that holds nothing its saved document lacks,
+    /// using the same compare-and-swap unbind and reconcile receipt as a stale
+    /// binding found while restoring messages. Fails when the stored record
+    /// changed since `thread` was read.
     pub(crate) fn release_stale_session_holder(
         &self,
         thread: &ThreadRecord,
         reason: &str,
     ) -> Result<()> {
-        self.unbind_stale_session(thread, reason)
+        anyhow::ensure!(
+            self.unbind_stale_session(thread, reason, true)?,
+            "saved holder changed during admission; retry"
+        );
+        Ok(())
     }
 
     /// Unbind every thread in this store that names `session_id` (#6144).

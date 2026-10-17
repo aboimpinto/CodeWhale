@@ -27,8 +27,16 @@
           "id": "claude-fable-5"
         },
         {
+          "id": "claude-fable-5-1",
+          "canonical": "anthropic/claude-fable-5-1"
+        },
+        {
           "id": "claude-haiku-4-5",
           "canonical": "anthropic/claude-haiku-4-5"
+        },
+        {
+          "id": "claude-haiku-5-5",
+          "canonical": "anthropic/claude-haiku-5-5"
         },
         {
           "id": "claude-opus-4-8"
@@ -38,11 +46,19 @@
           "canonical": "anthropic/claude-opus-5"
         },
         {
+          "id": "claude-opus-5-5",
+          "canonical": "anthropic/claude-opus-5-5"
+        },
+        {
           "id": "claude-sonnet-4-6",
           "default": true
         },
         {
           "id": "claude-sonnet-5"
+        },
+        {
+          "id": "claude-sonnet-5-5",
+          "canonical": "anthropic/claude-sonnet-5-5"
         }
       ],
       "transport": "anthropic-messages"
@@ -374,6 +390,18 @@
         {
           "id": "muse-spark-1.2-contributor",
           "canonical": "meta/muse-spark-1.2"
+        },
+        {
+          "id": "muse-spark-1.3",
+          "canonical": "meta/muse-spark-1.3"
+        },
+        {
+          "id": "muse-spark-1.3-contributor",
+          "canonical": "meta/muse-spark-1.3"
+        },
+        {
+          "id": "muse-wonder-1.0",
+          "canonical": "meta/muse-wonder-1.0"
         }
       ],
       "transport": "chat-completions"
@@ -512,10 +540,6 @@
           "id": "qwen3.8-max",
           "canonical": "alibaba/qwen3.8-max",
           "default": true
-        },
-        {
-          "id": "qwen3.8-max-preview",
-          "canonical": "alibaba/qwen3.8-max-preview"
         }
       ],
       "transport": "chat-completions"
@@ -558,10 +582,6 @@
           "id": "qwen3.8-max",
           "canonical": "alibaba/qwen3.8-max",
           "default": true
-        },
-        {
-          "id": "qwen3.8-max-preview",
-          "canonical": "alibaba/qwen3.8-max-preview"
         }
       ],
       "transport": "anthropic-messages"
@@ -612,10 +632,6 @@
           "id": "qwen3.8-max",
           "canonical": "alibaba/qwen3.8-max",
           "default": true
-        },
-        {
-          "id": "qwen3.8-max-preview",
-          "canonical": "alibaba/qwen3.8-max-preview"
         }
       ],
       "transport": "chat-completions"
@@ -666,10 +682,6 @@
           "id": "qwen3.8-max",
           "canonical": "alibaba/qwen3.8-max",
           "default": true
-        },
-        {
-          "id": "qwen3.8-max-preview",
-          "canonical": "alibaba/qwen3.8-max-preview"
         }
       ],
       "transport": "anthropic-messages"
@@ -1292,7 +1304,7 @@
       "label": "Xiaomi MiMo",
       "endpoint": "https://token-plan-sgp.xiaomimimo.com/v1",
       "wire": "chat-completions",
-      "defaultModel": "mimo-v2.5-pro",
+      "defaultModel": "mimo-v2.6-pro",
       "envVars": [
         "XIAOMI_MIMO_TOKEN_PLAN_API_KEY",
         "MIMO_TOKEN_PLAN_API_KEY",
@@ -1308,17 +1320,11 @@
       ],
       "models": [
         {
-          "id": "mimo-v2.5"
-        },
-        {
-          "id": "mimo-v2.5-pro",
-          "default": true
-        },
-        {
           "id": "mimo-v2.6-flash"
         },
         {
-          "id": "mimo-v2.6-pro"
+          "id": "mimo-v2.6-pro",
+          "default": true
         }
       ],
       "transport": "chat-completions"

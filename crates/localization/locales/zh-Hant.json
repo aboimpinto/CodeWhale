@@ -418,7 +418,7 @@
   "ConfigActionChoose": "按 Enter 開啟選項",
   "ConfigActionEdit": "按 Enter 編輯",
   "ConfigActionReadOnly": "唯讀",
-  "ModelPickerAutoNetworkHint": "每回合 · 可用供應商 · 請求與近期上下文 → DeepSeek / deepseek-v4-flash",
+  "ModelPickerAutoNetworkHint": "每回合 · 可用供應商 · 請求與近期上下文 → DeepSeek / deepseek-flash",
   "ModelPickerAutoNetworkActiveProviderHint": "每回合 · 僅目前供應商 · 請求與近期上下文 → {provider} / {model}",
   "ModelPickerAutoLocalHint": "每回合 · 本機啟發式 · 不傳送路由請求",
   "ModelPickerAutoLastRoute": "上次 {provider} · {model}",

@@ -418,7 +418,7 @@
   "ConfigActionChoose": "Enter विकल्प खोलता है",
   "ConfigActionEdit": "Enter संपादित करता है",
   "ConfigActionReadOnly": "केवल पठन",
-  "ModelPickerAutoNetworkHint": "प्रति टर्न · चलाने योग्य प्रोवाइडर · अनुरोध + हालिया संदर्भ → DeepSeek / deepseek-v4-flash",
+  "ModelPickerAutoNetworkHint": "प्रति टर्न · चलाने योग्य प्रोवाइडर · अनुरोध + हालिया संदर्भ → DeepSeek / deepseek-flash",
   "ModelPickerAutoLocalHint": "प्रति टर्न · लोकल ह्यूरिस्टिक · कोई राउटर अनुरोध नहीं",
   "ModelPickerAutoLastRoute": "अंतिम {provider} · {model}",
   "AutoRouteSelectedToast": "Auto: {provider} / {model} ({source} द्वारा) · Ctrl+O: रूट विवरण",

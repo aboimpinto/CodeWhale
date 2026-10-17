@@ -194,6 +194,15 @@ entry against the current catalog and policy before advertising it again. A
 session sync clears it. The cache cannot resurrect a removed, denied, or
 newly-eager tool.
 
+When a search's activation pushes a previously activated tool out of the
+cache, that search's result lists it under `evicted_tool_references`, so the
+model is told the tool is no longer callable rather than finding it missing
+from the next request. Only tools that actually left the active set are listed;
+a tool that became eager stays callable and is not reported. Known limit: a
+tool dropped by the per-turn revalidation (removed, denied, or no longer
+deferred) outside a search is still dropped silently, because there is no tool
+result to carry the notice.
+
 Each subagent gets its own policy-filtered deferred catalog, always-present
 `tool_search`, and bounded activation cache. Forked messages and instructions
 remain in context, but the child cache starts empty and discovers tools locally;

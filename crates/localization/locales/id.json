@@ -418,7 +418,7 @@
   "ConfigActionChoose": "Enter membuka pilihan",
   "ConfigActionEdit": "Enter mengedit",
   "ConfigActionReadOnly": "hanya baca",
-  "ModelPickerAutoNetworkHint": "per giliran · penyedia yang dapat dijalankan · permintaan + konteks terbaru → DeepSeek / deepseek-v4-flash",
+  "ModelPickerAutoNetworkHint": "per giliran · penyedia yang dapat dijalankan · permintaan + konteks terbaru → DeepSeek / deepseek-flash",
   "ModelPickerAutoLocalHint": "per giliran · heuristik lokal · tanpa permintaan router",
   "ModelPickerAutoLastRoute": "terakhir {provider} · {model}",
   "AutoRouteSelectedToast": "Auto: {provider} / {model} via {source} · Ctrl+O: detail rute",

@@ -6040,7 +6040,7 @@ mode = "token-plan-usa"
 fn xiaomi_mimo_aliases_resolve_to_canonical_models() {
     assert_eq!(
         normalize_model_for_provider(ProviderKind::XiaomiMimo, "omni"),
-        "mimo-v2.5"
+        "mimo-v2.6-flash"
     );
     assert_eq!(
         normalize_model_for_provider(ProviderKind::XiaomiMimo, "pro-ultraspeed"),

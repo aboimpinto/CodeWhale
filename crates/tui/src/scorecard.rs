@@ -14,9 +14,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::config::ProviderKind;
 #[cfg(test)]
-use crate::config::{DEEPSEEK_ALIAS_REPLACEMENT, DEEPSEEK_ALIAS_RETIREMENT_UTC};
+use crate::config::DEEPSEEK_ALIAS_RETIREMENT_UTC;
+use crate::config::ProviderKind;
 use crate::pricing::{
     CostEstimate, TurnCostAudit, audit_turn_cost_for_route_at, token_usage_for_pricing,
 };
@@ -1537,7 +1537,7 @@ mod tests {
                 created_at: Some(&before_retirement),
                 provider: Some("deepseek"),
                 billing_surface: Some(crate::pricing::FIRST_PARTY_PAYG_BILLING_SURFACE),
-                model: DEEPSEEK_ALIAS_REPLACEMENT.into(),
+                model: "deepseek-v4-flash".into(),
                 usage: &u,
             },
             TurnInput {

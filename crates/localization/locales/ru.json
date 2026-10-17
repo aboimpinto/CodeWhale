@@ -418,7 +418,7 @@
   "ConfigActionChoose": "Enter — открыть варианты",
   "ConfigActionEdit": "Enter — изменить",
   "ConfigActionReadOnly": "только чтение",
-  "ModelPickerAutoNetworkHint": "на ход · готовые провайдеры · запрос + недавний контекст → DeepSeek / deepseek-v4-flash",
+  "ModelPickerAutoNetworkHint": "на ход · готовые провайдеры · запрос + недавний контекст → DeepSeek / deepseek-flash",
   "ModelPickerAutoLocalHint": "на ход · локальная эвристика · без запроса к маршрутизатору",
   "ModelPickerAutoLastRoute": "последний {provider} · {model}",
   "AutoRouteSelectedToast": "Auto: {provider} / {model} через {source} · Ctrl+O: детали маршрута",

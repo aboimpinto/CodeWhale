@@ -7765,7 +7765,7 @@ fn subagent_model_strength_faster_uses_known_family_sibling() {
         SubAgentThinking::Inherit,
     );
     assert_eq!(route.model_route, ModelRoute::Faster);
-    assert_eq!(route.model, "deepseek-v4-flash");
+    assert_eq!(route.model, "deepseek-flash");
     assert_eq!(route.reasoning_effort.as_deref(), Some("off"));
 }
 
@@ -7797,7 +7797,7 @@ fn explicit_child_thinking_overrides_faster_default_off() {
         ModelRoute::Faster,
         SubAgentThinking::Effort(ReasoningEffort::High),
     );
-    assert_eq!(route.model, "deepseek-v4-flash");
+    assert_eq!(route.model, "deepseek-flash");
     assert_eq!(route.reasoning_effort.as_deref(), Some("high"));
     assert_eq!(route.tuning.reasoning_effort, Some(ReasoningEffort::High));
 }
@@ -7847,7 +7847,7 @@ async fn route_resolution_matrix_uses_explicit_model_strength_routes() {
             configured_model: None,
             requested_route: ModelRoute::Faster,
             expected_route: ModelRoute::Faster,
-            expected_model: "deepseek-v4-flash",
+            expected_model: "deepseek-flash",
             expected_reasoning: Some("off"),
             expected_tuning_effort: Some(ReasoningEffort::Off),
         },
@@ -17921,7 +17921,7 @@ fn faster_route_uses_known_deepseek_and_glm_family_siblings() {
         ModelRoute::Faster,
         SubAgentThinking::Inherit,
     );
-    assert_eq!(route.model, "deepseek-v4-flash");
+    assert_eq!(route.model, "deepseek-flash");
 
     let mut zai = stub_runtime_for_provider("zai");
     zai.model = "GLM-5.2".to_string();

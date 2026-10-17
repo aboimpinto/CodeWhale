@@ -175,14 +175,9 @@ fn modelstudio_image_input_capability_is_per_model() {
     use super::capabilities::CapabilityState;
 
     // Owner's Token Plan console (verified 2026-08-03) lists Visual
-    // Understanding for exactly these four models; upstream Models.dev
-    // modalities agree (image/video input) and mark the rest text-only.
-    const VISION: &[&str] = &[
-        "qwen3.8-max",
-        "qwen3.8-max-preview",
-        "qwen3.7-plus",
-        "qwen3.6-flash",
-    ];
+    // Understanding for these models; upstream Models.dev modalities agree
+    // (image/video input) and mark the rest text-only.
+    const VISION: &[&str] = &["qwen3.8-max", "qwen3.7-plus", "qwen3.6-flash"];
     const TEXT_ONLY: &[&str] = &[
         "qwen3.7-max",
         "deepseek-v4-pro",

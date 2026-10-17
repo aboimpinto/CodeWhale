@@ -14,8 +14,8 @@ use codewhale_config::pricing::{
 #[cfg(test)]
 use crate::config::DEFAULT_STEPFUN_MODEL;
 use crate::config::{
-    DEEPSEEK_ALIAS_REPLACEMENT, DEEPSEEK_ALIAS_RETIREMENT_UTC, DEFAULT_STEPFUN_BASE_URL,
-    DEFAULT_STEPFUN_PLAN_BASE_URL, ProviderKind, canonical_model_id_for_provider,
+    DEEPSEEK_ALIAS_RETIREMENT_UTC, DEFAULT_STEPFUN_BASE_URL, DEFAULT_STEPFUN_PLAN_BASE_URL,
+    ProviderKind, canonical_model_id_for_provider,
 };
 use codewhale_models::{Usage, has_date_snapshot_suffix};
 
@@ -721,10 +721,16 @@ fn pricing_for_model_at(model: &str, now: DateTime<Utc>) -> Option<ModelPricing>
     }
     // A new or expiring model ID does not inherit a neighboring model's
     // rates. Keep this metadata lookup as exact as the billing route owner.
-    match lower.as_str() {
+    deepseek_time_aware_pricing(&lower, now)
+}
+
+fn deepseek_time_aware_pricing(model_lower: &str, now: DateTime<Utc>) -> Option<ModelPricing> {
+    match model_lower {
         "deepseek-v4-pro" => Some(deepseek_v4_pro_pricing(now)),
-        "deepseek-v4-flash" => Some(deepseek_v4_flash_pricing(now)),
-        "deepseek-flash" => Some(deepseek_flash_pricing(now)),
+        "deepseek-v4-flash" | "deepseek-flash" => Some(deepseek_v4_flash_pricing(now)),
+        "deepseek-v4-flash-vision-exp" => {
+            (now >= deepseek_flash_effective_from()).then(|| deepseek_flash_pricing(now))
+        }
         _ => None,
     }
 }
@@ -821,6 +827,9 @@ fn direct_openai_long_context_tier_is_unpriced(
             | "gpt-5.6-sol"
             | "gpt-5.6-terra"
             | "gpt-5.6-luna"
+            | "gpt-6-sol"
+            | "gpt-6.1-sol"
+            | "gpt-6-luna"
     ) || has_date_snapshot_suffix(&model_lower, "gpt-5.4-")
         || has_date_snapshot_suffix(&model_lower, "gpt-5.4-pro-")
         || has_date_snapshot_suffix(&model_lower, "gpt-5.5-");
@@ -965,11 +974,7 @@ fn deepseek_is_peak(now: DateTime<Utc>) -> bool {
 #[must_use]
 pub(crate) fn deepseek_time_tier(model: &str, now: DateTime<Utc>) -> Option<bool> {
     let lower = model.trim().to_ascii_lowercase();
-    matches!(
-        lower.as_str(),
-        "deepseek-v4-pro" | "deepseek-v4-flash" | "deepseek-flash"
-    )
-    .then(|| deepseek_is_peak(now))
+    deepseek_time_aware_pricing(&lower, now).map(|_| deepseek_is_peak(now))
 }
 
 fn deepseek_v4_pro_pricing(now: DateTime<Utc>) -> ModelPricing {
@@ -1045,7 +1050,16 @@ fn deepseek_flash_pricing(now: DateTime<Utc>) -> ModelPricing {
     }
 }
 
+fn deepseek_flash_effective_from() -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 9, 10, 4, 0, 0)
+        .single()
+        .expect("2026-09-10T04:00Z is a valid UTC instant")
+}
+
 fn deepseek_v4_flash_pricing(now: DateTime<Utc>) -> ModelPricing {
+    if now >= deepseek_flash_effective_from() {
+        return deepseek_flash_pricing(now);
+    }
     let peak = deepseek_is_peak(now);
     let (hit, miss, out) = if peak {
         (0.014, 0.44, 1.32)
@@ -1566,7 +1580,15 @@ fn audit_turn_cost_for_provider_on_endpoint_for_identity_at(
         if recorded_at >= retirement.with_timezone(&Utc) {
             return TurnCostAudit::unpriced(UnpricedReason::RetiredAlias);
         }
-        DEEPSEEK_ALIAS_REPLACEMENT.to_string()
+        "deepseek-v4-flash".to_string()
+    } else if direct_deepseek
+        && matches!(
+            model_lower.as_str(),
+            "flash-vision" | "deepseek-v4flashvisionexp"
+        )
+        && recorded_at < deepseek_flash_effective_from()
+    {
+        "deepseek-v4-flash-vision-exp".to_string()
     } else {
         canonical_model
     };
@@ -2361,7 +2383,10 @@ fn provider_owned_hand_pricing_at(
             // just because DeepSeek does.
             matches!(
                 model_lower.as_str(),
-                "deepseek-v4-pro" | "deepseek-v4-flash" | "deepseek-flash"
+                "deepseek-v4-pro"
+                    | "deepseek-v4-flash"
+                    | "deepseek-v4-flash-vision-exp"
+                    | "deepseek-flash"
             )
         }
         ProviderKind::Openai => matches!(
@@ -2374,6 +2399,9 @@ fn provider_owned_hand_pricing_at(
                 | "gpt-5.6-sol"
                 | "gpt-5.6-terra"
                 | "gpt-5.6-luna"
+                | "gpt-6-sol"
+                | "gpt-6.1-sol"
+                | "gpt-6-luna"
         ),
         ProviderKind::Anthropic => matches!(
             model_lower.as_str(),
@@ -2383,6 +2411,9 @@ fn provider_owned_hand_pricing_at(
                 | "claude-fable-5"
                 | "claude-sonnet-5"
                 | "claude-opus-5"
+                | "claude-opus-5-5"
+                | "claude-sonnet-5-5"
+                | "claude-fable-5-1"
         ),
         ProviderKind::Xai => is_grok_tiered(&model_lower),
         // GLM-5.3 is deliberately absent: this allowlist declares that Z.ai
@@ -2419,13 +2450,17 @@ fn provider_owned_hand_pricing_at(
                 | "codestral"
         ),
         ProviderKind::Arcee => model_lower == "trinity-large-thinking",
-        // 1.2 and its contributor tier own hand-written rows the same way 1.1
-        // does (see `pricing_for_model_at`). 1.2 is now `DEFAULT_META_MODEL`,
-        // so omitting them here left the default Meta route without a
+        // Every Muse tier owns a hand-written row the same way 1.1 does (see
+        // `pricing_for_model_at`), so `DEFAULT_META_MODEL` (1.3) always has a
         // provider-owned fallback row.
         ProviderKind::Meta => matches!(
             model_lower.as_str(),
-            "muse-spark-1.1" | "muse-spark-1.2" | "muse-spark-1.2-contributor"
+            "muse-spark-1.1"
+                | "muse-spark-1.2"
+                | "muse-spark-1.2-contributor"
+                | "muse-spark-1.3"
+                | "muse-spark-1.3-contributor"
+                | "muse-wonder-1.0"
         ),
         // Deployment-style ids (Fireworks account prefix, OpenCode Zen
         // gateway) have no Models.dev cost fields. When the live control
@@ -2465,7 +2500,7 @@ fn provider_owned_hand_pricing_at(
 /// DeepSeek's $0.0028 cache-hit card — Fireworks publishes $0.028.
 fn fireworks_bundled_fallback_pricing(model_lower: &str) -> Option<ModelPricing> {
     match fireworks_deployment_id(model_lower) {
-        "deepseek-v4-flash" | "deepseek-v4-flash-0731" => {
+        "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4-flash-0731" => {
             Some(hosted_deepseek_v4_flash_standard_pricing())
         }
         "deepseek-v4-pro" => Some(hosted_deepseek_v4_pro_standard_pricing()),
@@ -4331,7 +4366,7 @@ mod tests {
 
         for (provider, model) in [
             (ProviderKind::Zai, "GLM-5.3"),
-            (ProviderKind::XiaomiMimo, "mimo-v2.5-pro"),
+            (ProviderKind::XiaomiMimo, "mimo-v2.6-pro"),
             (ProviderKind::ModelstudioTokenPlan, "qwen3.8-max"),
         ] {
             let offering =

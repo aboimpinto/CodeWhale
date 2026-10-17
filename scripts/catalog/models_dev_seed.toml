@@ -127,7 +127,6 @@ env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
 default = "qwen3.8-max"
 models = [
   "qwen3.8-max",
-  "qwen3.8-max-preview",
   "qwen3.7-plus",
   "qwen3.7-max",
   "qwen3.6-flash",
@@ -146,7 +145,6 @@ env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
 default = "qwen3.8-max"
 models = [
   "qwen3.8-max",
-  "qwen3.8-max-preview",
   "qwen3.7-plus",
   "qwen3.7-max",
   "qwen3.6-flash",
@@ -165,7 +163,6 @@ env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
 default = "qwen3.8-max"
 models = [
   { id = "qwen3.8-max", from = "alibaba-token-plan" },
-  { id = "qwen3.8-max-preview", from = "alibaba-token-plan" },
   "qwen3.7-plus",
   { id = "deepseek-v4-pro", from = "alibaba-token-plan" },
   { id = "deepseek-v4-flash-0731", from = "alibaba-token-plan" },
@@ -182,7 +179,6 @@ env = ["MODELSTUDIO_API_KEY", "DASHSCOPE_API_KEY"]
 default = "qwen3.8-max"
 models = [
   { id = "qwen3.8-max", from = "alibaba-token-plan" },
-  { id = "qwen3.8-max-preview", from = "alibaba-token-plan" },
   "qwen3.7-plus",
   { id = "deepseek-v4-pro", from = "alibaba-token-plan" },
   { id = "deepseek-v4-flash-0731", from = "alibaba-token-plan" },
@@ -200,6 +196,9 @@ models = [
   "muse-spark-1.1",
   "muse-spark-1.2",
   "muse-spark-1.2-contributor",
+  "muse-spark-1.3",
+  "muse-spark-1.3-contributor",
+  "muse-wonder-1.0",
 ]
 
 [[providers]]
@@ -233,6 +232,10 @@ models = [
   "claude-opus-5",
   "claude-sonnet-5",
   "claude-fable-5",
+  "claude-opus-5-5",
+  "claude-sonnet-5-5",
+  "claude-haiku-5-5",
+  "claude-fable-5-1",
 ]
 
 [[providers]]
@@ -339,10 +342,8 @@ name = "Xiaomi MiMo"
 api = "https://api-mimo.xiaomi.com/v1"
 npm = "@ai-sdk/openai-compatible"
 env = ["XIAOMI_MIMO_API_KEY", "MIMO_API_KEY"]
-default = "mimo-v2.5-pro"
+default = "mimo-v2.6-pro"
 models = [
-  "mimo-v2.5-pro",
-  "mimo-v2.5",
   "mimo-v2.6-pro",
   "mimo-v2.6-flash",
 ]

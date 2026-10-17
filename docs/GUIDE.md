@@ -425,7 +425,7 @@ level per turn. When the DeepSeek routing model is available, Auto may select
 any runnable provider/model pair in the redacted inventory. That classification
 sends the latest request (capped at 4,000 characters) plus a bounded summary of
 up to six recent context rows (900 characters each) to
-`DeepSeek / deepseek-v4-flash`. Credentials, endpoints, and provider error text
+`DeepSeek / deepseek-flash`. Credentials, endpoints, and provider error text
 are not included in the inventory. Without that router, Auto uses a local,
 provider-aware heuristic and sends no routing request. If a classifier attempt
 fails validation or errors, Auto falls back to that heuristic while retaining

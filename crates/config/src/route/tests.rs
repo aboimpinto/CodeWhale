@@ -1866,7 +1866,7 @@ fn mimo_native_search_is_exact_to_documented_chat_models() {
     use crate::route::CapabilityState;
 
     let resolver = RouteResolver::new();
-    for model in ["mimo-v2.5-pro", "mimo-v2.5"] {
+    for model in ["mimo-v2.6-pro", "mimo-v2.6-flash"] {
         let direct = resolver
             .resolve(&req(Some(ProviderKind::XiaomiMimo), Some(model)))
             .expect("official MiMo chat route resolves");

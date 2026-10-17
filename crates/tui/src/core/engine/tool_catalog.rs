@@ -1543,9 +1543,15 @@ fn execute_tool_search_inner(
     };
 
     let mut cache_rejected = Vec::new();
+    let mut evicted = Vec::new();
     if let Some(cache) = cache {
         let delta = cache.activate(catalog, &discovered);
-        remove_evicted_cache_activations(catalog, active_tools, delta.evicted);
+        remove_evicted_cache_activations(catalog, active_tools, delta.evicted.iter().cloned());
+        evicted = delta
+            .evicted
+            .into_iter()
+            .filter(|name| !active_tools.contains(name))
+            .collect();
         cache_rejected = delta.rejected;
         discovered = delta.admitted;
     }
@@ -1575,19 +1581,33 @@ fn execute_tool_search_inner(
         })
     }));
 
-    let payload = json!({
+    let mut payload = json!({
         "type": "tool_search_tool_search_result",
         "tool_references": references,
         "unavailable_tool_references": unavailable_references.clone(),
     });
+    let mut metadata = json!({
+        "tool_references": discovered,
+        "unavailable_tool_references": unavailable_references,
+    });
+    if !evicted.is_empty() {
+        payload["evicted_tool_references"] = evicted
+            .iter()
+            .map(|name| {
+                json!({
+                    "type": "evicted_tool_reference",
+                    "tool_name": name,
+                    "reason": "No longer in this conversation's bounded toolbox (8 cached tools, 16KiB of added serialized schemas), so it is not callable now. Search for it again before using it."
+                })
+            })
+            .collect();
+        metadata["evicted_tool_references"] = json!(evicted);
+    }
 
     Ok(ToolResult {
         content: serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string()),
         success: true,
-        metadata: Some(json!({
-            "tool_references": discovered,
-            "unavailable_tool_references": unavailable_references,
-        })),
+        metadata: Some(metadata),
     })
 }
 

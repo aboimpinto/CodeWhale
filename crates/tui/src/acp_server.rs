@@ -722,7 +722,7 @@ impl AcpServer {
         Ok(self.current_model())
     }
 }
-const ACP_FULL_ACCESS_HINT: &str = "Start the server with `codewhale --approval-policy full-access serve --acp`, or set approval_policy = \"full-access\" in config.toml. Full Access also turns off Codewhale's own sandbox unless sandbox_mode tightens it; Plan stays read-only.";
+const ACP_FULL_ACCESS_HINT: &str = "Start the server with `codewhale --yolo serve --acp`, or set `yolo = true` in config.toml. Full Access also turns off Codewhale's own sandbox unless sandbox_mode tightens it; Plan stays read-only.";
 
 fn acp_mode(config: &Config) -> AppMode {
     if config.sandbox_mode.as_deref() == Some("read-only") {

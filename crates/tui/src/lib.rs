@@ -16499,14 +16499,11 @@ mod doctor_endpoint_tests {
 
         let report = provider_capability_report(&config);
 
-        assert_eq!(report["resolved_model"], "deepseek-v4-flash");
+        assert_eq!(report["resolved_model"], "deepseek-flash");
         assert_eq!(report["context_window"], 1_000_000);
         assert_eq!(report["thinking_supported"], true);
         assert_eq!(report["alias_deprecation"]["alias"], "deepseek-chat");
-        assert_eq!(
-            report["alias_deprecation"]["replacement"],
-            "deepseek-v4-flash"
-        );
+        assert_eq!(report["alias_deprecation"]["replacement"], "deepseek-flash");
         assert_eq!(
             report["alias_deprecation"]["retirement_utc"],
             "2026-07-24T15:59:00Z"

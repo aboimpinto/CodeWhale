@@ -366,10 +366,8 @@ pub fn provider_capability_with_wire(
     } else {
         None
     };
-    let exact_deepseek = canonical_official_deepseek_model_id(&model_lower);
-    let is_v4_pro = exact_deepseek == Some("deepseek-v4-pro");
-    let is_v4_flash =
-        exact_deepseek == Some(DEEPSEEK_ALIAS_REPLACEMENT) || alias_deprecation.is_some();
+    let official_deepseek =
+        canonical_official_deepseek_model_id(&model_lower).is_some() || alias_deprecation.is_some();
     let is_reasoner = matches!(provider, ProviderKind::WanjieArk)
         && (model_lower.contains("reasoner") || model_lower.contains("r1"));
 
@@ -377,7 +375,7 @@ pub fn provider_capability_with_wire(
     // model-only row. Reuse those facts before conservative fallback budgets.
     let offering =
         crate::provider_lake::bundled_catalog_offering_for_model(provider, resolved_model);
-    let context_window = if is_v4_pro || is_v4_flash {
+    let context_window = if official_deepseek {
         codewhale_models::DEEPSEEK_V4_CONTEXT_WINDOW_TOKENS
     } else if let Some(window) = codewhale_models::context_window_for_model(resolved_model) {
         window
@@ -424,8 +422,7 @@ pub fn provider_capability_with_wire(
         });
 
     // Exact catalog reasoning facts and recognized compatibility aliases only.
-    let thinking_supported = is_v4_pro
-        || is_v4_flash
+    let thinking_supported = official_deepseek
         || is_reasoner
         || offering
             .as_ref()
@@ -467,7 +464,7 @@ fn deepseek_alias_deprecation(model_lower: &str) -> Option<ModelAliasDeprecation
             retirement_date: DEEPSEEK_ALIAS_RETIREMENT_DATE.to_string(),
             retirement_utc: DEEPSEEK_ALIAS_RETIREMENT_UTC.to_string(),
             notice: format!(
-                "{model_lower} is a compatibility alias for {DEEPSEEK_ALIAS_REPLACEMENT} and is scheduled to retire on {DEEPSEEK_ALIAS_RETIREMENT_DATE}."
+                "DeepSeek retired {model_lower} on {DEEPSEEK_ALIAS_RETIREMENT_DATE}; Codewhale sends {DEEPSEEK_ALIAS_REPLACEMENT} instead."
             ),
         }),
         _ => None,
@@ -476,9 +473,9 @@ fn deepseek_alias_deprecation(model_lower: &str) -> Option<ModelAliasDeprecation
 
 /// Canonicalize compact DeepSeek model aliases to stable IDs.
 ///
-/// Already-valid model IDs pass through unchanged. Only the compact
-/// `v4pro`/`v4flash` spellings and the experimental vision shorthand are
-/// rewritten to their hyphenated forms.
+/// Already-valid model IDs pass through unchanged. The compact `v4pro`
+/// spelling is rewritten to its hyphenated form, and the Flash and retired
+/// vision shorthands select `deepseek-flash`.
 #[must_use]
 pub fn canonical_model_name(model: &str) -> Option<&'static str> {
     codewhale_config::catalog::reviewed::compatibility_alias(
@@ -10319,40 +10316,49 @@ fn model_for_provider(provider: ProviderKind, normalized: String) -> String {
     let lowered = normalized.to_ascii_lowercase();
     match (provider, lowered.as_str()) {
         (ProviderKind::NvidiaNim, "deepseek-v4-pro") => DEFAULT_NVIDIA_NIM_MODEL.to_string(),
-        (ProviderKind::NvidiaNim, "deepseek-v4-flash") => {
+        (ProviderKind::NvidiaNim, "deepseek-flash" | "deepseek-v4-flash") => {
             DEFAULT_NVIDIA_NIM_FLASH_MODEL.to_string()
         }
         (ProviderKind::Openrouter, "deepseek-v4-pro") => DEFAULT_OPENROUTER_MODEL.to_string(),
-        (ProviderKind::Openrouter, "deepseek-v4-flash") => {
+        (ProviderKind::Openrouter, "deepseek-flash" | "deepseek-v4-flash") => {
             DEFAULT_OPENROUTER_FLASH_MODEL.to_string()
         }
         (ProviderKind::Novita, "deepseek-v4-pro") => DEFAULT_NOVITA_MODEL.to_string(),
-        (ProviderKind::Novita, "deepseek-v4-flash") => DEFAULT_NOVITA_FLASH_MODEL.to_string(),
+        (ProviderKind::Novita, "deepseek-flash" | "deepseek-v4-flash") => {
+            DEFAULT_NOVITA_FLASH_MODEL.to_string()
+        }
         (ProviderKind::Fireworks, "deepseek-v4-pro") => DEFAULT_FIREWORKS_MODEL.to_string(),
+        (ProviderKind::Fireworks, "deepseek-flash") => "deepseek-v4-flash".to_string(),
         (
             ProviderKind::Siliconflow | ProviderKind::SiliconflowCN,
             "deepseek-v4-pro" | "deepseek-reasoner" | "deepseek-r1",
         ) => DEFAULT_SILICONFLOW_MODEL.to_string(),
         (
             ProviderKind::Siliconflow | ProviderKind::SiliconflowCN,
-            "deepseek-v4-flash" | "deepseek-chat" | "deepseek-v3",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-chat" | "deepseek-v3",
         ) => DEFAULT_SILICONFLOW_FLASH_MODEL.to_string(),
         (ProviderKind::Sglang, "deepseek-v4-pro") => DEFAULT_SGLANG_MODEL.to_string(),
-        (ProviderKind::Sglang, "deepseek-v4-flash") => DEFAULT_SGLANG_FLASH_MODEL.to_string(),
+        (ProviderKind::Sglang, "deepseek-flash" | "deepseek-v4-flash") => {
+            DEFAULT_SGLANG_FLASH_MODEL.to_string()
+        }
         (ProviderKind::Vllm, "deepseek-v4-pro") => DEFAULT_VLLM_MODEL.to_string(),
-        (ProviderKind::Vllm, "deepseek-v4-flash") => DEFAULT_VLLM_FLASH_MODEL.to_string(),
+        (ProviderKind::Vllm, "deepseek-flash" | "deepseek-v4-flash") => {
+            DEFAULT_VLLM_FLASH_MODEL.to_string()
+        }
         (ProviderKind::Deepinfra, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_DEEPINFRA_MODEL.to_string()
         }
-        (ProviderKind::Deepinfra, "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner") => {
-            DEFAULT_DEEPINFRA_FLASH_MODEL.to_string()
-        }
+        (
+            ProviderKind::Deepinfra,
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-chat" | "deepseek-reasoner",
+        ) => DEFAULT_DEEPINFRA_FLASH_MODEL.to_string(),
         (ProviderKind::Together, "deepseek-v4-pro" | "deepseek-v4pro") => {
             DEFAULT_TOGETHER_MODEL.to_string()
         }
         (
             ProviderKind::Together,
-            "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat" | "deepseek-reasoner",
+            "deepseek-flash" | "deepseek-v4-flash" | "deepseek-v4flash" | "deepseek-chat"
+            | "deepseek-reasoner",
         ) => DEFAULT_TOGETHER_FLASH_MODEL.to_string(),
         (ProviderKind::Together, "inkling" | "together-inkling" | "thinkingmachines/inkling") => {
             TOGETHER_INKLING_MODEL.to_string()

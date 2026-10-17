@@ -420,7 +420,7 @@
   "ConfigActionChoose": "按 Enter 打开选项",
   "ConfigActionEdit": "按 Enter 编辑",
   "ConfigActionReadOnly": "只读",
-  "ModelPickerAutoNetworkHint": "每回合 · 可用提供商 · 请求及近期上下文 → DeepSeek / deepseek-v4-flash",
+  "ModelPickerAutoNetworkHint": "每回合 · 可用提供商 · 请求及近期上下文 → DeepSeek / deepseek-flash",
   "ModelPickerAutoNetworkActiveProviderHint": "每回合 · 仅当前提供商 · 请求及近期上下文 → {provider} / {model}",
   "ModelPickerAutoLocalHint": "每回合 · 本地启发式 · 不发送路由请求",
   "ModelPickerAutoLastRoute": "上次 {provider} · {model}",

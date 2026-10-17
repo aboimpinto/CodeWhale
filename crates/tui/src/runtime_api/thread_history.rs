@@ -990,6 +990,7 @@ async fn settle_prepared_history_operation(
     })
     .await?;
     if let Some((saved, _target_lease)) = saved {
+        runtime.admit_history_execution().await?;
         let from = witness.seed_from_message_index;
         ensure!(
             from <= saved.messages.len(),
@@ -1101,6 +1102,7 @@ async fn mutate_in_owner(
             return Ok(receipt);
         }
     }
+    runtime.admit_history_execution().await?;
     let is_resume = matches!(&request.mutation, CanonicalThreadMutation::Resume { .. });
     let mut create = CreateThreadRequest::default();
     let mut source_thread = None;
@@ -1238,48 +1240,65 @@ async fn mutate_in_owner(
                         .saved_session_checkpoint
                         .as_ref()
                         .ok_or_else(|| anyhow!("saved holder checkpoint is missing"))?;
-                    // The checkpoint records the history the holder was
-                    // seeded with; turns the holder ran since then extend the
-                    // document past it. Like the other checkpoint guards here,
-                    // require it to cover a prefix, and let the exact
-                    // live == document check below prove that everything
-                    // after that prefix came from this holder. Requiring full
-                    // coverage refused every second resume of a continued
-                    // session.
-                    ensure!(
-                        crate::runtime_threads::checkpoint_prefix_len(
-                            checkpoint,
-                            &observed.messages
-                        )?
-                        .is_some(),
-                        "saved holder checkpoint differs from the saved history; refresh history"
-                    );
-                    let full = snapshot_in_runtime(&runtime, &sessions_dir, thread.id.clone())
-                        .await
-                        .map_err(|error| anyhow!(error.message))?;
-                    let live: SavedSession = serde_json::from_value(full.session)?;
-                    if live.messages == observed.messages && live.journal == observed.journal {
-                        source_thread = Some(thread);
-                    } else if live.messages.len() < observed.messages.len()
-                        && observed.messages.starts_with(&live.messages)
-                    {
-                        // After a resume the TUI runs its turns in its own
-                        // engine and saves them to the document; this holder
-                        // stayed at the history it was seeded with. It is
-                        // strictly behind the document and has no live work
-                        // (checked above), so it holds nothing the document
-                        // lacks: release its binding (receipt kept, turns
-                        // kept) and mount the document fresh. Refusing here
-                        // made every continued session impossible to resume
-                        // a second time.
-                        runtime.release_stale_session_holder(
-                            &thread,
-                            "the saved document advanced past this thread after a resume",
-                        )?;
+                    let covered = crate::runtime_threads::checkpoint_prefix_len(
+                        checkpoint,
+                        &observed.messages,
+                    )?;
+                    let released = if crate::runtime_threads::checkpoint_covers_every_turn(
+                        checkpoint,
+                        &detail.turns,
+                    ) {
+                        match covered {
+                            Some(len) if len == observed.messages.len() => {
+                                source_thread = Some(thread);
+                                None
+                            }
+                            Some(_) => Some((
+                                thread,
+                                "the saved document advanced past this thread after a resume",
+                            )),
+                            None => Some((
+                                thread,
+                                "the saved document's head was rewritten after this thread's checkpoint",
+                            )),
+                        }
                     } else {
-                        bail!(
-                            "saved holder has a successor outside the selected document; refresh history"
+                        ensure!(
+                            covered.is_some(),
+                            "saved holder checkpoint differs from the saved history; refresh history"
                         );
+                        let full = snapshot_in_runtime(&runtime, &sessions_dir, thread.id.clone())
+                            .await
+                            .map_err(|error| anyhow!(error.message))?;
+                        let live: SavedSession = serde_json::from_value(full.session)?;
+                        if live.messages == observed.messages && live.journal == observed.journal {
+                            source_thread = Some(thread);
+                            None
+                        } else if live.messages.len() < observed.messages.len()
+                            && observed.messages.starts_with(&live.messages)
+                        {
+                            let fresh = runtime.get_thread(&thread.id).await?;
+                            ensure!(
+                                fresh.session_id == thread.session_id
+                                    && fresh.latest_turn_id == thread.latest_turn_id,
+                                "saved holder changed during admission; retry"
+                            );
+                            Some((
+                                fresh,
+                                "the saved document advanced past this thread after a resume",
+                            ))
+                        } else {
+                            bail!(
+                                "saved holder has a successor outside the selected document; refresh history"
+                            );
+                        }
+                    };
+                    if let Some((holder, reason)) = released {
+                        let release_runtime = Arc::clone(&runtime);
+                        history_owner_work(move || {
+                            release_runtime.release_stale_session_holder(&holder, reason)
+                        })
+                        .await?;
                     }
                 }
                 observed
