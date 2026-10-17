@@ -14,7 +14,7 @@
 //!
 //! ## Authoritative host-proxy design (D1)
 //!
-//! `CommandContexts` has twenty-five independently optional facet slots, all
+//! `CommandContexts` has independently optional facet slots, all
 //! constructed here. The diagnostics adapter joins the host bundle in FEAT-029. Important behavior (mode transitions, model
 //! invalidation, cost accounting, skill refresh) is authoritative on `App`. The adapters therefore share a
 //! synchronous TUI-owned host proxy. Each trait call borrows `App` only for the
@@ -32,6 +32,8 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 mod config_main;
+mod core_navigation;
+use core_navigation::NavigationAdapter;
 pub(in crate::commands) mod config_policy;
 #[cfg(test)]
 mod config_policy_baseline;
@@ -205,6 +207,7 @@ pub(crate) fn key_to_message_id(key: &'static str) -> Option<MessageId> {
         "cmd_help_description" => MessageId::CmdHelpDescription,
         "cmd_hf_description" => MessageId::CmdHfDescription,
         "cmd_home_description" => MessageId::CmdHomeDescription,
+        "cmd_overview_description" => MessageId::CmdOverviewDescription,
         "cmd_hooks_description" => MessageId::CmdHooksDescription,
         "cmd_import_claude_description" => MessageId::CmdImportClaudeDescription,
         "cmd_inline_description" => MessageId::CmdInlineDescription,
@@ -2130,7 +2133,7 @@ impl CommandSkillsContext for SkillsAdapter<'_> {
     }
 }
 
-/// Workspace path and bounded serialized work-state snapshot.
+/// Workspace observations and confined anchor operations.
 pub(crate) struct WorkspaceAdapter<'a> {
     host: SharedCommandHost<'a>,
 }
@@ -2138,6 +2141,43 @@ pub(crate) struct WorkspaceAdapter<'a> {
 impl CommandWorkspaceContext for WorkspaceAdapter<'_> {
     fn workspace(&self) -> PathBuf {
         self.host.app.borrow().workspace.clone()
+    }
+
+    fn effective_home_dir(&self) -> Option<PathBuf> {
+        crate::config::effective_home_dir()
+    }
+
+    fn inspect_workspace_target(
+        &self,
+        candidate: &Path,
+    ) -> codewhale_command_contract::navigation::WorkspaceTarget {
+        use codewhale_command_contract::navigation::WorkspaceTarget;
+        if !candidate.exists() {
+            WorkspaceTarget::Missing
+        } else if !candidate.is_dir() {
+            WorkspaceTarget::NotDirectory
+        } else {
+            WorkspaceTarget::Directory {
+                canonical_or_candidate: candidate
+                    .canonicalize()
+                    .unwrap_or_else(|_| candidate.to_path_buf()),
+            }
+        }
+    }
+
+    fn read_anchor_document(&self) -> Result<Option<String>, String> {
+        core_navigation::read_anchor_document(&self.workspace())
+    }
+
+    fn append_anchor_bytes(
+        &mut self,
+        parts: &[&[u8]],
+    ) -> Result<PathBuf, codewhale_command_contract::navigation::AnchorWriteError> {
+        core_navigation::append_anchor_bytes(&self.workspace(), parts)
+    }
+
+    fn replace_anchor_document(&mut self, bytes: &[u8]) -> Result<(), String> {
+        core_navigation::replace_anchor_document(&self.workspace(), bytes)
     }
 
     fn work_state_snapshot(&self) -> Result<Option<String>, String> {
@@ -2181,6 +2221,7 @@ impl CommandPresentationContext for PresentationAdapter<'_> {
             .or_else(|| diagnostics_messages::resolve(key))
             .or_else(|| config_policy_messages::resolve(key))
             .or_else(|| config_messages::resolve(key))
+            .or_else(|| core_navigation::resolve_message(key))
         else {
             return Err("unknown translation key".to_string());
         };
@@ -4626,6 +4667,7 @@ pub(crate) struct CommandContextBundle<'a> {
     trust: TrustAdapter<'a>,
     login: LoginAdapter<'a>,
     work_surface: WorkSurfaceAdapter<'a>,
+    navigation: NavigationAdapter<'a>,
 }
 
 impl<'a> CommandContextBundle<'a> {
@@ -4722,6 +4764,9 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::WORK_SURFACE) {
             contexts = contexts.with_work_surface(&mut self.work_surface);
         }
+        if capabilities.contains(CommandCapabilities::NAVIGATION) {
+            contexts = contexts.with_navigation(&mut self.navigation);
+        }
         contexts
     }
 
@@ -4757,7 +4802,8 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::PET)
             .union(CommandCapabilities::TRUST)
             .union(CommandCapabilities::LOGIN)
-            .union(CommandCapabilities::WORK_SURFACE);
+            .union(CommandCapabilities::WORK_SURFACE)
+            .union(CommandCapabilities::NAVIGATION);
         self.contexts(all_test_capabilities).into_parts()
     }
 }
@@ -4808,7 +4854,8 @@ impl App {
             pet: PetAdapter { host: host.clone() },
             trust: TrustAdapter { host: host.clone() },
             login: LoginAdapter { host: host.clone() },
-            work_surface: WorkSurfaceAdapter { host },
+            work_surface: WorkSurfaceAdapter { host: host.clone() },
+            navigation: NavigationAdapter { host },
         }
     }
 }

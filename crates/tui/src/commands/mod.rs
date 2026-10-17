@@ -14,6 +14,8 @@ mod config_main_import_host;
 mod config_policy_host;
 mod contract;
 mod core_navigation_host;
+#[cfg(test)]
+mod core_navigation_host_tests;
 pub mod discovery;
 pub(crate) mod groups;
 
@@ -1349,6 +1351,144 @@ mod tests {
 
     #[test]
     fn command_info_resolves_canonical_names_and_aliases() {
+        use codewhale_command_contract::handler::{
+            CommandCapabilities as Caps, CommandContexts, CommandHandler, ContextParts,
+        };
+        struct MissingTemplate;
+        impl codewhale_command_contract::facets::CommandPresentationContext for MissingTemplate {
+            fn translate(&self, _: &str, _: &[(&str, &str)]) -> Result<String, String> {
+                Err("template unavailable".into())
+            }
+        }
+        for (name, service, needs_presentation) in [
+            ("help", Caps::NAVIGATION, true),
+            ("home", Caps::NAVIGATION, true),
+            ("overview", Caps::NAVIGATION, true),
+            ("links", Caps::NAVIGATION, true),
+            ("anchor", Caps::WORKSPACE, false),
+            ("workspace", Caps::WORKSPACE, true),
+            ("translate", Caps::CONFIG, true),
+        ] {
+            let expected = if needs_presentation {
+                service | Caps::PRESENTATION
+            } else {
+                service
+            };
+            let CommandHandler::Contextual {
+                capabilities,
+                handler,
+            } = registry().get(name).unwrap().contextual_handler().unwrap()
+            else {
+                panic!("/{name} must declare scoped authority");
+            };
+            assert_eq!(capabilities, expected);
+            let missing = handler(CommandContexts::empty(), Some("missing-facet-input"));
+            assert!(missing.is_error && missing.action.is_none());
+            let mut app = create_test_app();
+            app.launch.dismiss();
+            let before_view = format!("{:?}", app.view_stack.top_kind());
+            let before_translation = app.translation_enabled;
+            if needs_presentation {
+                let missing_presentation = {
+                    let mut bundle = app.command_contexts();
+                    handler(bundle.contexts(service), None)
+                };
+                assert!(missing_presentation.is_error && missing_presentation.action.is_none());
+                assert!(
+                    missing_presentation
+                        .message
+                        .as_deref()
+                        .is_some_and(|text| text.contains("presentation"))
+                );
+            }
+            if name == "translate" {
+                let mut failing = MissingTemplate;
+                let failure = {
+                    let mut bundle = app.command_contexts();
+                    handler(
+                        bundle.contexts(service).with_presentation(&mut failing),
+                        None,
+                    )
+                };
+                assert!(failure.is_error && failure.action.is_none());
+            }
+            assert!(!app.launch.visible);
+            assert_eq!(format!("{:?}", app.view_stack.top_kind()), before_view);
+            assert_eq!(app.translation_enabled, before_translation);
+            let mut bundle = app.command_contexts();
+            let ContextParts {
+                session,
+                model,
+                cost,
+                mode_policy,
+                system_prompt,
+                skills,
+                workspace,
+                presentation,
+                media,
+                memory,
+                project,
+                skill_group,
+                plugin,
+                lifecycle,
+                control,
+                export,
+                structcopy,
+                debug_receipts,
+                debug_change,
+                debug_history,
+                debug_diff,
+                debug_undo,
+                debug_diagnostics,
+                permissions,
+                config_status,
+                config,
+                pet,
+                trust,
+                login,
+                work_surface,
+                navigation,
+            } = bundle.contexts(capabilities).into_parts();
+            for (capability, exposed) in [
+                (Caps::SESSION, session.is_some()),
+                (Caps::MODEL, model.is_some()),
+                (Caps::COST, cost.is_some()),
+                (Caps::MODE_POLICY, mode_policy.is_some()),
+                (Caps::SYSTEM_PROMPT, system_prompt.is_some()),
+                (Caps::SKILLS, skills.is_some()),
+                (Caps::WORKSPACE, workspace.is_some()),
+                (Caps::PRESENTATION, presentation.is_some()),
+                (Caps::MEDIA, media.is_some()),
+                (Caps::MEMORY, memory.is_some()),
+                (Caps::PROJECT, project.is_some()),
+                (Caps::SKILL_GROUP, skill_group.is_some()),
+                (Caps::PLUGIN, plugin.is_some()),
+                (Caps::SESSION_LIFECYCLE, lifecycle.is_some()),
+                (Caps::SESSION_CONTROL, control.is_some()),
+                (Caps::SESSION_EXPORT, export.is_some()),
+                (Caps::SESSION_STRUCTCOPY, structcopy.is_some()),
+                (Caps::DEBUG_RECEIPTS, debug_receipts.is_some()),
+                (Caps::DEBUG_CHANGE, debug_change.is_some()),
+                (Caps::DEBUG_HISTORY, debug_history.is_some()),
+                (Caps::DEBUG_DIFF, debug_diff.is_some()),
+                (Caps::DEBUG_UNDO, debug_undo.is_some()),
+                (Caps::DEBUG_DIAGNOSTICS, debug_diagnostics.is_some()),
+                (Caps::PERMISSIONS, permissions.is_some()),
+                (Caps::CONFIG_STATUS, config_status.is_some()),
+                (Caps::CONFIG, config.is_some()),
+                (Caps::PET, pet.is_some()),
+                (Caps::TRUST, trust.is_some()),
+                (Caps::LOGIN, login.is_some()),
+                (Caps::WORK_SURFACE, work_surface.is_some()),
+                (Caps::NAVIGATION, navigation.is_some()),
+            ] {
+                assert_eq!(
+                    exposed,
+                    expected.contains(capability),
+                    "/{name} facet {capability:?}"
+                );
+            }
+        }
         for (name, expected) in [
             ("hotbar", AppAction::OpenHotbarSetup),
             ("transcript", AppAction::OpenLiveTranscript),
@@ -2186,6 +2326,13 @@ mod tests {
         // register bounded portable groups/slices; every entry outside the
         // explicit list must still use the original legacy dispatcher.
         const MIGRATED_GROUPS: &[&str] = &[
+            "translate",
+            "anchor",
+            "workspace",
+            "help",
+            "home",
+            "overview",
+            "links",
             "hotbar",
             "transcript",
             "turn",

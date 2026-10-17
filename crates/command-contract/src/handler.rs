@@ -101,6 +101,7 @@ impl CommandCapabilities {
     pub const LOGIN: Self = Self(1 << 28);
     /// Workbar placement/panel state for `/workbar` (FEAT-028 D3).
     pub const WORK_SURFACE: Self = Self(1 << 29);
+    pub const NAVIGATION: Self = Self(1 << 30);
 
     /// Raw bit pattern, for tests that pin the capability-space capacity.
     ///
@@ -174,6 +175,7 @@ pub struct CommandContexts<'a> {
     trust: Option<&'a mut dyn crate::config::CommandTrustContext>,
     login: Option<&'a mut dyn crate::config::CommandLoginContext>,
     work_surface: Option<&'a mut dyn crate::config::CommandWorkSurfaceContext>,
+    navigation: Option<&'a mut dyn crate::navigation::CommandNavigationContext>,
 }
 
 /// Consumed envelope used when one handler needs several independent facets.
@@ -208,6 +210,7 @@ pub struct ContextParts<'a> {
     pub trust: Option<&'a mut dyn crate::config::CommandTrustContext>,
     pub login: Option<&'a mut dyn crate::config::CommandLoginContext>,
     pub work_surface: Option<&'a mut dyn crate::config::CommandWorkSurfaceContext>,
+    pub navigation: Option<&'a mut dyn crate::navigation::CommandNavigationContext>,
 }
 
 impl<'a> CommandContexts<'a> {
@@ -243,6 +246,7 @@ impl<'a> CommandContexts<'a> {
             trust: None,
             login: None,
             work_surface: None,
+            navigation: None,
         }
     }
 
@@ -278,6 +282,7 @@ impl<'a> CommandContexts<'a> {
             trust: self.trust,
             login: self.login,
             work_surface: self.work_surface,
+            navigation: self.navigation,
         }
     }
 
@@ -317,6 +322,17 @@ impl<'a> CommandContexts<'a> {
         assert!(
             self.work_surface.replace(value).is_none(),
             "work-surface facet already set"
+        );
+        self
+    }
+
+    pub fn with_navigation(
+        mut self,
+        value: &'a mut dyn crate::navigation::CommandNavigationContext,
+    ) -> Self {
+        assert!(
+            self.navigation.replace(value).is_none(),
+            "navigation facet already set"
         );
         self
     }

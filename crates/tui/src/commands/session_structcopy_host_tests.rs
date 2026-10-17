@@ -373,6 +373,7 @@ fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_cross
         trust,
         login,
         work_surface,
+        navigation,
     } = bundle.contexts(capabilities).into_parts();
     assert!(
         permissions.is_none()
@@ -382,6 +383,7 @@ fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_cross
             && trust.is_none()
             && login.is_none()
             && work_surface.is_none()
+            && navigation.is_none()
     );
     assert!(presentation.is_some());
     assert!(
