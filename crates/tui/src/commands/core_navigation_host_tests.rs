@@ -123,6 +123,36 @@ fn test_help_links_topic_shows_aliases() {
     assert!(msg.contains("Show Codewhale, community, and provider links"));
     assert!(msg.contains("Usage: /links"));
     assert!(msg.contains("Aliases: dashboard, api"));
+
+    let root = tempdir().unwrap();
+    crate::test_support::trust_workspace(root.path());
+    let directory = root.path().join(".codewhale/commands");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("custom-links.md"), "---\ndescription: User link helper\nusage: /custom-links <target>\naliases: api\n---\nuser link $ARGUMENTS").unwrap();
+    let mut app = crate::tui::test_support::test_app_with_options(
+        crate::tui::test_support::test_tui_options(root.path()),
+    );
+    app.ui_locale = Locale::En;
+    app.cached_skills = vec![
+        ("custom-links".into(), "Wrong skill fallback".into()),
+        ("links".into(), "Wrong builtin fallback".into()),
+    ];
+    crate::commands::user_registry::reload(Some(root.path()));
+    for topic in ["custom-links", "api"] {
+        let result = help(&mut app, Some(topic));
+        assert!(!result.is_error);
+        let text = result.message.unwrap();
+        assert!(text.starts_with("custom-links\n\n"));
+        assert!(text.contains("User link helper"));
+        assert!(text.contains("Usage: /custom-links <target>"));
+        assert!(text.contains("Aliases: api"), "{text}");
+        assert!(!text.contains("Wrong skill fallback"));
+    }
+    let text = help(&mut app, Some("links")).message.unwrap();
+    assert!(text.starts_with("links\n\n"));
+    assert!(text.contains("Aliases: dashboard, lianjie"));
+    assert!(!text.contains("Aliases: dashboard, api"));
+    assert!(!text.contains("Wrong builtin fallback"));
 }
 
 #[test]
@@ -150,10 +180,16 @@ fn test_help_pushes_overlay() {
 #[test]
 fn test_help_does_not_duplicate_overlay() {
     let mut app = create_test_app();
+    assert!(app.view_stack.is_empty());
     help(&mut app, None);
     let initial_kind = app.view_stack.top_kind();
     help(&mut app, None);
     assert_eq!(app.view_stack.top_kind(), initial_kind);
+    assert!(app.view_stack.pop().is_some());
+    assert!(
+        app.view_stack.is_empty(),
+        "one dismissal must remove the only help modal"
+    );
 }
 
 #[test]
@@ -427,6 +463,17 @@ fn workspace_without_arg_shows_current_workspace() {
     assert!(msg.contains("Current workspace:"));
     assert!(msg.contains("/tmp/test-workspace"));
     assert!(result.action.is_none());
+    let home = crate::config::effective_home_dir().expect("hermetic home");
+    let result = workspace_switch(&mut app, Some("~"));
+    assert!(
+        matches!(result.action, Some(AppAction::SwitchWorkspace { workspace }) if workspace == home.canonicalize().unwrap_or(home.clone()))
+    );
+    let child = tempfile::tempdir_in(&home).unwrap();
+    let input = format!("~/{}", child.path().file_name().unwrap().to_str().unwrap());
+    let result = workspace_switch(&mut app, Some(&input));
+    assert!(
+        matches!(result.action, Some(AppAction::SwitchWorkspace { workspace }) if workspace == child.path().canonicalize().unwrap())
+    );
 }
 
 #[test]
@@ -487,6 +534,73 @@ mod anchor {
             .map(|arg| format!("/anchor {arg}"))
             .unwrap_or_else(|| "/anchor".into());
         crate::commands::execute(&input, app)
+    }
+
+    enum AnchorFault {
+        Read,
+        Open,
+        Write,
+        Replace,
+    }
+
+    impl codewhale_command_contract::facets::CommandWorkspaceContext for AnchorFault {
+        fn workspace(&self) -> std::path::PathBuf {
+            unreachable!("unexpected workspace observation")
+        }
+        fn work_state_snapshot(&self) -> Result<Option<String>, String> {
+            unreachable!("unexpected work observation")
+        }
+        fn operation_digest(&mut self) -> Result<String, String> {
+            unreachable!("unexpected work observation")
+        }
+        fn effective_home_dir(&self) -> Option<std::path::PathBuf> {
+            unreachable!("unexpected home observation")
+        }
+        fn inspect_workspace_target(
+            &self,
+            _: &std::path::Path,
+        ) -> codewhale_command_contract::navigation::WorkspaceTarget {
+            unreachable!("unexpected path inspection")
+        }
+        fn read_anchor_document(&self) -> Result<Option<String>, String> {
+            match self {
+                Self::Read => Err("read denied".into()),
+                Self::Replace => Ok(Some("first\n---\nsecond".into())),
+                _ => unreachable!("append must not read the document"),
+            }
+        }
+        fn append_anchor_bytes(
+            &mut self,
+            parts: &[&[u8]],
+        ) -> Result<std::path::PathBuf, codewhale_command_contract::navigation::AnchorWriteError>
+        {
+            use codewhale_command_contract::navigation::AnchorWriteError;
+            let expected: &[&[u8]] = &[b"\n---\n", b"entry", b"\n"];
+            assert_eq!(parts, expected);
+            match self {
+                Self::Open => Err(AnchorWriteError::Open("open denied".into())),
+                Self::Write => Err(AnchorWriteError::Write("partial write".into())),
+                _ => unreachable!("unexpected append"),
+            }
+        }
+        fn replace_anchor_document(&mut self, bytes: &[u8]) -> Result<(), String> {
+            assert!(matches!(self, Self::Replace));
+            assert_eq!(bytes, b"second");
+            Err("replace denied".into())
+        }
+    }
+
+    fn fault_result(fault: &mut AnchorFault, arg: &str) -> CommandResult {
+        use codewhale_command_contract::handler::{CommandContexts, CommandHandler};
+        let CommandHandler::Contextual { handler, .. } = crate::commands::registry()
+            .get("anchor")
+            .unwrap()
+            .contextual_handler()
+            .unwrap()
+        else {
+            panic!("anchor must be contextual");
+        };
+        handler(CommandContexts::empty().with_workspace(fault), Some(arg))
     }
 
     fn create_test_app_with_tmpdir(tmpdir: &TempDir) -> App {
@@ -605,6 +719,20 @@ mod anchor {
         assert!(path.exists());
         let content = std::fs::read_to_string(&path).unwrap();
         assert!(content.contains("API status field is unreliable"));
+        for (mut fault, expected) in [
+            (
+                AnchorFault::Open,
+                "Error: Failed to open anchors file: open denied",
+            ),
+            (
+                AnchorFault::Write,
+                "Error: Failed to write anchor: partial write",
+            ),
+        ] {
+            let result = fault_result(&mut fault, "entry");
+            assert!(result.is_error && result.action.is_none());
+            assert_eq!(result.message.as_deref(), Some(expected));
+        }
     }
 
     #[test]
@@ -614,6 +742,12 @@ mod anchor {
         let result = anchor(&mut app, Some("list"));
         assert!(!result.is_error);
         assert!(result.message.unwrap().contains("No anchors set"));
+        let result = fault_result(&mut AnchorFault::Read, "list");
+        assert!(result.is_error && result.action.is_none());
+        assert_eq!(
+            result.message.as_deref(),
+            Some("Error: Failed to read anchors file: read denied")
+        );
     }
 
     #[test]
@@ -646,6 +780,12 @@ mod anchor {
         assert!(msg.contains("1 total"));
         assert!(msg.contains("Second anchor"));
         assert!(!msg.contains("First anchor"));
+        let result = fault_result(&mut AnchorFault::Replace, "remove 1");
+        assert!(result.is_error && result.action.is_none());
+        assert_eq!(
+            result.message.as_deref(),
+            Some("Error: Failed to write anchors file: replace denied")
+        );
     }
 
     #[test]
