@@ -115,7 +115,7 @@ if [ -e "$area" ] || printf '%s' "$area" | grep -q /; then
     tests/portable-config/*|tests/portable-config)
       area=portable-config
       ;;
-    tests/portable-core-navigation/*|tests/portable-core-navigation|crates/tui/src/commands/groups/core/navigation.rs|crates/tui/src/commands/groups/core/anchor.rs|crates/tui/src/commands/groups/core/help.rs|crates/tui/src/commands/groups/core/home.rs|crates/tui/src/commands/groups/core/hotbar.rs|crates/tui/src/commands/groups/core/links.rs|crates/tui/src/commands/groups/core/transcript.rs|crates/tui/src/commands/groups/core/translate.rs|crates/tui/src/commands/groups/core/turn.rs|crates/tui/src/commands/groups/core/voice.rs|crates/tui/src/commands/groups/core/workspace.rs)
+    tests/portable-core-navigation/*|tests/portable-core-navigation)
       area=portable-core-navigation
       ;;
     crates/command-contract/src/navigation.rs)

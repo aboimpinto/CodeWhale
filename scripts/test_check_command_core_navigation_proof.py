@@ -19,6 +19,17 @@ class NavigationProofTests(unittest.TestCase):
 
     def test_actual_complete_group_is_included(self):
         self.assertEqual(proof.violations(proof.ROOT), [])
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            host = root / proof.HOST
+            source = host.read_text()
+            unrelated = 'Box::new(FunctionCommand::new(extra::ExtraCmd::info(), extra::ExtraCmd::execute)),\n'
+            host.write_text(source.replace(
+                'crate::commands::core_navigation_host::registration::<0>(),',
+                unrelated + 'crate::commands::core_navigation_host::registration::<0>(),',
+            ))
+            self.assertEqual(proof.violations(root), [])
 
     def test_selected_leaf_stub_and_test_only_root_are_rejected(self):
         actual = (proof.ROOT / proof.PROOF).read_text()
@@ -41,7 +52,7 @@ class NavigationProofTests(unittest.TestCase):
             self.assertTrue(any("conditional" in error for error in proof.violations(root)))
 
     def test_omitted_root_or_helper_is_rejected(self):
-        for case in ["anchor", "voice", "inventory", "host_order", "metadata", "include"]:
+        for case in ["anchor", "voice", "inventory", "host_order", "host_duplicate", "host_reorder", "metadata", "include"]:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp)
                 self.fixture(root)
@@ -53,6 +64,17 @@ class NavigationProofTests(unittest.TestCase):
                 elif case == "host_order":
                     host = root / proof.HOST
                     host.write_text(host.read_text().replace("registration::<0>()", "registration::<99>()"))
+                elif case in {"host_duplicate", "host_reorder"}:
+                    host = root / proof.HOST
+                    text = host.read_text()
+                    if case == "host_duplicate":
+                        text = text.replace('registration::<1>()', 'registration::<0>()')
+                    else:
+                        text = text.replace('registration::<0>()', 'registration::<TEMP>()')
+                        text = text.replace('registration::<1>()', 'registration::<0>()')
+                        text = text.replace('registration::<TEMP>()', 'registration::<1>()')
+                    host.write_text(text)
+                    self.assertTrue(any('relative order' in error for error in proof.violations(root)))
                 elif case == "include":
                     source.write_text(source.read_text() + '\ninclude!("untracked-helper.rs");\n')
                 else:

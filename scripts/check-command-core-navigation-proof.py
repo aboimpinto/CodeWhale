@@ -22,7 +22,6 @@ NAMES = {
     "home": ("home", "overview"), "workspace": ("workspace",),
     "translate": ("translate",), "voice": ("voice", "voicesend", "voicecontrol"),
 }
-POSITIONS = (0, 2, 20, 24, 25, 26, 29, 30, 31, 34, 35, 37, 38)
 REQUIRED = {ROOTS[0]} | {f"{GROUP}/{name}.rs" for name in NAMES}
 ALLOWED_NORMAL = {
     "codewhale-portable-core-navigation", "codewhale-command-contract", "codewhale-protocol",
@@ -125,10 +124,11 @@ def violations(root):
         path = root / GROUP / f"{module}.rs"
         if path.is_file() and tuple(re.findall(r'\bname:\s*"([^"]+)"', source_text(path))) != expected:
             errors.append(f"canonical metadata mismatch: {module}")
-    entries = list(re.finditer(r'core_navigation_host::registration::<(\d+)>\(\)|Box::new\(FunctionCommand::new\(', source_text(root / HOST)))
-    actual = [(position, int(entry.group(1))) for position, entry in enumerate(entries) if entry.group(1) is not None]
-    if len(entries) != 40 or actual != list(zip(POSITIONS, range(13))):
-        errors.append("real host core registry must interleave all13 inventory entries at their original positions")
+    actual = [int(index) for index in re.findall(
+        r'core_navigation_host::registration::<(\d+)>\(\)', source_text(root / HOST)
+    )]
+    if actual != list(range(len(PAIRS))):
+        errors.append("real host core registry must contain all 13 inventory entries exactly once in relative order")
     return errors
 
 

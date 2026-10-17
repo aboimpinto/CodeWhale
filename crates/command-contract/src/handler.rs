@@ -95,7 +95,7 @@ impl CommandCapabilities {
     /// general configuration and system settings.
     pub const PET: Self = Self(1 << 26);
     /// Workspace trust and trusted-path allow-list host data (FEAT-028 D3),
-    /// independent of the general config facet and of `WORKSPACE` path reads.
+    /// independent of the general config facet and of `WORKSPACE` operations.
     pub const TRUST: Self = Self(1 << 27);
     /// Account/provider session state for `/login` and `/logout` (FEAT-028 D3).
     pub const LOGIN: Self = Self(1 << 28);
