@@ -259,6 +259,7 @@ fn diagnostics_registrations_expose_exact_facets_and_preview_is_pure() {
                         login,
                         work_surface,
                         navigation,
+                        voice_input,
                     } = parts;
                     assert!(
                         permissions.is_none()
@@ -269,6 +270,7 @@ fn diagnostics_registrations_expose_exact_facets_and_preview_is_pure() {
                             && login.is_none()
                             && work_surface.is_none()
                             && navigation.is_none()
+                            && voice_input.is_none()
                     );
                     assert!(debug_diagnostics.is_some(), "/{spelling} needs diagnostics");
                     assert_eq!(

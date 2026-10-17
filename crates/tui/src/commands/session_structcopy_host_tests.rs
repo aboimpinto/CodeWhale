@@ -374,6 +374,7 @@ fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_cross
         login,
         work_surface,
         navigation,
+        voice_input,
     } = bundle.contexts(capabilities).into_parts();
     assert!(
         permissions.is_none()
@@ -384,6 +385,7 @@ fn structcopy_host_exposes_exact_authority_and_filters_private_data_before_cross
             && login.is_none()
             && work_surface.is_none()
             && navigation.is_none()
+            && voice_input.is_none()
     );
     assert!(presentation.is_some());
     assert!(

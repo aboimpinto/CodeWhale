@@ -1,7 +1,7 @@
 use super::CommandResult;
 use super::groups::core::navigation::portable_handlers;
 use super::traits::{Command, ContextualCommand};
-use crate::tui::app::AppAction;
+use crate::tui::app::{App, AppAction};
 use codewhale_command_contract::handler::CommandHandler;
 use codewhale_command_contract::metadata::{CommandInfo, RegisterCommand};
 use codewhale_command_contract::outcome::{CoreNavigationAction, CoreNavigationCommandResult};
@@ -50,6 +50,22 @@ fn host_result(result: CoreNavigationCommandResult) -> CommandResult {
             CoreNavigationAction::VoiceCapture => AppAction::VoiceCapture,
         }),
         is_error: result.is_error,
+    }
+}
+
+pub(in crate::commands) fn dispatch<const INDEX: usize>(
+    app: &mut App,
+    arg: Option<&str>,
+) -> CommandResult {
+    match Registration::<INDEX>::handler() {
+        CommandHandler::Pure(run) => run(arg),
+        CommandHandler::Contextual {
+            capabilities,
+            handler,
+        } => {
+            let mut bundle = app.command_contexts_with_config(None);
+            handler(bundle.contexts(capabilities), arg)
+        }
     }
 }
 

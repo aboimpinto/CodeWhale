@@ -34,7 +34,6 @@ mod setup;
 mod stash;
 mod subagents;
 pub mod util;
-pub mod voice;
 mod workflow;
 
 pub(in crate::commands) use self::core::reset_conversation_state;
@@ -155,19 +154,10 @@ impl CommandGroup for CoreCommands {
                 rlm::RlmCmd::execute,
             )),
             crate::commands::core_navigation_host::registration::<9>(),
-            Box::new(FunctionCommand::new(
-                voice::VoiceCmd::info(),
-                voice::VoiceCmd::execute,
-            )),
+            crate::commands::core_navigation_host::registration::<10>(),
             Box::new(FunctionCommand::new(&effort::EFFORT_INFO, effort::effort,)),
-            Box::new(FunctionCommand::new(
-                voice::VoiceSendCmd::info(),
-                voice::VoiceSendCmd::execute,
-            )),
-            Box::new(FunctionCommand::new(
-                voice::VoiceControlCmd::info(),
-                voice::VoiceControlCmd::execute,
-            )),
+            crate::commands::core_navigation_host::registration::<11>(),
+            crate::commands::core_navigation_host::registration::<12>(),
             Box::new(FunctionCommand::new(
                 pin::PinCmd::info(),
                 pin::PinCmd::execute

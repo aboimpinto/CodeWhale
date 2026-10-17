@@ -33,7 +33,7 @@ use std::rc::Rc;
 
 mod config_main;
 mod core_navigation;
-use core_navigation::NavigationAdapter;
+use core_navigation::{NavigationAdapter, VoiceInputAdapter};
 pub(in crate::commands) mod config_policy;
 #[cfg(test)]
 mod config_policy_baseline;
@@ -4668,6 +4668,7 @@ pub(crate) struct CommandContextBundle<'a> {
     login: LoginAdapter<'a>,
     work_surface: WorkSurfaceAdapter<'a>,
     navigation: NavigationAdapter<'a>,
+    voice_input: VoiceInputAdapter<'a>,
 }
 
 impl<'a> CommandContextBundle<'a> {
@@ -4767,6 +4768,9 @@ impl<'a> CommandContextBundle<'a> {
         if capabilities.contains(CommandCapabilities::NAVIGATION) {
             contexts = contexts.with_navigation(&mut self.navigation);
         }
+        if capabilities.contains(CommandCapabilities::VOICE_INPUT) {
+            contexts = contexts.with_voice_input(&mut self.voice_input);
+        }
         contexts
     }
 
@@ -4803,7 +4807,8 @@ impl<'a> CommandContextBundle<'a> {
             .union(CommandCapabilities::TRUST)
             .union(CommandCapabilities::LOGIN)
             .union(CommandCapabilities::WORK_SURFACE)
-            .union(CommandCapabilities::NAVIGATION);
+            .union(CommandCapabilities::NAVIGATION)
+            .union(CommandCapabilities::VOICE_INPUT);
         self.contexts(all_test_capabilities).into_parts()
     }
 }
@@ -4855,7 +4860,8 @@ impl App {
             trust: TrustAdapter { host: host.clone() },
             login: LoginAdapter { host: host.clone() },
             work_surface: WorkSurfaceAdapter { host: host.clone() },
-            navigation: NavigationAdapter { host },
+            navigation: NavigationAdapter { host: host.clone() },
+            voice_input: VoiceInputAdapter { host },
         }
     }
 }

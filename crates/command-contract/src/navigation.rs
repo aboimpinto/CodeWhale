@@ -93,3 +93,13 @@ pub trait CommandNavigationContext {
     fn overview(&self) -> NavigationOverview;
     fn links(&self) -> NavigationLinks;
 }
+
+pub trait CommandVoiceInputContext {
+    fn recorder_available(&self) -> bool;
+    fn voice_enabled(&self) -> bool;
+    fn set_voice_enabled(&mut self, enabled: bool);
+    fn send_enabled(&self) -> bool;
+    fn set_send_enabled(&mut self, enabled: bool);
+    fn control_enabled(&self) -> bool;
+    fn set_control_enabled(&mut self, enabled: bool);
+}

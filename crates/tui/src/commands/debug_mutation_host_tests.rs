@@ -1612,6 +1612,7 @@ fn whole_debug_registry_matches_portable_inventory_and_exact_host_authority() {
                         login,
                         work_surface,
                         navigation,
+                        voice_input,
                     } = bundle.contexts(capabilities).into_parts();
                     assert!(
                         permissions.is_none()
@@ -1622,6 +1623,7 @@ fn whole_debug_registry_matches_portable_inventory_and_exact_host_authority() {
                             && login.is_none()
                             && work_surface.is_none()
                             && navigation.is_none()
+                            && voice_input.is_none()
                     );
                     for (name, present, capability) in [
                         ("session", session.is_some(), Caps::SESSION),

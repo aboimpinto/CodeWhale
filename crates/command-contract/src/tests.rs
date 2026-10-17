@@ -3593,6 +3593,7 @@ fn structcopy_capability_preserves_all_published_identities() {
         CommandCapabilities::LOGIN,
         CommandCapabilities::WORK_SURFACE,
         CommandCapabilities::NAVIGATION,
+        CommandCapabilities::VOICE_INPUT,
     ];
     let exact = CommandCapabilities::SESSION_STRUCTCOPY | CommandCapabilities::PRESENTATION;
     for (index, capability) in capabilities.into_iter().enumerate() {
@@ -3658,6 +3659,7 @@ fn structcopy_slot_is_optional_and_does_not_grant_other_authority() {
         login,
         work_surface,
         navigation,
+        voice_input,
     } = CommandContexts::empty()
         .with_structcopy(&mut fixture)
         .with_presentation(&mut presentation)
@@ -3708,6 +3710,7 @@ fn structcopy_slot_is_optional_and_does_not_grant_other_authority() {
         login.is_some(),
         work_surface.is_some(),
         navigation.is_some(),
+        voice_input.is_some(),
     ] {
         assert!(!present);
     }

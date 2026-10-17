@@ -133,6 +133,34 @@ impl CommandNavigationContext for NavigationAdapter<'_> {
     }
 }
 
+pub(super) struct VoiceInputAdapter<'a> {
+    pub(super) host: SharedCommandHost<'a>,
+}
+
+impl codewhale_command_contract::navigation::CommandVoiceInputContext for VoiceInputAdapter<'_> {
+    fn recorder_available(&self) -> bool {
+        crate::voice::is_available()
+    }
+    fn voice_enabled(&self) -> bool {
+        self.host.app.borrow().voice_enabled
+    }
+    fn set_voice_enabled(&mut self, enabled: bool) {
+        self.host.app.borrow_mut().voice_enabled = enabled;
+    }
+    fn send_enabled(&self) -> bool {
+        self.host.app.borrow().voice_send_enabled
+    }
+    fn set_send_enabled(&mut self, enabled: bool) {
+        self.host.app.borrow_mut().voice_send_enabled = enabled;
+    }
+    fn control_enabled(&self) -> bool {
+        self.host.app.borrow().voice_control_enabled
+    }
+    fn set_control_enabled(&mut self, enabled: bool) {
+        self.host.app.borrow_mut().voice_control_enabled = enabled;
+    }
+}
+
 pub(super) fn anchors_path(workspace: &std::path::Path) -> std::path::PathBuf {
     let primary = workspace.join(".codewhale").join("anchors.md");
     if primary.symlink_metadata().is_ok() || workspace.join(".codewhale").is_symlink() {
@@ -175,6 +203,13 @@ pub(super) fn replace_anchor_document(
 
 pub(super) fn resolve_message(key: &str) -> Option<MessageId> {
     Some(match key {
+        "voice_disabled" => MessageId::VoiceDisabled,
+        "voice_enabled" => MessageId::VoiceEnabled,
+        "voice_err_no_recorder" => MessageId::VoiceErrNoRecorder,
+        "voice_send_enabled" => MessageId::VoiceSendEnabled,
+        "voice_send_disabled" => MessageId::VoiceSendDisabled,
+        "voice_control_enabled" => MessageId::VoiceControlEnabled,
+        "voice_control_disabled" => MessageId::VoiceControlDisabled,
         "cmd_translate_on" => MessageId::CmdTranslateOn,
         "cmd_translate_off" => MessageId::CmdTranslateOff,
         "workspace_current" => MessageId::WorkspaceCurrent,
