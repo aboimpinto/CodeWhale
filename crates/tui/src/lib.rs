@@ -10,9 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-#[cfg(test)]
-use clap::CommandFactory;
-use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use tempfile::NamedTempFile;
 use wait_timeout::ChildExt;
 
@@ -406,22 +404,10 @@ enum SessionsCommand {
 }
 
 #[derive(Args, Debug, Clone)]
-#[command(after_help = "\
-Examples:
-  codewhale exec \"explain this function\"
-  codewhale exec --auto \"list crates/ with ls\"
-  codewhale exec --auto --output-format stream-json \"fix the failing test\"
-
-Plain `codewhale exec` is a one-shot model response: one Engine turn with the
-same system prompt as every other run, and no tools. Use `--auto` for
-non-interactive agent-with-tools execution. Tools are offered only with
-`--auto`, `--yolo`, `--allowed-tools`, or when resuming a session; limits such
-as `--max-turns`, `--disallowed-tools` or `--sandbox`, and the output format,
-never add tools. A reply cut off at the provider's output limit is continued
-in the same turn, at most 8 model steps unless `--max-turns` says otherwise.
-`--auto` does not change the sandbox posture or elevate a denied tool. Use `--sandbox danger-full-access`
-or `--allow-sandbox-elevation` to explicitly authorize sandbox elevation.
-")]
+#[command(after_help = codewhale_localization::tr(
+    codewhale_localization::resolve_locale("auto"),
+    codewhale_localization::MessageId::ExecAfterHelp,
+))]
 struct ExecArgs {
     /// Override model for this run
     #[arg(long)]
@@ -437,12 +423,15 @@ struct ExecArgs {
     /// Accepted values: auto, off, low, medium, high, max.
     #[arg(long = "reasoning-effort", value_name = "EFFORT")]
     reasoning_effort: Option<String>,
-    /// Enable agent-with-tools mode with automatic tool approvals. This does
-    /// not authorize sandbox elevation.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, help = codewhale_localization::tr(
+        codewhale_localization::resolve_locale("auto"),
+        codewhale_localization::MessageId::ExecAutoHelp,
+    ))]
     auto: bool,
-    /// Sandbox policy for this exec run; independent from --auto.
-    #[arg(long, value_name = "POLICY")]
+    #[arg(long, value_name = "POLICY", help = codewhale_localization::tr(
+        codewhale_localization::resolve_locale("auto"),
+        codewhale_localization::MessageId::ExecSandboxHelp,
+    ))]
     sandbox: Option<String>,
     /// Explicitly allow a denied tool to retry with danger-full-access.
     #[arg(long, default_value_t = false)]
@@ -497,15 +486,52 @@ struct ExecArgs {
     /// prompts past the OS per-argument limit (~128 KiB on Linux).
     #[arg(long, value_name = "PATH", conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
-    /// Prompt to send to the model. Taken literally, including a lone `-`;
-    /// use `--prompt-file -` to read stdin.
     #[arg(
         value_name = "PROMPT",
         required_unless_present = "prompt_file",
         trailing_var_arg = true,
-        allow_hyphen_values = true
+        help = codewhale_localization::tr(
+            codewhale_localization::resolve_locale("auto"),
+            codewhale_localization::MessageId::ExecPromptHelp,
+        )
     )]
     prompt: Vec<String>,
+}
+
+fn parse_cli_args(args: &[impl AsRef<str>]) -> Result<Cli, clap::Error> {
+    let mut command = Cli::command();
+    let matches = command.try_get_matches_from_mut(args.iter().map(|arg| arg.as_ref()))?;
+    let cli = Cli::from_arg_matches(&matches)?;
+    if let Some(Commands::Exec(exec)) = &cli.command {
+        let prompt_start = args.len().saturating_sub(exec.prompt.len());
+        if !args[..prompt_start]
+            .last()
+            .is_some_and(|arg| arg.as_ref() == "--")
+        {
+            let command = command.find_subcommand_mut("exec").expect("exec command");
+            for word in exec.prompt.iter().take_while(|word| *word != "--") {
+                let flag = word.split_once('=').map_or(word.as_str(), |(flag, _)| flag);
+                if flag.strip_prefix("--").is_some_and(|name| {
+                    command.get_arguments().any(|arg| {
+                        arg.get_long() == Some(name)
+                            || arg
+                                .get_all_aliases()
+                                .is_some_and(|aliases| aliases.contains(&name))
+                    })
+                }) {
+                    return Err(command.error(
+                        clap::error::ErrorKind::UnknownArgument,
+                        codewhale_localization::tr(
+                            codewhale_localization::resolve_locale("auto"),
+                            codewhale_localization::MessageId::ExecFlagAfterPrompt,
+                        )
+                        .replace("{flag}", flag),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(cli)
 }
 
 #[derive(Args, Debug, Clone)]
@@ -1415,7 +1441,8 @@ struct ReviewArgs {
     /// is only printed locally.
     #[arg(long, requires = "pr")]
     post: bool,
-    /// Base ref to diff against (e.g. origin/main)
+    /// Base ref to diff against (e.g. origin/main). The reviewer also gets the
+    /// base..HEAD commit messages as the author's stated intent.
     #[arg(long, conflicts_with_all = ["staged", "pr"])]
     base: Option<String>,
     /// Limit diff to a specific path
@@ -1982,7 +2009,7 @@ fn run_with_args(options: RuntimeOptions, args: Vec<String>) -> Result<()> {
     // configuration, MCP, trust, sandbox, executable lookup, or plugin
     // discovery. Plugin discovery therefore runs first, and the loader below
     // admits only built-in provider credential names from a stable file read.
-    let cli = match Cli::try_parse_from(args) {
+    let cli = match parse_cli_args(&args) {
         Ok(mut cli) => {
             cli.options = options.merge(cli.options)?;
             cli
@@ -2844,7 +2871,6 @@ async fn run_async_main_dispatch(
                         auto_mode,
                         args.allow_sandbox_elevation,
                         args.sandbox.as_deref(),
-                        auto_mode,
                         args.json,
                         resume_session,
                         force_configured_route,
@@ -2910,7 +2936,10 @@ async fn run_async_main_dispatch(
                 let workspace = resolve_workspace(&cli);
                 integrations::cli::run(&config, &workspace, command)
             }
-            Commands::Sandbox(args) => run_sandbox_command(args),
+            Commands::Sandbox(args) => {
+                let config = load_config_from_cli(&cli)?;
+                run_sandbox_command(&config, args)
+            }
             Commands::Serve(args) => {
                 let workspace = cli.workspace.clone().unwrap_or_else(|| {
                     std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
@@ -9964,9 +9993,12 @@ async fn prepare_mounted_session(
         } else {
             manager.resolve_session_id_prefix(&selector)?
         };
-        // Capture the complete document and separate local goal under the
-        // same existing inactive-session guard; neither read repairs history.
+        // Under the existing inactive-session guard, promote any crash
+        // checkpoint first: the mount below stamps a newer document, and the
+        // later attach would then discard the checkpoint as stale. Then
+        // capture the complete document and separate local goal.
         let _source_lease = manager.reserve_session_for_external_write(&id)?;
+        manager.promote_interrupted_checkpoint(&id);
         let saved = manager.load_session_snapshot_bounded(&id, MAX_CANONICAL_HISTORY_BYTES)?;
         // Project grants were captured for this launch before awaiting. The
         // existing restore changes App workspace, so it cannot silently apply
@@ -10283,6 +10315,12 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
         Some(number) => Some((number, run_gh_pr_view(number, args.repo.as_deref())?)),
         None => None,
     };
+    if let Some(base) = args.base.as_deref() {
+        anyhow::ensure!(
+            !base.starts_with('-'),
+            "--base must name a commit or ref, not an option: {base}"
+        );
+    }
     let diff = collect_diff(
         &args,
         pr_view.as_ref().map(|(_, view)| view),
@@ -10294,6 +10332,12 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
     if args.check_receipt {
         return run_review_receipt_check(&diff, &args, pr_view.as_ref().map(|(_, view)| view));
     }
+    let commits = match (&args.base, args.pr) {
+        (Some(base), None) => {
+            collect_base_commit_messages(base, args.path.as_deref(), &std::env::current_dir()?)?
+        }
+        _ => String::new(),
+    };
 
     let pr_plan = pr_view
         .as_ref()
@@ -10315,9 +10359,12 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
             .features
             .enabled(crate::features::Feature::ReviewHost)
         {
-            crate::tools::review_host::cli_prompt(&diff, &review_context).await?
+            crate::tools::review_host::cli_prompt(&diff, &commits, &review_context).await?
         } else {
-            format!("Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff.")
+            format!(
+                "{}Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff.",
+                crate::tools::review::commit_intent_preamble(&commits)
+            )
         }]
     };
     let model = resolve_review_model(config, args.model.as_deref());
@@ -11645,6 +11692,46 @@ fn collect_diff(
     Ok(diff)
 }
 
+fn collect_base_commit_messages(
+    base: &str,
+    path: Option<&std::path::Path>,
+    workspace: &std::path::Path,
+) -> Result<String> {
+    let mut cmd = crate::dependencies::Git::review_command(workspace)?;
+    cmd.current_dir(workspace)
+        .args([
+            "log",
+            "--no-merges",
+            "--no-color",
+            "--no-notes",
+            "--no-show-signature",
+            "--format=commit %h%n%B",
+        ])
+        .arg(format!("{base}..HEAD"));
+    if let Some(path) = path {
+        cmd.arg("--").arg(path);
+    }
+    let output = cmd
+        .output()
+        .map_err(|e| anyhow::anyhow!("Failed to run git log. Is git installed? ({e})"))?;
+    if !output.status.success() {
+        bail!(
+            "git log failed: {}",
+            first_stderr_line(&String::from_utf8_lossy(&output.stderr))
+        );
+    }
+    let log = String::from_utf8_lossy(&output.stdout);
+    let log = log.trim();
+    let limit = crate::tools::review::MAX_REVIEW_COMMIT_MESSAGE_CHARS;
+    if log.chars().count() <= limit {
+        return Ok(log.to_string());
+    }
+    let kept: String = log.chars().take(limit).collect();
+    Ok(format!(
+        "{kept}\n[commit messages truncated at {limit} characters]"
+    ))
+}
+
 /// Outside a work tree `git diff` prints its whole `--no-index` usage; say
 /// what is actually wrong instead. Only git's own "not a git repository"
 /// becomes that one line; any other failure (dubious ownership, permissions,
@@ -12415,7 +12502,7 @@ fn is_scoped_npm_package_arg(command: &str, argument: &str) -> bool {
         })
 }
 
-fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
+fn run_sandbox_command(config: &Config, args: SandboxArgs) -> Result<()> {
     use crate::sandbox::{CommandSpec, SandboxManager};
 
     let SandboxCommand::Run {
@@ -12444,8 +12531,20 @@ fn run_sandbox_command(args: SandboxArgs) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Command is required"))?;
     let spec =
         CommandSpec::program(program, args.to_vec(), cwd.clone(), timeout).with_policy(policy);
-    let manager = SandboxManager::new();
+    let mut manager = SandboxManager::new();
+    manager.set_prefer_bwrap(config.prefers_bwrap());
+    manager.set_bwrap_extensions(crate::sandbox::BwrapMountExtensions {
+        read_only_roots: config.bwrap_ro_roots.clone(),
+        device_roots: config.bwrap_dev_roots.clone(),
+    });
+    manager.set_denied_read_subpaths(config.effective_sandbox_denied_read_paths());
     let exec_env = manager.prepare(&spec);
+    if spec.sandbox_policy.should_sandbox() && !exec_env.is_sandboxed() {
+        bail!(
+            "no OS sandbox can enforce the {} policy on this host; nothing was run",
+            spec.sandbox_policy.posture_label()
+        );
+    }
 
     let mut cmd = Command::new(exec_env.program());
     cmd.args(exec_env.args())
@@ -12903,8 +13002,9 @@ fn preserve_interrupted_checkpoint_for_explicit_resume(launch_workspace: &Path) 
     if newest.source == session_manager::CheckpointSource::Legacy {
         // Migrate legacy single-slot checkpoint to per-session format
         // before clearing the legacy file, or the data is unrecoverable.
-        let _ = manager.save_checkpoint(&newest.session);
-        let _ = manager.clear_legacy_checkpoint();
+        if manager.save_checkpoint(&newest.session).is_ok() {
+            let _ = manager.clear_legacy_checkpoint();
+        }
     }
 
     let age_str = checkpoint_age_label(newest.age);
@@ -13503,6 +13603,10 @@ async fn run_interactive_prepared(
     // alongside the Models.dev snapshot. Currently active for TelecomJS, whose
     // model list is not covered by the Models.dev catalog.
     crate::client::CodewhaleClient::spawn_active_provider_catalog_refresh(config);
+    // The picker lists every configured route, so the relays this session is
+    // not currently on are probed too; otherwise a relay's roster stays empty
+    // until the user switches to it.
+    crate::client::CodewhaleClient::spawn_configured_provider_catalog_refresh(config);
 
     // Boot janitors — snapshot prune (7-day default), spillover prune
     // (#422), and managed-session cleanup (v0.8.44) — are best-effort disk
@@ -13998,6 +14102,8 @@ enum ExecStreamEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         reasoning_replay_tokens: Option<u32>,
         duration_ms: u64,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        finish_reason: Option<String>,
     },
     #[serde(rename = "metadata")]
     Metadata { meta: Box<ExecStreamMeta> },
@@ -14804,6 +14910,7 @@ fn persist_exec_session(
     system_prompt: &Option<SystemPrompt>,
     session_id: Option<&str>,
     total_tokens: u64,
+    turn_failure: Option<&str>,
     session_manager: Option<&SessionManager>,
 ) -> Result<String> {
     let default_manager;
@@ -14852,6 +14959,12 @@ fn persist_exec_session(
         provider_route.id,
         workspace,
     );
+    if let Some(error) = turn_failure {
+        session_manager::push_turn_outcome(
+            &mut saved.turn_outcomes,
+            session_manager::SavedTurnOutcome::failed(error, messages.len()),
+        );
+    }
     let id = saved.metadata.id.clone();
     manager
         .save_session(&saved)

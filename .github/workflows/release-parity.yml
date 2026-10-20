@@ -115,6 +115,7 @@ jobs:
           kill "$monitor" 2>/dev/null || true
           exit "$status"
         env:
+          CARGO_BUILD_JOBS: '1'
           # Match the CI test lane: test threads get the same stack the product
           # gives itself (main.rs CODEWHALE_MAIN_STACK_BYTES). See the note in
           # ci.yml's "Run tests" step. Without it this gate runs the deep

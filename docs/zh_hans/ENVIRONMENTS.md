@@ -36,6 +36,8 @@ CODEWHALE_PROVIDER=vllm VLLM_BASE_URL=http://127.0.0.1:8000/v1 VLLM_MODEL=<id> \
 ```
 
 `codewhale exec`（加上 `--auto` 可启用工具调用）是跑通完整智能体循环的非交互路径。
+`--auto` 默认启用 Full Access（完全访问）：没有 Codewhale shell 沙箱，并开启信任模式。
+加上 `--sandbox workspace-write` 可保留 shell 沙箱和文件工具的工作区限制，并关闭信任模式。
 
 ## 在回合期间让主机保持唤醒
 

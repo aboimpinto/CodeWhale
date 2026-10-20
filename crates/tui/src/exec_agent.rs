@@ -297,7 +297,6 @@ pub(crate) async fn run_exec_agent(
     auto_approve: bool,
     allow_sandbox_elevation: bool,
     explicit_sandbox: Option<&str>,
-    trust_mode: bool,
     json_output: bool,
     resume_session: Option<session_manager::SavedSession>,
     force_configured_route: bool,
@@ -407,7 +406,32 @@ pub(crate) async fn run_exec_agent(
     let prompt_sha256 = format!("sha256:{}", crate::hashing::sha256_hex(prompt.as_bytes()));
     let binary_sha256 = current_binary_sha256();
     let approval_posture = if auto_approve { "auto_tools" } else { "ask" }.to_string();
-    let sandbox_posture = explicit_sandbox.unwrap_or("configured_default").to_string();
+    // The Full Access posture travels in the op's auto_approve/approval_mode
+    // fields; modes no longer carry permission.
+    let mode = AppMode::Agent;
+    let turn_approval_mode = if auto_approve {
+        ApprovalMode::Bypass
+    } else {
+        execution_config
+            .approval_policy
+            .as_deref()
+            .and_then(ApprovalMode::from_config_value)
+            .unwrap_or_default()
+    };
+    let turn_sandbox_policy = crate::core::authority::sandbox_policy_for_turn(
+        mode,
+        turn_approval_mode,
+        execution_config.sandbox_mode.as_deref(),
+        &workspace,
+        crate::core::authority::SandboxNetworkAccess::from_config(
+            execution_config.sandbox_network_access,
+        ),
+    );
+    let trust_mode = auto_approve
+        && matches!(
+            turn_sandbox_policy,
+            crate::sandbox::SandboxPolicy::DangerFullAccess
+        );
     let active_route_limits =
         crate::route_budget::known_route_limits(validated_route.candidate.limits());
     let max_subagents = if max_subagents
@@ -695,49 +719,16 @@ pub(crate) async fn run_exec_agent(
     };
 
     let engine_handle = spawn_engine(engine_config, &execution_config, None);
-    // The Full Access posture travels in the op's auto_approve/approval_mode
-    // fields; modes no longer carry permission.
-    let mode = AppMode::Agent;
-    let turn_approval_mode = if auto_approve {
-        ApprovalMode::Bypass
-    } else {
-        execution_config
-            .approval_policy
-            .as_deref()
-            .and_then(ApprovalMode::from_config_value)
-            .unwrap_or_default()
-    };
     // A restricted posture that resolves to no enforcing sandbox must reach
     // the person running exec, not only the model's posture line: policy-only
     // is accepted (read-only already fails closed in the shell tool), but it
-    // is never silent. Mirrors the enforcement detection in `Engine::new`.
-    let turn_sandbox_policy = crate::core::authority::sandbox_policy_for_turn(
-        mode,
-        turn_approval_mode,
-        execution_config.sandbox_mode.as_deref(),
-        &workspace,
-        crate::core::authority::SandboxNetworkAccess::from_config(
-            execution_config.sandbox_network_access,
-        ),
-    );
-    let enforcement_unavailable = crate::sandbox::backend::SandboxKind::parse(
-        execution_config
-            .sandbox_backend
-            .as_deref()
-            .unwrap_or("none"),
-    )
-    .is_none()
-        && crate::sandbox::get_platform_sandbox_with_bwrap_preference(
-            execution_config.prefers_bwrap(),
-        )
-        .is_none();
-    if enforcement_unavailable && turn_sandbox_policy.should_sandbox() {
-        eprintln!(
-            "warning: {} — shell commands will run unrestricted",
-            turn_sandbox_policy.posture_label_with_enforcement(
-                crate::sandbox::policy::SandboxEnforcement::Unavailable,
-            )
-        );
+    // is never silent. Uses the enforcement pinned by `Engine::new`.
+    let sandbox_enforcement = engine_handle.sandbox_enforcement;
+    let sandbox_posture = turn_sandbox_policy.posture_label_with_enforcement(sandbox_enforcement);
+    if sandbox_enforcement == crate::sandbox::policy::SandboxEnforcement::Unavailable
+        && turn_sandbox_policy.should_sandbox()
+    {
+        eprintln!("warning: {sandbox_posture} — shell commands will run unrestricted");
     }
 
     let resuming_session = resume_session.is_some();
@@ -861,7 +852,7 @@ pub(crate) async fn run_exec_agent(
     let mut reported_sandbox_contract = false;
 
     let mut should_persist_session =
-        resuming_session || output_format == ExecOutputFormat::StreamJson;
+        !one_shot || resuming_session || output_format == ExecOutputFormat::StreamJson;
     let mut latest_session_id = loaded_session_id;
     let mut latest_messages: Arc<Vec<Message>> = Arc::new(Vec::new());
     let mut latest_system_prompt: Option<SystemPrompt> = None;
@@ -1206,7 +1197,10 @@ pub(crate) async fn run_exec_agent(
                 }
             }
             Event::TurnUsage {
-                usage, duration_ms, ..
+                usage,
+                duration_ms,
+                finish_reason,
+                ..
             } => {
                 if output_format == ExecOutputFormat::StreamJson {
                     turn_usage_seq = turn_usage_seq.saturating_add(1);
@@ -1220,6 +1214,7 @@ pub(crate) async fn run_exec_agent(
                         prompt_cache_write_tokens: usage.prompt_cache_write_tokens,
                         reasoning_replay_tokens: usage.reasoning_replay_tokens,
                         duration_ms,
+                        finish_reason,
                     })?;
                 }
             }
@@ -1366,6 +1361,13 @@ pub(crate) async fn run_exec_agent(
                         &latest_system_prompt,
                         latest_session_id.as_deref(),
                         u64::from(usage.input_tokens) + u64::from(usage.output_tokens),
+                        (terminal_status == crate::core::events::TurnOutcomeStatus::Failed)
+                            .then_some(
+                                summary
+                                    .error
+                                    .as_deref()
+                                    .unwrap_or(termination_reason.as_str()),
+                            ),
                         fleet_capture.as_ref().map(|(_, manager)| manager),
                     ) {
                         Ok(id) => {
@@ -1657,6 +1659,9 @@ mod tests {
             ..Usage::default()
         };
         Event::TurnComplete {
+            turn_id: None,
+            submission_id: None,
+            compaction_id: None,
             usage: usage.clone(),
             parent_route_usage: usage,
             routed_usage_dropped_records: 0,

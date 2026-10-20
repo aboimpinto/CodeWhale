@@ -37,7 +37,10 @@ CODEWHALE_PROVIDER=vllm VLLM_BASE_URL=http://127.0.0.1:8000/v1 VLLM_MODEL=<id> \
 ```
 
 `codewhale exec` (add `--auto` for tool use) is the non-interactive path to
-exercise the full agent loop.
+exercise the full agent loop. `--auto` enables Full Access by default: no
+Codewhale shell sandbox, with trust mode on. Add `--sandbox workspace-write`
+to keep the shell sandbox and file-tool workspace restrictions, with trust
+mode off.
 
 ## Keeping the host awake during a turn
 

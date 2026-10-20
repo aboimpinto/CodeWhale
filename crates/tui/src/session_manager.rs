@@ -30,7 +30,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use uuid::Uuid;
 
-/// Maximum number of active (non-archived) transcripts to retain.
+/// Maximum active transcripts to retain separately for exec and interactive modes.
 ///
 /// A transcript that falls out of this window is archived, never unlinked
 /// (#6136); archived records sit outside the cap until the user prunes them,
@@ -1176,6 +1176,8 @@ pub struct SavedSession {
     /// config default instead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_title: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub composer_color: Option<String>,
     /// Most recent accepted/completed Auto decision, when the saved model mode
     /// is `auto`. Optional for backward-compatible session loads.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1268,7 +1270,16 @@ impl SavedSession {
         let journal = self.journal.as_mut().expect("journal ensured");
         journal.branch_to(entry_id)?;
         self.leaf_id = journal.leaf_id.clone();
-        self.messages = journal.to_messages();
+        let messages = journal.to_messages();
+        let unchanged = self
+            .messages
+            .iter()
+            .zip(&messages)
+            .take_while(|(old, new)| old == new)
+            .count();
+        self.turn_outcomes
+            .retain(|outcome| outcome.after_message_count <= unchanged);
+        self.messages = messages;
         self.metadata.message_count = self.messages.len();
         self.metadata.updated_at = Utc::now();
         Ok(())
@@ -1362,6 +1373,7 @@ impl SavedSession {
             approval_receipts: Vec::new(),
             work_state: None,
             window_title: None,
+            composer_color: None,
             last_auto_route: None,
             turn_outcomes: Vec::new(),
         })
@@ -2633,6 +2645,7 @@ impl SessionManager {
         prune: Option<(usize, usize)>,
     ) -> std::io::Result<PathBuf> {
         let session_id = session.metadata.id.clone();
+        let exec_mode = session.metadata.mode.as_deref() == Some("exec");
         let path = self.validated_session_path(&session_id)?;
         // Not a `move` closure: `session` is consumed inside, so inference
         // captures it by value while `path` and `session_id` stay borrowed for
@@ -2674,7 +2687,7 @@ impl SessionManager {
 
         // Cleanup may delete sessions, so release this session's lifecycle
         // lock first instead of recursively acquiring it during cleanup.
-        self.cleanup_old_sessions()?;
+        self.cleanup_old_sessions_for_mode(None, Some(exec_mode))?;
 
         Ok(path)
     }
@@ -2877,7 +2890,7 @@ impl SessionManager {
         session_id: &str,
         entries: &[&SessionEntry],
     ) -> io::Result<()> {
-        use std::io::{Seek as _, SeekFrom, Write as _};
+        use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
         if entries.is_empty() {
             return Ok(());
         }
@@ -2901,9 +2914,27 @@ impl SessionManager {
         }
         let created_file = !path.exists();
         let mut file = open_private_lock_file(&path)?;
-        file.seek(SeekFrom::End(0))?;
-        file.write_all(&buf)?;
-        file.sync_all()?;
+        let mut start = file.seek(SeekFrom::End(0))?;
+        if start > 0 {
+            let mut last = [0u8; 1];
+            file.seek(SeekFrom::End(-1))?;
+            file.read_exact(&mut last)?;
+            if last[0] != b'\n' {
+                let mut raw = Vec::new();
+                file.seek(SeekFrom::Start(0))?;
+                file.read_to_end(&mut raw)?;
+                start = raw
+                    .iter()
+                    .rposition(|byte| *byte == b'\n')
+                    .map_or(0, |index| index as u64 + 1);
+                file.set_len(start)?;
+            }
+            file.seek(SeekFrom::Start(start))?;
+        }
+        if let Err(error) = file.write_all(&buf).and_then(|()| file.sync_all()) {
+            let _ = file.set_len(start).and_then(|()| file.sync_all());
+            return Err(error);
+        }
         #[cfg(unix)]
         if created_file || created_dir {
             // Make the new directory entries durable, not only the bytes.
@@ -3559,7 +3590,7 @@ impl SessionManager {
     /// consume it. Callers hold the session's attach lease. A stale checkpoint
     /// never replaces a newer document; an unreadable document and a failed
     /// save leave both files as they were.
-    fn promote_interrupted_checkpoint(&self, id: &str) {
+    pub(crate) fn promote_interrupted_checkpoint(&self, id: &str) {
         let Ok(Some(checkpoint)) = self.load_session_checkpoint(id) else {
             return;
         };
@@ -3608,6 +3639,19 @@ impl SessionManager {
                 .map(|(recovery, lease)| (recovery.session, lease));
         }
         let lease = self.reserve_session_for_attach(&parsed.metadata.id)?;
+        if let Ok(saved) = self.load_session_metadata_by_id(&parsed.metadata.id)
+            && saved.updated_at > parsed.metadata.updated_at
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "session {} has a newer saved record than {}; continue it with `/resume {}`, or move that record aside before loading this older copy",
+                    parsed.metadata.id,
+                    path.display(),
+                    parsed.metadata.id
+                ),
+            ));
+        }
         let mut session = parsed;
         if let Some(journal) = session.journal.as_ref() {
             validate_saved_journal(journal)?;
@@ -4080,7 +4124,8 @@ impl SessionManager {
         }
     }
 
-    /// Clean up old sessions to stay within the active cap.
+    /// Clean up old sessions to stay within each mode's active cap.
+    #[cfg(test)]
     pub fn cleanup_old_sessions(&self) -> std::io::Result<()> {
         self.cleanup_old_sessions_keeping(None)
     }
@@ -4090,12 +4135,21 @@ impl SessionManager {
     /// races session restore can retire the just-resumed session when 50+
     /// newer records exist (its `updated_at` is not bumped until first save).
     ///
-    /// The cap counts *active* transcripts: archived records sit outside it
-    /// until the user prunes them, and empty auto-created stubs get their own
-    /// small cap so they can never push a real transcript out (#6136, #6137).
+    /// The cap counts *active* transcripts separately for exec and interactive
+    /// modes: archived records sit outside it until the user prunes them, and
+    /// empty auto-created stubs get their own small cap per mode so they can
+    /// never push a real transcript out (#6136, #6137).
     /// A transcript past the cap is archived, never unlinked; the store's
     /// destructive paths stay the explicit user actions.
     pub fn cleanup_old_sessions_keeping(&self, keep: Option<&str>) -> std::io::Result<()> {
+        self.cleanup_old_sessions_for_mode(keep, None)
+    }
+
+    fn cleanup_old_sessions_for_mode(
+        &self,
+        keep: Option<&str>,
+        exec_mode: Option<bool>,
+    ) -> std::io::Result<()> {
         // Archiving saves the record, and every save runs retention again.
         // Drain a backlog in one pass here instead of nesting one cleanup per
         // archived transcript.
@@ -4105,34 +4159,43 @@ impl SessionManager {
         {
             return Ok(());
         }
-        let result = self.cleanup_old_sessions_inner(keep);
+        let result = self.cleanup_old_sessions_inner(keep, exec_mode);
         self.retention_in_progress
             .store(false, std::sync::atomic::Ordering::SeqCst);
         result
     }
 
-    fn cleanup_old_sessions_inner(&self, keep: Option<&str>) -> std::io::Result<()> {
+    fn cleanup_old_sessions_inner(
+        &self,
+        keep: Option<&str>,
+        exec_mode: Option<bool>,
+    ) -> std::io::Result<()> {
         let records = self.list_session_records()?;
 
         // What retention owes each class (#6136/#6137): archived records are
         // already outside the cap; empty auto-created stubs are junk the
         // product writes on every boot and are capped apart so they can never
-        // occupy a transcript's slot; everything else carries the
-        // MAX_SESSIONS window.
-        let mut active: Vec<&SessionMetadata> = Vec::new();
-        let mut stubs: Vec<(&Path, &SessionMetadata)> = Vec::new();
+        // occupy a transcript's slot; exec and interactive sessions carry
+        // independent MAX_SESSIONS windows.
+        let mut active: [Vec<&SessionMetadata>; 2] = Default::default();
+        let mut stubs: [Vec<(&Path, &SessionMetadata)>; 2] = Default::default();
         for (path, session) in &records {
-            if session.archived {
+            let is_exec = session.mode.as_deref() == Some("exec");
+            if session.archived || exec_mode.is_some_and(|expected| expected != is_exec) {
                 continue;
             }
+            let mode = usize::from(is_exec);
             if is_empty_auto_created_session(session) {
-                stubs.push((path, session));
+                stubs[mode].push((path, session));
             } else {
-                active.push(session);
+                active[mode].push(session);
             }
         }
 
-        for session in active.iter().skip(MAX_SESSIONS) {
+        for session in active
+            .iter()
+            .flat_map(|sessions| sessions.iter().skip(MAX_SESSIONS))
+        {
             if keep.is_some_and(|id| id == session.id) {
                 continue;
             }
@@ -4149,7 +4212,10 @@ impl SessionManager {
             }
         }
 
-        for (listed_path, session) in stubs.iter().skip(MAX_EMPTY_SESSION_STUBS) {
+        for (listed_path, session) in stubs
+            .iter()
+            .flat_map(|sessions| sessions.iter().skip(MAX_EMPTY_SESSION_STUBS))
+        {
             if keep.is_some_and(|id| id == session.id) {
                 continue;
             }
@@ -4706,6 +4772,7 @@ fn create_saved_session_inner(
         approval_receipts: Vec::new(),
         work_state: None,
         window_title: None,
+        composer_color: None,
         last_auto_route: None,
         turn_outcomes: Vec::new(),
     }
@@ -4722,6 +4789,11 @@ pub fn update_session(
     session.ensure_journal();
     let old_len = session.messages.len();
     let new_len = messages.len();
+    let common = messages
+        .iter()
+        .zip(session.messages.iter())
+        .take_while(|(a, b)| a == b)
+        .count();
     if new_len >= old_len && messages[..old_len] == session.messages[..] {
         if let Some(journal) = session.journal.as_mut() {
             for msg in &messages[old_len..] {
@@ -4732,11 +4804,6 @@ pub fn update_session(
     } else if (new_len != old_len || messages != session.messages.as_slice())
         && let Some(journal) = session.journal.as_mut()
     {
-        let common = messages
-            .iter()
-            .zip(session.messages.iter())
-            .take_while(|(a, b)| a == b)
-            .count();
         if common > 0 && common <= journal.entries.len() {
             let target_id = journal
                 .root_to_leaf()
@@ -4760,6 +4827,9 @@ pub fn update_session(
     }
     session.messages.clear();
     session.messages.extend_from_slice(messages);
+    session
+        .turn_outcomes
+        .retain(|outcome| outcome.after_message_count <= common);
     session.metadata.updated_at = Utc::now();
     session.metadata.message_count = messages.len();
     session.metadata.total_tokens = total_tokens;

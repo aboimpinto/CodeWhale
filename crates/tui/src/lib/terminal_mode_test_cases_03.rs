@@ -456,6 +456,7 @@
             prompt_cache_write_tokens: Some(0),
             reasoning_replay_tokens: Some(40),
             duration_ms: 1834,
+            finish_reason: None,
         };
 
         let value = exec_stream_value(&event).expect("serializes");
@@ -491,6 +492,7 @@
             prompt_cache_write_tokens: None,
             reasoning_replay_tokens: None,
             duration_ms: 250,
+            finish_reason: None,
         };
 
         let value = exec_stream_value(&event).expect("serializes");
@@ -696,7 +698,7 @@
                 duration_ms: 2500,
                 retry_count: None,
                 approval_posture: "ask".to_string(),
-                sandbox_posture: "configured_default".to_string(),
+                sandbox_posture: "workspace-write".to_string(),
                 binary_sha256: Some("sha256:binary".to_string()),
                 config_sha256: None,
                 prompt_sha256: "sha256:prompt".to_string(),

@@ -396,8 +396,11 @@ prompt into `codewhale exec --auto --output-format stream-json --prompt-file -`,
 list models with `codewhale models --json`, and continue a run with
 `codewhale exec --resume <id>`, taking the id from the `saved_session_id` field
 of the `session_capture` event; the terminal `metadata` event carries only a
-fingerprint. [Agent runtime](AGENT_RUNTIME.md#event-vocabulary) describes the
-event stream.
+fingerprint. `--auto` enables Full Access by default (no Codewhale shell
+sandbox, trust mode on); adding `--sandbox workspace-write` keeps the shell
+sandbox and file-tool workspace restrictions, with trust mode off. These
+tool-offering exec runs are saved with either plain-text or streaming output.
+[Agent runtime](AGENT_RUNTIME.md#event-vocabulary) describes the event stream.
 
 ## Config File Location
 

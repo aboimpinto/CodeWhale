@@ -246,7 +246,8 @@ Run options such as --model, --provider, --config and --profile work before or a
   codewhale exec --model MODEL \"explain this function\"
 
 Common forwarded flags:
-  --auto                           Enable tool-backed agent mode with auto-approvals
+  --auto                           Enable tools with automatic approvals and Full Access by default
+  --sandbox <POLICY>               Override the sandbox policy for this run
   --json                           Emit summary JSON
   --resume <SESSION_ID>            Resume a previous session by ID or prefix
   --session-id <SESSION_ID>        Resume a previous session by ID or prefix
@@ -254,9 +255,17 @@ Common forwarded flags:
   --output-format <FORMAT>         Output format: text or stream-json
   --hooks                          Opt in to configured hooks (tool_call_before, shell_env)
 
-Plain `codewhale exec` is a one-shot model response. Use `--auto` for
-non-interactive filesystem/shell tool use, matching the supported automation
-path used by stream-json wrappers.
+Plain `codewhale exec` is a one-shot model response: one Engine turn with the
+same system prompt as every other run, and no tools. Use `--auto` for
+non-interactive agent-with-tools execution. Tools are offered only with
+`--auto`, `--yolo`, `--allowed-tools`, or when resuming a session; limits such
+as `--max-turns`, `--disallowed-tools` or `--sandbox`, and the output format,
+never add tools. A reply cut off at the provider's output limit is continued
+in the same turn, at most 8 model steps unless `--max-turns` says otherwise.
+--auto defaults to Full Access: no shell sandbox and trust mode on. Use --sandbox workspace-write to keep the shell sandbox and file-tool workspace restrictions; stricter configured policies also apply. A denied sandbox retry requires --allow-sandbox-elevation or --sandbox danger-full-access.
+Any --sandbox other than danger-full-access (or an equivalent sandbox_mode in config) disables trust mode.
+Runs that offer tools, stream-json runs, and resumed sessions are saved for codewhale sessions, exec --continue, and codewhale receipts <id>. Plain answer-only text/--json runs are not saved unless compaction needs recovery.
+Put flags before the prompt. Put -- before a prompt starting with - or containing literal exec flags.
 ")]
     Exec(TuiPassthroughArgs),
     /// Manage durable Agent fleet runs.
@@ -13231,6 +13240,19 @@ verbosity = "concise"
         assert!(exec.contains("work before or after exec"), "{exec}");
         assert!(exec.contains("codewhale --model MODEL exec"), "{exec}");
         assert!(exec.contains("codewhale exec --model MODEL"), "{exec}");
+        assert!(exec.contains("--sandbox <POLICY>"), "{exec}");
+        assert!(exec.contains("Full Access"), "{exec}");
+        assert!(
+            exec.contains("no shell sandbox and trust mode on"),
+            "{exec}"
+        );
+        assert!(
+            exec.contains("Any --sandbox other than danger-full-access"),
+            "{exec}"
+        );
+        assert!(exec.contains("equivalent sandbox_mode in config"), "{exec}");
+        assert!(exec.contains("Put flags before the prompt"), "{exec}");
+        assert!(exec.contains("codewhale receipts <id>"), "{exec}");
         let rc = help_for(&["codewhale", "rc", "--help"]);
         assert!(rc.contains("hand it to the Codewhale web app"), "{rc}");
     }

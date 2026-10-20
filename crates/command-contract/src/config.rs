@@ -536,6 +536,7 @@ pub enum CommandSearchProvider {
     Volcengine,
     Sofya,
     Serply,
+    DeepSeek,
 }
 
 /// Operator-notification delivery method.

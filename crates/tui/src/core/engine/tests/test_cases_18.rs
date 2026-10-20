@@ -866,6 +866,7 @@ fn engine_handle_try_send_does_not_block_when_op_channel_is_full() {
     let cancel_token = CancellationToken::new();
     let handle = EngineHandle {
         goal_state: new_shared_goal_state(),
+        sandbox_enforcement: crate::sandbox::policy::SandboxEnforcement::Unavailable,
         tx_op,
         rx_event: Arc::new(RwLock::new(mpsc::channel::<Event>(1).1)),
         cancel_token: Arc::new(StdMutex::new(cancel_token)),

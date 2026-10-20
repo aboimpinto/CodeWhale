@@ -439,7 +439,7 @@ jobs:
           pattern: '*windows-x64*'
       - name: Install NSIS
         shell: pwsh
-        run: choco install nsis -y --no-progress
+        run: ./scripts/installer/install-nsis.ps1
       - name: Build NSIS installer
         shell: pwsh
         run: |

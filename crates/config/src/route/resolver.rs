@@ -41,7 +41,7 @@ use super::errors::RouteError;
 use super::ids::{LogicalModelRef, ModelId, ProviderId, WireModelId};
 use super::offering::{ProviderModelOffering, RouteLimits, bundled_offerings};
 use crate::catalog::{CatalogOffering, bundled_catalog_offerings};
-use crate::provider::WirePolicy;
+use crate::provider::{WireFormat, WirePolicy};
 use crate::{ProviderKind, opencode_go_model_id, provider_preserves_custom_base_url_model};
 
 /// A request to resolve into an executable route.
@@ -63,6 +63,13 @@ pub struct RouteRequest {
     /// for adjusting a route's effective limits: the candidate itself is
     /// immutable once minted.
     pub limit_overrides: Vec<SourcedLimitOverride>,
+    /// Wire override for a custom provider table, honored ONLY for
+    /// `ProviderKind::Custom` (built-ins keep their descriptor policy). The
+    /// tui route layer populates it from the resolved identity's
+    /// `[providers.<name>] wire` dialect so a table saying
+    /// `wire = "responses"` mints a wire-true candidate instead of Custom's
+    /// backward-compatible static Chat policy.
+    pub wire_override: Option<WireFormat>,
 }
 
 /// Resolves [`RouteRequest`]s into [`ReadyRouteCandidate`]s.
@@ -290,6 +297,14 @@ impl RouteResolver {
         let descriptor = ProviderDescriptor::for_kind(provider_kind);
         let provider_id = descriptor.id();
         let default_offering = self.default_offering(&provider_id);
+        // Bound once so the endpoint-key consumers below cannot desync from
+        // the protocol stamp: only a custom table may override the descriptor
+        // policy, and a `chat` / unknown dialect arrives as `None` (the
+        // static policy applies).
+        let custom_wire_override = match (provider_kind, req.wire_override) {
+            (ProviderKind::Custom, Some(protocol)) => Some(protocol),
+            _ => None,
+        };
 
         // 2. Determine the logical selector from explicit choice, then the
         //    saved-model fallback, then the provider default.
@@ -478,8 +493,8 @@ impl RouteResolver {
             }
         }
 
-        let protocol = descriptor
-            .protocol_for_endpoint(&selected.endpoint_key)
+        let protocol = custom_wire_override
+            .or_else(|| descriptor.protocol_for_endpoint(&selected.endpoint_key))
             .ok_or_else(|| RouteError::UnsupportedModelProtocol {
                 provider: provider_id.clone(),
                 model: selected.wire_model_id.as_str().to_string(),

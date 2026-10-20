@@ -19,6 +19,7 @@ use codewhale_models::{
     OpaqueReasoningState, StreamEvent, Tool, Usage,
 };
 
+use super::chat::REASONING_REPLAY_PLACEHOLDER;
 use super::prepared::WireDialect;
 use super::role_placement::{RolePlacement, role_placement};
 use super::wire::{extract_sse_data_value, next_sse_line, push_sse_event_data};
@@ -706,7 +707,15 @@ impl CodewhaleClient {
                             thinking,
                             signature: None,
                             state: None,
+                            redacted_data: None,
                         },
+                        // Redacted thinking does not occur on Responses
+                        // routes (encrypted reasoning rides the reasoning
+                        // item's `encrypted_content` instead); keep the
+                        // match total without inventing a block shape.
+                        ContentBlockStart::RedactedThinking { .. } => {
+                            continue;
+                        }
                         ContentBlockStart::ToolUse {
                             id,
                             name,
@@ -874,6 +883,67 @@ pub(super) fn convert_messages_to_responses_input(
                 }
             }
             RolePlacement::Assistant | RolePlacement::InterruptedAssistant => {
+                let reasoning_item = |block: &ContentBlock| -> Option<Value> {
+                    let ContentBlock::Thinking {
+                        thinking, state, ..
+                    } = block
+                    else {
+                        return None;
+                    };
+                    if let Some(state) = state {
+                        let matches = state.provider == provider.as_str()
+                            && if provider == ProviderKind::OpenaiCodex {
+                                reasoning_api.is_some_and(|api| state.api == api)
+                            } else {
+                                state.api == "openai-responses"
+                            }
+                            && state.model == request.model;
+                        if !matches {
+                            return None;
+                        }
+                        let mut item = json!({
+                            "type": "reasoning",
+                            "summary": [],
+                            "encrypted_content": state.encrypted_content,
+                        });
+                        if let Some(id) = state.id.as_ref() {
+                            item["id"] = json!(id);
+                        }
+                        return Some(item);
+                    }
+                    is_deepseek.then(|| {
+                        let text = if thinking.trim().is_empty() {
+                            REASONING_REPLAY_PLACEHOLDER
+                        } else {
+                            thinking.as_str()
+                        };
+                        json!({
+                            "type": "reasoning",
+                            "content": [{
+                                "type": "reasoning_text",
+                                "text": text,
+                            }],
+                        })
+                    })
+                };
+                if is_deepseek {
+                    let before = items.len();
+                    items.extend(msg.content.iter().filter_map(&reasoning_item));
+                    if items.len() == before
+                        && msg
+                            .content
+                            .iter()
+                            .any(|block| matches!(block, ContentBlock::ToolUse { .. }))
+                    {
+                        items.push(json!({
+                            "type": "reasoning",
+                            "content": [{
+                                "type": "reasoning_text",
+                                "text": REASONING_REPLAY_PLACEHOLDER,
+                            }],
+                        }));
+                    }
+                }
                 for block in &msg.content {
                     match block {
                         ContentBlock::Text { text, .. } => {
@@ -910,36 +980,9 @@ pub(super) fn convert_messages_to_responses_input(
                             }
                             items.push(item);
                         }
-                        ContentBlock::Thinking {
-                            thinking, state, ..
-                        } => {
-                            if let Some(state) = state {
-                                if state.provider == provider.as_str()
-                                    && if provider == ProviderKind::OpenaiCodex {
-                                        reasoning_api.is_some_and(|api| state.api == api)
-                                    } else {
-                                        state.api == "openai-responses"
-                                    }
-                                    && state.model == request.model
-                                {
-                                    let mut item = json!({
-                                        "type": "reasoning",
-                                        "summary": [],
-                                        "encrypted_content": state.encrypted_content,
-                                    });
-                                    if let Some(id) = state.id.as_ref() {
-                                        item["id"] = json!(id);
-                                    }
-                                    items.push(item);
-                                }
-                            } else if is_deepseek {
-                                items.push(json!({
-                                    "type": "reasoning",
-                                    "content": [{
-                                        "type": "reasoning_text",
-                                        "text": thinking,
-                                    }],
-                                }));
+                        ContentBlock::Thinking { .. } if !is_deepseek => {
+                            if let Some(item) = reasoning_item(block) {
+                                items.push(item);
                             }
                         }
                         _ => {}

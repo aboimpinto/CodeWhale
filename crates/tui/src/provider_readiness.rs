@@ -406,6 +406,16 @@ pub(crate) fn route_is_valid_for_model(
         saved_provider_model: None,
         base_url_override: Some(config.base_url_for_route(identity)),
         limit_overrides: Vec::new(),
+        // Readiness validates the route the turn would mint, so a custom
+        // table's wire dialect rides here exactly as it does at runtime.
+        wire_override: (kind == ProviderKind::Custom)
+            .then(|| {
+                codewhale_config::provider::wire_dialect_override(
+                    identity.key.as_str(),
+                    config.provider_wire_dialect(identity),
+                )
+            })
+            .flatten(),
     };
     RouteResolver::new()
         .resolve(&request)

@@ -64,6 +64,15 @@ fn set_api_messages_installs_the_shared_snapshot_without_copying() {
     });
     assert_eq!(snapshot.len(), 1);
     assert_eq!(app.api_messages.len(), 2);
+    app.session_turn_outcomes = vec![
+        crate::session_manager::SavedTurnOutcome::failed("shared failure", 1),
+        crate::session_manager::SavedTurnOutcome::failed("replaced failure", 2),
+    ];
+    let replacement = Arc::new(vec![snapshot[0].clone(), snapshot[0].clone()]);
+    app.set_api_messages(Arc::clone(&replacement));
+    assert!(Arc::ptr_eq(&app.api_messages, &replacement));
+    assert_eq!(app.session_turn_outcomes.len(), 1);
+    assert_eq!(app.session_turn_outcomes[0].error, "shared failure");
 }
 
 #[test]
@@ -4632,7 +4641,7 @@ fn expanded_tool_scenario() {
 
         app.shift_history_maps_down(3);
 
-        assert_eq!(app.expanded_tool_runs, std::collections::HashSet::from([3]));
+        assert_eq!(app.expanded_tool_runs, std::collections::HashSet::from([4]));
     }
     // from expanded_tool_runs_prune_when_history_is_truncated
     {

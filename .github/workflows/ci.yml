@@ -837,39 +837,7 @@ jobs:
       - name: Install NSIS for Windows installer regression
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'windows-latest'
         shell: pwsh
-        # Bounded retry, not a weaker check (#5403). Every observed failure here
-        # was Chocolatey's feed, not the code: a 504 from the V2 API, and
-        # "package was not found with the source(s) listed". A single attempt
-        # made `Test (windows-latest)` — a required check on every PR — report
-        # on community.chocolatey.org's availability instead of on the tree.
-        # NSIS must still install for the regression below to run; this only
-        # survives a transient outage.
-        #
-        # A feed failure also makes `choco install` exit 0 without installing
-        # anything ("Chocolatey installed 0/0 packages" after a V2 feed 504),
-        # so an attempt only counts when `makensis.exe` exists where the installer
-        # regression looks for it (Program Files; choco does not put it on PATH).
-        # Without that check the retry reported success on an unprovisioned
-        # runner and the regression below failed as an unattributable exit
-        # code instead of this step naming the outage (2026-09-24).
-        run: |
-          $ErrorActionPreference = 'Continue'
-          $delays = @(0, 20, 45)
-          for ($attempt = 0; $attempt -lt $delays.Count; $attempt++) {
-            if ($delays[$attempt] -gt 0) {
-              Write-Host "NSIS install attempt $($attempt + 1) after $($delays[$attempt])s backoff"
-              Start-Sleep -Seconds $delays[$attempt]
-            }
-            choco install nsis -y --no-progress
-            $makensis = @("${env:ProgramFiles(x86)}\NSIS\makensis.exe", "$env:ProgramFiles\NSIS\makensis.exe") | Where-Object { Test-Path $_ } | Select-Object -First 1
-            if ($LASTEXITCODE -eq 0 -and $makensis) {
-              Write-Host "NSIS installed on attempt $($attempt + 1)"
-              exit 0
-            }
-            Write-Host "::warning::NSIS is still unavailable after attempt $($attempt + 1) (choco exit $LASTEXITCODE)"
-          }
-          Write-Host "::error::NSIS could not be provisioned from Chocolatey after $($delays.Count) attempts"
-          exit 1
+        run: ./scripts/installer/install-nsis.ps1
       - name: Test Windows installer PATH regression
         if: needs.changes.outputs.heavy == 'true' && matrix.os == 'windows-latest'
         shell: pwsh
@@ -1040,6 +1008,7 @@ jobs:
           if [ -n "$monitor" ]; then kill "$monitor" 2>/dev/null || true; fi
           exit "$status"
         env:
+          CARGO_BUILD_JOBS: '1'
           QA_PTY_DIAGNOSTICS_DIR: ${{ runner.temp }}/pty-failures
           CODEWHALE_EXT_HOST_TESTS: '1'
           CODEWHALE_EXT_HOST_BUN_TESTS: '1'
@@ -1077,6 +1046,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice' && matrix.os == 'ubuntu-latest'
         shell: bash
         env:
+          CARGO_BUILD_JOBS: '1'
           EXPECTED_SHA: ${{ inputs.expected_sha }}
           CODEWHALE_EXT_HOST_TESTS: '1'
           CODEWHALE_EXT_HOST_BUN_TESTS: '1'
