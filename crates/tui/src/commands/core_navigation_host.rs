@@ -53,11 +53,14 @@ fn host_result(result: CoreNavigationCommandResult) -> CommandResult {
     }
 }
 
-pub(in crate::commands) fn dispatch<const INDEX: usize>(
-    app: &mut App,
-    arg: Option<&str>,
-) -> CommandResult {
-    match Registration::<INDEX>::handler() {
+pub(in crate::commands) fn dispatch(app: &mut App, name: &str, arg: Option<&str>) -> CommandResult {
+    let Some(handler) = super::registry()
+        .get(name)
+        .and_then(Command::contextual_handler)
+    else {
+        return CommandResult::error(format!("Navigation command unavailable: {name}"));
+    };
+    match handler {
         CommandHandler::Pure(run) => run(arg),
         CommandHandler::Contextual {
             capabilities,

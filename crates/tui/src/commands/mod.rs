@@ -667,6 +667,10 @@ mod tests {
             !app.voice_enabled,
             "builtin voice shortcut must not dispatch a shadowing user command"
         );
+        let missing =
+            super::core_navigation_host::dispatch(&mut app, "__missing_navigation_builtin__", None);
+        assert!(missing.is_error && missing.action.is_none());
+        assert!(!app.voice_enabled);
     }
 
     #[test]
@@ -1531,9 +1535,14 @@ mod tests {
                 panic!("/{name} must be pure and require no host envelope");
             };
             let result = run(None);
-            assert_eq!(result.action, Some(expected));
+            assert_eq!(result.action, Some(expected.clone()));
             assert!(result.message.is_none());
             assert!(!result.is_error);
+            let mut app = create_test_app();
+            let shortcut = super::core_navigation_host::dispatch(&mut app, name, None);
+            assert_eq!(shortcut.action, Some(expected));
+            assert!(shortcut.message.is_none());
+            assert!(!shortcut.is_error);
         }
         for command in command_infos() {
             for lookup in [command.name.to_string(), format!("/{}", command.name)] {

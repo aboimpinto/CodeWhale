@@ -1,6 +1,7 @@
 //! Host-owned voice capture and builtin shortcut transport.
 
 use crate::commands::CommandResult;
+use crate::commands::groups::core::navigation::voice::VOICE_INFO;
 use crate::config::Config;
 use crate::tui::app::App;
 use crate::voice::{
@@ -10,7 +11,7 @@ use codewhale_localization::{MessageId, tr};
 use std::time::Duration;
 
 pub fn voice(app: &mut App) -> CommandResult {
-    super::core_navigation_host::dispatch::<10>(app, None)
+    super::core_navigation_host::dispatch(app, VOICE_INFO.name, None)
 }
 
 // --- Capture orchestration (UI event loop) ---------------------------------

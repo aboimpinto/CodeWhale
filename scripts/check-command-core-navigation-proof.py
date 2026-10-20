@@ -119,7 +119,7 @@ def violations(root):
                 errors.append(f"conditional declared movable source: {name}")
     inventory = source_text(root / ROOTS[0])
     if tuple(PAIR.findall(inventory)) != PAIRS or not re.search(r';\s*13\s*\]', inventory):
-        errors.append("production inventory must contain all13 real matching registrations in original filtered order")
+        errors.append("production inventory must contain all 13 real matching registrations in original filtered order")
     for module, expected in NAMES.items():
         path = root / GROUP / f"{module}.rs"
         if path.is_file() and tuple(re.findall(r'\bname:\s*"([^"]+)"', source_text(path))) != expected:
@@ -140,7 +140,7 @@ def main():
     for error in errors:
         print(f"[core-navigation-proof] FAIL: {error}")
     if not errors:
-        print("[core-navigation-proof] PASS: all13 actual registrations, complete source closure, host parity and approved normal graph; core remains pending")
+        print("[core-navigation-proof] PASS: all 13 actual registrations, complete source closure, host parity and approved normal graph; core remains pending")
     return bool(errors)
 
 
