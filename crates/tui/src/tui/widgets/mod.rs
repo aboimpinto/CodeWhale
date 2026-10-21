@@ -3847,7 +3847,7 @@ mod tests {
         let mut running_buf = Buffer::empty(area);
         ChatWidget::new(&mut app, area).render(area, &mut running_buf);
         let running = buffer_text(&running_buf, area);
-        assert!(running.contains("run running"), "{running}");
+        assert!(running.contains("$ sleep 30 · running"), "{running}");
 
         app.finalize_active_cell_as_interrupted();
         let HistoryCell::Tool(ToolCell::Exec(exec)) = &app.history[0] else {
@@ -3859,10 +3859,10 @@ mod tests {
         ChatWidget::new(&mut app, area).render(area, &mut settled_buf);
         let settled = buffer_text(&settled_buf, area);
         assert!(
-            !settled.contains("run running"),
+            !settled.contains("· running"),
             "flushed terminal state reused the active cache entry:\n{settled}"
         );
-        assert!(settled.contains("run failed"), "{settled}");
+        assert!(settled.contains("$ sleep 30 · failed"), "{settled}");
     }
 
     fn render_approval_request(
@@ -4303,7 +4303,7 @@ mod tests {
         let mut running_buf = Buffer::empty(area);
         ChatWidget::new(&mut app, area).render(area, &mut running_buf);
         let running = buffer_text(&running_buf, area);
-        assert!(running.contains("run running"), "{running}");
+        assert!(running.contains("$ sleep 30 · running"), "{running}");
         assert_eq!(app.collapsed_cell_map, vec![0, 3]);
 
         app.finalize_active_cell_as_interrupted();
@@ -4317,10 +4317,10 @@ mod tests {
         ChatWidget::new(&mut app, area).render(area, &mut settled_buf);
         let settled = buffer_text(&settled_buf, area);
         assert!(
-            !settled.contains("run running"),
+            !settled.contains("· running"),
             "history cell reused the active slow-path cache entry:\n{settled}"
         );
-        assert!(settled.contains("run failed"), "{settled}");
+        assert!(settled.contains("$ sleep 30 · failed"), "{settled}");
     }
 
     #[test]

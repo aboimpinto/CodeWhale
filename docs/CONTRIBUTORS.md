@@ -54,7 +54,7 @@ changelog or release notes, and this contributor record.
 - **[Lstarsky0](https://github.com/Lstarsky0)** — localized `/profile` replies across all 15 complete locale packs ([#6919](https://github.com/codewhale-hq/Codewhale/pull/6919)), and workflow gates that block their own role rejected at plan admission ([#6952](https://github.com/codewhale-hq/Codewhale/pull/6952)).
 - **[LIghtJUNction](https://github.com/LIghtJUNction)** — plugin shell install and in-TUI plugin OAuth sign-in with `/connect` and `/disconnect` ([#6950](https://github.com/codewhale-hq/Codewhale/pull/6950)).
 - **[jayanthvee](https://github.com/jayanthvee)** — Windows npm launcher guidance and targeted process shutdown ([#6906](https://github.com/codewhale-hq/Codewhale/pull/6906)).
-- **[asto18089](https://github.com/asto18089)** — reference fix for longer browser sign-in callback windows ([#6865](https://github.com/codewhale-hq/Codewhale/issues/6865)).
+- **[asto18089](https://github.com/asto18089)** — reference fix for longer browser sign-in callback windows ([#6865](https://github.com/codewhale-hq/Codewhale/issues/6865)), and owner-only CNB mirroring so forks skip it while missing upstream credentials fail explicitly ([#7016](https://github.com/codewhale-hq/Codewhale/pull/7016)), with initial absent-secret handling co-authored by [zhuowp](https://github.com/zhuowp).
 
 **Reports and verification**
 

@@ -721,12 +721,16 @@ impl TranscriptViewCache {
             hinted
         });
         let line = hinted.as_ref().unwrap_or(line);
-        let rail = tool_group_rail(
-            self.per_cell.as_slice(),
-            cell_index,
-            line_in_cell,
-            rendered_line_count,
-        );
+        let rail = if self.options.calm_cards() && cached.is_tool_groupable {
+            (line_in_cell > 0).then_some(crate::tui::widgets::tool_card::CardRail::Indent)
+        } else {
+            tool_group_rail(
+                self.per_cell.as_slice(),
+                cell_index,
+                line_in_cell,
+                rendered_line_count,
+            )
+        };
         let final_line = line_with_group_rail(line, rail, usize::from(self.width));
         let final_links = if is_hint {
             Vec::new()
@@ -737,7 +741,11 @@ impl TranscriptViewCache {
                 usize::from(self.width),
             )
         };
-        let rail_prefix_width = compute_rail_prefix_width(&final_line);
+        let rail_prefix_width = if rail == Some(crate::tui::widgets::tool_card::CardRail::Indent) {
+            2 + compute_rail_prefix_width(line)
+        } else {
+            compute_rail_prefix_width(&final_line)
+        };
         let copy_prefix_width = if is_hint {
             final_line.width().saturating_sub(rail_prefix_width)
         } else {
@@ -895,8 +903,7 @@ impl TranscriptViewCache {
             let cached = &self.per_cell[cell_index];
             if let Some(next) = next_visible_cell(&self.per_cell, cell_index) {
                 let separator = separator_between(cached, next, spacing);
-                let rail = separator
-                    .railed
+                let rail = (separator.railed && !self.options.calm_cards())
                     .then_some(crate::tui::widgets::tool_card::CardRail::Middle);
                 for _ in 0..separator.rows {
                     let line = line_with_group_rail(&Line::from(""), rail, usize::from(self.width));

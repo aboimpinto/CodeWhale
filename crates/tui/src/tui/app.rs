@@ -2337,9 +2337,6 @@ pub struct App {
     /// The transcript keeps completed entries until turn flush, but the
     /// sidebar can use these timestamps to let settled live rows expire.
     pub active_tool_entry_completed_at: HashMap<usize, Instant>,
-    /// Active exploring cell entry index (within `active_cell.entries`).
-    /// `None` once the active cell flushes or no exploring entry exists.
-    pub exploring_cell: Option<usize>,
     /// Mapping of exploring tool ids to `(entry index in active_cell, entry
     /// within ExploringCell)`. Used to update individual exploring entries
     /// when their tools complete.
@@ -5873,7 +5870,6 @@ impl App {
             return;
         };
         if active.is_empty() {
-            self.exploring_cell = None;
             self.exploring_entries.clear();
             self.active_tool_details.clear();
             self.active_tool_entry_completed_at.clear();
@@ -5918,7 +5914,7 @@ impl App {
                 .or_insert(detail);
         }
 
-        self.exploring_cell = None;
+        crate::tui::tool_routing::release_oldest_tool_detail_outputs(self);
         self.exploring_entries.clear();
 
         for cell in drained {

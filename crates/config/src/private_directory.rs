@@ -112,20 +112,32 @@ fn open_owned_directory(directory: &Path, protect: bool, create: bool) -> Result
     );
     let resolved = resolve_ancestors(directory);
     let directory = resolved.as_path();
+    let directory_flags = libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW;
+    #[cfg(target_os = "linux")]
+    let ancestor_flags = directory_flags | libc::O_PATH;
+    #[cfg(not(target_os = "linux"))]
+    let ancestor_flags = directory_flags | libc::O_RDONLY;
     // SAFETY: the literal root path contains no interior NUL and the returned
     // descriptor is immediately owned by `File`.
     let root_fd = unsafe {
         libc::open(
             c"/".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+            if directory == Path::new("/") {
+                directory_flags | libc::O_RDONLY
+            } else {
+                ancestor_flags
+            },
         )
     };
     if root_fd < 0 {
-        return Err(std::io::Error::last_os_error()).context("opening filesystem root");
+        let error = std::io::Error::last_os_error();
+        let context = format!("opening filesystem root: {error}");
+        return Err(error).context(context);
     }
     // SAFETY: `root_fd` is a newly owned descriptor on the success path above.
     let mut current = unsafe { File::from_raw_fd(root_fd) };
-    for component in directory.components() {
+    let mut components = directory.components().peekable();
+    while let Some(component) = components.next() {
         let Component::Normal(name) = component else {
             if matches!(component, Component::RootDir) {
                 continue;
@@ -136,12 +148,17 @@ fn open_owned_directory(directory: &Path, protect: bool, create: bool) -> Result
             );
         };
         let name = cstring_from_os_str(name)?;
+        let flags = if components.peek().is_none() {
+            directory_flags | libc::O_RDONLY
+        } else {
+            ancestor_flags
+        };
         // SAFETY: parent borrowed from live `current`; `name` outlives the call.
         let mut fd = unsafe {
             libc::openat(
                 std::os::fd::AsRawFd::as_raw_fd(&current),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                flags,
             )
         };
         if create
@@ -173,7 +190,7 @@ fn open_owned_directory(directory: &Path, protect: bool, create: bool) -> Result
                 libc::openat(
                     std::os::fd::AsRawFd::as_raw_fd(&current),
                     name.as_ptr(),
-                    libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    flags,
                 )
             };
         }
@@ -1714,7 +1731,12 @@ mod tests {
             fs::metadata(&selected).unwrap().permissions().mode() & 0o777,
             0o755
         );
-        let credentials = PrivateDirectory::open(&selected).unwrap();
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o111)).unwrap();
+        let credentials = PrivateDirectory::open(&selected);
+        #[cfg(target_os = "linux")]
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let credentials = credentials.unwrap();
         assert_eq!(
             credentials
                 .directory_handle

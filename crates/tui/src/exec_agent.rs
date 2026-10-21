@@ -1225,10 +1225,11 @@ pub(crate) async fn run_exec_agent(
                 tool_catalog,
                 ..
             } => {
-                let (terminal_status, terminal_error) = (status, error);
-                settled_usage = Some(usage.clone());
+                let mut terminal_status = status;
+                let terminal_error = error;
                 #[cfg(unix)]
-                let (mut terminal_status, mut terminal_error) = (terminal_status, terminal_error);
+                let mut terminal_error = terminal_error;
+                settled_usage = Some(usage.clone());
                 if matches!(
                     terminal_status,
                     crate::core::events::TurnOutcomeStatus::Completed
@@ -1295,9 +1296,69 @@ pub(crate) async fn run_exec_agent(
                             .to_string(),
                     );
                 }
+                if last_error_category.is_none() {
+                    last_error_category = summary
+                        .error
+                        .as_deref()
+                        .map(crate::error_taxonomy::classify_error_message);
+                    summary.error_category =
+                        last_error_category.map(|category| category.to_string());
+                }
+                let saved_session_id = if should_persist_session && !latest_messages.is_empty() {
+                    match persist_exec_session(
+                        &latest_messages,
+                        &latest_model,
+                        PersistedProviderRoute {
+                            kind: effective_identity.persisted_kind(),
+                            id: effective_identity.persisted_id(),
+                        },
+                        &latest_workspace,
+                        &latest_system_prompt,
+                        latest_session_id.as_deref(),
+                        u64::from(usage.input_tokens) + u64::from(usage.output_tokens),
+                        (terminal_status == crate::core::events::TurnOutcomeStatus::Failed)
+                            .then_some(summary.error.as_deref().unwrap_or_else(|| {
+                                crate::core::termination::classify_turn_termination(
+                                    terminal_status,
+                                    last_error_category,
+                                    tool_error_seen,
+                                    approval_required,
+                                )
+                                .as_str()
+                            })),
+                        fleet_capture.as_ref().map(|(_, manager)| manager),
+                    ) {
+                        Ok(id) => {
+                            if output_format == ExecOutputFormat::Text && !json_output {
+                                eprintln!("{}", exec_saved_session_line(&id));
+                            }
+                            Some(id)
+                        }
+                        Err(err) => {
+                            let error = format!(
+                                "Failed to save exec session: {err:#}. The task may already have run; do not retry automatically."
+                            );
+                            terminal_status = crate::core::events::TurnOutcomeStatus::Failed;
+                            summary.status = Some("failed".to_string());
+                            summary.error = Some(match summary.error.take() {
+                                Some(previous) => format!("{previous}; {error}"),
+                                None => error.clone(),
+                            });
+                            last_error_category = Some(crate::error_taxonomy::ErrorCategory::State);
+                            summary.error_category =
+                                last_error_category.map(|category| category.to_string());
+                            if output_format == ExecOutputFormat::StreamJson {
+                                emit_exec_stream_event(&ExecStreamEvent::Error { error })?;
+                            }
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
                 // Lifecycle outbox: the clean headless turn-end boundary.
-                // `terminal_status` is authoritative here — persistent-service
-                // handoff failures above already demoted it to Failed, and
+                // `terminal_status` includes persistent-service handoff and
+                // session-save failures above, and
                 // `summary.error` includes the sandbox-denial augmentation.
                 // No-op when the feature is disabled.
                 {
@@ -1326,14 +1387,6 @@ pub(crate) async fn run_exec_agent(
                         }),
                     });
                 }
-                if last_error_category.is_none() {
-                    last_error_category = summary
-                        .error
-                        .as_deref()
-                        .map(crate::error_taxonomy::classify_error_message);
-                    summary.error_category =
-                        last_error_category.map(|category| category.to_string());
-                }
                 let termination_reason = crate::core::termination::classify_turn_termination(
                     terminal_status,
                     last_error_category,
@@ -1349,43 +1402,6 @@ pub(crate) async fn run_exec_agent(
                 if !termination_reason.is_success() {
                     codewhale_telemetry::set_exit_class(codewhale_telemetry::ExitClass::Error);
                 }
-                let saved_session_id = if should_persist_session && !latest_messages.is_empty() {
-                    match persist_exec_session(
-                        &latest_messages,
-                        &latest_model,
-                        PersistedProviderRoute {
-                            kind: effective_identity.persisted_kind(),
-                            id: effective_identity.persisted_id(),
-                        },
-                        &latest_workspace,
-                        &latest_system_prompt,
-                        latest_session_id.as_deref(),
-                        u64::from(usage.input_tokens) + u64::from(usage.output_tokens),
-                        (terminal_status == crate::core::events::TurnOutcomeStatus::Failed)
-                            .then_some(
-                                summary
-                                    .error
-                                    .as_deref()
-                                    .unwrap_or(termination_reason.as_str()),
-                            ),
-                        fleet_capture.as_ref().map(|(_, manager)| manager),
-                    ) {
-                        Ok(id) => {
-                            if output_format == ExecOutputFormat::Text && !json_output {
-                                eprintln!("{}", exec_saved_session_line(&id));
-                            }
-                            Some(id)
-                        }
-                        Err(err) => {
-                            if output_format == ExecOutputFormat::Text && !json_output {
-                                eprintln!("warning: failed to save exec session: {err}");
-                            }
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
                 if output_format == ExecOutputFormat::StreamJson {
                     if let Some(id) = saved_session_id.as_ref() {
                         emit_exec_stream_event(&ExecStreamEvent::SessionCapture {

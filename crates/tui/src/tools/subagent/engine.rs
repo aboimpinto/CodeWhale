@@ -1497,14 +1497,23 @@ pub(super) async fn run_child_agent(
     } else {
         prepare_child_membership(runtime, &assignment, &agent_id).await?
     };
+    let owner_agent_name = runtime
+        .manager
+        .read()
+        .await
+        .get_result(&agent_id)
+        .map(|agent| subagent_result_display_name(&agent))
+        .unwrap_or_else(|_| {
+            assignment
+                .role
+                .clone()
+                .unwrap_or_else(|| agent_type.as_str().to_owned())
+        });
     let authority = ChildAuthority::capture(
         runtime.clone(),
         agent_type.clone(),
         agent_id.clone(),
-        assignment
-            .role
-            .clone()
-            .unwrap_or_else(|| agent_type.as_str().to_owned()),
+        owner_agent_name,
         allowed_tools.clone(),
     );
     let system =

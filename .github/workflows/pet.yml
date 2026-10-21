@@ -1,14 +1,6 @@
 name: Pet conformance
 
 on:
-  pull_request:
-    paths:
-      - 'pet/**'
-      - 'crates/tui/src/tui/pet_watch/**'
-      - 'crates/tui/src/tui/ambient_life/pet_*'
-      - 'crates/tui/src/tui/ambient_life/whale-points.tsv'
-      - 'npm/runtime-sdk/**'
-      - '.github/workflows/pet.yml'
   workflow_dispatch:
 
 permissions:

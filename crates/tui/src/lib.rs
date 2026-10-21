@@ -757,9 +757,14 @@ struct FleetRunArgs {
     /// JSON or TOML task spec to enqueue
     #[arg(value_name = "TASK_SPEC")]
     task_spec: PathBuf,
-    /// Maximum local workers to lease concurrently
+    /// Maximum workers to lease concurrently
     #[arg(long, default_value_t = 4)]
     max_workers: usize,
+    #[arg(
+        long = "require-placement",
+        help = "Require environment placement support; older Engines refuse this flag"
+    )]
+    _require_placement: bool,
     /// Seconds without heartbeat before a running task is counted stale
     #[arg(long, default_value_t = 300)]
     stale_after_seconds: u64,
@@ -1231,7 +1236,7 @@ struct SetupArgs {
     /// Initialize MCP config, skills, tools, and plugins
     #[arg(long, default_value_t = false)]
     all: bool,
-    /// Create a local workspace skills directory (./skills)
+    /// Create a local workspace skills directory (./.codewhale/skills)
     #[arg(long, default_value_t = false)]
     local: bool,
     /// Overwrite existing template files
@@ -1434,12 +1439,12 @@ struct ReviewArgs {
     pr: Option<u32>,
     /// Repository in `owner/name` form for --pr. Defaults to the current
     /// workspace's `gh` config (i.e. the repo gh thinks you're in).
-    #[arg(long, requires = "pr")]
+    #[arg(long, requires = "pr", conflicts_with_all = ["staged", "base", "path"])]
     repo: Option<String>,
     /// Post the review to the pull request (one COMMENT review with inline
     /// line comments plus a summary). Requires --pr; without it the review
     /// is only printed locally.
-    #[arg(long, requires = "pr")]
+    #[arg(long, requires = "pr", conflicts_with_all = ["staged", "base", "path"])]
     post: bool,
     /// Base ref to diff against (e.g. origin/main). The reviewer also gets the
     /// base..HEAD commit messages as the author's stated intent.
@@ -1694,6 +1699,15 @@ pub fn mcp_subcommand_help() -> String {
     }
     help.push_str("\nRun `codewhale mcp <COMMAND> --help` for a command's options.");
     help
+}
+
+#[must_use]
+pub fn doctor_options_help() -> String {
+    DoctorArgs::augment_args(clap::Command::new("doctor"))
+        .disable_help_flag(true)
+        .help_template("Doctor options:\n{options}")
+        .render_help()
+        .to_string()
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -4336,7 +4350,7 @@ fn run_setup(
 
     if run_skills {
         let skills_dir = if args.local {
-            workspace.join("skills")
+            workspace.join(".codewhale").join("skills")
         } else {
             config.skills_dir()
         };
@@ -4357,7 +4371,7 @@ fn run_setup(
         }
         if args.local {
             println!(
-                "    Local skills dir enabled for this workspace: {}",
+                "    Project skills dir (loads after workspace trust): {}",
                 crate::utils::display_path(&skills_dir)
             );
         } else {
@@ -5586,18 +5600,8 @@ async fn run_doctor(
     // to the merged catalogue.
     let opencode_skills_dir = workspace.join(".opencode").join("skills");
     let claude_skills_dir = workspace.join(".claude").join("skills");
-    let selected_skills_dir = if agents_skills_dir.exists() {
-        agents_skills_dir.clone()
-    } else if local_skills_dir.exists() {
-        local_skills_dir.clone()
-    } else if config.skills_dir.is_none()
-        && let Some(global_agents) = agents_global_skills_dir.as_ref()
-        && global_agents.exists()
-    {
-        global_agents.clone()
-    } else {
-        global_skills_dir.clone()
-    };
+    let selected_skills_dir =
+        crate::tui::app::resolve_skills_dir(workspace, &global_skills_dir, config);
 
     let describe_dir = |dir: &Path| -> usize {
         std::fs::read_dir(dir)
@@ -5702,14 +5706,15 @@ async fn run_doctor(
             unrecognized_system_skills.join(", ")
         );
     }
-    if !agents_skills_dir.exists()
+    if !workspace.join(".codewhale").join("skills").is_dir()
+        && !agents_skills_dir.exists()
         && !local_skills_dir.exists()
         && !agents_global_skills_dir
             .as_ref()
             .is_some_and(|dir| dir.exists())
         && !global_skills_dir.exists()
     {
-        println!("    Run `codewhale setup --skills` (or add --local for ./skills).");
+        println!("    Run `codewhale setup --skills` (or add --local for ./.codewhale/skills).");
     }
 
     // Tools directory
@@ -8142,18 +8147,8 @@ fn run_doctor_json(
     // global agentskills.io content is contributing to the merged catalogue.
     let opencode_skills_dir = workspace.join(".opencode").join("skills");
     let claude_skills_dir = workspace.join(".claude").join("skills");
-    let selected_skills_dir = if agents_skills_dir.exists() {
-        agents_skills_dir.clone()
-    } else if local_skills_dir.exists() {
-        local_skills_dir.clone()
-    } else if config.skills_dir.is_none()
-        && let Some(global_agents) = agents_global_skills_dir.as_ref()
-        && global_agents.exists()
-    {
-        global_agents.clone()
-    } else {
-        global_skills_dir.clone()
-    };
+    let selected_skills_dir =
+        crate::tui::app::resolve_skills_dir(workspace, &global_skills_dir, config);
     let agents_global_summary = agents_global_skills_dir
         .as_ref()
         .map(|path| {

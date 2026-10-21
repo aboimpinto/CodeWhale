@@ -654,6 +654,7 @@ mod platform {
                     },
                     line = self.read.next_line() => match line? {
                         None if !input_open => return Ok(()),
+                        None if self.frontend==crate::daemon_socket::AttachFrontend::Acp => bail!("The Codewhale Runtime this ACP session attached to (pid {}) has exited, so the session has ended. Restart the agent to continue; pending operation outcomes may be uncertain.", self.receipt.pid),
                         None => bail!("selected owner connection closed; pending operation outcomes may be uncertain"),
                         Some(line) => {
                             let _: Value = serde_json::from_str(&line).context("invalid owner response")?;

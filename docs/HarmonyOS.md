@@ -6,14 +6,15 @@ This page covers Codewhale on HarmonyOS PC and OpenHarmony cross-build setups.
 
 ## Support Tier
 
-| Target | Codewhale tier | CI coverage | Distribution |
+| Target | Codewhale tier | Validation | Distribution |
 | --- | --- | --- | --- |
 | HarmonyOS PC with a glibc-compatible userspace | Tier 1 Linux ARM64 runtime | Covered by the Linux ARM64 release build | GitHub release binaries; npm secondary |
-| `aarch64-unknown-linux-ohos` (OpenHarmony) | Tier 2 cross-build target | `codewhale-tui` is checked with a real OpenHarmony native SDK/sysroot | Build from source; no prebuilt release asset |
+| `aarch64-unknown-linux-ohos` (OpenHarmony) | Tier 2 cross-build target | Manually dispatched SDK check for `codewhale-tui` and `codewhale-cli` | Build from source; no prebuilt release asset |
 
-Tier 2 means every relevant source change is compile-checked, but maintainers do
-not promise a release binary or full device-level runtime testing. The CI job
-uses the published OpenHarmony 6.1 native SDK; it deliberately fails if the SDK,
+Tier 2 provides a source-build path and a manually dispatched SDK check; it does
+not promise a check on every commit, a release binary, or full device-level
+runtime testing. The OpenHarmony workflow uses the published OpenHarmony 6.1
+native SDK; it deliberately fails if the SDK,
 Clang, or sysroot is unavailable rather than substituting host headers or a stub
 that could report false success.
 
@@ -50,7 +51,8 @@ On Windows PowerShell:
 $env:OHOS_NATIVE_SDK="<path-to-openharmony-native-sdk>"
 . .\scripts\ohos-env.ps1
 rustup target add aarch64-unknown-linux-ohos
-cargo build --target aarch64-unknown-linux-ohos -p codewhale-cli
+$env:CODEWHALE_BUILD_SHA = (git rev-parse HEAD).Trim()
+cargo build --locked --release --target aarch64-unknown-linux-ohos -p codewhale-cli
 ```
 
 On Linux or macOS:
@@ -59,8 +61,14 @@ On Linux or macOS:
 export OHOS_NATIVE_SDK=/path/to/openharmony/native
 . ./scripts/ohos-env.sh
 rustup target add aarch64-unknown-linux-ohos
-cargo build --target aarch64-unknown-linux-ohos -p codewhale-cli
+export CODEWHALE_BUILD_SHA="$(git rev-parse HEAD)"
+cargo build --locked --release --target aarch64-unknown-linux-ohos -p codewhale-cli
 ```
+
+The executable is `target/aarch64-unknown-linux-ohos/release/codewhale` (no
+`.exe`, including when built on Windows), unless `CARGO_TARGET_DIR` overrides
+the output directory. Copy it to the device and run `./codewhale --version`.
+Build from a clean checkout when using the commit stamp above.
 
 The setup scripts export Cargo's target-specific `linker`, `AR`, `CC`, `CXX`,
 `CFLAGS`, `CXXFLAGS`, `CARGO_ENCODED_RUSTFLAGS`, `CC_SHELL_ESCAPED_FLAGS`, and
@@ -76,6 +84,34 @@ Cargo's linker arguments and exit status. The launcher re-quotes every
 argument before forwarding, so an SDK path containing spaces (for example the
 default `D:\DevEco Studio\...` install) keeps its `--sysroot` intact through
 the final link.
+
+## Identifying A Development Build
+
+Current development is on `main`. A version such as `0.10.2 (dev)` means the
+build did not supply a source stamp; it does not identify a development channel
+or prove that the binary includes the latest fixes. The commands above embed
+the first 12 characters of the source commit in `--version`. Record the full
+`git rev-parse HEAD` alongside the binary. A local rebuild does not update an
+older installed binary automatically; check the exact executable you copied.
+
+Native OpenHarmony has no prebuilt release asset. Linux ARM64 release binaries
+require a compatible Linux userspace and are not native OHOS binaries. GitHub
+build-only release-candidate artifacts, when available, identify their source
+commit but do not establish native OHOS support or a published release.
+
+## Sign-In Filesystem Errors
+
+`ChatGPT sign-in failed: opening filesystem root` occurs while preparing local
+credential storage, before browser sign-in or callback setup. It does not by
+itself identify a read-only `/tmp`. Current source uses traversal-only handles
+for Linux/OpenHarmony ancestors and keeps a normal, protected handle for the
+private credential directory. Root-open failures include the OS error.
+
+For a report, include the exact `--version`, full build commit, device/OS and
+terminal version, and complete error text. Keep tokens, authorization URLs and
+credential files out of the report. Do not make system directories writable or
+disable credential checks. A successful build or Linux permission reproduction
+still needs a sign-in check on the affected device.
 
 ## Compiler Wrappers
 

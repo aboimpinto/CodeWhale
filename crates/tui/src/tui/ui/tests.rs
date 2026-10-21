@@ -25131,10 +25131,7 @@ fn apply_loaded_session_restores_artifact_registry() {
 }
 
 #[test]
-fn parallel_exploring_tool_starts_share_one_active_entry() {
-    // Three exploring tools start in any order; they must collapse into one
-    // entry inside the active cell rather than three separate cells. This is
-    // the central CX#7 contract for the most common parallel case.
+fn parallel_exploring_tool_starts_keep_distinct_active_entries() {
     let mut app = create_test_app();
 
     handle_tool_call_started(
@@ -25159,26 +25156,20 @@ fn parallel_exploring_tool_starts_share_one_active_entry() {
     // History must remain empty: nothing flushes until the turn ends.
     assert_eq!(app.history.len(), 0, "no history cells written mid-turn");
     let active = app.active_cell.as_ref().expect("active cell created");
-    assert_eq!(
-        active.entry_count(),
-        1,
-        "all exploring starts share one entry"
-    );
-    let HistoryCell::Tool(ToolCell::Exploring(explore)) = &active.entries()[0] else {
-        panic!("expected exploring cell")
-    };
-    assert_eq!(explore.entries.len(), 3);
-    for entry in &explore.entries {
-        assert_eq!(entry.status, ToolStatus::Running);
+    assert_eq!(active.entry_count(), 3);
+    for (index, id) in ["t-a", "t-b", "t-c"].into_iter().enumerate() {
+        assert_eq!(active.entry_index_for_tool(id), Some(index));
+        let HistoryCell::Tool(ToolCell::Exploring(explore)) = &active.entries()[index] else {
+            panic!("expected exploring cell")
+        };
+        assert_eq!(explore.entries.len(), 1);
+        assert_eq!(explore.entries[0].status, ToolStatus::Running);
+        assert_eq!(app.tool_detail_record_for_cell(index).unwrap().tool_id, id);
     }
 }
 
 #[test]
-fn out_of_order_completes_finalize_one_history_cell_per_turn() {
-    // Three parallel tools complete in reverse order; we then signal turn
-    // complete and assert exactly one tool history cell exists (the
-    // finalized active group). This proves the active cell didn't bounce
-    // mid-turn and that the flush path correctly migrates entries.
+fn out_of_order_completes_preserve_each_tool_history_cell() {
     let mut app = create_test_app();
 
     handle_tool_call_started(
@@ -25208,33 +25199,40 @@ fn out_of_order_completes_finalize_one_history_cell_per_turn() {
     // Still nothing in history: the active cell holds everything.
     assert_eq!(app.history.len(), 0);
     let active = app.active_cell.as_ref().expect("active cell still present");
-    let HistoryCell::Tool(ToolCell::Exploring(explore)) = &active.entries()[0] else {
-        panic!("expected exploring cell")
-    };
-    assert!(
-        explore
-            .entries
-            .iter()
-            .all(|e| e.status == ToolStatus::Success),
-        "all exploring entries should be Success after their tools complete"
-    );
+    assert_eq!(active.entry_count(), 3);
+    for cell in active.entries() {
+        let HistoryCell::Tool(ToolCell::Exploring(explore)) = cell else {
+            panic!("expected exploring cell")
+        };
+        assert_eq!(explore.entries.len(), 1);
+        assert_eq!(explore.entries[0].status, ToolStatus::Success);
+    }
 
     // Flush via the explicit helper (mirrors what TurnComplete does).
     app.flush_active_cell();
 
     assert!(app.active_cell.is_none(), "active cell cleared after flush");
-    // The flushed group is exactly one history cell — the merged exploring
-    // aggregate. This is the heart of CX#7: parallel work renders as ONE
-    // finalized cell, regardless of completion order.
     let tool_cells = app
         .history
         .iter()
         .filter(|c| matches!(c, HistoryCell::Tool(_)))
         .count();
-    assert_eq!(
-        tool_cells, 1,
-        "exactly one tool history cell after parallel turn"
-    );
+    assert_eq!(tool_cells, 3);
+    for (index, (id, output)) in [
+        ("t-1", "contents A"),
+        ("t-2", "contents B"),
+        ("t-3", "two hits"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let detail = app.tool_detail_record_for_cell(index).unwrap();
+        assert_eq!(detail.tool_id, id);
+        assert_eq!(detail.output.as_deref(), Some(output));
+    }
+    let groups = crate::tui::history::detect_tool_runs(&app.history, 3);
+    assert_eq!(groups.len(), 1);
+    assert_eq!(groups[0].count, 3);
 }
 
 #[test]
@@ -25264,7 +25262,7 @@ fn mixed_parallel_tools_render_in_single_active_cell() {
 
     assert_eq!(app.history.len(), 0);
     let active = app.active_cell.as_ref().expect("active cell present");
-    // 3 entries: exploring aggregate (1) + exec + generic.
+    // 3 entries: exploring + exec + generic.
     assert_eq!(active.entry_count(), 3);
 
     handle_tool_call_complete(&mut app, "shell-1", "exec_shell", &ok_result("ok"));

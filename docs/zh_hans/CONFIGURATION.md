@@ -1307,7 +1307,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 
   `/config subagents status` 打印全局值和活动 provider 的解析 profile，这样速率限制调整在 TUI 中可见。`[subagents.models]` 接受小写的 Fleet 角色键，如 `worker`、`scout`、`planner`、`reviewer`、`builder` 和 `verifier`；旧类型键在 v0.9.x 期间仍被接受。值在派生时对照活动 provider 验证；直接 DeepSeek 需要 DeepSeek ID，而 OpenAI 兼容/自定义 provider 路由把显式模型 ID 透传给该 provider。要把子智能体路由到不同于父会话的 provider，保存带显式 `provider` 和 `model` 字段的 Fleet/AgentProfile(包括 `lm-studio` 这样的用户命名自定义 provider)，并调用 `agent(profile: "...")`；见 [SUBAGENTS.md](SUBAGENTS.md)。
 
-- `skills_dir`(字符串，可选)：默认 `~/.codewhale/skills`(每个技能是包含 `SKILL.md` 的目录)。存在时优先使用工作区本地的 `.agents/skills` 或 `./skills`；运行时还发现全局 agentskills.io 兼容的 `~/.agents/skills` 和更广的 Claude 生态系统 `~/.claude/skills`。首次启动为常见工作流安装带版本的捆绑技能，包括技能创建、委派、MCP/插件脚手架、文档、演示文稿、电子表格、PDF 和飞书/Lark。只有 CodeWhale 自有的根(`<workspace>/.codewhale/skills` 和 `~/.codewhale/skills`)是可写安装/导入目标；兼容 harness 根保持只读。裸 `/skills` 打开技能管理器(仅自有，零网络)。管理器、审计状态、来源标记和变更规则见 [SKILLS.md](SKILLS.md)，可移植 `SKILL.md` 包与 Claude Code 插件运行时之间的受支持边界见 [CLAUDE_PLUGIN_COMPAT.md](../CLAUDE_PLUGIN_COMPAT.md)。
+- `skills_dir`(字符串，可选)：默认 `~/.codewhale/skills`(每个技能是包含 `SKILL.md` 的目录)。工作区获得信任后，项目技能优先于全局技能，其中 `.codewhale/skills` 优先于 `.agents/skills` 等兼容目录。顶层 `./skills` 需要显式设置 `[skills] flat_workspace_root = true` 或 `skills_dir` 才会加载。运行时还发现全局 agentskills.io 兼容的 `~/.agents/skills` 和更广的 Claude 生态系统 `~/.claude/skills`。首次启动为常见工作流安装带版本的捆绑技能，包括技能创建、委派、MCP/插件脚手架、文档、演示文稿、电子表格、PDF 和飞书/Lark。只有 CodeWhale 自有的根(`<workspace>/.codewhale/skills` 和 `~/.codewhale/skills`)是可写安装/导入目标；兼容 harness 根保持只读。裸 `/skills` 打开 Extensions → Skills(仅自有，零网络)；`/skills manage` 打开技能管理器。管理器、审计状态、来源标记和变更规则见 [SKILLS.md](SKILLS.md)，可移植 `SKILL.md` 包与 Claude Code 插件运行时之间的受支持边界见 [CLAUDE_PLUGIN_COMPAT.md](../CLAUDE_PLUGIN_COMPAT.md)。
 
 - `[skills].scan_codewhale_only`(bool，默认 `false`)：为 `true` 时，会话技能发现忽略跨工具根，如 `.claude/skills`、`.opencode/skills`、`.cursor/skills` 和 `~/.agents/skills`。Codewhale 仍扫描 `<workspace>/.codewhale/skills`、`~/.codewhale/skills` 和任何显式 `skills_dir` 覆盖。技能管理器仍可独立于这个运行时旋钮切换本地兼容审计扫描——见 [SKILLS.md](SKILLS.md)。
 
@@ -1798,6 +1798,7 @@ code_mode = true # execute_tools composes MCP/plugin/native calls; false defers 
 | Tavily | `time_range` | 不发送（Tavily 使用国家全名） |
 | SearXNG | `time_range` | `language`，原样发送 |
 | Serply | 不发送（文档未说明） | `hl` 语言，`gl` 国家 |
+| DeepSeek | 不发送 | 不发送（`localization` 需要 IP 地址） |
 
 时效会向上取整到后端最接近的窗口（天、周、月、年），所以 `recency = 10` 会搜索最近一个月。其他后端忽略这两项，并在回执中说明。
 
@@ -1830,11 +1831,13 @@ Codewhale 按 `score` 从高到低排序返回行，再对排序结果应用 `ma
 
 **Serply**([serply.io](https://serply.io))返回 Google 自然搜索结果，包含标题、URL 和摘要片段。把 `[search] api_key` 设为你的 Serply key，或用 `SERPLY_API_KEY` 环境变量。这只是搜索工具后端；它不添加 Serply 模型 provider。
 
+**DeepSeek**([docs](https://api-docs.deepseek.com/guides/search))使用 `POST https://api.deepseek.com/v1/tools/search`。设置 `provider = "deepseek"`（也接受 `deep-seek` 和 `deepseek-search`），并依次从 `[search] api_key` 或 `DEEPSEEK_API_KEY` 环境变量读取 key。此搜索后端不复用已保存的 DeepSeek 模型 provider key。查询截断为 128 个 Unicode 字符。后端把数量限制在 1–50；共享搜索工具目前每次最多请求 10 条结果。`site:`、`lang:`、`after:`、`before:` 等查询运算符原样传递；`recency` 和 `locale` 两项被忽略。结果包含标题、URL 和摘要片段；摘要片段为空时回退到 summary。
+
 **Tavily**([tavily.com](https://tavily.com))在存在 Tavily key 且没有固定 provider 时自动选中：设置了 `TAVILY_API_KEY`，或 `[search] api_key` / `CODEWHALE_SEARCH_API_KEY` 属于 `tvly-` 家族。doctor 会把这种情况报告为 `source: tavily key`。自动检测只在运行时生效——Codewhale 不会为它写入 `[search] provider`，也不会把 `TAVILY_API_KEY` 合并进 `[search] api_key`。显式的 `[search] provider` 或 `CODEWHALE_SEARCH_PROVIDER` 始终优先，所以即使环境里有 Tavily key，`provider = "firecrawl"` 仍然是 Firecrawl。固定为 `tavily` 时接受任何非空的 `[search] api_key`，由该 key 或 `TAVILY_API_KEY` 提供配置；两者都为空时直接失败关闭。
 
 ```toml
 [search]
-provider = "firecrawl" # 也 duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya | serply
+provider = "firecrawl" # 也 duckduckgo | bing | tavily | bocha | metaso | searxng | baidu | volcengine | sofya | serply | deepseek
 # base_url = "https://search.example/" # provider = "duckduckgo" 时可选;"searxng" 时必填
 # api_key = "YOUR_KEY" # firecrawl 可选;其他 API 提供商必填
 # native = false # provider 原生搜索:不设置 = 仅在未配置 provider 时使用
@@ -1869,7 +1872,7 @@ allowed_sandbox_modes = ["read-only", "workspace-write"]
 
 `codewhale doctor` 遵循与 TUI 其余部分相同的配置解析规则。这意味着 `--config`、`CODEWHALE_CONFIG_PATH` 和旧 `DEEPSEEK_CONFIG_PATH` 都被尊重，MCP/skills 检查使用解析出的 `mcp_config_path` / `skills_dir`(含环境覆盖)。
 
-要引导缺失的 MCP/skills 路径，运行 `codewhale setup --all`。你也可以运行 `codewhale setup --skills --local` 创建工作区本地的 `./skills` 目录。
+要引导缺失的 MCP/skills 路径，运行 `codewhale setup --all`。你也可以运行 `codewhale setup --skills --local` 创建自有的项目目录 `.codewhale/skills`。项目技能在工作区获得信任后加载。
 
 普通 `codewhale doctor` 和 `doctor --json` 都是结构性的，默认离线。它们不检查 release 服务、托管 provider API、本地 provider 端点或 MCP 进程，也不加载工作区凭据 `.env`。用 `--check-updates`、`--probe-api`、`--probe-local` 或 `--probe-mcp` 选择加入对应的实时边界；`--probe-local` 可能启动 Ollama 这样的桌面托管服务。只有显式 API/local 探测路径可以加载工作区凭据 `.env` 值。实时标志与 `--json` 冲突，所以机器可读 doctor 输出总是离线。顶层键包括 `version`、`paths`、`secret_backend`、`config_path`、`config_present`、`workspace`、`api_key.source`、`api_key.availability`、`base_url`、`default_text_model`、`mcp`、`skills`、`tools`、`plugins`、`sandbox`、`platform`、`api_connectivity` 和 `capability`。CI 消费者应依赖 `api_key.source`(`config_declared`/`env_declared`/`external_auth_declared`/`secret_store_unprobed`/`secret_store_unavailable`/`oauth_unprobed`/`external_consent`/`none`/`local_runtime`/`unknown`)和 `api_key.availability`(`present`/`not_required`/`not_probed`/`unavailable`/`unknown`)，而不是解析人类可读的 `doctor` 文本。Source 是声明元数据，不是凭据存在或工作的证明。只有非空、非哨兵的字面配置值才在结构上 `present`；无认证和本地路由是 `not_required`。环境、外部认证、OAuth、consent 和 secret-store 声明保持 `not_probed`，不能让结构 Setup 或 Fleet 就绪成为真。被禁止使用共享存储的命名/自定义端点上的 secret-store 哨兵是 `secret_store_unavailable`/`unavailable`，而 `unknown` 保留给缺乏受支持结构结论的情况。确切和空白包裹的旧哨兵从不被当作字面凭据。结构加载器仍遵循安全环境路由/模型/策略字段，但从不物化环境 HTTP 头、沙箱 API key 或搜索 API key；只有显式 API/local 探测切换到正常凭据加载路径。选择加入的更新检查也只发出类型化通用失败：不可信 release 元数据和传输错误不被回显。
 

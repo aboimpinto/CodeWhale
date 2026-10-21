@@ -3210,7 +3210,7 @@ impl ShellManager {
         shell.snapshot()
     }
 
-    fn mark_cancel_reported(&mut self, result: &ShellResult) {
+    pub(crate) fn mark_cancel_reported(&mut self, result: &ShellResult) {
         if result.status == ShellStatus::Killed
             && let Some(shell) = result
                 .task_id

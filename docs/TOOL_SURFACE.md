@@ -72,12 +72,18 @@ ordinary approval behavior but does not bypass hard safety or repository law.
 not model-visible. `tasks`, `Git`, `Run`, `Web`, `remember`, and other
 specialized capabilities are searchable rather than first-turn ceremony.
 
-A Bash description appears as a muted, bounded note under the command on the
-TUI shell card, including on automatic runs. It never replaces the command and
-is excluded from execution, exact approval keys and Auto-Review input. The
-original description remains in the recorded tool input and exports. Approval
-prompts, `/jobs`, the activity inspector, ACP and other Runtime clients keep
-showing the command; this change adds no description row to those surfaces.
+On the TUI's default (calm) shell card the Bash description is the headline,
+shown as written apart from stripped terminal escapes, collapsed whitespace and
+a length bound, and the command sits on its own `$` row directly under it in
+every state and at every width, including automatic runs. A card without a
+description leads with the `$` command instead. The labeled card
+(`show_tool_details = true` with `calm_mode = false`) keeps the command in its
+header and the description as a muted `note:` row. The description never
+replaces the command and is excluded from execution, exact approval keys and
+Auto-Review input. The original description remains in the recorded tool input
+and exports. Approval prompts, `/jobs`, the activity inspector, ACP and other
+Runtime clients keep showing the command; this change adds no description row
+to those surfaces.
 
 ## Local code execution
 

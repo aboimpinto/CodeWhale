@@ -1376,6 +1376,7 @@
         let exec = FleetExecConfig::default();
         let workspace = tempfile::TempDir::new().unwrap();
         let worker = FleetWorkerSpec {
+            environment: None,
             id: "worker-1".to_string(),
             name: "Worker 1".to_string(),
             host: FleetHostSpec::Local,

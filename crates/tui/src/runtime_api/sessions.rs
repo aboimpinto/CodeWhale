@@ -443,6 +443,7 @@ pub(crate) async fn resume_session_in_runtime(
             .metadata
             .mode
             .clone()
+            .filter(|mode| crate::runtime_policy::parse_runtime_mode(mode).is_some())
             .unwrap_or_else(|| "agent".to_string())
     });
 

@@ -1920,35 +1920,31 @@ pub fn accept_callback(expected_state: &str, outcome: CallbackOutcome) -> Result
     accept_callback_with_client(expected_state, outcome).map(|(code, _)| code)
 }
 
+fn validate_callback_state(expected_state: &str, outcome: &CallbackOutcome) -> Result<()> {
+    let state = match outcome {
+        CallbackOutcome::Success { state, .. } => Some(state.as_str()),
+        CallbackOutcome::Error { state, .. } => state.as_deref(),
+    };
+    anyhow::ensure!(
+        state.is_some_and(|state| codewhale_core::secret_eq::constant_time_eq(
+            state.as_bytes(),
+            expected_state.as_bytes(),
+        )),
+        "OAuth callback state did not match the pending login"
+    );
+    Ok(())
+}
+
 fn accept_callback_with_client(
     expected_state: &str,
     outcome: CallbackOutcome,
 ) -> Result<(String, Option<String>)> {
+    validate_callback_state(expected_state, &outcome)?;
     match outcome {
         CallbackOutcome::Success {
-            code,
-            state,
-            client_id,
-        } => {
-            anyhow::ensure!(
-                codewhale_core::secret_eq::constant_time_eq(
-                    state.as_bytes(),
-                    expected_state.as_bytes(),
-                ),
-                "OAuth callback state did not match the pending login"
-            );
-            Ok((code, client_id))
-        }
-        CallbackOutcome::Error {
-            error,
-            description,
-            state,
-        } => {
-            anyhow::ensure!(
-                state.as_deref() == Some(expected_state),
-                "OAuth error callback state did not match the pending login"
-            );
-            let _ = description;
+            code, client_id, ..
+        } => Ok((code, client_id)),
+        CallbackOutcome::Error { error, .. } => {
             let error = compact_form_error(&error);
             bail!("sign-in was not completed ({error})")
         }
@@ -2111,12 +2107,15 @@ fn wait_for_callback_validated(
         for listener in listeners {
             match listener.accept() {
                 Ok((stream, _)) => {
-                    return handle_callback_stream_validated(
+                    if let Ok(outcome) = handle_callback_stream_validated(
                         stream,
                         params,
                         expected_state,
                         expected_issuer,
-                    );
+                        deadline,
+                    ) {
+                        return accept_callback_with_client(expected_state, outcome);
+                    }
                 }
                 Err(error)
                     if error.kind() == std::io::ErrorKind::WouldBlock
@@ -2129,7 +2128,11 @@ fn wait_for_callback_validated(
                 }
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(50)),
+        );
     }
 }
 
@@ -2139,7 +2142,14 @@ fn handle_callback_stream(
     params: &OAuthProviderParams,
     expected_state: &str,
 ) -> Result<(String, Option<String>)> {
-    handle_callback_stream_validated(stream, params, expected_state, None)
+    let outcome = handle_callback_stream_validated(
+        stream,
+        params,
+        expected_state,
+        None,
+        Instant::now() + CALLBACK_TIMEOUT,
+    )?;
+    accept_callback_with_client(expected_state, outcome)
 }
 
 fn handle_callback_stream_validated(
@@ -2147,7 +2157,9 @@ fn handle_callback_stream_validated(
     params: &OAuthProviderParams,
     expected_state: &str,
     expected_issuer: Option<&str>,
-) -> Result<(String, Option<String>)> {
+    deadline: Instant,
+) -> Result<CallbackOutcome> {
+    let deadline = deadline.min(Instant::now() + Duration::from_secs(5));
     // BSD sockets (macOS) hand the accepted stream the listener's O_NONBLOCK;
     // the bounded read below needs a blocking socket with a timeout.
     stream.set_nonblocking(false).with_context(|| {
@@ -2156,47 +2168,62 @@ fn handle_callback_stream_validated(
             params.display_name
         )
     })?;
-    stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
-    // One read is not one request: TCP may deliver the callback in
-    // fragments, and a truncated query parses as a missing parameter.
-    // Read until the blank line that ends the HTTP headers.
-    let mut buf = [0u8; 4096];
-    let mut len = 0usize;
-    loop {
-        if len == buf.len() {
-            break;
-        }
-        let n = stream
-            .read(&mut buf[len..])
-            .with_context(|| format!("reading {} OAuth callback request", params.display_name))?;
-        if n == 0 {
-            break;
-        }
-        len += n;
-        if buf[..len].windows(4).any(|window| window == b"\r\n\r\n") {
-            break;
-        }
-    }
-    let request = String::from_utf8_lossy(&buf[..len]);
-    let request_line = request.lines().next().unwrap_or_default();
     let result = (|| {
+        // One read is not one request: TCP may deliver the callback in
+        // fragments, and a truncated query parses as a missing parameter.
+        // Read until the blank line that ends the HTTP headers.
+        let mut buf = [0u8; 4096];
+        let mut len = 0usize;
+        loop {
+            if len == buf.len() {
+                break;
+            }
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .context("OAuth callback request timed out")?;
+            stream.set_read_timeout(Some(remaining))?;
+            let n = stream.read(&mut buf[len..]).with_context(|| {
+                format!("reading {} OAuth callback request", params.display_name)
+            })?;
+            if n == 0 {
+                break;
+            }
+            len += n;
+            if buf[..len].windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        anyhow::ensure!(
+            buf[..len].windows(4).any(|window| window == b"\r\n\r\n"),
+            "OAuth callback request headers are incomplete"
+        );
+        let request = String::from_utf8_lossy(&buf[..len]);
+        let request_line = request.lines().next().unwrap_or_default();
         let target = parse_http_request_target(request_line)?;
         let query = query_from_target(params, &target)?;
         if let Some(issuer) = expected_issuer {
             validate_plugin_callback(query, issuer)?;
         }
         let outcome = parse_callback_query(params, query)?;
-        accept_callback_with_client(expected_state, outcome)
+        validate_callback_state(expected_state, &outcome)?;
+        Ok(outcome)
     })();
     let (status, body) = match &result {
-        Ok(_) => ("200 OK", CALLBACK_HTML_OK),
-        Err(_) => ("400 Bad Request", CALLBACK_HTML_ERR),
+        Ok(CallbackOutcome::Success { .. }) => ("200 OK", CALLBACK_HTML_OK),
+        _ => ("400 Bad Request", CALLBACK_HTML_ERR),
     };
-    let _ = write!(
-        stream,
-        "HTTP/1.1 {status}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
-        body.len()
-    );
+    if let Some(remaining) = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        && stream.set_write_timeout(Some(remaining)).is_ok()
+    {
+        let _ = write!(
+            stream,
+            "HTTP/1.1 {status}\r\ncontent-type: text/html; charset=utf-8\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+    }
     result
 }
 
@@ -9410,12 +9437,14 @@ mod plugin_oauth_tests {
             let server = std::thread::spawn(move || {
                 let config = descriptor();
                 let (stream, _) = listener.accept()?;
-                handle_callback_stream_validated(
+                let outcome = handle_callback_stream_validated(
                     stream,
                     &config.callback_params(),
                     "expected-state",
                     Some(&config.issuer),
-                )
+                    Instant::now() + CALLBACK_TIMEOUT,
+                )?;
+                accept_callback_with_client("expected-state", outcome)
             });
             let mut client = TcpStream::connect(address)?;
             write!(

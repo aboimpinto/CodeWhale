@@ -1,12 +1,6 @@
 name: CI
 
 on:
-  push:
-    branches: [master, main]
-  pull_request:
-    branches: [master, main]
-  schedule:
-    - cron: '31 6 * * 1'
   workflow_dispatch:
     inputs:
       expected_sha:
@@ -25,12 +19,6 @@ permissions:
   contents: read
 
 concurrency:
-  # PRs still share one group so a new push cancels the superseded head.
-  # Push/schedule/dispatch on main must be keyed by SHA: with cancel-in-progress
-  # false, GitHub still cancels a *pending* run in the same group when a new
-  # one queues. That is how 31 of the last 40 main CI runs vanished without a
-  # verdict (test bankruptcy, 2026-08-19). Each SHA gets its own group so
-  # every commit on main actually finishes.
   group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-{0}-{1}', github.workflow, github.sha) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 

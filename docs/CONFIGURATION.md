@@ -2514,17 +2514,19 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   `model` fields (including user-named custom providers such as `lm-studio`)
   and call `agent(profile: "...")`; see [SUBAGENTS.md](SUBAGENTS.md).
 - `skills_dir` (string, optional): defaults to `~/.codewhale/skills` (each skill is
-  a directory containing `SKILL.md`). Workspace-local `.agents/skills` or
-  `./skills` are preferred when present; the runtime also discovers global
-  agentskills.io-compatible `~/.agents/skills` and the broader Claude-ecosystem
+  a directory containing `SKILL.md`). After workspace trust, project skills
+  take precedence, with `.codewhale/skills` ahead of compatible roots such as
+  `.agents/skills`. Flat `./skills` requires explicit opt-in below. The runtime
+  also discovers global agentskills.io-compatible `~/.agents/skills` and the
+  broader Claude-ecosystem
   `~/.claude/skills`. First launch installs versioned bundled skills for common
   workflows including skill creation, delegation, MCP/plugin scaffolding,
   documents, presentations, spreadsheets, PDFs, and Feishu/Lark. Only
   Codewhale-owned roots (`<workspace>/.codewhale/skills` and
   `~/.codewhale/skills`) are writable install/import targets; compatible harness
-  roots stay read-only. Bare `/skills` opens the Skills Manager (owned-only,
-  zero network). See [SKILLS.md](SKILLS.md) for the manager, audit statuses,
-  provenance markers, and mutation rules, and
+  roots stay read-only. Bare `/skills` opens Extensions → Skills (owned-only,
+  zero network); `/skills manage` opens the manager. See [SKILLS.md](SKILLS.md)
+  for the manager, audit statuses, provenance markers, and mutation rules, and
   [CLAUDE_PLUGIN_COMPAT.md](CLAUDE_PLUGIN_COMPAT.md) for the supported boundary
   between portable `SKILL.md` bundles and Claude Code plugin runtimes.
 - `[skills].scan_codewhale_only` (bool, default `false`): when `true`, session
@@ -3459,8 +3461,8 @@ TUI. That means `--config`, `CODEWHALE_CONFIG_PATH`, and the legacy
 checks use the resolved `mcp_config_path` / `skills_dir` (including env overrides).
 
 To bootstrap missing MCP/skills paths, run `codewhale setup --all`. You can
-also run `codewhale setup --skills --local` to create a workspace-local
-`./skills` dir.
+also run `codewhale setup --skills --local` to create the owned project
+`.codewhale/skills` directory. Project skills load after workspace trust.
 
 Both plain `codewhale doctor` and `codewhale doctor --json` are structural and
 offline by default. They do not check the release service, hosted provider

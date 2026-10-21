@@ -76,6 +76,13 @@ pub(super) async fn list_targets(State(state): State<RuntimeApiState>) -> Json<V
         },
         "ssh": unsupported_surface("SSH remote workspaces"),
         "cloud": unsupported_surface("Hosted cloud computers"),
+        "tailnet": {
+            "supported": true,
+            "inventory": "/v1/tailnet",
+            "enrollment": "external",
+            "execution": "explicit_fleet_workers",
+        },
+        "placement": { "version": 1, "preview": "POST /v1/fleet/placement", "dispatch": "operator_fleet_cli" },
     }))
 }
 
@@ -236,4 +243,45 @@ pub(super) async fn cloud_attach(State(_state): State<RuntimeApiState>) -> ApiEr
     ApiError::not_implemented(
         "hosted cloud computers are owned by the Codewhale control plane; this runtime does not provision them",
     )
+}
+
+pub(super) async fn tailnet_inventory(
+    State(_state): State<RuntimeApiState>,
+) -> Result<Json<Value>, ApiError> {
+    let result = tokio::task::spawn_blocking(crate::fleet::tailnet::inventory)
+        .await
+        .map_err(|error| ApiError::internal(format!("Tailnet inventory task failed: {error}")))?;
+    Ok(Json(match result {
+        Ok(nodes) => json!({ "available": true, "nodes": nodes, "grants_execution": false }),
+        Err(error) => {
+            json!({ "available": false, "nodes": [], "code": "tailnet_unavailable", "reason": error.to_string(), "grants_execution": false })
+        }
+    }))
+}
+
+pub(super) async fn placement_preview(
+    State(_state): State<RuntimeApiState>,
+    Json(mut document): Json<crate::fleet::task_spec::FleetTaskSpecDocument>,
+) -> Result<Json<Value>, ApiError> {
+    if document.tasks.len() > 64 {
+        return Err(ApiError::bad_request(
+            "Placement previews support up to 64 tasks",
+        ));
+    }
+    crate::fleet::task_spec::validate_task_spec_document(&document)
+        .map_err(|error| ApiError::bad_request(error.to_string()))?;
+    if document.workers.is_empty() {
+        document.workers.push(serde_json::from_value(json!({
+            "id": "local", "name": "This computer", "host": { "kind": "local" }, "capabilities": ["local"],
+        })).map_err(|error| ApiError::internal(error.to_string()))?);
+    }
+    let unavailable = std::collections::BTreeSet::new();
+    let decisions: Vec<_> = document
+        .tasks
+        .iter()
+        .map(|task| crate::fleet::placement::decide(task, &document.workers, &unavailable))
+        .collect();
+    Ok(Json(
+        json!({ "execution": "preview", "evidence": "operator_declared", "grants_execution": false, "decisions": decisions }),
+    ))
 }

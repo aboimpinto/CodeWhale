@@ -1371,6 +1371,7 @@ async fn document_from_fetched(
         &payload.url,
         Some(&payload.content_type),
         &payload.bytes,
+        payload.truncated,
         Some(context),
     )
     .await

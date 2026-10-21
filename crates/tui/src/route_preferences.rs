@@ -6,7 +6,7 @@ use std::path::Path;
 
 use anyhow::{Context, Result, ensure};
 
-use crate::config::{Config, ProviderIdentity, ProviderKind};
+use crate::config::{BaseUrlEnvReceipt, Config, ProviderIdentity, ProviderKind};
 use crate::config_persistence as persistence;
 
 /// Whether a config key names a provider or model selection.
@@ -319,6 +319,57 @@ pub fn selected_route(path: &Path) -> Result<(String, String, codewhale_config::
         codewhale_config::ModelSource::ProviderDefault
     };
     Ok((provider, config.default_model(), source))
+}
+
+pub fn list_models(
+    store: &codewhale_config::ConfigStore,
+    filter: Option<ProviderKind>,
+) -> Result<Vec<(ProviderKind, Vec<String>)>> {
+    crate::models_dev_live::maybe_load_persisted_cache();
+    let mut config = saved_config(store)?;
+    config.base_url_env_receipt = config
+        .active_provider_identity()
+        .map_or(BaseUrlEnvReceipt::NoOwner, |identity| {
+            BaseUrlEnvReceipt::Route(identity.provider, identity.key.to_string())
+        });
+    let providers = filter
+        .as_ref()
+        .map_or(ProviderKind::all(), std::slice::from_ref);
+    let mut catalogs = Vec::with_capacity(providers.len());
+    for provider in providers {
+        if *provider == ProviderKind::Custom
+            && config
+                .providers
+                .as_ref()
+                .and_then(|providers| providers.custom_provider_config(provider.as_str()))
+                .is_none()
+        {
+            continue;
+        }
+        let identity = config
+            .legacy_selection_identity(provider.as_str())
+            .map_err(anyhow::Error::msg)?;
+        let mut route_config = config.clone();
+        route_config
+            .scope_to_provider_identity(&identity)
+            .map_err(anyhow::Error::msg)?;
+        let mut models = crate::provider_lake::configured_catalog_models_for_route(
+            &route_config,
+            identity.provider,
+            identity.key.as_str(),
+            &route_config.active_route_base_url(),
+        );
+        if identity.provider != ProviderKind::OpenaiCodex {
+            let default_model = route_config.default_model();
+            if !default_model.is_empty() && !default_model.eq_ignore_ascii_case("auto") {
+                models.push(default_model);
+            }
+            models.sort();
+            models.dedup();
+        }
+        catalogs.push((*provider, models));
+    }
+    Ok(catalogs)
 }
 
 pub fn resolve_model(

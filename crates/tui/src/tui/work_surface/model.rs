@@ -1114,7 +1114,7 @@ fn finished_shell_outcome(locale: Locale, entry: &TaskPanelEntry) -> String {
 }
 
 /// Row ids of the plan-step (to-do) nodes in the cached graph.
-fn plan_step_row_ids(app: &App) -> HashSet<String> {
+pub(super) fn plan_step_row_ids(app: &App) -> HashSet<String> {
     app.work_surface
         .cached_graph
         .as_ref()

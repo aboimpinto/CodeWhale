@@ -1,19 +1,6 @@
 name: Marketplace connection
 
 on:
-  pull_request:
-    paths:
-      - 'crates/tui/assets/first-party-marketplace.json'
-      - 'scripts/sync-marketplace.py'
-      - '.github/workflows/marketplace-sync.yml'
-  push:
-    branches: [main]
-    paths:
-      - 'crates/tui/assets/first-party-marketplace.json'
-      - 'scripts/sync-marketplace.py'
-      - '.github/workflows/marketplace-sync.yml'
-  schedule:
-    - cron: '23 10 * * 1'
   workflow_dispatch:
 
 permissions:

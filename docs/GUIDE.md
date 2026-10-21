@@ -616,7 +616,8 @@ Use skills when a task has a repeatable process:
 - Using a project-specific memory or wiki workflow.
 
 Inside the TUI, `/skill <name>` activates a skill when one is available, and
-bare `/skills` opens the Skills Manager (owned-only inventory, no network). Use
+bare `/skills` opens Extensions → Skills (owned-only inventory, no network).
+Use `/skills manage` for the manager and
 `/skills <prefix>`, `/skills inspect`, `/skills --remote`, `/skills suggest <task>`,
 or `/skills sync` for the text/registry paths. Suggestions rank the remote
 catalog but never install or activate anything. The command palette can also

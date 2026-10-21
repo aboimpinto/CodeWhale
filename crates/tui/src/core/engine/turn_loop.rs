@@ -5619,7 +5619,17 @@ pub(super) fn shell_completion_status_text(
     let count = events.len();
     let failed = events
         .iter()
-        .filter(|event| event.status != crate::tools::shell::ShellStatus::Completed)
+        .filter(|event| {
+            matches!(
+                event.status,
+                crate::tools::shell::ShellStatus::Failed
+                    | crate::tools::shell::ShellStatus::TimedOut
+            )
+        })
+        .count();
+    let stopped = events
+        .iter()
+        .filter(|event| event.status == crate::tools::shell::ShellStatus::Killed)
         .count();
     let noun = if count == 1 { "job" } else { "jobs" };
     let prefix = if timing.trim().is_empty() {
@@ -5627,11 +5637,13 @@ pub(super) fn shell_completion_status_text(
     } else {
         format!("{} ", timing.trim())
     };
-    let mut status = if failed == 0 {
-        format!("{prefix}{count} background shell {noun} completed")
-    } else {
-        format!("{prefix}{count} background shell {noun} finished ({failed} failed)")
+    let outcome = match (failed, stopped) {
+        (0, 0) => "completed".to_string(),
+        (0, stopped) => format!("finished ({stopped} stopped)"),
+        (failed, 0) => format!("finished ({failed} failed)"),
+        (failed, stopped) => format!("finished ({failed} failed, {stopped} stopped)"),
     };
+    let mut status = format!("{prefix}{count} background shell {noun} {outcome}");
 
     if count == 1
         && let Some(event) = events.first()

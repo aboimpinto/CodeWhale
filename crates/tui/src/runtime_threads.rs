@@ -5338,6 +5338,7 @@ enum RuntimeTurnInputSource {
     /// durable-turn machinery as any other input.
     GoalContinuation {
         continuation_index: u32,
+        expected_goal: Box<codewhale_protocol::ThreadGoal>,
     },
 }
 
@@ -5373,8 +5374,11 @@ impl RuntimeTurnInputSource {
             // must not call it one.
             Self::GoalContinuation {
                 continuation_index: 0,
+                ..
             } => Some("Goal kickoff (host-driven)".to_string()),
-            Self::GoalContinuation { continuation_index } => Some(format!(
+            Self::GoalContinuation {
+                continuation_index, ..
+            } => Some(format!(
                 "Goal continuation pass #{continuation_index} (host-driven)"
             )),
         }
@@ -5387,7 +5391,9 @@ impl RuntimeTurnInputSource {
                 "input_provenance": "agent_mail",
                 "agent_mail_message_id": message_id,
             })),
-            Self::GoalContinuation { continuation_index } => Some(json!({
+            Self::GoalContinuation {
+                continuation_index, ..
+            } => Some(json!({
                 "input_provenance": "goal_continuation",
                 "goal_continuation_index": continuation_index,
             })),
@@ -9494,7 +9500,7 @@ impl RuntimeThreadManager {
         if objective.is_empty() {
             return Ok(());
         }
-        self.start_goal_turn(thread_id, objective, 0).await?;
+        self.start_goal_turn(thread_id, objective, 0, goal).await?;
         Ok(())
     }
 
@@ -9520,6 +9526,7 @@ impl RuntimeThreadManager {
         thread_id: &str,
         prompt: String,
         continuation_index: u32,
+        expected_goal: codewhale_protocol::ThreadGoal,
     ) -> Result<TurnRecord> {
         let req = StartTurnRequest {
             account_model_owner: None,
@@ -9550,7 +9557,10 @@ impl RuntimeThreadManager {
         self.start_turn_with_source(
             thread_id,
             req,
-            RuntimeTurnInputSource::GoalContinuation { continuation_index },
+            RuntimeTurnInputSource::GoalContinuation {
+                continuation_index,
+                expected_goal: Box::new(expected_goal),
+            },
             None,
             false,
         )
@@ -9740,7 +9750,7 @@ impl RuntimeThreadManager {
         let continuation_index = u32::try_from(goal.continuation_count.max(1)).unwrap_or(u32::MAX);
         let snapshot = crate::tools::goal::GoalSnapshot::from_thread_goal(&goal);
         let prompt = crate::tools::goal::render_continuation_prompt(&snapshot, continuation_index);
-        self.start_goal_turn(thread_id, prompt, continuation_index)
+        self.start_goal_turn(thread_id, prompt, continuation_index, goal)
             .await?;
         Ok(())
     }
@@ -13616,6 +13626,17 @@ impl RuntimeThreadManager {
         history_operation: Option<&RuntimeHistoryOperation>,
         checkpoint_messages: &[Message],
     ) -> Result<()> {
+        let config = self.read_config().clone();
+        let secrets = receipt_secret_values(config).await?;
+        let mut tool_names = HashMap::new();
+        for block in checkpoint_messages[..checkpoint_messages.len().saturating_sub(messages.len())]
+            .iter()
+            .flat_map(|message| &message.content)
+        {
+            if let ContentBlock::ToolUse { name, .. } = block {
+                tool_names.insert(block.tool_call_key(), name.as_str());
+            }
+        }
         // Session seeding writes turns/items and then advances the existing
         // thread pointer as one synchronous record transaction.
         let thread_mutation = self.store.thread_mutation.lock();
@@ -13685,12 +13706,28 @@ impl RuntimeThreadManager {
                                 is_error,
                                 content_blocks,
                             } => {
+                                let name = tool_names
+                                    .get(&block.tool_call_key())
+                                    .copied()
+                                    .unwrap_or_default();
                                 tool_results.push(SeedItem::ToolResult {
                                     tool_use_id: tool_use_id.clone(),
                                     execution_id: execution_id.clone(),
-                                    content: content.clone(),
+                                    content: tool_receipt_detail(name, content, &secrets),
                                     is_error: is_error.unwrap_or(false),
-                                    content_blocks: content_blocks.clone(),
+                                    content_blocks: content_blocks
+                                        .as_ref()
+                                        .filter(|_| name != REQUEST_USER_INPUT_TOOL_NAME)
+                                        .map(|blocks| {
+                                            blocks
+                                                .iter()
+                                                .map(|value| {
+                                                    crate::client::redact_json_model_bound_text(
+                                                        value, &secrets,
+                                                    )
+                                                })
+                                                .collect()
+                                        }),
                                 });
                             }
                             // Other block types in user messages are rare;
@@ -13754,6 +13791,7 @@ impl RuntimeThreadManager {
                                 caller,
                                 thought_signature,
                             } => {
+                                tool_names.insert(block.tool_call_key(), name.as_str());
                                 turn.items.push(SeedItem::ToolUse {
                                     id: id.clone(),
                                     execution_id: execution_id.clone(),
@@ -14985,6 +15023,13 @@ impl RuntimeThreadManager {
         // dispatch can carry its predecessor's URL, key, model, or policy.
         let _config_admission = self.config_admission.read().await;
         self.ensure_accepting_execution()?;
+        if let RuntimeTurnInputSource::GoalContinuation { expected_goal, .. } = &input_source {
+            anyhow::ensure!(
+                expected_goal.status == codewhale_protocol::ThreadGoalStatus::Active
+                    && self.store.load_goal(thread_id)?.as_ref() == Some(expected_goal.as_ref()),
+                "Goal changed before its automatic turn could start"
+            );
+        }
         let image_blocks = if stored_image_bytes {
             crate::image_attach::prepare_stored_images(&req.images)?
         } else {
@@ -15397,6 +15442,12 @@ impl RuntimeThreadManager {
         // durable record keeps the engine aligned with the store; a replaced
         // objective (PUT) still resets counters through the same sync path.
         let turn_goal = self.store.load_goal(thread_id)?;
+        if let RuntimeTurnInputSource::GoalContinuation { expected_goal, .. } = &input_source {
+            anyhow::ensure!(
+                turn_goal.as_ref() == Some(expected_goal.as_ref()),
+                "Goal changed before its automatic turn could start"
+            );
+        }
         let turn_goal_objective = turn_goal
             .as_ref()
             .map(|goal| goal.objective.trim().to_string())
@@ -17451,18 +17502,7 @@ impl RuntimeThreadManager {
                 .scope_to_provider_identity(&state.route_identity)
                 .map_err(anyhow::Error::msg)?;
         }
-        #[cfg(test)]
-        let ticket = crate::test_support::env_scope_ticket();
-        let receipt_secrets = tokio::task::spawn_blocking(move || {
-            #[cfg(test)]
-            let _membership = crate::test_support::join_env_scope(ticket);
-            let active_key = receipt_config
-                .active_route_api_key_read_only()
-                .unwrap_or_default();
-            crate::client::configured_model_bound_secret_values(&receipt_config, &active_key)
-        })
-        .await
-        .context("Runtime receipt redaction setup failed")?;
+        let receipt_secrets = receipt_secret_values(receipt_config).await?;
         let mut latest_goal_snapshot: Option<crate::tools::goal::GoalSnapshot> = None;
         // Tool definitions of the finished turn's request surface, from the
         // final TurnComplete receipt. Goal settlement uses it to mirror the
@@ -18026,6 +18066,8 @@ impl RuntimeThreadManager {
                                 } else {
                                     TurnItemLifecycleStatus::Failed
                                 };
+                                let detail =
+                                    tool_receipt_detail(&name, &output.content, &receipt_secrets);
                                 if name == REQUEST_USER_INPUT_TOOL_NAME {
                                     // The engine must return the structured
                                     // answers to the model, but Runtime
@@ -18033,8 +18075,8 @@ impl RuntimeThreadManager {
                                     // clients. Persist only a machine-readable
                                     // redaction marker, never answer labels or
                                     // free-text values.
-                                    item.summary = REDACTED_USER_INPUT_RECEIPT.to_string();
-                                    item.detail = Some(REDACTED_USER_INPUT_RECEIPT.to_string());
+                                    item.summary = detail.clone();
+                                    item.detail = Some(detail);
                                     item.metadata = Some(json!({
                                         "tool_call_id": id,
                                         "tool_name": REQUEST_USER_INPUT_TOOL_NAME,
@@ -18044,15 +18086,9 @@ impl RuntimeThreadManager {
                                     // Durable receipt: credentials a tool
                                     // printed are masked before they reach
                                     // the item store or the event log (B1).
-                                    let content = crate::client::redact_model_bound_text(
-                                        &output.content,
-                                        &receipt_secrets,
-                                    );
-                                    item.summary = summarize_text(
-                                        &format!("{name}: {content}"),
-                                        SUMMARY_LIMIT,
-                                    );
-                                    item.detail = Some(content);
+                                    item.summary =
+                                        summarize_text(&format!("{name}: {detail}"), SUMMARY_LIMIT);
+                                    item.detail = Some(detail);
                                     // `detail` is now the tool output, so the
                                     // call identity persisted at start must be
                                     // carried through metadata. Mark the
@@ -20279,6 +20315,26 @@ fn tool_kind_for_name(name: &str) -> TurnItemKind {
         return TurnItemKind::FileChange;
     }
     TurnItemKind::ToolCall
+}
+
+pub(crate) fn tool_receipt_detail(name: &str, content: &str, secrets: &[String]) -> String {
+    if name == REQUEST_USER_INPUT_TOOL_NAME {
+        REDACTED_USER_INPUT_RECEIPT.to_string()
+    } else {
+        crate::client::redact_model_bound_text(content, secrets)
+    }
+}
+
+pub(crate) async fn receipt_secret_values(config: Config) -> Result<Vec<String>> {
+    #[cfg(test)]
+    let ticket = crate::test_support::env_scope_ticket();
+    tokio::task::spawn_blocking(move || {
+        #[cfg(test)]
+        let _membership = crate::test_support::join_env_scope(ticket);
+        crate::client::active_model_bound_secret_values(&config)
+    })
+    .await
+    .context("Runtime receipt redaction setup failed")
 }
 
 pub fn summarize_text(text: &str, limit: usize) -> String {

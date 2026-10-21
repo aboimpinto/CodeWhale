@@ -1,30 +1,6 @@
 name: OpenHarmony
 
 on:
-  push:
-    branches: [main, master]
-    paths:
-      - '.github/workflows/ohos.yml'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'crates/**'
-      - 'scripts/ohos/**'
-      - 'scripts/ohos-env.sh'
-      - 'scripts/ohos-env.ps1'
-      - 'scripts/release/check-ohos-deps.sh'
-  pull_request:
-    branches: [main, master]
-    paths:
-      - '.github/workflows/ohos.yml'
-      - 'Cargo.lock'
-      - 'Cargo.toml'
-      - 'crates/**'
-      - 'scripts/ohos/**'
-      - 'scripts/ohos-env.sh'
-      - 'scripts/ohos-env.ps1'
-      - 'scripts/release/check-ohos-deps.sh'
-  schedule:
-    - cron: '47 7 * * 1'
   workflow_dispatch:
 
 permissions:
@@ -32,7 +8,6 @@ permissions:
 
 concurrency:
   group: ohos-${{ github.event.pull_request.number || github.ref }}
-  # Same as ci.yml: cancel superseded PR heads only; never cancel main pushes.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:

@@ -311,6 +311,15 @@ docs = "docs/FLEET.md"
 owner = "crates/tui/src/fleet"
 
 [[feature]]
+id = "environment-placement"
+name = "Environment-aware Fleet placement"
+summary = "Places Fleet tasks by environment requirements and connects explicitly configured workers through Tailscale."
+status = "experimental"
+surfaces = { tui = "preview", api = "preview" }
+docs = "docs/ENVIRONMENTS.md#environment-aware-fleet-placement-preview"
+owner = "crates/tui/src/fleet/placement.rs"
+
+[[feature]]
 id = "workflows"
 name = "Workflows"
 summary = "Checked-in .workflow.js scripts coordinate agents step by step."

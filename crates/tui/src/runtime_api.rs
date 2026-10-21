@@ -1862,6 +1862,10 @@ pub async fn run_http_server(
     let existing_binding: Option<crate::runtime_threads::RuntimeStoreBinding> = None;
     #[cfg(any(unix, windows))]
     if let Some(control) = published {
+        anyhow::ensure!(
+            !(acp_selected && control.routing().is_some_and(|routing| routing.acp_only)),
+            "Another `codewhale serve --acp` already owns this runtime, and a second ACP server cannot attach to it. Close the other editor's agent session and try again, or set CODEWHALE_RUNTIME_DIR to a different directory."
+        );
         validate_selected_owner(&control, selected_store.clone()).await?;
         let observed_owner = control.receipt().clone();
         let client = match options.control_frontend.as_ref() {
@@ -2396,9 +2400,17 @@ async fn run_attached_frontend(
                 | codewhale_app_server::RuntimeControlFrontend::Acp { .. }
         )
     ) {
-        return client
+        let forwarded = client
             .forward(tokio::io::stdin(), tokio::io::stdout())
             .await;
+        if acp_selected && let Err(error) = forwarded.as_ref() {
+            eprintln!("error: {error}");
+            for cause in error.chain().skip(1) {
+                eprintln!("  caused by: {cause}");
+            }
+            std::process::exit(1);
+        }
+        return forwarded;
     }
     if matches!(
         options.control_frontend.as_ref(),
@@ -2736,6 +2748,11 @@ pub fn build_router(state: RuntimeApiState) -> Router {
             get(targets::list_targets).post(targets::create_target),
         )
         .route("/v1/targets/switch", post(targets::switch_target))
+        .route("/v1/tailnet", get(targets::tailnet_inventory))
+        .route(
+            "/v1/fleet/placement",
+            post(targets::placement_preview).layer(DefaultBodyLimit::max(256 * 1024)),
+        )
         .route("/v1/remote", get(targets::remote_status))
         .route("/v1/remote/connect", post(targets::remote_connect))
         .route(

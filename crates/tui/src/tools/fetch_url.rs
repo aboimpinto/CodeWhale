@@ -206,6 +206,7 @@ impl ToolSpec for FetchUrlTool {
                         &fetched.url,
                         &fetched.content_type,
                         &fetched.bytes,
+                        fetched.truncated,
                         is_success,
                         body_text.as_deref(),
                         PdfTextCommand::system(Some(context)),
@@ -289,6 +290,7 @@ async fn extract_fetched_document(
     url: &str,
     content_type: &str,
     bytes: &[u8],
+    truncated: bool,
     is_success: bool,
     decoded_body: Option<&str>,
     pdf_command: PdfTextCommand<'_>,
@@ -310,6 +312,7 @@ async fn extract_fetched_document(
             url,
             Some(content_type),
             bytes,
+            truncated,
             pdf_command,
         )
         .await

@@ -4425,7 +4425,6 @@ pub(crate) fn apply_loaded_session_with_goal(
     app.active_tool_details.clear();
     app.active_tool_entry_completed_at.clear();
     app.active_cell_revision = app.active_cell_revision.wrapping_add(1);
-    app.exploring_cell = None;
     app.exploring_entries.clear();
     app.ignored_tool_calls.clear();
     app.pending_tool_uses.clear();

@@ -753,6 +753,11 @@ fn push_file_backed_model_bound_secrets(values: &mut Vec<String>) {
     }
 }
 
+pub(crate) fn active_model_bound_secret_values(config: &Config) -> Vec<String> {
+    let active_key = config.active_route_api_key_read_only().unwrap_or_default();
+    configured_model_bound_secret_values(config, &active_key)
+}
+
 pub(crate) fn configured_model_bound_secret_values(
     config: &Config,
     active_api_key: &str,

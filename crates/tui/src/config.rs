@@ -654,7 +654,7 @@ pub(crate) fn opencode_go_model_id(model: &str) -> Option<&'static str> {
     codewhale_config::opencode_go_model_id(model)
 }
 
-fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
+pub(crate) fn canonical_xiaomi_mimo_model_id(model: &str) -> Option<&'static str> {
     codewhale_config::catalog::reviewed::compatibility_alias(
         "canonical_xiaomi_mimo_model_id",
         &model.trim().to_ascii_lowercase().replace(['_', ' '], "-"),

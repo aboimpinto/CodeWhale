@@ -595,6 +595,7 @@ pub(super) async fn kill_thread_job(
     tokio::task::spawn_blocking(move || {
         let mut guard = manager.lock().unwrap_or_else(|e| e.into_inner());
         let result = guard.kill(&job_id).map_err(map_job_err)?;
+        guard.mark_cancel_reported(&result);
         let snapshot = guard.inspect_job(&job_id).map_err(map_job_err)?.snapshot;
         Ok(Json(KillJobResponse {
             job: JobView::new(snapshot, thread_id, &guard),

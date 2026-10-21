@@ -393,7 +393,7 @@ pub(crate) fn windows_publish_retry_delay(
     error: &std::io::Error,
     attempt: usize,
 ) -> Option<std::time::Duration> {
-    const MAX_PERSIST_ATTEMPTS: usize = 6;
+    const MAX_PERSIST_ATTEMPTS: usize = 8;
     // 5 ERROR_ACCESS_DENIED, 32 ERROR_SHARING_VIOLATION, 33 ERROR_LOCK_VIOLATION.
     let transient = error.kind() == std::io::ErrorKind::PermissionDenied
         || matches!(error.raw_os_error(), Some(5 | 32 | 33));

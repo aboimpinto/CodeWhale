@@ -115,6 +115,15 @@ fn probe_output(
     capture: bool,
     timeout: std::time::Duration,
 ) -> std::io::Result<std::process::Output> {
+    probe_output_bounded(command, capture, timeout, VERSION_PROBE_MAX_OUTPUT)
+}
+
+pub(crate) fn probe_output_bounded(
+    command: &mut Command,
+    capture: bool,
+    timeout: std::time::Duration,
+    max_output: u64,
+) -> std::io::Result<std::process::Output> {
     use std::io::Read;
     use std::process::Stdio;
     use wait_timeout::ChildExt;
@@ -140,10 +149,10 @@ fn probe_output(
                 .spawn(move || {
                     let mut bytes = Vec::new();
                     let result = pipe
-                        .take(VERSION_PROBE_MAX_OUTPUT + 1)
+                        .take(max_output.saturating_add(1))
                         .read_to_end(&mut bytes)
                         .and_then(|_| {
-                            if bytes.len() as u64 > VERSION_PROBE_MAX_OUTPUT {
+                            if bytes.len() as u64 > max_output {
                                 Err(std::io::Error::new(
                                     std::io::ErrorKind::InvalidData,
                                     "version probe output exceeded limit",

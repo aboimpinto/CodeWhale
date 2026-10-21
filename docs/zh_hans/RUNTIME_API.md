@@ -587,6 +587,10 @@ Core 回合、事件时间线、审批等待器和完整 Engine 会话快照。
 编辑器接口支持 `initialize`、`session/new`、`session/list`、`session/load`
 （含持久 ID 前缀）、`session/prompt`、`session/cancel`、模型发现/选择，
 以及声明的模式/模型配置选项。新会话先持久化裸 UUID 和空检查点，不调用提供商。
+`session/load` 在响应前以 `session/update` 通知重放已保存的对话：用户与智能体
+文本，以及每个工具调用及其最终状态。重放的工具结果与实时流一样脱敏：
+`request_user_input` 的回答显示为 `User input submitted`，已配置的凭据被遮蔽。
+推理内容和图片不会重放。
 连接最多保留64个空闲绑定；淘汰绑定不删除持久会话。恢复复用已有线程绑定。
 完整历史、工具调用/结果配对、签名、媒体和部分执行回执通过 HTTP 同用的检查点
 守卫与会话写入租约保存。ACP 展示文本可以缩短，持久历史仍是完整 Core 快照。
@@ -597,7 +601,8 @@ shell 工具。Shell 同时要求编辑器声明 terminal 支持、操作者允�
 后台 shell、解释器、子智能体或 RLM 生命周期。内置工具覆盖会移除整个兼容别名族。
 最终派发再次校验 profile；伪造别名、hook 改写或目录中缺失的工具不能绕过限制。
 Full Access 下 Plan 仍只读。Full Access 与普通审批姿态是服务端拥有的只读选项，
-编辑器不能放宽。Core 的类型化规则、严格 hooks、仓库约束、Headless Auto-Review
+编辑器不能放宽。`approval_policy = "never"` 不是 ACP 审批姿态，服务端会拒绝
+以该配置启动，而不是把它当作 Ask 提供。Core 的类型化规则、严格 hooks、仓库约束、Headless Auto-Review
 与硬性下限仍生效；工作区写入不享受免审批例外，需要 guardian 的裁决会明确拒绝。
 
 工具首先显示 `pending`；只有 Core 到达最终派发才显示 `in_progress`。
@@ -614,10 +619,15 @@ owner 关闭或无法产生终态的存储故障会明确报错，不会重新�
 `max_turn_requests`；Core 失败仍是错误。单次提示词最多50个模型步骤（更小的配置
 上限仍有效），并复用 Core 的有界最终报告响应；此 profile 不派发自主目标续跑。
 
-ACP 当前声明一个独占的规范 Runtime owner。其他进程已持有该存储时，启动拒绝；
-会话绑定另一 Runtime 存储时也拒绝。经过身份校验的跨进程 owner 附着尚未完成验证，
-ACP 不把活跃会话复制到随机存储。它也不向编辑器提供全部 `/v1/*` 引导、任务或
-控制方法；完整运行时 API 请使用 `codewhale app-server --http`。
+没有进程持有 Runtime 存储时，ACP 声明自己独占的规范 Runtime owner。已有非 ACP
+的 Runtime 宿主持有该存储时（桌面应用、`codewhale app-server --http` 或
+`codewhale serve --http`），ACP 通过其本地控制套接字以经过身份校验的访客身份
+附着到该 owner，并用 owner 的存储服务编辑器。该 owner 退出时，ACP 进程以说明
+该退出的错误结束；待决操作的结果可能不确定，且不会重放。存储已由另一个 ACP
+服务端持有时，第二个 `codewhale serve --acp` 在启动时拒绝，第一个继续服务。
+会话绑定另一 Runtime 存储时也拒绝；ACP 不把活跃会话复制到随机存储。它也不向
+编辑器提供全部 `/v1/*` 引导、任务或控制方法；完整运行时 API 请使用
+`codewhale app-server --http`。
 
 
 ## 能力端点：`codewhale doctor --json`
@@ -843,7 +853,10 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 - `DELETE /v1/sessions/{id}`
 - `POST /v1/sessions/{id}/resume-thread` 返回已经持有整个已保存会话的打开线程
   （`200`）；没有这样的线程时，从该会话播种一个新线程（`201`），包括会话在那个
-  线程打开它之后又有增长的情况。
+  线程打开它之后又有增长的情况。请求体未给出 `mode` 时，新线程沿用
+  已保存的模式；不是 Runtime 模式的已保存模式（例如 `exec`）以 `agent` 恢复。
+  新线程保存的工具结果与实时回执一样脱敏：`request_user_input` 的回答记为
+  `User input submitted`，已配置的凭据被遮蔽。`GET /v1/sessions/{id}` 仍返回未脱敏的内容。
 - `GET /v1/sessions/{id}/artifacts` 与 `GET /v1/sessions/{id}/artifacts/{artifact_id}?offset=&limit=`
   （参见上文的工作区文件与会话工件；运行时回合的溢出通过
   `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}` 读取）

@@ -1321,13 +1321,19 @@ pub(crate) fn handle_shell_job_action(app: &mut App, action: crate::tui::app::Sh
         }
         crate::tui::app::ShellJobAction::Cancel { id } => {
             match manager.kill_for_session(&active_session_id, &id) {
-                Ok(result) => add_shell_job_message(app, format_shell_poll(&result)),
+                Ok(result) => {
+                    manager.mark_cancel_reported(&result);
+                    add_shell_job_message(app, format_shell_poll(&result));
+                }
                 Err(err) => add_shell_job_message(app, format!("Command cancel failed: {err}")),
             }
         }
         crate::tui::app::ShellJobAction::CancelAll => {
             match manager.kill_running_for_session(&active_session_id) {
                 Ok(results) => {
+                    for result in &results {
+                        manager.mark_cancel_reported(result);
+                    }
                     let count = results.len();
                     if count == 0 {
                         add_shell_job_message(app, "No running commands to cancel.".to_string());

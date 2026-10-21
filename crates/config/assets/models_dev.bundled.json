@@ -7097,6 +7097,56 @@
         "context_window": 1000000,
         "reasoning": true
       },
+      "deepseek-ai/deepseek-v4-pro-0813": {
+        "context_window": 1048576,
+        "modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "DeepInfra model listing and ModelScope model card, verified 2026-10-20; see source_receipts",
+        "family": "DeepSeek"
+      },
+      "deepseek-ai/deepseek-v4.1-flash-1017": {
+        "context_window": 1048576,
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "DeepInfra model listing, verified 2026-10-20; see source_receipts",
+        "family": "DeepSeek"
+      },
+      "deepseek-ai/deepseek-v4.1-flash": {
+        "context_window": 1048576,
+        "modalities": [
+          "text",
+          "image"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "DeepInfra model listing and ModelScope model card, verified 2026-10-20; see source_receipts",
+        "family": "DeepSeek"
+      },
+      "deepseek-ai/deepseek-v4-flash-0731": {
+        "context_window": 1048576,
+        "modalities": [
+          "text"
+        ],
+        "supported_parameters": [
+          "reasoning"
+        ],
+        "reasoning": true,
+        "source": "DeepInfra model listing, verified 2026-10-20; see source_receipts",
+        "family": "DeepSeek"
+      },
       "thinkingmachines/inkling": {
         "source": "preserved exact reasoning fact; see source_receipts",
         "reasoning": true,
@@ -8515,6 +8565,44 @@
         "provider": "deepinfra"
       },
       {
+        "id": "deepseek-ai/DeepSeek-V4-Pro-0813",
+        "aliases": [
+          "deepseek-v4-pro-0813",
+          "di-deepseek-v4-pro-0813"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "deepinfra"
+      },
+      {
+        "id": "deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        "aliases": [
+          "di-deepseek-v4.1-flash-1017"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "deepinfra"
+      },
+      {
+        "id": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "aliases": [
+          "deepseek-v4.1-flash",
+          "di-deepseek-v4.1-flash"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "deepinfra"
+      },
+      {
+        "id": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "aliases": [
+          "di-deepseek-v4-flash-0731"
+        ],
+        "supports_tools": true,
+        "supports_reasoning": true,
+        "provider": "deepinfra"
+      },
+      {
         "id": "fugu",
         "aliases": [
           "sakana-fugu",
@@ -9923,7 +10011,10 @@
       "https://dev.meta.ai/docs/pricing-rate-limits": "verified 2026-10-17: Muse Spark 1.3 and 1.2 $1.25 in / $0.15 cached / $4.25 out, contributor $0.10 / $0.002 / $0.20; Muse Wonder 1.0 $4 / $0.20 / $20; no long-context premium",
       "https://mimo.mi.com/docs/updates/deprecate": "verified 2026-10-17 via its loaded chunk: mimo-v2.5-pro (to mimo-v2.6-pro) and mimo-v2.5 (to mimo-v2.6-flash) are replaced from 2026-10-14 10:00 UTC+8 and return errors from 2026-10-21 10:00 UTC+8",
       "https://platform.minimax.io/docs/guides/models-intro": "verified 2026-10-17: MiniMax-M2.7, M2.7-highspeed, M2.5 and M2.5-highspeed close to new users 2026-10-19 and retire 2026-11-18; they leave the fallback picker but stay accepted until then",
-      "https://www.alibabacloud.com/en/notice/alibaba_cloud_model_studio_model_upgrade_notice_81a?_p_lc=1": "verified 2026-10-17: qwen3.8-max-preview retired 2026-08-05 and its requests route to qwen3.8-max"
+      "https://www.alibabacloud.com/en/notice/alibaba_cloud_model_studio_model_upgrade_notice_81a?_p_lc=1": "verified 2026-10-17: qwen3.8-max-preview retired 2026-08-05 and its requests route to qwen3.8-max",
+      "https://api.deepinfra.com/models/list": "verified 2026-10-20: deepseek-ai/DeepSeek-V4.1-Flash-1017, deepseek-ai/DeepSeek-V4.1-Flash, deepseek-ai/DeepSeek-V4-Pro-0813 and deepseek-ai/DeepSeek-V4-Flash-0731 are listed and not deprecated, each with max_tokens 1048576 and the tools tag; both V4.1 Flash ids are tagged multimodal and reasoning, V4-Flash-0731 reasoning; V4-Pro-0813 carries can-disable-reasoning beside a non-reasoning tag, while its model page documents low, high and max reasoning effort and the Models.dev deepseek/deepseek-v4-pro-0813 row marks reasoning, so reasoning is recorded; the V4-Pro and V4-Flash previews are still listed; no separate output limit is published, so none is recorded",
+      "https://modelscope.cn/api/v1/models/deepseek-ai/DeepSeek-V4-Pro-0813": "verified 2026-10-20: the ModelScope card describes DeepSeek-V4-Pro-0813 as the official release of DeepSeek-V4-Pro on the preview model structure, whose card lists a 1M context length; no separate ModelScope API-Inference context limit is published there",
+      "https://modelscope.cn/api/v1/models/deepseek-ai/DeepSeek-V4.1-Flash": "verified 2026-10-20: the ModelScope card states contexts of up to one million tokens and a recommended 1M context_window; no separate ModelScope API-Inference context limit is published there"
     },
     "transports": [
       {

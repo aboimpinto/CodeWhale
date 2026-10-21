@@ -196,7 +196,7 @@ pub(crate) struct ReadableFetch<T> {
 }
 
 /// Fetch `url` and extract it, re-fetching once past every cache when a 2xx
-/// response yields no readable content.
+/// response that was not cut off at `max_bytes` yields no readable content.
 ///
 /// This is the single place that turns the JS-shell case into either a second
 /// chance or an error the model can act on. `extract` runs against the fetched
@@ -298,6 +298,20 @@ where
                     attempts,
                 });
             }
+            Err(error)
+                if error.content()
+                    && is_js_shell_error(&error.error)
+                    && payload.truncated
+                    && (200..300).contains(&payload.status) =>
+            {
+                attempts.push(record);
+                return Err(js_shell_failure(
+                    &final_url,
+                    &attempts,
+                    context,
+                    Some(options.max_bytes),
+                ));
+            }
             // A 2xx whose body held no readable content is the one failure a
             // second request can fix: the first response may have been a
             // cached client-side shell.
@@ -312,7 +326,7 @@ where
             Err(error) => {
                 attempts.push(record);
                 return Err(if error.content() && is_js_shell_error(&error.error) {
-                    js_shell_failure(&final_url, &attempts, context)
+                    js_shell_failure(&final_url, &attempts, context, None)
                 } else {
                     error.error
                 });
@@ -324,18 +338,31 @@ where
 
 /// The terminal JS-shell error, carrying the failure receipt and the recovery
 /// the *calling role* actually owns.
-fn js_shell_failure(url: &str, attempts: &[FetchAttempt], context: &ToolContext) -> ToolError {
+fn js_shell_failure(
+    url: &str,
+    attempts: &[FetchAttempt],
+    context: &ToolContext,
+    truncated_at: Option<usize>,
+) -> ToolError {
     let receipt = attempts
         .iter()
         .map(FetchAttempt::summarize)
         .collect::<Vec<_>>()
         .join("; ");
-    ToolError::execution_failed(format!(
-        "{marker} {url} after {count} attempts, the second past every cache ({receipt}). The response parsed but held no readable body, which usually means the page renders its content with JavaScript. Recovery: {recovery}",
-        marker = super::extract::JS_SHELL_MARKER,
-        count = attempts.len(),
-        recovery = js_shell_recovery(url, context),
-    ))
+    let marker = super::extract::JS_SHELL_MARKER;
+    let recovery = js_shell_recovery(url, context);
+    ToolError::execution_failed(match truncated_at {
+        None => format!(
+            "{marker} {url} after {count} attempts, the second past every cache ({receipt}). The response parsed but held no readable body, which usually means the page renders its content with JavaScript. Recovery: {recovery}",
+            count = attempts.len(),
+        ),
+        Some(limit) if limit < HARD_MAX_BYTES => format!(
+            "{marker} {url} in the first {limit} bytes, where the response was cut off ({receipt}). Either the readable content starts past that cap or the page renders it with JavaScript. Recovery: retry with a larger `max_bytes` (up to {HARD_MAX_BYTES}). If the whole page still has no readable body, {recovery}"
+        ),
+        Some(limit) => format!(
+            "{marker} {url} in the first {limit} bytes, the fetch limit, where the response was cut off ({receipt}). Either the readable content starts past that limit or the page renders it with JavaScript. Recovery: {recovery}"
+        ),
+    })
 }
 
 /// Whether the model-facing `Web` tool is reachable from this context.
@@ -874,6 +901,7 @@ mod tests {
                 &payload.url,
                 Some(&payload.content_type),
                 &payload.bytes,
+                payload.truncated,
                 None,
             )
             .await

@@ -186,11 +186,7 @@ pub(crate) fn configured_secrets(
     profile: Option<&str>,
 ) -> anyhow::Result<Vec<String>> {
     let config = crate::config::Config::load(config_path, profile)?;
-    let active_key = config.active_route_api_key_read_only().unwrap_or_default();
-    Ok(crate::client::configured_model_bound_secret_values(
-        &config,
-        &active_key,
-    ))
+    Ok(crate::client::active_model_bound_secret_values(&config))
 }
 
 /// Whether `path` sits directly in `manager`'s pre-import archive directory

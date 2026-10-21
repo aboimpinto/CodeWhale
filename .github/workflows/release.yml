@@ -457,6 +457,16 @@ jobs:
     secrets:
       CNB_GIT_TOKEN: ${{ secrets.CNB_GIT_TOKEN }}
 
+  gitcode:
+    needs: [release, resolve]
+    if: ${{ !cancelled() && needs.release.result == 'success' && vars.GITCODE_MIRROR == 'enabled' }}
+    uses: ./.github/workflows/sync-gitcode.yml
+    with:
+      release_tag: ${{ needs.resolve.outputs.tag }}
+      source_sha: ${{ needs.resolve.outputs.sha }}
+    secrets:
+      GITCODE_TOKEN: ${{ secrets.GITCODE_TOKEN }}
+
   npm:
     timeout-minutes: 20
     needs: [release, resolve]

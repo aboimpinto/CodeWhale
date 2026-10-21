@@ -706,7 +706,11 @@ The editor surface supports `initialize`, `session/new`, `session/list`,
 `session/load` (including durable ID prefixes), `session/prompt`, `session/cancel`,
 model discovery/selection, and the advertised mode/model config options.
 `session/new` creates a durable bare UUID and empty checkpoint without calling a
-provider. At most 64 idle transport bindings are retained; eviction keeps the
+provider. `session/load` replays the saved conversation as `session/update`
+notifications before it responds: user and agent text, then each tool call with
+its final status. Replayed tool results are masked as on the live stream: a
+`request_user_input` answer becomes `User input submitted` and configured
+credentials are redacted. Reasoning and images are not replayed. At most 64 idle transport bindings are retained; eviction keeps the
 durable conversation. Resume deduplicates against the existing thread binding.
 Full histories, tool pairs, signatures, media and partial-effect receipts are
 saved under the same checkpoint guard and session write lease used by HTTP.
@@ -721,6 +725,8 @@ whole compatibility alias family. Final dispatch rechecks the profile, so a
 fabricated alias, hook rewrite or omitted catalog entry cannot bypass it. Plan
 remains read-only under Full Access. Full Access and the ordinary approval
 posture are server-owned read-only options; the editor cannot widen them.
+`approval_policy = "never"` is not an ACP posture, so the server refuses to
+start with it instead of serving it as Ask.
 
 Tool updates begin `pending`. `in_progress` means Core reached final dispatch;
 `completed`/`failed` and typed image blocks come from the actual Core result.
@@ -743,12 +749,18 @@ or typed `max_turn_requests`; Core failure remains an error. Prompts use at most
 50 model steps (a lower configured limit still wins) and Core's bounded final
 report response; this profile does not dispatch autonomous goal continuations.
 
-ACP presently claims its own exclusive canonical Runtime owner. If another
-process holds that store, startup refuses. A saved conversation bound to another
-Runtime store also refuses; authenticated cross-process owner attachment remains
-unqualified and ACP does not copy a live conversation into a random store. This
-does not expose every `/v1/*` steering, job or control method to an ACP editor.
-Use `codewhale app-server --http` for that full runtime API.
+When no process owns the Runtime store, ACP claims its own exclusive canonical
+Runtime owner. When a non-ACP Runtime host already owns it (the desktop app,
+`codewhale app-server --http` or `codewhale serve --http`), ACP attaches to that
+owner as an authenticated guest over its local control socket and serves the
+editor from the owner's store. If that owner exits, the ACP process ends with
+an error naming the exit; pending operation outcomes may be uncertain and are
+not replayed. A second `codewhale serve --acp` in a store another ACP server
+already owns refuses at startup and leaves the first serving. A saved
+conversation bound to another Runtime store also refuses; ACP does not copy a
+live conversation into a random store. This does not expose every `/v1/*`
+steering, job or control method to an ACP editor. Use
+`codewhale app-server --http` for that full runtime API.
 
 
 ## Capability endpoint: `codewhale doctor --json`
@@ -983,6 +995,11 @@ a TLS or verified transport boundary.
 - `POST /v1/sessions/{id}/resume-thread` returns the open thread that already
   holds the whole saved session (`200`), or seeds a new thread from it (`201`)
   when none does, including when the session grew after that thread opened it.
+  Without a `mode` in the body, a new thread takes the saved mode; a saved mode
+  that is not a Runtime mode, such as `exec`, resumes as `agent`. The new
+  thread's tool results are stored masked as live receipts are: a
+  `request_user_input` answer becomes `User input submitted` and configured
+  credentials are redacted. `GET /v1/sessions/{id}` still returns them unmasked.
 - `GET /v1/sessions/{id}/artifacts` and `GET /v1/sessions/{id}/artifacts/{artifact_id}?offset=&limit=`
   (see workspace files and session artifacts above; runtime-turn spills are
   read through `GET /v1/threads/{id}/turns/{turn_id}/artifacts/{artifact_id}`)

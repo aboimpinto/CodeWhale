@@ -3597,7 +3597,9 @@ impl SessionManager {
         match self.load_session(id) {
             Ok(saved) if saved.metadata.updated_at >= checkpoint.metadata.updated_at => {}
             Ok(_) => {
-                if self.save_session(&checkpoint).is_err() {
+                let mut promoted = checkpoint;
+                self.merge_persisted_lifecycle(&mut promoted.metadata);
+                if self.save_session(&promoted).is_err() {
                     return;
                 }
             }

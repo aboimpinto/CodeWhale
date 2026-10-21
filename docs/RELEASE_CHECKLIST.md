@@ -90,10 +90,14 @@ known limitations and publication approval. These proofs are separate.
 ## 3. Verify and land preparation slices
 
 - [ ] Run the existing checks appropriate to each changed surface once; batch
-      coherent Rust edits before compiling. Web changes use
-      `npm test && npm run check:web` from the repository root. Record actual
-      results and failures in commit messages; hosted CI owns exhaustive
-      workspace and platform coverage.
+      coherent Rust edits before compiling. During implementation, use the
+      smallest local check or running-product observation that proves the
+      change. After implementation and product review, freeze the candidate
+      commit and run final validation once, including
+      `npm test && npm run check:web` from the repository root. Hosted CI owns
+      exhaustive workspace and platform coverage at that final step. Rerun
+      only checks invalidated by a fix. Record actual results and failures in
+      commit messages.
 - [ ] Commit verified owned paths directly to `main` and push normally. Resolve
       push rejection with the other writer while preserving dirty work; never
       force-push. Reuse valid receipts instead of rebuilding merely to commit

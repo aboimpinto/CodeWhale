@@ -12,8 +12,8 @@ use crate::tools::spec::{ToolError, ToolResult};
 use crate::tui::active_cell::ActiveCell;
 use crate::tui::app::{App, ToolDetailRecord, ToolEvidence};
 use crate::tui::history::{
-    ExecCell, ExecSource, ExecWait, ExploringEntry, GenericToolCell, HistoryCell, McpToolCell,
-    PatchSummaryCell, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus, ViewImageCell,
+    ExecCell, ExecSource, ExecWait, ExploringCell, ExploringEntry, GenericToolCell, HistoryCell,
+    McpToolCell, PatchSummaryCell, PlanUpdateCell, ReviewCell, ToolCell, ToolStatus, ViewImageCell,
     WebSearchCell, output_looks_like_diff, summarize_mcp_output, summarize_tool_args,
     summarize_tool_output,
 };
@@ -46,34 +46,23 @@ pub(super) fn handle_tool_call_started(
 
     if is_exploring_tool(semantic_name) {
         let label = exploring_label(semantic_name, input, &app.workspace);
-        // ensure_exploring + append_to_exploring keeps all parallel exploring
-        // starts in a single ExploringCell entry.
-        let active = app.active_cell.as_mut().expect("active_cell just ensured");
-        let entry_idx = active.ensure_exploring();
-        app.active_tool_entry_completed_at.remove(&entry_idx);
-        let inner = active
-            .append_to_exploring(
-                id.clone(),
-                ExploringEntry {
+        push_active_tool_cell(
+            app,
+            &id,
+            name,
+            input,
+            HistoryCell::Tool(ToolCell::Exploring(ExploringCell {
+                entries: vec![ExploringEntry {
                     label,
                     status: ToolStatus::Running,
                     error: None,
-                },
-            )
-            .map_or(0, |(_, inner)| inner);
-        app.exploring_cell = Some(entry_idx);
-        let virtual_index = app.history.len() + entry_idx;
-        app.exploring_entries
-            .insert(id.clone(), (virtual_index, inner));
-        register_tool_cell(app, &id, name, input, virtual_index);
-        app.mark_history_updated();
+                }],
+            })),
+        );
+        let virtual_index = app.tool_cells[&id];
+        app.exploring_entries.insert(id, (virtual_index, 0));
         return;
     }
-
-    // Non-exploring tool: each is its own entry inside the active cell. We
-    // intentionally do NOT clear `exploring_cell` here — the active cell can
-    // hold both an exploring aggregate AND independent tool entries
-    // simultaneously, which is exactly the case CX#7 fixes.
 
     if is_exec_tool(semantic_name) {
         let command = exec_target_from_input(input);
@@ -467,7 +456,7 @@ fn store_tool_detail_output(
 /// Hold the retained-output total under [`TOOL_DETAIL_TOTAL_BUDGET_BYTES`] by
 /// dropping the oldest cells' outputs. The records themselves stay, so the
 /// inspector still lists the call and its input.
-fn release_oldest_tool_detail_outputs(app: &mut App) {
+pub(super) fn release_oldest_tool_detail_outputs(app: &mut App) {
     let mut total = 0usize;
     for detail in app.tool_details_by_cell.values() {
         total = total.saturating_add(detail.output.as_ref().map_or(0, String::len));
@@ -1622,15 +1611,14 @@ fn push_orphan_tool_completion(
 fn tool_status_from_result(result: &Result<ToolResult, ToolError>) -> ToolStatus {
     match result.as_ref() {
         Ok(tool_result) if is_deferred_schema_hydration(tool_result) => ToolStatus::Hydrated,
-        Ok(tool_result) => match tool_result.metadata.as_ref() {
-            Some(meta)
-                if meta
-                    .get("status")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|s| s == "Running") =>
-            {
-                ToolStatus::Running
-            }
+        Ok(tool_result) => match tool_result
+            .metadata
+            .as_ref()
+            .and_then(|meta| meta.get("status"))
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("Running") => ToolStatus::Running,
+            Some("Killed") => ToolStatus::Stopped,
             _ => {
                 if tool_result.success {
                     ToolStatus::Success
@@ -2888,17 +2876,24 @@ mod tests {
         // 200 records x 64 KiB = 12.8 MiB, well past the 8 MiB budget.
         let record_count = 200usize;
         for index in 0..record_count {
-            app.tool_details_by_cell.insert(
-                index,
+            let tool_id = format!("tool-{index}");
+            super::handle_tool_call_started(
+                &mut app,
+                &tool_id,
+                "read_file",
+                &serde_json::json!({ "path": format!("file-{index}.txt") }),
+            );
+            app.active_tool_details.insert(
+                tool_id.clone(),
                 ToolDetailRecord {
-                    tool_id: format!("tool-{index}"),
-                    tool_name: "Bash".to_string(),
+                    tool_id,
+                    tool_name: "read_file".to_string(),
                     input: serde_json::Value::Null,
                     output: Some("y".repeat(super::TOOL_DETAIL_OUTPUT_MAX_BYTES)),
                 },
             );
         }
-        super::release_oldest_tool_detail_outputs(&mut app);
+        app.flush_active_cell();
 
         let retained: usize = app
             .tool_details_by_cell
