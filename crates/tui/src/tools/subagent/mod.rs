@@ -5612,9 +5612,7 @@ impl SubAgentManager {
     ///
     /// The same single predicate as claim admission (#5562): an agent restored
     /// `Running` from a prior session (crash leftover) and an owner whose agent
-    /// record is not loaded are both non-live — the per-workspace coordination
-    /// process lock means no other process is writing concurrently, so there is
-    /// no live peer to fail closed against.
+    /// record is not loaded are both non-live.
     ///
     /// Worktree-isolated peers are excluded too: they write into their own
     /// checkout and can never contend for these paths.
@@ -11205,6 +11203,17 @@ pub fn new_shared_subagent_manager(workspace: PathBuf, max_agents: usize) -> Sha
         max_agents,
         Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
         max_agents,
+    )
+}
+
+#[must_use]
+pub(crate) fn new_shared_worker_authority(workspace: PathBuf) -> SharedSubAgentManager {
+    new_shared_subagent_manager_with_timeout(
+        workspace,
+        MAX_SUBAGENTS,
+        MAX_SUBAGENTS,
+        Duration::from_secs(crate::config::DEFAULT_SUBAGENT_HEARTBEAT_TIMEOUT_SECS),
+        MAX_SUBAGENTS,
     )
 }
 
@@ -18008,8 +18017,9 @@ fn subagent_reasoning_effort_for_request(
     role_reasoning_default: Option<&str>,
 ) -> Option<String> {
     let normalize = |effort: ReasoningEffort| {
-        effort.normalize_for_route(
+        effort.normalize_for_route_identity(
             runtime.client.api_provider(),
+            runtime.client.admitted_provider_identity().key.as_str(),
             runtime.client.base_url(),
             model,
         )
@@ -18049,8 +18059,9 @@ fn subagent_reasoning_effort_for_request(
 
 fn fallback_subagent_reasoning_effort(runtime: &SubAgentRuntime, model: &str) -> Option<String> {
     let normalize = |effort: ReasoningEffort| {
-        effort.normalize_for_route(
+        effort.normalize_for_route_identity(
             runtime.client.api_provider(),
+            runtime.client.admitted_provider_identity().key.as_str(),
             runtime.client.base_url(),
             model,
         )

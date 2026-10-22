@@ -510,6 +510,7 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
                 path.display()
             ));
         }
+        let in_place = explicit_save_path.is_none();
         let save_path = explicit_save_path.unwrap_or_else(|| {
             let dir = crate::session_manager::default_sessions_dir()
                 .unwrap_or_else(|_| app.workspace.clone());
@@ -523,7 +524,11 @@ impl CommandSessionLifecycleContext for SessionLifecycleAdapter<'_> {
 
         match std::fs::create_dir_all(&sessions_dir) {
             Ok(()) => {
-                let json = match serde_json::to_string_pretty(&session) {
+                let json = match if in_place {
+                    serde_json::to_string(&session)
+                } else {
+                    serde_json::to_string_pretty(&session)
+                } {
                     Ok(j) => j,
                     Err(e) => return Err(format!("Failed to serialize session: {e}")),
                 };

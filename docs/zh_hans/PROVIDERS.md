@@ -85,7 +85,7 @@ codewhale models --provider openai --json
 
 `models --update`（也可写作 `--refresh`）会更新共享的 Models.dev 元数据，并用每个已配置提供商各自的凭据调用其现有的 `/models` 端点。`--provider ID` 把刷新限定在该提供商，包括具名的自定义端点。它不发起任何推理请求，也不会更改已保存的提供商或模型。命令行传入的 API 密钥只限于当前提供商；本次调用中其他路由会被报告为已跳过。
 
-不带 `--update` 的 `models` 会列出当前提供商已保存的目录，不发起提供商请求。ChatGPT 路由会先在本地验证所选注册，再读取该账户的缓存目录。刷新成功后，结果保存在 Codewhale 的目录文件夹下，供模型/提供商选择器使用。缓存文件按提供商身份和端点划分；刷新失败时会保留原有行。文本输出报告来源、最近一次成功获取的时间（Unix 秒）和新鲜度。`--update --json` 会额外给出每个来源的回执和汇总计数；部分失败时，会在写完这些回执后返回非零退出码。普通的 `models --json` 仍保持模型数组格式。随附的或已配置的回退项并不能证明账户可以使用列出的每个模型。
+不带 `--update` 的 `models` 会列出当前提供商已保存的目录，不发起提供商请求。ChatGPT 路由会先在本地验证所选注册，再读取该账户的缓存目录。刷新成功后，结果保存在 Codewhale 的目录文件夹下，供模型/提供商选择器使用；账户目录（Codewhale 账户、Baseten 和插件账户目录）除外，它们只保留在读取它们的进程内存中，因此 `exec`、`review` 和工作流工具会在第一次请求前读取一次账户模型列表，读取失败时使用内置限制继续运行。缓存文件按提供商身份和端点划分；刷新失败时会保留原有行。文本输出报告来源、最近一次成功获取的时间（Unix 秒）和新鲜度。`--update --json` 会额外给出每个来源的回执和汇总计数；部分失败时，会在写完这些回执后返回非零退出码。普通的 `models --json` 仍保持模型数组格式。随附的或已配置的回退项并不能证明账户可以使用列出的每个模型。
 
 ### 使用 ChatGPT 登录
 
@@ -651,22 +651,31 @@ OrcaRouter（`https://api.orcarouter.ai/v1`）是专用的具名路由（[OrcaRo
 PKCE S256、回环回调与恒定时间 state 校验获得持久 `sk-orca-…` key；两条路径写入
 同一个 `orcarouter` 秘密槽位，`auth_mode = "api_key"`。
 
-浏览器授权为 `https://www.orcarouter.ai/auth`；交换为
-`POST https://www.orcarouter.ai/api/v1/auth/keys`，无需 client secret 或预注册
-回调 URI。推理和目录使用独立的 `https://api.orcarouter.ai/v1`，不能由另一个
-源站猜测路径。自托管可显式用 `ORCA_AUTH_BASE_URL` 与
-`ORCA_API_BASE_URL` / `ORCAROUTER_BASE_URL` 覆盖各自源站；远程必须 HTTPS，
-HTTP 只允许回环。
+浏览器授权为 `https://www.orcarouter.ai/auth`，参数含 `ref`（Codewhale 在
+OrcaRouter 的公开标识；OrcaRouter 签发 `app_id` 后一并携带）；交换为
+`POST https://www.orcarouter.ai/api/v1/auth/keys`，无需 client secret。推理和目录
+使用独立的 `https://api.orcarouter.ai/v1`，不能由另一个源站猜测路径。推理源站可用
+`ORCA_API_BASE_URL`、`ORCA_BASE_URL` 或 `ORCAROUTER_BASE_URL` 覆盖；远程必须
+HTTPS，HTTP 只允许回环。登录源站固定为 `https://www.orcarouter.ai`：
+`ORCA_AUTH_BASE_URL` 与 `ORCAROUTER_AUTH_BASE_URL` 只能将其改为回环 HTTP 地址以供
+本地测试夹具使用，其他值一律忽略，`ORCA_BASE_URL` 不再影响登录源站。
 
 所得 key 不是刷新令牌：重启后复用，不发送 refresh grant。请在 OrcaRouter
 控制台撤销；`/auth orcarouter-revoke` 只清除本地副本。Relay 401 将该凭据版本
 标为需重新认证，不静默重试。
 
-实时 `GET https://api.orcarouter.ai/v1/models` 用所配置 key 获取目录。
-聊天选择器仅保留 `supported_endpoint_types` 含 `openai`、`anthropic`、`gemini`
-或 `openai-response` 的行；图像生成、视频与 rerank 行被过滤，不按名称猜测。
+实时 `GET https://api.orcarouter.ai/v1/models` 用所配置 key 获取目录，其标价（含
+长提示词分档价）作为该路由的价格估计。该路由只使用 Chat Completions，因此聊天选择器
+仅保留 `supported_endpoint_types` 含 `openai` 的行；只在其他协议上提供的行（如仅限
+Gemini 的图像模型）不列出；图像生成、视频与 rerank 行被过滤，不按名称猜测。
 `architecture.input_modalities` 含 `image` 才确认图像输入；无 architecture 的行
 能力为未知。
+
+桌面应用通过 Runtime API 的 `POST /v1/providers/orcarouter/connect` 连接
+OrcaRouter，无需终端：本地 Engine 运行同一流程，应用在系统浏览器中打开返回的
+授权链接，Engine 在回环回调上等待、交换授权码，并以与
+`codewhale auth orcarouter` 完全相同的方式保存 key。详见
+[RUNTIME_API.md](RUNTIME_API.md)。
 
 ### 近期 OpenRouter 大模型
 

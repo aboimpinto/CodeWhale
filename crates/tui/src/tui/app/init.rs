@@ -695,11 +695,11 @@ impl App {
                 plugin_registry.as_ref(),
             )
             .map(|cfg| {
-                // Boot is lazy (#6033): the pre-event "connecting" prediction
-                // is the eager set — `required` servers plus ones the user's
-                // `tools.always_load` selection covers — not every enabled
-                // server. The engine's first boot event replaces this with
-                // the real in-flight set.
+                // The pre-event "connecting" prediction names only servers a
+                // session must start — `required` ones plus those the user's
+                // `tools.always_load` selection covers — not every server the
+                // boot pass starts. The engine's first boot event replaces
+                // this with the real in-flight set.
                 let requested = config
                     .tools
                     .as_ref()

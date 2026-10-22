@@ -710,6 +710,7 @@ pub struct LaunchState {
     /// Claude Code config was detected on this host (probed once at
     /// construction); drives the launch card's migration notice line.
     pub claude_code_detected: bool,
+    pub whats_new: Option<crate::whats_new::WhatsNewNotice>,
 }
 
 /// The launch card's dissolve motion budget. One bounded motion; reduced
@@ -804,6 +805,7 @@ impl LaunchState {
             dissolve_started_ms: None,
             mark_reveal_started_at: None,
             claude_code_detected,
+            whats_new: None,
         }
     }
 
@@ -7201,7 +7203,12 @@ impl App {
             crate::config::legacy_deepseek_alias_effort_for_route(provider, base_url, model)
         });
         self.reasoning_effort = if let Some(requested) = self.reasoning_effort_preference {
-            requested.normalize_for_route(provider, base_url, wire_model)
+            requested.normalize_for_route_identity(
+                provider,
+                self.provider_identity_for_persistence(),
+                base_url,
+                wire_model,
+            )
         } else if let Some(effort) = inferred {
             ReasoningEffort::from_setting(effort)
                 .normalize_for_route(provider, base_url, wire_model)
@@ -7210,8 +7217,12 @@ impl App {
         {
             default
         } else {
-            self.reasoning_effort
-                .normalize_for_route(provider, base_url, wire_model)
+            self.reasoning_effort.normalize_for_route_identity(
+                provider,
+                self.provider_identity_for_persistence(),
+                base_url,
+                wire_model,
+            )
         };
         self.invalidate_route_receipts_for_reasoning_change();
     }
@@ -7540,6 +7551,7 @@ impl App {
     pub(crate) fn reasoning_effort_api_value_for_replay(
         &self,
         provider: ProviderKind,
+        identity: &str,
         base_url: &str,
         model: &str,
     ) -> Option<&'static str> {
@@ -7549,7 +7561,9 @@ impl App {
         } else {
             self.reasoning_effort
         };
-        requested.api_value_for_route(provider, base_url, model)
+        requested
+            .normalize_for_route_identity(provider, identity, base_url, model)
+            .api_value_for_provider(provider)
     }
 
     pub fn compaction_config(&self) -> CompactionConfig {

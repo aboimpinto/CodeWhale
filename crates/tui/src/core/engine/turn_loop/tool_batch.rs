@@ -162,6 +162,11 @@ impl Engine {
             }
         }
 
+        if let Some(stop) = turn.auto_review_denials.stop().map(str::to_string) {
+            let _ = self.send_event(Event::status(stop.clone())).await;
+            return PhaseResult::Return((TurnOutcomeStatus::Interrupted, Some(stop)));
+        }
+
         if authority_changed || accepted_steer_after_tools {
             if let Some(guard) = progress.fleet_denial_guard.as_mut() {
                 guard.reset();

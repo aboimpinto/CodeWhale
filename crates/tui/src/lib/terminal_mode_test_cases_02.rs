@@ -208,6 +208,7 @@
             description: "detail".to_string(),
             path: path.map(str::to_string),
             line,
+            ..Default::default()
         }
     }
 
@@ -234,7 +235,7 @@
             summary: "summary".to_string(),
             issues,
             suggestions,
-            overall_assessment: String::new(),
+            ..Default::default()
         }
     }
 
@@ -945,7 +946,7 @@
             "{posted}"
         );
         assert!(!posted.contains("```suggestion"), "{posted}");
-        assert!(posted.contains("```text"), "{posted}");
+        assert!(posted.contains("```diff"), "{posted}");
     }
 
     /// #6510: a plain-diff review now asks for the one structured review

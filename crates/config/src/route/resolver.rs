@@ -448,7 +448,10 @@ impl RouteResolver {
                 })
         {
             selected.canonical_model = None;
-            selected.limits = offering.limits;
+            selected.limits = RouteLimits {
+                output_declared: offering.limits.output_tokens.is_some(),
+                ..offering.limits
+            };
             selected.capabilities = offering.capabilities;
             selected.pricing = offering.pricing.clone();
             for (field, value) in [
@@ -547,7 +550,12 @@ impl RouteResolver {
             match limit_override.field {
                 LimitField::ContextTokens => limits.context_tokens = limit_override.value,
                 LimitField::InputTokens => limits.input_tokens = limit_override.value,
-                LimitField::OutputTokens => limits.output_tokens = limit_override.value,
+                LimitField::OutputTokens => {
+                    limits.output_tokens = limit_override.value;
+                    limits.output_declared = limit_override.source
+                        == super::OverrideSource::UserModelMetadata
+                        && limit_override.value.is_some();
+                }
             }
         }
 

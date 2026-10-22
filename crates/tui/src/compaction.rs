@@ -732,6 +732,17 @@ pub fn estimate_input_tokens_for_pressure(
         .saturating_add(framing_overhead)
 }
 
+#[must_use]
+pub(crate) fn estimate_request_input_tokens(
+    messages: &[Message],
+    system: Option<&SystemPrompt>,
+    tools: Option<&[Tool]>,
+) -> usize {
+    estimate_input_tokens_for_pressure(messages, system).saturating_add(tools.map_or(0, |tools| {
+        serde_json::to_string(tools).map_or(0, |schema| schema.len().div_ceil(4))
+    }))
+}
+
 fn estimate_retained_floor_conservative(
     messages: &[Message],
     system_prompt: Option<&SystemPrompt>,
@@ -1988,13 +1999,47 @@ async fn create_summary(
         // much output the model may need instead of imposing a smaller,
         // compaction-only ceiling that can be consumed by hidden reasoning.
         let cost_route = client.effective_route_envelope(&config.model, chrono::Utc::now());
+        let ceiling = client.effective_max_output_tokens(&cost_route.model);
+        let summary_floor = crate::route_budget::route_output_reservation(
+            cost_route.provider,
+            &cost_route.model,
+            client.route_limits(),
+        )
+        .min(ceiling)
+            / 2;
+        let max_tokens = match crate::route_budget::request_output_cap_for_input(
+            cost_route.provider,
+            &cost_route.model,
+            client.route_limits(),
+            ceiling,
+            u64::try_from(estimate_request_input_tokens(
+                &request_messages,
+                system_prompt,
+                tools,
+            ))
+            .unwrap_or(u64::MAX),
+        ) {
+            Some(cap) if cap >= summary_floor => cap,
+            _ => {
+                if !drop_oldest_history_messages(&mut request_messages) {
+                    anyhow::bail!(
+                        "The summary request for making room leaves too little output room in this route's context window, and no older history is left to drop."
+                    );
+                }
+                logging::warn(
+                    "Compaction summary input leaves too little output room in the context \
+                     window; dropped the oldest history item and retrying",
+                );
+                continue;
+            }
+        };
         let request = compaction_summary_request(
             request_messages.clone(),
             config,
             system_prompt,
             tools,
             reasoning_effort,
-            client.effective_max_output_tokens(&cost_route.model),
+            max_tokens,
         );
 
         // Capture the session scope before awaiting so a late response cannot

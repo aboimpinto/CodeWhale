@@ -106,6 +106,7 @@ fn tokens_report_uses_codex_oauth_route_context() {
         context_tokens: Some(272_000),
         input_tokens: None,
         output_tokens: None,
+        output_declared: false,
     });
 
     let message = tokens(&mut app).message.expect("tokens report");

@@ -438,6 +438,7 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Zai,
+            ProviderKind::Zai.as_str(),
             crate::config::DEFAULT_ZAI_BASE_URL,
             crate::config::ZAI_GLM_5_TURBO_MODEL,
         ),
@@ -449,6 +450,7 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Minimax,
+            ProviderKind::Minimax.as_str(),
             crate::config::DEFAULT_MINIMAX_BASE_URL,
             crate::config::DEFAULT_MINIMAX_MODEL,
         ),
@@ -459,6 +461,7 @@ fn cache_replay_keeps_untiered_reasoning_enabled() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Zai,
+            ProviderKind::Zai.as_str(),
             crate::config::DEFAULT_ZAI_BASE_URL,
             crate::config::ZAI_GLM_5_TURBO_MODEL,
         ),
@@ -477,6 +480,7 @@ fn cache_replay_normalizes_reasoning_against_the_concrete_auto_route() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::OpenaiCodex,
+            ProviderKind::OpenaiCodex.as_str(),
             crate::config::DEFAULT_OPENAI_CODEX_BASE_URL,
             crate::config::DEFAULT_OPENAI_CODEX_MODEL,
         ),
@@ -488,6 +492,7 @@ fn cache_replay_normalizes_reasoning_against_the_concrete_auto_route() {
     assert_eq!(
         app.reasoning_effort_api_value_for_replay(
             ProviderKind::Moonshot,
+            ProviderKind::Moonshot.as_str(),
             crate::config::DEFAULT_KIMI_CODE_BASE_URL,
             crate::config::KIMI_CODE_K3_MODEL,
         ),

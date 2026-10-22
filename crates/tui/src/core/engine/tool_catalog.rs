@@ -446,23 +446,6 @@ pub(crate) fn remove_evicted_cache_activations(
     }
 }
 
-/// Promote a successfully executed deferred tool only when this conversation
-/// had already activated it. Execution can update recency, never grant a name.
-pub(crate) fn touch_cached_tool_after_execution(
-    catalog: &[Tool],
-    active: &mut HashSet<String>,
-    cache: &mut ToolActivationCache,
-    name: &str,
-) -> bool {
-    if !cache.names().any(|cached| cached == name) {
-        return false;
-    }
-    let delta = cache.activate(catalog, &[name.to_string()]);
-    remove_evicted_cache_activations(catalog, active, delta.evicted);
-    active.extend(delta.admitted);
-    true
-}
-
 /// Make the recovery schema visible on the next provider step when a tool
 /// result actually publishes retrievable evidence. The initial toolbox stays
 /// small, while a receipt never advertises a deferred route that merely asks
@@ -478,7 +461,8 @@ pub(crate) fn activate_result_dependencies(
         .as_ref()
         .and_then(|metadata| metadata.get("evidence_available"))
         .and_then(Value::as_bool)
-        == Some(true);
+        == Some(true)
+        || super::context::offers_retrieval(result.metadata.as_ref());
     if !needs_retrieval {
         return false;
     }
@@ -565,7 +549,12 @@ impl ToolSurfacePolicy {
         // explicit command gate.
         catalog.retain(|tool| {
             !tool_denied(disallowed_tools.as_deref(), &tool.name)
-                && tool_allowed(allowed_tools.as_deref(), &tool.name)
+                && (tool_allowed(allowed_tools.as_deref(), &tool.name)
+                    || retrieval_available_beside_an_allowlist(
+                        allowed_tools.as_deref(),
+                        disallowed_tools.as_deref(),
+                        &tool.name,
+                    ))
         });
         for tool in &mut catalog {
             if let Some(actions) = tool
@@ -613,6 +602,11 @@ impl ToolSurfacePolicy {
 
     pub(super) fn passes_allow_list(&self, name: &str) -> bool {
         tool_allowed(self.allowed_tools.as_deref(), name)
+            || retrieval_available_beside_an_allowlist(
+                self.allowed_tools.as_deref(),
+                self.disallowed_tools.as_deref(),
+                name,
+            )
     }
 
     /// A configured-server handshake may only serve this captured turn's
@@ -644,6 +638,25 @@ pub(super) fn tool_allowed(allowed_tools: Option<&[String]>, tool_name: &str) ->
         return true;
     };
     tool_matches_any_rule(allowed_tools, tool_name)
+}
+
+/// Retrieval stays off the initial `tools` field but must survive an allow-list
+/// narrowing, or a result that names a saved copy advertises a route the turn
+/// cannot call.
+///
+/// This is deliberately not a branch inside [`tool_allowed`]: that answer is
+/// "does this name match the allow-list", and an empty allow-list means no
+/// tools, which `exec` relies on. Keeping the tool in the catalog lets
+/// [`activate_result_dependencies`] admit it later, only after a result really
+/// publishes retrievable evidence, and an explicit deny still removes it.
+fn retrieval_available_beside_an_allowlist(
+    allowed_tools: Option<&[String]>,
+    disallowed_tools: Option<&[String]>,
+    tool_name: &str,
+) -> bool {
+    tool_name == TOOL_RESULT_RETRIEVAL_NAME
+        && disallowed_tools.is_none_or(|rules| !tool_denied(Some(rules), tool_name))
+        && allowed_tools.is_some_and(|rules| !rules.is_empty())
 }
 
 pub(crate) fn tool_denied(disallowed_tools: Option<&[String]>, tool_name: &str) -> bool {
@@ -1543,6 +1556,7 @@ fn execute_tool_search_inner(
     };
 
     let mut cache_rejected = Vec::new();
+    let mut cache_held = Vec::new();
     let mut evicted = Vec::new();
     if let Some(cache) = cache {
         let delta = cache.activate(catalog, &discovered);
@@ -1553,6 +1567,7 @@ fn execute_tool_search_inner(
             .filter(|name| !active_tools.contains(name))
             .collect();
         cache_rejected = delta.rejected;
+        cache_held = delta.held;
         discovered = delta.admitted;
     }
     for name in &discovered {
@@ -1580,6 +1595,14 @@ fn execute_tool_search_inner(
             "reason": "The tool schema exceeds the bounded conversation toolbox (8 cached tools, 16KiB of added serialized schemas). Narrow the search or use a smaller matching tool."
         })
     }));
+    unavailable_references.extend(cache_held.iter().map(|name| {
+        json!({
+            "type": "unavailable_tool_reference",
+            "tool_name": name,
+            "reason": "Not loaded: tools used in this or the previous turn fill this conversation's bounded toolbox (8 cached tools, 16KiB of added serialized schemas). Call tool_search with tool_search_input to load it on its own.",
+            "tool_search_input": readmission_search_input(name),
+        })
+    }));
 
     let mut payload = json!({
         "type": "tool_search_tool_search_result",
@@ -1597,7 +1620,8 @@ fn execute_tool_search_inner(
                 json!({
                     "type": "evicted_tool_reference",
                     "tool_name": name,
-                    "reason": "No longer in this conversation's bounded toolbox (8 cached tools, 16KiB of added serialized schemas), so it is not callable now. Search for it again before using it."
+                    "reason": "Evicted from this conversation's bounded toolbox (8 cached tools, 16KiB of added serialized schemas) because it was not used in this or the previous turn, so it is not callable now. Call tool_search with tool_search_input to load it again.",
+                    "tool_search_input": readmission_search_input(name),
                 })
             })
             .collect();
@@ -1608,6 +1632,14 @@ fn execute_tool_search_inner(
         content: serde_json::to_string(&payload).unwrap_or_else(|_| payload.to_string()),
         success: true,
         metadata: Some(metadata),
+    })
+}
+
+fn readmission_search_input(name: &str) -> Value {
+    json!({
+        "query": format!("^{}\\n", regex::escape(&name.to_lowercase())),
+        "match": "regex",
+        "max_results": 1,
     })
 }
 

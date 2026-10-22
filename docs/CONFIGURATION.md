@@ -964,6 +964,42 @@ official GitHub API endpoint. If a configured `update_uri` cannot be fetched or
 parsed and a release mirror env var is set, the TUI falls back to that mirror
 instead of failing startup.
 
+#### What's new after an update
+
+The first time Codewhale starts after its version goes up, it says so once and
+links that version's release notes on codewhale.net:
+
+```text
+Updated to 0.10.2. Got 12 features, 31 fixes and 8 other changes.
+Release notes: https://codewhale.net/en/changelog/0.10.2
+```
+
+The counts come from the changelog compiled into the binary. Entries under
+Added or New count as features; Fixed, Security and Latest fixes count as
+fixes; Contributors, Thanks, Community and Known limits or issues are not
+counted; every other section counts as other changes. The link uses your UI
+language where the site has it (`zh` for Chinese) and English otherwise.
+
+The TUI shows the notice on the startup card and moves it into the transcript
+when the card leaves (at once when the session opens from `--resume`,
+`--continue` or a prompt), adding `/change <version>` for reading the notes in
+place. The `doctor`, `models`,
+`sessions`, `receipts`, `setup`, `init`, `install`, `features`,
+`integrations`, `mcp`, `config`, `model`, `metrics`, `providers`, `account`,
+`login`, `logout` and `update` commands print it to stderr instead, when
+stdout and stderr are both terminals and no JSON output is requested. `exec`,
+servers, JSON output and non-terminal runs never show it; the next start that
+can show it does.
+
+Nothing is shown on a fresh install or after a downgrade. The version that
+last started is recorded in `~/.codewhale/last-launch.json`. The notice reads
+only local files, so it is independent of `check_for_updates`. To turn it off:
+
+```toml
+[update]
+show_whats_new = false
+```
+
 ## Workshop output budgets
 
 By default an oversized tool result uses bounded spillover: a result
@@ -2090,7 +2126,7 @@ separate:
 | Quantity | Meaning | Allowed to drive |
 |---|---|---|
 | Active request input estimate | Conservative estimate of the next request's live system prompt and transcript payload. | Header/footer context percent, auto-compaction trigger, opt-in Flash seam trigger, and emergency overflow preflight. |
-| Reserved response headroom | The effective request cap plus `1024` safety tokens on every route. Normal no-override requests start at `65536`; a smaller route/provider ceiling narrows that value, and an explicit output override raises it only within the resolved route window and output ceiling. The identical cap reaches the wire and drives preflight; reasoning effort does not add a second hidden reservation. A separately published route input ceiling independently clamps the spendable input budget. | Emergency overflow budget checks only. |
+| Reserved response headroom | The effective request cap plus `1024` safety tokens. Normal no-override requests start at `65536`; a smaller route/provider ceiling narrows that value, and an explicit output override raises it only within the resolved route window and output ceiling. The identical cap reaches the wire and drives preflight, except on a route that states an output limit above half its known context window with no explicit output override: there compaction aims to keep a quarter of the window free (at most `65536`, and never more than the request cap), preflight refuses a request only when fewer than `128` output tokens would fit, and every request's `max_tokens` is what the window has left after that request's estimated input and the `1024` safety tokens, never above the request cap. Reasoning effort does not add a second hidden reservation. A separately published route input ceiling independently clamps the spendable input budget. | Emergency overflow budget checks only. |
 | Cumulative API usage | Provider-reported input plus output tokens summed across completed API calls; multi-tool turns may count the same stable prefix more than once. | Session usage and approximate cost telemetry only. |
 | Prompt cache hit/miss | Provider cache telemetry for the most recent call when available. | Cache-hit display and cost estimation only; never compaction or seam triggers. |
 | Context percent | Active request input estimate divided by the model context window. | Display only; it mirrors the active-input basis used by context safeguards. |
@@ -2218,6 +2254,10 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   timeout_seconds = 300
   ```
 - `sandbox_mode` (string, optional): `read-only`, `workspace-write`, `danger-full-access`, `external-sandbox`.
+  The value can only narrow the sandbox the permission mode picks (Full
+  Access: no wrapper; Ask and Auto-Review: `workspace-write`; Plan:
+  `read-only`), so `danger-full-access` and `external-sandbox` take effect
+  only in Full Access (`yolo`).
   Platform support is not identical. macOS uses Seatbelt when its runtime
   probe succeeds. Linux uses bubblewrap by default whenever `/usr/bin/bwrap`
   is installed and a probe proves it can confine a child; `prefer_bwrap =
@@ -2617,7 +2657,15 @@ reasoning contract, and all four membership ids omit generic sampling fields.
   - `[retry].respect_retry_after` (bool, default `true`): wait for a server
     `Retry-After` header instead of the computed backoff
 
-  `[retry]` schedules HTTP-request retries inside the client. The stream-level
+  `[retry]` schedules HTTP-request retries inside the client. When a
+  streaming request opens, its retries, backoff and any honored `Retry-After`
+  wait share one `stream.open_timeout_secs` window per protocol attempt, so
+  that window bounds how many of `max_retries` the open can reach. On the
+  default HTTP/2 client an expired window counts as a header stall and the open
+  is tried once more over HTTP/1.1 with a fresh window and retry schedule; with
+  HTTP/1.1 pinned there is one window. A `Retry-After` longer than the
+  remaining window ends the open as a response-header timeout; raise
+  `stream.open_timeout_secs` to wait it out. The stream-level
   budgets that sit above it — how often a turn re-issues a request whose
   stream failed to open or died — are the `[stream]` keys below; legacy `tui.stream_max_*` keys remain fallbacks.
 - `[notifications]`: notification delivery, attention, categories and audio share one
@@ -3301,7 +3349,24 @@ route. `[search] native` decides the order:
 - `native = true`: native search leads even when a provider is pinned;
 - `native = false`: native search is never used.
 
-The native answer is returned whole; oversized tool output spills to a session
+Native citations are link-checked before they are returned. Each cited URL is
+requested through the same guarded fetch as `Web` fetch (SSRF, DNS and redirect
+checks, `[network]` policy): a `HEAD`, then a one-byte ranged `GET` when `HEAD`
+is refused, at most four at a time and five seconds each. The request uses the
+address as it will appear in `results`, without userinfo, fragment or
+credential-like query parameters; an address whose query string repeats the
+search query is not requested and is removed. Only sources that
+answer with a 2xx status stay in `results`; the receipt lists each removed one
+as `citation_unverified` with its reason. When no citation passes, or when the
+query asks for `recency` (no native search tool can enforce a time window), the
+search falls through to the configured provider. A citation whose host the
+`[network]` policy denies is removed. A citation whose host the policy would
+ask you about is not fetched: it stays in `results` and the receipt records it
+as `citation_unchecked` until you allow the host.
+
+The provider's prose answer is returned whole in a separate
+`unverified_synthesis` field: it is the provider model's summary, and neither
+its claims nor its links are checked. Oversized tool output spills to a session
 artifact the model can page back.
 
 **Recency and locale.** `recency` and `locale` are forwarded where the
@@ -3315,6 +3380,7 @@ ignored:
 | SearXNG | `time_range` | `language`, as given |
 | Serply | not sent (undocumented) | `hl` language, `gl` country |
 | DeepSeek | not sent | not sent (`localization` takes an IP address) |
+| Provider-native | declined; the search falls through to the configured provider | not sent |
 
 Recency is rounded up to the backend's nearest window (day, week, month,
 year), so `recency = 10` searches the last month. Other backends ignore both

@@ -531,6 +531,16 @@ docs = "docs/CONFIGURATION.md"
 owner = "crates/config/src/settings_schema.rs"
 
 [[feature]]
+id = "whats-new-notice"
+name = "What's new after an update"
+summary = "Says once, on the first start after an update, what changed and links that version's release notes."
+status = "stable"
+surfaces = { tui = "stable" }
+since = "0.10.2"
+docs = "docs/CONFIGURATION.md#whats-new-after-an-update"
+owner = "crates/tui/src/whats_new.rs"
+
+[[feature]]
 id = "themes"
 name = "Themes"
 summary = "/theme picks a built-in theme; user themes follow a JSON schema."
@@ -714,7 +724,7 @@ id = "orcarouter-sign-in"
 name = "Sign in with OrcaRouter"
 summary = "OrcaRouter provider: sk-orca- API key or OAuth 2.0 + PKCE sign-in, plus a live chat model catalog."
 status = "experimental"
-surfaces = { tui = "preview", api = "none", web = "none" }
+surfaces = { tui = "preview", api = "preview", web = "none" }
 since = "0.10.1"
 docs = "docs/PROVIDERS.md"
 owner = "crates/tui/src/oauth.rs"

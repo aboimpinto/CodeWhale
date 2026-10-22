@@ -2007,6 +2007,12 @@ pub struct UpdateConfig {
     /// Optional GitHub-compatible latest-release JSON endpoint.
     #[serde(default)]
     pub update_uri: Option<String>,
+    #[serde(default = "default_update_show_whats_new")]
+    pub show_whats_new: bool,
+}
+
+fn default_update_show_whats_new() -> bool {
+    true
 }
 
 impl Default for UpdateConfig {
@@ -2015,6 +2021,7 @@ impl Default for UpdateConfig {
             check_for_updates: true,
             check_interval_hours: default_update_check_interval_hours(),
             update_uri: None,
+            show_whats_new: true,
         }
     }
 }
@@ -11264,7 +11271,7 @@ fn apply_requirements(config: &mut Config) -> Result<()> {
                     Path::new("."),
                     SandboxNetworkAccess::from_config(config.sandbox_network_access),
                 ) {
-                    SandboxPolicy::ReadOnly => "read-only",
+                    SandboxPolicy::ReadOnly { .. } => "read-only",
                     SandboxPolicy::WorkspaceWrite { .. } => "workspace-write",
                     SandboxPolicy::DangerFullAccess => "danger-full-access",
                     SandboxPolicy::ExternalSandbox { .. } => "external-sandbox",

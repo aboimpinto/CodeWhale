@@ -197,19 +197,26 @@ auto-approved native calls only, no MCP.
 ### Conversation toolbox cache
 
 A successful search activation is remembered by name for the current
-conversation. The cache holds at most eight deferred names and 16 KiB of
-serialized schemas, evicts least-recently-used entries, and revalidates every
-entry against the current catalog and policy before advertising it again. A
-session sync clears it. The cache cannot resurrect a removed, denied, or
-newly-eager tool.
+conversation. The cache is bounded at eight deferred names and 16 KiB of
+serialized schemas. To make room it evicts tools that were never called first
+(oldest activation first), then the least recently called; a tool called in the
+current or previous turn is never evicted. When such tools already fill the
+cache, a search still activates its best match over the bound and holds the
+rest; a later activation restores the bound once those tools go unused. Every
+entry is revalidated against the current catalog and policy before it is
+advertised again. A session sync clears it. The cache cannot resurrect a
+removed, denied, or newly-eager tool.
 
 When a search's activation pushes a previously activated tool out of the
 cache, that search's result lists it under `evicted_tool_references`, so the
 model is told the tool is no longer callable rather than finding it missing
-from the next request. Only tools that actually left the active set are listed;
-a tool that became eager stays callable and is not reported. Known limit: a
-tool dropped by the per-turn revalidation (removed, denied, or no longer
-deferred) outside a search is still dropped silently, because there is no tool
+from the next request. A held match is listed under
+`unavailable_tool_references`. Both carry `tool_search_input`, an exact regex
+query for that one name that loads it again. Only tools that actually left the
+active set are listed; a tool that became eager stays callable and is not
+reported. Known limit: a tool dropped by the per-turn revalidation (removed,
+denied, or no longer deferred), or evicted to make room for a direct first call
+to a deferred tool, is still dropped silently, because there is no search
 result to carry the notice.
 
 Each subagent gets its own policy-filtered deferred catalog, always-present

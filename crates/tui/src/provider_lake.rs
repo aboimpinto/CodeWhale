@@ -1868,6 +1868,48 @@ pub(crate) async fn update_provider_catalog(
     receipt
 }
 
+pub(crate) async fn refresh_account_catalog_before_first_request(config: &Config) {
+    let Ok(identity) = config.active_provider_identity() else {
+        return;
+    };
+    if !crate::provider_catalog_live::route_is_account_scoped(config, &identity)
+        || live_catalog_unavailable(config, &identity)
+    {
+        return;
+    }
+    let handle = tokio::runtime::Handle::current();
+    let refresh_config = config.clone();
+    let refresh_identity = identity.clone();
+    let receipt = tokio::task::spawn_blocking(move || {
+        handle.block_on(update_provider_catalog(&refresh_config, &refresh_identity))
+    })
+    .await
+    .ok();
+    let status = crate::provider_catalog_live::status_for_route(
+        identity.provider,
+        identity.key.as_str(),
+        &config.active_route_base_url(),
+    );
+    if !matches!(status, CatalogStatus::Fresh) {
+        let reason = match &status {
+            CatalogStatus::Failed { reason } => reason.label(),
+            _ => receipt.map_or("refresh_failed", |receipt| {
+                receipt.error.unwrap_or(receipt.outcome)
+            }),
+        };
+        tracing::warn!(
+            target: "provider_catalog",
+            provider = %identity.key,
+            reason,
+            "account model listing unavailable before the first request"
+        );
+        eprintln!(
+            "codewhale: could not read the {} account model listing ({reason}); requesting with built-in model limits.",
+            identity.key
+        );
+    }
+}
+
 pub(crate) async fn run_models(
     config: &Config,
     update: bool,

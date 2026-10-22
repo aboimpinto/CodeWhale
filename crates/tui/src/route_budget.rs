@@ -248,8 +248,10 @@ pub(crate) enum OutputCeilingSource {
     Uncatalogued(u32),
     /// The route publishes no ceiling we can stand behind, but a defensible
     /// floor is still applied: an Anthropic-family model the catalogue does
-    /// not describe (64K Messages floor) and the Codex OAuth route (4K
-    /// policy). Clamping trades late provider failure for early truncation;
+    /// not describe (64K Messages floor), the Codex OAuth route (4K
+    /// policy), and a model-only catalogue row reached through a custom
+    /// endpoint, whose shared wire spelling does not establish the catalogued
+    /// model. Clamping trades late provider failure for early truncation;
     /// lying about why is not part of that trade, so receipts and pickers
     /// must render this as an assumption, never as "documented" (#5440).
     Unverified(u32),
@@ -322,7 +324,13 @@ pub(crate) fn output_ceiling_source(provider: ProviderKind, model: &str) -> Outp
                 OutputCeilingSource::Uncatalogued(UNCATALOGUED_COMPAT_MAX_OUTPUT_TOKENS)
             }
         },
-        OutputCeilingSource::Documented,
+        |tokens| {
+            if provider == ProviderKind::Custom {
+                OutputCeilingSource::Unverified(tokens)
+            } else {
+                OutputCeilingSource::Documented(tokens)
+            }
+        },
     )
 }
 
@@ -385,8 +393,15 @@ fn effective_max_output_tokens_for_route_with_cap(
     // fact — absence keeps a labeled automatic allowance
     // (see `output_ceiling_source`). A concrete route/offering maximum is the
     // missing evidence for that exact route and may replace only the generic
-    // uncatalogued guess; known compatibility caps stay authoritative and are
-    // still intersected with any route maximum.
+    // uncatalogued guess or a custom endpoint's model-only assumption. An
+    // explicit request may also rise past a compatibility cap to a maximum
+    // the operator declared for this exact model and endpoint. Otherwise known
+    // compatibility caps stay authoritative and are still intersected with
+    // any route maximum.
+    let custom_endpoint_assumption = provider == ProviderKind::Custom
+        && matches!(compatibility_source, OutputCeilingSource::Unverified(_));
+    let declared_route_override = explicit_max_output_tokens_override().is_some()
+        && route_limits.is_some_and(|limits| limits.output_declared);
     let cap = match (compatibility_source, route_cap) {
         // A concrete route/offering maximum is evidence about this exact
         // route. It therefore outranks the generic fallback that exists only
@@ -394,6 +409,9 @@ fn effective_max_output_tokens_for_route_with_cap(
         // route fact the conservative guess still applies, and the route fact
         // can never raise the caller's requested cap.
         (OutputCeilingSource::Uncatalogued(_), Some(route_cap)) => requested_cap.min(route_cap),
+        (_, Some(route_cap)) if custom_endpoint_assumption || declared_route_override => {
+            requested_cap.min(route_cap)
+        }
         (OutputCeilingSource::Uncatalogued(_), None)
             if explicit_max_output_tokens_override().is_some() =>
         {
@@ -468,13 +486,74 @@ pub(crate) fn route_output_reservation(
     model: &str,
     route_limits: Option<RouteLimits>,
 ) -> u32 {
-    // Use exactly the value that can reach the wire on every window size.
-    // The previous split reserved 65K for a possible 325K wire request below
-    // 500K, then jumped to an unrequested 262K reservation at 500K. Both
-    // directions made preflight disagree with the actual request. Reasoning
-    // effort is a request control, not separately metered non-wire output, so
-    // it does not justify a second hidden context reservation.
-    effective_max_output_tokens_for_route(provider, model, route_limits)
+    // Use exactly the value that can reach the wire on every window size,
+    // except on a route whose published output limit is more than half its
+    // window: there the limit is the shared window itself, so a quarter of the
+    // window (at most 64K) is reserved and each request's wire cap is sized
+    // from what its input leaves (`request_output_cap_for_input`). The previous split
+    // reserved 65K for a possible 325K wire request below 500K, then jumped to
+    // an unrequested 262K reservation at 500K. Both directions made preflight
+    // disagree with the actual request. Reasoning effort is a request control,
+    // not separately metered non-wire output, so it does not justify a second
+    // hidden context reservation.
+    let ceiling = effective_max_output_tokens_for_route(provider, model, route_limits);
+    if shares_context_window(provider, model, route_limits) {
+        ceiling.min(
+            (route_context_window_tokens(provider, model, route_limits) / 4)
+                .clamp(1, UNCATALOGUED_COMPAT_MAX_OUTPUT_TOKENS),
+        )
+    } else {
+        ceiling
+    }
+}
+
+fn shares_context_window(
+    provider: ProviderKind,
+    model: &str,
+    route_limits: Option<RouteLimits>,
+) -> bool {
+    route_limits
+        .and_then(|limits| limits.context_tokens)
+        .is_some_and(|tokens| (1..=u64::from(u32::MAX)).contains(&tokens))
+        && explicit_max_output_tokens_override().is_none()
+        && route_output_limit_tokens(route_limits)
+            .is_some_and(|cap| cap > route_context_window_tokens(provider, model, route_limits) / 2)
+}
+
+#[must_use]
+pub(crate) fn route_admission_input_ceiling(
+    provider: ProviderKind,
+    model: &str,
+    route_limits: Option<RouteLimits>,
+) -> Option<u64> {
+    shares_context_window(provider, model, route_limits).then(|| {
+        ContextBudget::new_with_input_limit(
+            u64::from(route_context_window_tokens(provider, model, route_limits)),
+            0,
+            crate::tools::subagent::budget_handback::MIN_HAND_BACK_OUTPUT,
+            route_input_limit_tokens(route_limits).map(u64::from),
+        )
+        .input_budget_ceiling
+    })
+}
+
+#[must_use]
+pub(crate) fn request_output_cap_for_input(
+    provider: ProviderKind,
+    model: &str,
+    route_limits: Option<RouteLimits>,
+    ceiling: u32,
+    estimated_input_tokens: u64,
+) -> Option<u32> {
+    if !shares_context_window(provider, model, route_limits) {
+        return Some(ceiling);
+    }
+    let remaining = u64::from(route_context_window_tokens(provider, model, route_limits))
+        .saturating_sub(estimated_input_tokens)
+        .saturating_sub(crate::context_budget::CONTEXT_HEADROOM_TOKENS);
+    u32::try_from(remaining.min(u64::from(ceiling)))
+        .ok()
+        .filter(|cap| *cap > 0)
 }
 
 #[must_use]
@@ -669,7 +748,8 @@ mod tests {
     /// #5460: absence is not permission, but a positive output maximum on the
     /// resolved route is permission for that exact route. The concrete fact
     /// replaces only the catalogue-absence guess; it never raises the caller's
-    /// requested cap or a documented model ceiling.
+    /// requested cap, and an undeclared fact never raises a documented model
+    /// ceiling.
     #[test]
     fn concrete_route_output_limit_outranks_uncatalogued_guess() {
         let _lock = crate::test_support::lock_test_env();
@@ -1306,6 +1386,7 @@ mod tests {
             context_tokens: Some(1_000_000),
             input_tokens: Some(128_000),
             output_tokens: Some(64_000),
+            output_declared: false,
         };
 
         let budget = route_context_budget(

@@ -1335,36 +1335,25 @@ impl CodewhaleClient {
         url: &str,
         body: &Value,
     ) -> Result<(reqwest::Response, Duration)> {
+        let request_body =
+            serde_json::to_vec(body).context("Failed to serialize JSON request body")?;
         let open_req = self.stream_open_request();
         let idle_timeout = open_req.idle_timeout;
-        let response = super::stream_entry::open_sse_response(&open_req, |policy| async move {
-            match policy {
-                // The prebuilt HTTP/1.1 twin carries the same default
-                // headers/auth; send once, without the JSON retry loop
-                // (matching the pre-seam H1-pin behavior).
-                super::stream_entry::StreamHttpPolicy::Http1Only => {
-                    let client = super::stream_entry::client_for_policy(
-                        &self.http_client,
-                        self.http1_fallback_client(),
-                        policy,
-                    );
-                    Ok(self
-                        .authorize_plugin_request(
-                            client
-                                .post(url)
-                                .header(reqwest::header::CONTENT_TYPE, "application/json")
-                                .json(body),
-                        )
-                        .await?
-                        .send()
-                        .await?)
-                }
-                super::stream_entry::StreamHttpPolicy::DualWithH1Fallback => {
-                    // Stream open, not a JSON retry: the response body outlives
-                    // the open, so this path must not carry any total deadline
-                    // (`open_stream_json_with_retry`, not `send_json_with_retry`).
-                    self.open_stream_json_with_retry(url, body).await
-                }
+        let response = super::stream_entry::open_sse_response(&open_req, |policy| {
+            let request_body = request_body.clone();
+            async move {
+                let client = super::stream_entry::client_for_policy(
+                    &self.http_client,
+                    self.http1_fallback_client(),
+                    policy,
+                );
+                self.send_stream_open_with_retry(|| {
+                    client
+                        .post(url)
+                        .header(reqwest::header::CONTENT_TYPE, "application/json")
+                        .body(request_body.clone())
+                })
+                .await
             }
         })
         .await?;
@@ -1388,7 +1377,19 @@ impl CodewhaleClient {
         } = prepared;
         let url = endpoint.url;
 
-        let (response, stream_idle_timeout) = self.open_chat_stream_response(&url, &body).await?;
+        let (response, stream_idle_timeout) =
+            match self.open_chat_stream_response(&url, &body).await {
+                Ok(opened) => opened,
+                Err(error) => {
+                    // If DeepSeek rejected for missing reasoning_content despite the
+                    // sanitizer, dump the offending indices so we can diagnose where
+                    // they came from on the next failure.
+                    if format!("{error:#}").contains("reasoning_content") {
+                        log_thinking_mode_violations(&body);
+                    }
+                    return Err(error);
+                }
+            };
 
         let status = response.status();
         crate::client::record_provider_response(self.api_provider, status.as_u16());
@@ -1399,13 +1400,11 @@ impl CodewhaleClient {
                 status.as_u16(),
                 &raw_error_text,
             );
-            // If DeepSeek rejected for missing reasoning_content despite the
-            // sanitizer, dump the offending indices so we can diagnose where
-            // they came from on the next failure.
-            if error_text.contains("reasoning_content") {
-                log_thinking_mode_violations(&body);
-            }
-            anyhow::bail!("SSE stream request failed: HTTP {status}: {error_text}");
+            return Err(crate::llm_client::LlmError::from_http_response(
+                status.as_u16(),
+                &error_text,
+            )
+            .into());
         }
 
         let api_provider = self.api_provider;

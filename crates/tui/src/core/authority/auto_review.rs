@@ -1523,7 +1523,12 @@ fn pid_var_proofs(command: &str) -> HashMap<String, PidVarSource> {
             // Prefix `++`/`--`, destructuring (`$a, $b = ...` proves nothing
             // about `$b`), postfix `++`/`--`, and compound assignment all
             // mutate without proving: mark touched, keep no proof.
-            let prefix_mutated = i >= 2 && matches!(&stmt[i - 2..i], "++" | "--");
+            //
+            // Compare bytes, not a `&str` slice: `i` is a boundary because it
+            // points at an ASCII `$`, but `i - 2` can land inside a multi-byte
+            // character. Slicing the string there panicked for any Cyrillic or
+            // CJK input (#7048).
+            let prefix_mutated = i >= 2 && matches!(&bytes[i - 2..i], [b'+', b'+'] | [b'-', b'-']);
             let destructured = stmt[..i].trim_end().ends_with(',');
             while j < bytes.len() && (bytes[j] == b' ' || bytes[j] == b'\t') {
                 j += 1;
@@ -1859,7 +1864,8 @@ fn shell_params_are_publish_like(params: &Value) -> bool {
 /// non-read-only command as destructive (#3883).
 fn shell_params_are_destructive_like(params: &Value, workspace: Option<&std::path::Path>) -> bool {
     use codewhale_execpolicy::command_safety::{
-        SafetyLevel, analyze_command, command_invocations, is_literal_rm_invocation,
+        SafetyLevel, analyze_command, command_invocations, destroyer_floor_invocations,
+        is_literal_rm_invocation,
     };
     let Some(command) = shell_command_param(params) else {
         return false;
@@ -1875,6 +1881,9 @@ fn shell_params_are_destructive_like(params: &Value, workspace: Option<&std::pat
             let workspace = workspace.filter(|_| is_literal_rm_invocation(command));
             argvs.iter().any(|argv| argv_is_destroyer(argv, workspace))
         })
+        || (!is_literal_rm_invocation(command)
+            && destroyer_floor_invocations(command)
+                .is_none_or(|argvs| argvs.iter().any(|argv| argv_is_destroyer(argv, None))))
 }
 
 /// The background/headless floor, which Full Access skips, must hold
@@ -2764,6 +2773,7 @@ mod tests {
             "dd if=/dev/zero of=\"/dev/sda\"",
             "cat junk | dd of=/dev/sda",
             "timeout 30 mkfs /dev/sda1",
+            r#"echo \";mkfs.ext4 /dev/sda1"#,
         ] {
             let ctx = ctx_for(
                 "exec_shell",

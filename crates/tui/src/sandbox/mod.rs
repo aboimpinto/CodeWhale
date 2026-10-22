@@ -174,14 +174,19 @@ impl CommandSpec {
         self
     }
 
-    /// Add environment variables for this command.
+    /// Add environment variables without discarding shell defaults.
     pub fn with_env(mut self, env: HashMap<String, String>) -> Self {
-        self.env = env;
+        for (key, value) in env {
+            self = self.with_env_var(&key, &value);
+        }
         self
     }
 
     /// Add a single environment variable.
     pub fn with_env_var(mut self, key: &str, value: &str) -> Self {
+        #[cfg(windows)]
+        self.env
+            .retain(|existing, _| !existing.eq_ignore_ascii_case(key));
         self.env.insert(key.to_string(), value.to_string());
         self
     }
@@ -381,6 +386,13 @@ pub fn get_platform_sandbox_with_bwrap_preference(prefer_bwrap: bool) -> Option<
 /// Check if sandboxing is available on this platform.
 pub fn is_sandbox_available() -> bool {
     get_platform_sandbox().is_some()
+}
+
+pub fn bwrap_setup_failure(stderr: &str) -> Option<&str> {
+    stderr
+        .lines()
+        .map(str::trim_start)
+        .find(|line| line.starts_with("bwrap:"))
 }
 
 /// Manager for sandbox operations.
@@ -875,11 +887,7 @@ impl SandboxManager {
 
             #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
             SandboxType::LinuxBubblewrap => {
-                if let Some(error) = stderr
-                    .lines()
-                    .map(str::trim_start)
-                    .find(|line| line.starts_with("bwrap:"))
-                {
+                if let Some(error) = bwrap_setup_failure(stderr) {
                     format!("Bubblewrap could not create the sandbox: {}", error)
                 } else if stderr.contains("Read-only file system") {
                     "Bubblewrap blocked access outside the writable workspace view.".to_string()
@@ -1061,13 +1069,36 @@ mod tests {
     #[test]
     fn test_command_spec_builder() {
         let spec = CommandSpec::shell("test", PathBuf::from("."), Duration::from_secs(10))
-            .with_policy(SandboxPolicy::ReadOnly)
+            .with_policy(SandboxPolicy::read_only())
             .with_env_var("FOO", "bar")
             .with_justification("Testing");
 
-        assert!(matches!(spec.sandbox_policy, SandboxPolicy::ReadOnly));
+        assert!(matches!(
+            spec.sandbox_policy,
+            SandboxPolicy::ReadOnly { .. }
+        ));
         assert_eq!(spec.env.get("FOO"), Some(&"bar".to_string()));
         assert_eq!(spec.justification, Some("Testing".to_string()));
+
+        let spec = spec
+            .with_env(HashMap::new())
+            .with_env(HashMap::from([("SECOND".to_string(), "added".to_string())]));
+        assert_eq!(spec.env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(spec.env.get("SECOND").map(String::as_str), Some("added"));
+        let spec = spec.with_env(HashMap::from([("FOO".to_string(), "override".to_string())]));
+        assert_eq!(spec.env.get("FOO").map(String::as_str), Some("override"));
+        #[cfg(windows)]
+        {
+            let spec = spec.with_env(HashMap::from([(
+                "foo".to_string(),
+                "lowercase".to_string(),
+            )]));
+            assert!(!spec.env.contains_key("FOO"));
+            assert_eq!(spec.env.get("foo").map(String::as_str), Some("lowercase"));
+            let spec = spec.with_env_var("FOO", "uppercase");
+            assert!(!spec.env.contains_key("foo"));
+            assert_eq!(spec.env.get("FOO").map(String::as_str), Some("uppercase"));
+        }
     }
 
     #[test]
@@ -1394,7 +1425,7 @@ mod tests {
             ..SandboxManager::default()
         };
         let spec = CommandSpec::shell("true", PathBuf::from("/tmp"), Duration::from_secs(5))
-            .with_policy(SandboxPolicy::ReadOnly);
+            .with_policy(SandboxPolicy::read_only());
         let env = manager.prepare(&spec);
 
         assert_eq!(env.sandbox_type, SandboxType::LinuxBubblewrap);
@@ -1465,7 +1496,7 @@ mod tests {
         let manager = SandboxManager::new();
         let policies = [
             SandboxPolicy::DangerFullAccess,
-            SandboxPolicy::ReadOnly,
+            SandboxPolicy::read_only(),
             SandboxPolicy::workspace_with_network(),
             SandboxPolicy::default(),
         ];

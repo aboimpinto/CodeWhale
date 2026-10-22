@@ -599,11 +599,11 @@ pub(super) fn requested_sandbox_escalation(
         .to_string();
 
     let policy = match (effective, requested) {
-        (crate::sandbox::SandboxPolicy::ReadOnly, "workspace-write") => {
+        (crate::sandbox::SandboxPolicy::ReadOnly { .. }, "workspace-write") => {
             crate::sandbox::SandboxPolicy::default()
         }
         (
-            crate::sandbox::SandboxPolicy::ReadOnly
+            crate::sandbox::SandboxPolicy::ReadOnly { .. }
             | crate::sandbox::SandboxPolicy::WorkspaceWrite { .. },
             "danger-full-access",
         ) => crate::sandbox::SandboxPolicy::DangerFullAccess,
@@ -1423,6 +1423,14 @@ impl Engine {
         ) {
             turn.add_routed_usage_dropped_records(1);
         }
+        match &review.outcome {
+            super::reviewer::ReviewerOutcome::Allow { .. } => {
+                turn.auto_review_denials.record(false)
+            }
+            super::reviewer::ReviewerOutcome::Deny { .. } => turn.auto_review_denials.record(true),
+            super::reviewer::ReviewerOutcome::Unavailable { .. }
+            | super::reviewer::ReviewerOutcome::Cancelled => {}
+        }
         let decision = review.outcome.audit_decision();
         let risk = review.outcome.audit_risk();
         // The transcript receipt names the verdict a person never saw a
@@ -1522,6 +1530,7 @@ impl Engine {
         // Search activations belong to the conversation, not just the user
         // turn. Revalidate names against this turn's already-filtered catalog
         // before exposing them; stale mode/MCP/allow-list entries disappear.
+        self.session.tool_activation_cache.begin_turn();
         let evicted = self.session.tool_activation_cache.revalidate(&tool_catalog);
         super::tool_catalog::remove_evicted_cache_activations(
             &tool_catalog,
@@ -1815,7 +1824,7 @@ impl Engine {
         );
         let batch_sandbox_read_only = matches!(
             &batch_sandbox_policy,
-            crate::sandbox::SandboxPolicy::ReadOnly
+            crate::sandbox::SandboxPolicy::ReadOnly { .. }
         );
         for (index, tool) in tool_uses.iter_mut().enumerate() {
             let tool_id = tool.execution_id.clone();
@@ -1878,6 +1887,14 @@ impl Engine {
                 && let Some(guard) = fleet_denial_guard
             {
                 blocked_error = guard.admission_error(&tool_name, &tool_input);
+            }
+
+            if blocked_error.is_none()
+                && let Some(stop) = turn.auto_review_denials.stop()
+            {
+                blocked_error = Some(ToolError::permission_denied(format!(
+                    "{stop} This call was not run."
+                )));
             }
 
             // C02-10: the response granted after the step budget ran out is
@@ -2452,19 +2469,25 @@ impl Engine {
 
             // Consent is an exact human decision, never a standing grant or
             // autonomous approval. Keep existing hard blocks authoritative.
+            // Ask and Full Access both have a person at the card; Auto-Review
+            // and Never do not, and keep failing closed.
             if blocked_error.is_none()
                 && crate::tools::approval_cache::computer_use_user_gate(&tool_name, &tool_input)
                     .is_some()
             {
-                if batch_approval_mode == ApprovalMode::Suggest {
+                if matches!(
+                    batch_approval_mode,
+                    ApprovalMode::Suggest | ApprovalMode::Bypass
+                ) {
                     approval_required = true;
                     approval_force_prompt = true;
                 } else {
                     approval_required = false;
                     approval_force_prompt = false;
-                    blocked_error = Some(ToolError::permission_denied(
-                        "Computer Use consent, scripting and registration require the user's exact approval in Ask posture.".to_string()
-                    ));
+                    blocked_error = Some(ToolError::permission_denied(format!(
+                        "Computer Use consent, scripting and registration need the user's own answer, and the current {} posture has no one to ask. Switch to Ask or Full Access to review it.",
+                        batch_approval_mode.permission_chip_label()
+                    )));
                 }
             }
 
@@ -2542,10 +2565,16 @@ impl Engine {
                 guard_result,
             });
         }
-        let activation = self
-            .session
-            .tool_activation_cache
-            .activate(tool_catalog, &deferred_tools_hydrated_in_order);
+        let cache = &mut self.session.tool_activation_cache;
+        if source == ToolCallSource::Model {
+            for plan in &plans {
+                cache.record_use(&plan.name);
+            }
+        }
+        let activation = cache.activate(tool_catalog, &deferred_tools_hydrated_in_order);
+        for name in &activation.admitted {
+            cache.record_use(name);
+        }
         super::tool_catalog::remove_evicted_cache_activations(
             tool_catalog,
             active_tool_names,
@@ -2744,9 +2773,13 @@ impl Engine {
                 continue;
             }
 
-            let batch_tool_context = self
-                .live_tool_context(tool_registry)
-                .map(|context| context.with_origin_turn_id(origin_turn_id));
+            let browser_tool = crate::tools::web::fetch::rendering_browser_tool(
+                tool_catalog.iter().map(|tool| tool.name.as_str()),
+            );
+            let batch_tool_context = self.live_tool_context(tool_registry).map(|mut context| {
+                context.browser_tool = browser_tool;
+                context.with_origin_turn_id(origin_turn_id)
+            });
 
             if parallel_allowed {
                 let parallel_plan_receipts: Vec<_> = plans
@@ -4235,15 +4268,6 @@ impl Engine {
                             &mut self.session.tool_activation_cache,
                             &output,
                         );
-                    if output.success {
-                        tool_surface_changed |=
-                            super::tool_catalog::touch_cached_tool_after_execution(
-                                tool_catalog,
-                                active_tool_names,
-                                &mut self.session.tool_activation_cache,
-                                &outcome.name,
-                            );
-                    }
                     // A runtime MCP connection change — a completed login OR
                     // a live 401 that dropped one — rewrites the callable
                     // tool surface. Replace the pool's whole slice before
@@ -8746,7 +8770,7 @@ impl Engine {
                 content_blocks: answer.content_blocks.clone(),
             });
         // Finish through the same result owner as run_tool_batch_phase so
-        // successful cache uses and result dependencies are observed once.
+        // result dependencies are observed once.
         self.process_tool_results(
             outcomes,
             gate.turn,

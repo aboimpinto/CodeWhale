@@ -1688,6 +1688,12 @@ impl TaskManager {
             plugin_registry,
             binding,
         )?);
+        let workspace = cfg.default_workspace.clone();
+        let workers = tokio::task::spawn_blocking(move || {
+            crate::tools::subagent::new_shared_worker_authority(workspace)
+        })
+        .await?;
+        runtime_threads.attach_subagent_manager(workers).await?;
         Self::start_with_runtime_manager(cfg, api_config, runtime_threads).await
     }
 
@@ -4128,9 +4134,9 @@ mod tests {
 
     fn test_config(root: PathBuf) -> TaskManagerConfig {
         TaskManagerConfig {
+            default_workspace: root.join("workspace"),
             data_dir: root,
             worker_count: 1,
-            default_workspace: PathBuf::from("."),
             default_model: "deepseek-v4-flash".to_string(),
             default_mode: "agent".to_string(),
             allow_shell: false,

@@ -26,13 +26,14 @@ async fn host_managed_engine_defers_idle_subagent_completion_to_explicit_turn() 
         active_thread_id: Some("thr_host_managed".to_string()),
         ..crate::tools::spec::RuntimeToolServices::default()
     };
-    let engine_config = EngineConfig {
+    let mut engine_config = EngineConfig {
         max_steps: 0,
         snapshots_enabled: false,
         terminal_chrome_enabled: false,
         runtime_services,
         ..EngineConfig::default()
     };
+    engine_config.features.disable(Feature::Mcp);
     // This branch grants a zero-step host turn exactly one A2 report request
     // (see host_managed_engine_does_not_self_dispatch_goal_continuation,
     // which asserts that single dispatch). Script the response the same way

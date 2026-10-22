@@ -2760,7 +2760,11 @@ impl Renderable for ElevationWidget<'_> {
             .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::WHALE_BG))
+            .style(
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .bg(palette::WHALE_BG),
+            )
             .padding(Padding::uniform(1));
 
         if let Some(hitboxes) = self.hitboxes {
@@ -3946,7 +3950,7 @@ mod tests {
             let mut app = create_test_app();
             app.low_motion = true;
             app.fancy_animations = false;
-            app.transcript_spacing = TranscriptSpacing::Comfortable;
+            app.transcript_spacing = TranscriptSpacing::Spacious;
 
             for turn in 0..4 {
                 app.add_message(HistoryCell::User {
@@ -3976,12 +3980,12 @@ mod tests {
             );
             assert_eq!(
                 spacer_rows_after_transcript_cell(&app, 0),
-                1,
+                3,
                 "the top-level user turn needs a breathing row at width={width}"
             );
             assert_eq!(
                 spacer_rows_after_transcript_cell(&app, 1),
-                1,
+                2,
                 "answer to tool-group transition needs a breathing row at width={width}"
             );
             assert_eq!(
@@ -3991,7 +3995,7 @@ mod tests {
             );
             assert_eq!(
                 spacer_rows_after_transcript_cell(&app, 3),
-                1,
+                2,
                 "the completed tool group needs a breathing row at width={width}"
             );
             assert!(

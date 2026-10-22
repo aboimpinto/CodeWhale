@@ -467,7 +467,7 @@ pub(crate) async fn resume_session_in_runtime(
             config_source.1,
         )
         .await
-        .map_err(map_resume_thread_create_err)?;
+        .map_err(|err| map_resume_thread_create_err(&session.metadata.id, err))?;
 
     let msg_count = session.messages.len();
     runtime
@@ -1114,15 +1114,19 @@ fn map_session_err(id: &str, err: std::io::Error, action: &str) -> ApiError {
     }
 }
 
-fn map_resume_thread_create_err(err: anyhow::Error) -> ApiError {
+fn map_resume_thread_create_err(session_id: &str, err: anyhow::Error) -> ApiError {
     let reason = err.to_string();
     let message = format!("Failed to create thread: {reason}");
     if reason.starts_with("saved session has an empty provider identity")
         || reason.starts_with("saved session requires custom provider")
+        || reason.starts_with("persisted provider route requires exact custom provider")
         || reason.starts_with("legacy session records only the generic `custom` provider kind")
         || reason.starts_with("legacy `provider = \"custom\"`")
     {
-        ApiError::bad_request(message)
+        ApiError::bad_request(format!(
+            "{message}. {}",
+            crate::session_export::export_recovery_hint(session_id)
+        ))
     } else {
         // Thread-store writes, event persistence, and other runtime failures
         // are server-side faults; never disguise them as a client config error.
@@ -1221,14 +1225,18 @@ mod resume_thread_error_tests {
 
     #[test]
     fn provider_config_errors_are_client_errors_but_storage_errors_stay_internal() {
-        let provider = map_resume_thread_create_err(anyhow::anyhow!(
-            "saved session requires custom provider 'lm-studio', but `[providers.lm-studio]` is missing"
-        ));
+        let provider = map_resume_thread_create_err(
+            "session-1",
+            anyhow::anyhow!(
+                "saved session requires custom provider 'lm-studio', but `[providers.lm-studio]` is missing"
+            ),
+        );
         assert_eq!(provider.status, StatusCode::BAD_REQUEST);
 
-        let storage = map_resume_thread_create_err(anyhow::anyhow!(
-            "Failed to save runtime thread: permission denied"
-        ));
+        let storage = map_resume_thread_create_err(
+            "session-1",
+            anyhow::anyhow!("Failed to save runtime thread: permission denied"),
+        );
         assert_eq!(storage.status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 }

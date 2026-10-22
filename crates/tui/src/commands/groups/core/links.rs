@@ -41,7 +41,7 @@ fn links(contexts: CommandContexts<'_>, _: Option<&str>) -> CommandResult {
         .unwrap_or_else(CommandResult::error)
 }
 
-fn public_site_locale_segment(tag: &str) -> &'static str {
+pub(crate) fn public_site_locale_segment(tag: &str) -> &'static str {
     match tag {
         "zh-Hans" | "zh-Hant" => "zh",
         "ja" => "ja",

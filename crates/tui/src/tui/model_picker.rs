@@ -20,7 +20,7 @@ use ratatui::{
     widgets::{Block, Paragraph, Widget},
 };
 
-use codewhale_config::catalog::{CatalogRefreshError, CatalogSource, CatalogStatus};
+use codewhale_config::catalog::{CatalogSource, CatalogStatus};
 use codewhale_config::model_reference::ModelReferenceCard;
 use codewhale_config::pricing::OfferingPricing;
 
@@ -3913,10 +3913,7 @@ fn render_picker_model_hint(
     if !provider_live_source
         && let Some((CatalogStatus::Failed { reason }, _)) = provider_catalog_receipt
     {
-        parts.push(format!(
-            "refresh failed ({})",
-            catalog_refresh_error_label(*reason)
-        ));
+        parts.push(format!("refresh failed ({})", reason.label()));
     }
     if provider == Some(ProviderKind::OpenaiCodex) {
         parts.push(match codex_freshness {
@@ -3946,21 +3943,9 @@ fn provider_catalog_source_label(receipt: Option<&(CatalogStatus, bool)>) -> Str
             format!("stale catalog ({age_hours}h)")
         }
         CatalogStatus::Failed { reason } => {
-            format!("refresh failed ({})", catalog_refresh_error_label(*reason))
+            format!("refresh failed ({})", reason.label())
         }
         CatalogStatus::Unknown => "catalog freshness unknown".to_string(),
-    }
-}
-
-fn catalog_refresh_error_label(error: CatalogRefreshError) -> &'static str {
-    match error {
-        CatalogRefreshError::Unauthorized => "unauthorized",
-        CatalogRefreshError::Forbidden => "forbidden",
-        CatalogRefreshError::NotFound => "not found",
-        CatalogRefreshError::RateLimited => "rate limited",
-        CatalogRefreshError::InvalidResponse => "invalid response",
-        CatalogRefreshError::EmptyList => "empty list",
-        CatalogRefreshError::Network => "network error",
     }
 }
 
@@ -4813,6 +4798,7 @@ fn default_picker_effort_idx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use codewhale_config::catalog::CatalogRefreshError;
 
     #[test]
     fn picker_ladder_drops_rungs_that_resolve_to_an_offered_tier() {

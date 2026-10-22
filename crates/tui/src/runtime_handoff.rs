@@ -361,7 +361,7 @@ const MCP_CONFIGURED_SERVER_NAME_CHARS: usize = 64;
 
 /// Model-visible note naming the configured MCP servers a turn may load.
 ///
-/// Session boot is lazy and MCP tools are deferred, so without this the model
+/// MCP tools are deferred, so without this the model
 /// has no way to learn that a server exists until the user names it. Like the
 /// server guidance above, it is logged user history after the frozen prefix,
 /// never system-prompt text. Names only, bounded in count and length; an

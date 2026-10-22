@@ -29,6 +29,7 @@ export const RELEASE_CONTRIBUTORS: string[] = [
   "@gaord",
   "@Lstarsky0",
   "@jayanthvee",
+  "@leoca",
   "@asto18089",
   "@LIghtJUNction",
   "@zhuowp",
@@ -45,4 +46,15 @@ export const UNRELEASED_CONTRIBUTORS: string[] = [];
  * Contributors who helped with reports, reproductions, and verification.
  * Credit covers the 0.10.2 reports recorded in docs/CONTRIBUTORS.md.
  */
-export const RELEASE_HELPERS: string[] = ["@BX166"];
+export const RELEASE_HELPERS: string[] = [
+  "@BX166",
+  "@harryvizcaino-oss",
+  "@rafacouto",
+  "@luestr",
+  "@SergiuSSoluS",
+  "@8sero",
+  "@Asteria1028",
+  "@SakuraNeko",
+  "@Statter",
+  "@7jrxt42BxFZo4iAnN4CX",
+];

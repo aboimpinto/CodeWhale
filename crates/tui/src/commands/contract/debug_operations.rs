@@ -51,7 +51,7 @@ impl CommandDebugChangeContext for DebugOperationsAdapter<'_> {
     fn change_projection(&self) -> DebugChangeProjection {
         let app = self.host.app.borrow();
         DebugChangeProjection {
-            changelog: include_str!("../../../CHANGELOG.md"),
+            changelog: crate::whats_new::BUNDLED_CHANGELOG,
             is_english: app.ui_locale == codewhale_localization::Locale::En,
             translation_available: !app.offline_mode && !app.onboarding_needs_api_key,
             translation_target: app.ui_locale.translation_target_name(),

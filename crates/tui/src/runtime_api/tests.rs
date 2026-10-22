@@ -457,6 +457,7 @@ fn messages_from_thread_detail_batches_tool_results() {
         title: None,
         session_id: None,
         saved_session_checkpoint: None,
+        last_read: None,
     };
     let turn = TurnRecord {
         decision_receipts: Vec::new(),
@@ -677,6 +678,7 @@ fn legacy_exact_thread_export_normalizes_provider_kind_and_id() {
             title: None,
             session_id: None,
             saved_session_checkpoint: None,
+            last_read: None,
         },
         turns: Vec::new(),
         items: Vec::new(),
@@ -1375,6 +1377,7 @@ async fn build_test_server(
         shutdown: overrides.shutdown.clone().unwrap_or_default(),
         git_writes: Arc::new(tokio::sync::Mutex::new(())),
         provider_switches: Arc::new(tokio::sync::Mutex::new(())),
+        provider_connect: Default::default(),
         compat_stream_test_hook: overrides.compat_stream_test_hook,
     };
     let (owner_frontend, compatibility) = if let Some(socket) = overrides.owner_socket {
@@ -14053,7 +14056,10 @@ model = "local-model"
         // environment variable name. `credentialWritableReason` is
         // `skip_serializing_if = Option::is_none`, so it is absent for every
         // writable route and is asserted separately below when present.
+        // `browserConnect` is the same kind of fact as `credentialWritable`: a
+        // boolean that says the route has a sign-in flow the client can drive.
         let allowed_fields: std::collections::BTreeSet<_> = [
+            "browserConnect",
             "credentialSource",
             "credentialState",
             "credentialWritable",

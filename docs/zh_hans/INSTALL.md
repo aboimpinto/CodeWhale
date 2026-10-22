@@ -1038,7 +1038,7 @@ codewhale doctor
 
 #### 从 x64 交叉编译到 ARM64 Linux
 
-发布资源使用 `aarch64-unknown-linux-musl`，并在原生 ARM runner 上构建。如果你想在 x64 Linux 主机上构建一个 GNU 链接的 ARM64 Linux 二进制（例如给 HarmonyOS / openEuler ARM64 轻薄本用），请使用 [`cross`](https://github.com/cross-rs/cross)，它把官方的 Rust 交叉目标封装在 Docker 容器里：
+发布资源使用 `aarch64-unknown-linux-musl`，并在原生 ARM runner 上构建。如果你想在 x64 Linux 主机上构建一个 GNU 链接的 ARM64 Linux 二进制（例如给 HarmonyOS PC 上的 openEuler Linux 子系统用），请使用 [`cross`](https://github.com/cross-rs/cross)，它把官方的 Rust 交叉目标封装在 Docker 容器里：
 
 ```bash
 # Once

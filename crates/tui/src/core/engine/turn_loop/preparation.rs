@@ -269,13 +269,23 @@ impl Engine {
             )
             .and_then(|tokens| usize::try_from(tokens).ok())
             .unwrap_or(0);
-        if let Some(budget) = route_context_budget_for_route(
-            self.api_provider,
-            &self.session.model,
-            self.active_route_limits,
-            estimated_input,
-        ) {
-            let input_budget = usize::try_from(budget.input_budget_ceiling).unwrap_or(usize::MAX);
+        if !self.child_report()
+            && let Some(budget) = route_context_budget_for_route(
+                self.api_provider,
+                &self.session.model,
+                self.active_route_limits,
+                estimated_input,
+            )
+        {
+            let input_budget = usize::try_from(
+                crate::route_budget::route_admission_input_ceiling(
+                    self.api_provider,
+                    &self.session.model,
+                    self.active_route_limits,
+                )
+                .unwrap_or(budget.input_budget_ceiling),
+            )
+            .unwrap_or(usize::MAX);
             let triggered = estimated_input > input_budget;
             let output_ceiling =
                 crate::route_budget::output_ceiling_source(self.api_provider, &self.session.model);
@@ -315,78 +325,16 @@ impl Engine {
                 "resolved route context budget"
             );
             if triggered {
-                if progress.context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
-                    let message = context_overflow_exhausted_message(
-                        self.config.terminal_chrome_enabled,
-                        turn.stop_diagnostics.emergency_compaction_attempts,
-                        estimated_input,
-                        input_budget,
-                    );
-                    progress.turn_error = Some(message.clone());
-                    let _ = self
-                        .send_event(Event::error(ErrorEnvelope::context_overflow(message)))
-                        .await;
-                    return PhaseResult::Return((
-                        TurnOutcomeStatus::Failed,
-                        progress.turn_error.take(),
-                    ));
-                }
-
-                if self
-                    .recover_context_overflow(
-                        client.as_ref(),
-                        active_tools.as_deref(),
-                        "preflight token budget",
+                return self
+                    .context_budget_overflow(
                         turn,
-                    )
-                    .await
-                {
-                    progress.context_recovery_attempts =
-                        progress.context_recovery_attempts.saturating_add(1);
-                    return PhaseResult::Retry;
-                }
-                if self.cancel_token.is_cancelled() {
-                    return PhaseResult::Return((TurnOutcomeStatus::Interrupted, None));
-                }
-                // One failure, one true sentence (experience mark 2): a
-                // provider that refused the recovery request is the
-                // cause, and a history with nothing to summarize is a
-                // window problem, not a failed compaction.
-                if let Some(rejection) = turn.context_recovery_rejection.take() {
-                    let display_message = self.decorate_auth_error_message(
-                        initial_stream_error_user_message(&self.config.locale_tag, &rejection),
-                    );
-                    let mut envelope = crate::error_taxonomy::envelope_for_llm_error(
-                        rejection,
-                        display_message.clone(),
-                    );
-                    envelope.message = display_message.clone();
-                    let _ = self.send_event(Event::error(envelope)).await;
-                    return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(display_message)));
-                }
-                let message = if crate::compaction::has_compactable_history(&self.session.messages)
-                {
-                    "The request still exceeds this model's context budget and automatic recovery did not complete. The conversation is saved; retry or choose a larger context route.".to_string()
-                } else {
-                    let prefix_tokens = crate::compaction::estimate_input_tokens_for_pressure(
-                        &[],
-                        self.session.system_prompt.as_ref(),
-                    );
-                    super::context::context_does_not_fit_message(
-                        self.config.terminal_chrome_enabled,
-                        self.api_provider == crate::config::ProviderKind::Ollama,
-                        &self.session.model,
+                        progress,
+                        client,
+                        active_tools.as_deref(),
                         estimated_input,
                         input_budget,
-                        prefix_tokens,
                     )
-                };
-                let _ = self
-                    .send_event(Event::error(ErrorEnvelope::context_overflow(
-                        message.clone(),
-                    )))
                     .await;
-                return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(message)));
             }
         }
 
@@ -641,6 +589,56 @@ impl Engine {
             let window = crate::image_attach::cap_request_images(&mut request.messages, cap);
             self.note_request_image_window(image_provider, window).await;
         }
+        let report = self.child_report();
+        let request_input = crate::compaction::estimate_request_input_tokens(
+            &request.messages,
+            request.system.as_ref(),
+            request.tools.as_deref(),
+        );
+        let request_input = if report {
+            request_input
+        } else {
+            request_input.max(estimated_input)
+        };
+        let output_cap = crate::route_budget::request_output_cap_for_input(
+            self.api_provider,
+            &self.session.model,
+            self.active_route_limits,
+            request.max_tokens,
+            u64::try_from(request_input).unwrap_or(u64::MAX),
+        )
+        .filter(|cap| {
+            *cap == request.max_tokens
+                || u64::from(*cap) >= crate::tools::subagent::budget_handback::MIN_HAND_BACK_OUTPUT
+        });
+        let Some(output_cap) = output_cap else {
+            if report {
+                return PhaseResult::Return((
+                    TurnOutcomeStatus::Failed,
+                    Some(
+                        "bounded Core report request does not fit the route context window".into(),
+                    ),
+                ));
+            }
+            progress.reasoning_only_nudge = request_nudge;
+            let input_budget = crate::route_budget::route_admission_input_ceiling(
+                self.api_provider,
+                &self.session.model,
+                self.active_route_limits,
+            )
+            .map_or(0, |ceiling| usize::try_from(ceiling).unwrap_or(usize::MAX));
+            return self
+                .context_budget_overflow(
+                    turn,
+                    progress,
+                    client,
+                    active_tools.as_deref(),
+                    request_input,
+                    input_budget,
+                )
+                .await;
+        };
+        request.max_tokens = output_cap;
         let tool_request_snapshot =
             crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request_with_surface(
                 &turn.id,
@@ -725,6 +723,79 @@ impl Engine {
             fleet_report_response,
         })
     }
+    async fn context_budget_overflow(
+        &mut self,
+        turn: &mut TurnContext,
+        progress: &mut TurnLoopProgress,
+        client: &SharedModelClient,
+        tools: Option<&[codewhale_models::Tool]>,
+        estimated_input: usize,
+        input_budget: usize,
+    ) -> PhaseResult<PreparedModelStep> {
+        if progress.context_recovery_attempts >= MAX_CONTEXT_RECOVERY_ATTEMPTS {
+            let message = context_overflow_exhausted_message(
+                self.config.terminal_chrome_enabled,
+                turn.stop_diagnostics.emergency_compaction_attempts,
+                estimated_input,
+                input_budget,
+            );
+            progress.turn_error = Some(message.clone());
+            let _ = self
+                .send_event(Event::error(ErrorEnvelope::context_overflow(message)))
+                .await;
+            return PhaseResult::Return((TurnOutcomeStatus::Failed, progress.turn_error.take()));
+        }
+
+        if self
+            .recover_context_overflow(client.as_ref(), tools, "preflight token budget", turn)
+            .await
+        {
+            progress.context_recovery_attempts =
+                progress.context_recovery_attempts.saturating_add(1);
+            return PhaseResult::Retry;
+        }
+        if self.cancel_token.is_cancelled() {
+            return PhaseResult::Return((TurnOutcomeStatus::Interrupted, None));
+        }
+        // One failure, one true sentence (experience mark 2): a
+        // provider that refused the recovery request is the
+        // cause, and a history with nothing to summarize is a
+        // window problem, not a failed compaction.
+        if let Some(rejection) = turn.context_recovery_rejection.take() {
+            let display_message = self.decorate_auth_error_message(
+                initial_stream_error_user_message(&self.config.locale_tag, &rejection),
+            );
+            let mut envelope =
+                crate::error_taxonomy::envelope_for_llm_error(rejection, display_message.clone());
+            envelope.message = display_message.clone();
+            let _ = self.send_event(Event::error(envelope)).await;
+            return PhaseResult::Return((TurnOutcomeStatus::Failed, Some(display_message)));
+        }
+        let message = if crate::compaction::has_compactable_history(&self.session.messages) {
+            "The request still exceeds this model's context budget and automatic recovery did not complete. The conversation is saved; retry or choose a larger context route.".to_string()
+        } else {
+            let prefix_tokens = crate::compaction::estimate_request_input_tokens(
+                &[],
+                self.session.system_prompt.as_ref(),
+                tools,
+            );
+            super::context::context_does_not_fit_message(
+                self.config.terminal_chrome_enabled,
+                self.api_provider == crate::config::ProviderKind::Ollama,
+                &self.session.model,
+                estimated_input,
+                input_budget,
+                prefix_tokens,
+            )
+        };
+        let _ = self
+            .send_event(Event::error(ErrorEnvelope::context_overflow(
+                message.clone(),
+            )))
+            .await;
+        PhaseResult::Return((TurnOutcomeStatus::Failed, Some(message)))
+    }
+
     /// The same pure primary request builder and the same dispatch phase,
     /// with a whole bounded RLM history and no autonomous recovery producer.
     async fn prepare_rlm_model_step(
@@ -772,8 +843,15 @@ impl Engine {
             self.active_route_limits,
             usize::try_from(estimated).unwrap_or(usize::MAX),
         )
-        .is_some_and(|budget| estimated > budget.input_budget_ceiling)
-        {
+        .is_some_and(|budget| {
+            estimated
+                > crate::route_budget::route_admission_input_ceiling(
+                    self.api_provider,
+                    &self.session.model,
+                    self.active_route_limits,
+                )
+                .unwrap_or(budget.input_budget_ceiling)
+        }) {
             return PhaseResult::Return((TurnOutcomeStatus::Failed, Some("RLM whole round history exceeds the captured route context budget; history was not truncated".into())));
         }
         let reasoning_effort = resolve_auto_effort(
@@ -797,9 +875,17 @@ impl Engine {
             tool_choice: None,
             reasoning_effort,
         });
-        request.max_tokens = request
-            .max_tokens
-            .min(client.effective_max_output_tokens(&self.session.model));
+        let Some(output_cap) = crate::route_budget::request_output_cap_for_input(
+            self.api_provider,
+            &self.session.model,
+            self.active_route_limits,
+            request.max_tokens,
+            estimated,
+        ) else {
+            return PhaseResult::Return((TurnOutcomeStatus::Failed, Some("RLM whole round history leaves no output room in the captured route context window; history was not truncated".into())));
+        };
+        request.max_tokens =
+            output_cap.min(client.effective_max_output_tokens(&self.session.model));
         let snapshot =
             crate::tool_inspection::ToolInspectionSnapshot::from_prepared_request_with_surface(
                 &turn.id,

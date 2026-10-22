@@ -4,7 +4,7 @@ use super::{
     build_model_tool_catalog_with_surface, default_synthetic_catalog_tool_names,
     ensure_advanced_tooling, execute_tool_search_with_cache, initial_active_tools,
     is_synthetic_catalog_tool, remove_evicted_cache_activations, requested_tool_mode,
-    tool_matches_any_rule, touch_cached_tool_after_execution,
+    tool_matches_any_rule,
 };
 use crate::core::session::ToolActivationCache;
 use codewhale_config::AppMode;
@@ -262,12 +262,7 @@ fn successful_cached_execution_updates_lru_without_granting_uncached_names() {
     let delta = cache.activate(&catalog, &first);
     active.extend(delta.admitted);
 
-    assert!(touch_cached_tool_after_execution(
-        &catalog,
-        &mut active,
-        &mut cache,
-        "deferred-7"
-    ));
+    assert!(cache.record_use("deferred-7"));
     let delta = cache.activate(&catalog, &["deferred-8".to_string()]);
     remove_evicted_cache_activations(&catalog, &mut active, delta.evicted);
     active.extend(delta.admitted);
@@ -277,12 +272,7 @@ fn successful_cached_execution_updates_lru_without_granting_uncached_names() {
     assert!(cache.names().any(|name| name == "deferred-0"));
     assert!(!cache.names().any(|name| name == "deferred-6"));
 
-    assert!(!touch_cached_tool_after_execution(
-        &catalog,
-        &mut active,
-        &mut cache,
-        "never-activated"
-    ));
+    assert!(!cache.record_use("never-activated"));
     assert!(!active.contains("never-activated"));
 }
 

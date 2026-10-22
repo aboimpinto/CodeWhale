@@ -918,26 +918,47 @@ enum EngineHostSetup {
     Rlm(rlm_host::RlmHostSetup),
 }
 
-/// Rewrite the text of every tool result in `message`, including text
-/// content blocks, with `redact`.
-pub(crate) fn redact_tool_result_blocks(message: &mut Message, redact: impl Fn(&str) -> String) {
+/// Rewrite the text of every tool result and tool-call input in `message`,
+/// including text content blocks, with `redact`.
+pub(crate) fn redact_tool_blocks(message: &mut Message, redact: impl Fn(&str) -> String) {
     for block in &mut message.content {
-        let ContentBlock::ToolResult {
-            content,
-            content_blocks,
-            ..
-        } = block
-        else {
-            continue;
-        };
-        *content = redact(content);
-        for value in content_blocks.iter_mut().flatten() {
-            if value.get("type").and_then(serde_json::Value::as_str) == Some("text")
-                && let Some(serde_json::Value::String(text)) = value.get_mut("text")
-            {
-                *text = redact(text);
+        match block {
+            ContentBlock::ToolResult {
+                content,
+                content_blocks,
+                ..
+            } => {
+                *content = redact(content);
+                for value in content_blocks.iter_mut().flatten() {
+                    if value.get("type").and_then(serde_json::Value::as_str) == Some("text")
+                        && let Some(serde_json::Value::String(text)) = value.get_mut("text")
+                    {
+                        *text = redact(text);
+                    }
+                }
+            }
+            ContentBlock::ToolUse { input, .. } | ContentBlock::ServerToolUse { input, .. } => {
+                redact_json_strings(input, &redact);
+            }
+            _ => {}
+        }
+    }
+}
+
+fn redact_json_strings(value: &mut serde_json::Value, redact: &impl Fn(&str) -> String) {
+    match value {
+        serde_json::Value::String(text) => *text = redact(text),
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_strings(value, redact);
             }
         }
+        serde_json::Value::Object(values) => {
+            for value in values.values_mut() {
+                redact_json_strings(value, redact);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1028,6 +1049,7 @@ pub struct Engine {
     /// True while the spawn-time concurrent connect pass is still running.
     /// `mcp_tools` snapshots ready servers instead of waiting on optionals.
     mcp_boot_in_flight: bool,
+    mcp_pending_event: Option<Event>,
     mcp_boot_rx: Option<mpsc::Receiver<McpBootUpdate>>,
     /// Supervisor sweep updates. `Some` while the supervisor task is armed;
     /// the channel closing (task exited with the pool) disarms it and the
@@ -2462,6 +2484,7 @@ impl Engine {
             turn_tool_surface_budget: None,
             mcp_connection_errors: HashMap::new(),
             mcp_boot_in_flight: false,
+            mcp_pending_event: None,
             mcp_boot_rx: None,
             mcp_supervisor_rx: None,
             mcp_supervisor_task: None,
@@ -3365,6 +3388,9 @@ impl Engine {
 
     async fn next_run_input(&mut self, host_managed_turns: bool) -> Option<EngineRunInput> {
         loop {
+            if let Some(event) = self.mcp_pending_event.take() {
+                self.queue_mcp_session_boot(event);
+            }
             // A full mailbox means queued controls must run first. Retrying at
             // the top of each receive appends the continuation behind the
             // remaining controls as soon as one slot becomes available.
@@ -3400,6 +3426,14 @@ impl Engine {
                         op = self.rx_op.recv() => {
                             return op.map(|op| EngineRunInput::Operation(Box::new(op)));
                         }
+                        permit = self.tx_event.clone().reserve_owned(), if self.mcp_pending_event.is_some() => {
+                            if let Some(event) = self.mcp_pending_event.take()
+                                && let Ok(permit) = permit
+                            {
+                                permit.send(event);
+                            }
+                            continue;
+                        }
                         () = tokio::time::sleep(ready_at.saturating_duration_since(Instant::now())) => {
                             if let Some(scheduled) = self.scheduled_goal_continuation.as_mut()
                                 && scheduled.ready_at == Some(ready_at)
@@ -3430,6 +3464,14 @@ impl Engine {
                 tokio::select! {
                     op = self.rx_op.recv() => {
                         return op.map(|op| EngineRunInput::Operation(Box::new(op)));
+                    }
+                    permit = self.tx_event.reserve(), if self.mcp_pending_event.is_some() => {
+                        if let Some(event) = self.mcp_pending_event.take()
+                            && let Ok(permit) = permit
+                        {
+                            permit.send(event);
+                        }
+                        continue;
                     }
                     completion = self.rx_subagent_completion.recv(), if subagent_wake_armed => {
                         return completion.map(EngineRunInput::SubAgentCompletion);
@@ -4680,13 +4722,15 @@ impl Engine {
         self.emit_session_updated().await;
     }
 
-    /// Scrub credentials from tool output once, as it enters the transcript
-    /// (B1). The transcript is what session JSON, the journal and every
-    /// later request are built from, so a token a tool printed is never
-    /// written to disk live. Honors the confirmed `[redaction] model_bound`
-    /// opt-out the same way the request boundary does.
+    /// Scrub credentials from tool output and tool-call input once, as it
+    /// enters the transcript (B1). The transcript is what session JSON, the
+    /// journal and every later request are built from, so a token a tool
+    /// printed — or one a tool was *given* in its arguments — is never written
+    /// to disk live. Unlike the request boundary this does not honor the
+    /// `[redaction] model_bound` opt-out: that opt-out exists so the model can
+    /// quote file bytes back for exact edits, never to relax storage.
     fn redact_tool_results_for_transcript(&self, message: &mut Message) {
-        redact_tool_result_blocks(message, |text| self.redact_tool_output_for_transcript(text));
+        redact_tool_blocks(message, |text| self.redact_tool_output_for_transcript(text));
     }
 
     fn redact_tool_output_for_transcript(&self, text: &str) -> String {
@@ -5340,7 +5384,7 @@ impl Engine {
             }
             SendMessageOutcome::Finished {
                 status: TurnOutcomeStatus::Interrupted,
-                ..
+                error: None,
             } => {
                 // Goals are durable session objectives. An interrupted model
                 // turn (Esc, steer, compaction, cancel) must cancel only the
@@ -5359,6 +5403,10 @@ impl Engine {
                 let _ = self.send_event(Event::status(message.to_string())).await;
             }
             SendMessageOutcome::Finished {
+                status: TurnOutcomeStatus::Interrupted,
+                error: Some(_),
+            }
+            | SendMessageOutcome::Finished {
                 status: TurnOutcomeStatus::Completed,
                 ..
             } => {}
@@ -7975,8 +8023,7 @@ impl Engine {
     fn mcp_connecting_names(pool: &McpPool, errors: &HashMap<String, String>) -> Vec<String> {
         // The pool tracks spawned-but-unresolved connects (#6033). Inferring
         // "connecting" from enabled-minus-connected mislabels every on-demand
-        // server — `lazy = true` or plugin-contributed, never started — as
-        // mid-handshake.
+        // server — `lazy = true`, never started — as mid-handshake.
         pool.connecting_servers()
             .into_iter()
             .filter(|name| !errors.contains_key(name))
@@ -8029,28 +8076,30 @@ impl Engine {
         self.mcp_supervisor_rx = None;
         self.mcp_boot_generation = None;
         self.mcp_boot_in_flight = false;
+        self.mcp_pending_event = None;
         self.mcp_boot_rx = None;
         self.mcp_boot_done = None;
         self.mcp_connection_errors.clear();
     }
 
-    async fn emit_mcp_session_boot(&self, generation: u64, finished: bool) {
+    fn queue_mcp_session_boot(&mut self, event: Event) {
+        self.mcp_pending_event = match self.tx_event.try_send(event) {
+            Err(mpsc::error::TrySendError::Full(event)) => Some(event),
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => None,
+        };
+    }
+
+    async fn emit_mcp_session_boot(&mut self, generation: u64, finished: bool) {
         let Ok(snapshot) = self.mcp_session_snapshot().await else {
             return;
         };
-        let connecting = if finished {
-            Vec::new()
-        } else if let Some(pool) = self.mcp_pool.as_ref() {
+        let connecting = if let Some(pool) = self.mcp_pool.as_ref() {
             let pool = pool.lock().await;
             Self::mcp_connecting_names(&pool, &self.mcp_connection_errors)
         } else {
             Vec::new()
         };
-        // Zero servers and nothing connecting is not a session-boot surface.
-        if snapshot.servers.is_empty() && connecting.is_empty() {
-            return;
-        }
-        let _ = self.tx_event.try_send(Event::McpSessionBoot {
+        self.queue_mcp_session_boot(Event::McpSessionBoot {
             generation,
             snapshot,
             connecting,
@@ -8076,7 +8125,7 @@ impl Engine {
                 self.replace_mcp_boot_errors(&authority_errors, connection_errors);
                 self.session.pending_prefix_change_reason = Some("mcp-session-boot".to_string());
                 if let Ok(snapshot) = self.mcp_session_snapshot().await {
-                    let _ = self.tx_event.try_send(Event::McpSessionBoot {
+                    self.queue_mcp_session_boot(Event::McpSessionBoot {
                         generation,
                         snapshot,
                         connecting,
@@ -8094,6 +8143,8 @@ impl Engine {
                 }
                 if generation < self.mcp_event_generation {
                     self.finish_mcp_boot_generation(generation);
+                    let generation = self.next_mcp_event_generation();
+                    self.emit_mcp_session_boot(generation, true).await;
                     return;
                 }
                 self.mcp_event_generation = generation;
@@ -8110,6 +8161,7 @@ impl Engine {
         let Some(mut rx) = self.mcp_boot_rx.take() else {
             return;
         };
+        let mut emit = None;
         while let Ok(update) = rx.try_recv() {
             // Apply without emitting until the last queued update so the UI
             // sees one settled receipt rather than a burst.
@@ -8130,6 +8182,7 @@ impl Engine {
                     self.replace_mcp_boot_errors(&authority_errors, connection_errors);
                     self.session.pending_prefix_change_reason =
                         Some("mcp-session-boot".to_string());
+                    emit = Some((generation, false));
                 }
                 McpBootUpdate::Finished {
                     generation,
@@ -8141,6 +8194,7 @@ impl Engine {
                     }
                     if generation < self.mcp_event_generation {
                         self.finish_mcp_boot_generation(generation);
+                        emit = Some((self.next_mcp_event_generation(), true));
                         break;
                     }
                     self.mcp_event_generation = generation;
@@ -8148,12 +8202,16 @@ impl Engine {
                     self.finish_mcp_boot_generation(generation);
                     self.session.pending_prefix_change_reason =
                         Some("mcp-session-boot".to_string());
+                    emit = Some((generation, true));
                     break;
                 }
             }
         }
         if self.mcp_boot_in_flight && self.mcp_boot_generation == receiver_generation {
             self.mcp_boot_rx = Some(rx);
+        }
+        if let Some((generation, finished)) = emit {
+            self.emit_mcp_session_boot(generation, finished).await;
         }
     }
 
@@ -8723,7 +8781,7 @@ impl Engine {
         });
         drop(pool);
         let generation = self.next_mcp_event_generation();
-        let _ = self.tx_event.try_send(Event::McpSessionBoot {
+        self.queue_mcp_session_boot(Event::McpSessionBoot {
             generation,
             snapshot: snapshot.clone(),
             connecting: Vec::new(),
@@ -8753,11 +8811,12 @@ impl Engine {
             return pool.lock().await.to_api_tools();
         }
 
-        // Boot is lazy (#6033): unselected servers stay unconnected on
-        // purpose, so there is no per-turn sweep here. A `required` server
-        // that never got an attempt still owes the session an honest error
-        // row — `push_required_server_errors` only fills gaps a real
-        // diagnosis did not already cover.
+        // The boot pass starts every server not marked `lazy = true`; an
+        // unselected lazy server stays unconnected on purpose (#6033), so
+        // there is no per-turn sweep here. A `required` server that never
+        // got an attempt still owes the session an honest error row —
+        // `push_required_server_errors` only fills gaps a real diagnosis did
+        // not already cover.
         let mut gaps = Vec::new();
         {
             let pool = pool.lock().await;
@@ -8899,8 +8958,8 @@ impl Engine {
     /// Name the configured MCP servers this turn may load, in session history
     /// before a model request (KV-cache effect: append-only user history).
     ///
-    /// Session boot is lazy and MCP tools are deferred, so a server the user
-    /// added is otherwise invisible to the model until the user names it. The
+    /// MCP tools are deferred, so a server the user added is otherwise
+    /// invisible to the model until the user names it. The
     /// list is exactly what an MCP-focused `tool_search` may connect under
     /// this turn's ceiling ([`Self::discover_mcp_for_tool_search`]): enabled,
     /// allowed servers, and none when `tool_search` is not in `catalog`.

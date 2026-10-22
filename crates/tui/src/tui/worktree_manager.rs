@@ -128,7 +128,11 @@ impl ModalView for WorktreeManagerView {
             .borders(Borders::ALL)
             .title(" Worktrees ")
             .border_style(Style::default().fg(palette::BORDER_COLOR))
-            .style(Style::default().bg(palette::SURFACE_ELEVATED))
+            .style(
+                Style::default()
+                    .fg(palette::TEXT_PRIMARY)
+                    .bg(palette::SURFACE_ELEVATED),
+            )
             .render(popup, buf);
 
         let inner = Rect {

@@ -252,7 +252,12 @@ pub(crate) fn observe_cache_for_app(
         metadata: None,
         thinking: None,
         reasoning_effort: app
-            .reasoning_effort_api_value_for_replay(target.provider, replay_base_url, &target.model)
+            .reasoning_effort_api_value_for_replay(
+                target.provider,
+                &target.provider_identity,
+                replay_base_url,
+                &target.model,
+            )
             .map(str::to_string),
         stream: Some(true),
         temperature: None,

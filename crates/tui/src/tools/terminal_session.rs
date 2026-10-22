@@ -1551,7 +1551,7 @@ mod tests {
     #[test]
     fn narrowed_posture_without_a_backend_fails_closed() {
         assert!(pty_lacks_required_sandbox(
-            &crate::sandbox::SandboxPolicy::ReadOnly,
+            &crate::sandbox::SandboxPolicy::read_only(),
             crate::sandbox::SandboxType::None,
         ));
         assert!(!pty_lacks_required_sandbox(
@@ -1704,7 +1704,7 @@ mod tests {
         let workspace = DockWorkspace::new();
         let shell = workspace.session("posture");
         let id = shell.lock().unwrap().durable.session_id.clone();
-        let narrowed = SandboxPolicy::ReadOnly;
+        let narrowed = SandboxPolicy::read_only();
         assert!(
             get_or_create(
                 "posture",
@@ -1729,7 +1729,7 @@ mod tests {
             shell.sandbox_policy = original.clone();
         }
         let changed = [
-            SandboxPolicy::ReadOnly,
+            SandboxPolicy::read_only(),
             SandboxPolicy::workspace_with_roots(vec![], true),
             SandboxPolicy::workspace_with_roots(
                 vec![workspace.path().join("extra-write-root")],

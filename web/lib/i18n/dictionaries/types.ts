@@ -440,10 +440,18 @@ export interface ChangelogDict {
   /** "{shown} of {total} entries" */
   moreEntries: string;
   fullNotes: string;
-  /** "Full notes for {version}" — per-release deep link into CHANGELOG.md. */
+  /** "Full notes for {version}" — links /changelog/<version>, or CHANGELOG.md for Unreleased. */
   releaseNotesLink: string;
   emptyTitle: string;
   emptyBody: string;
+  /** `/changelog/[version]` — every entry for one release. */
+  versionMetaTitle: string;
+  versionMetaDescription: string;
+  versionKicker: string;
+  /** "Released {date}. …" */
+  versionLead: string;
+  versionLeadUndated: string;
+  allReleasesLink: string;
 }
 
 export interface LegalTermsDict {

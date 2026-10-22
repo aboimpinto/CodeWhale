@@ -680,8 +680,9 @@ pub(crate) fn normalize_auto_route_effort_for_configured_route(
 ) -> ReasoningEffort {
     crate::route_runtime::resolve_runtime_route_for_identity(config, identity, Some(model))
         .map(|route| {
-            effort.normalize_for_route(
+            effort.normalize_for_route_identity(
                 identity.provider,
+                identity.key.as_str(),
                 &route.candidate.endpoint().base_url,
                 &route.model,
             )

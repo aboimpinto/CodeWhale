@@ -1980,25 +1980,8 @@ pub(crate) async fn run_event_loop(
         app.should_adopt_live_local_ollama(),
     );
 
-    // Startup version-change hint: once per version, never on first run.
-    // `record_launch` owns the semantics (strict semver forward move, corrupt
-    // record = silent rewrite, downgrade records without hinting); this only
-    // renders the outcome. Local bookkeeping — independent of the network
-    // update check, and skipped entirely when home cannot be resolved.
-    if let Ok(home) = codewhale_config::codewhale_home() {
-        let outcome = codewhale_release::record_launch(&home, env!("CARGO_PKG_VERSION"));
-        if let Some(record_error) = outcome.record_error {
-            tracing::debug!(error = %record_error, "could not persist the last-launch record");
-        }
-        if let Some(change) = outcome.change {
-            let content = app
-                .tr(MessageId::UpdateChangedHint)
-                .replace("{previous}", &change.previous)
-                .replace("{current}", &change.current);
-            app.add_message(HistoryCell::System { content });
-            app.needs_redraw = true;
-        }
-    }
+    app.launch.whats_new =
+        crate::whats_new::take_after_update(app.ui_locale, config.update_config().show_whats_new);
 
     // Fire a one-shot initial remaining-credit fetch for prepaid
     // providers so the footer chip can show on the first frame without
@@ -2051,6 +2034,15 @@ pub(crate) async fn run_event_loop(
         // The background session-store repair's one-line result (#6144).
         if let Some(notice) = crate::session_reconcile::take_pending_notice() {
             app.push_status_toast(notice, StatusToastLevel::Info, None);
+            app.needs_redraw = true;
+        }
+
+        if app.onboarding == OnboardingState::None
+            && telemetry_notice_may_enter_transcript(app)
+            && let Some(notice) = app.launch.whats_new.take()
+        {
+            let content = format!("{}\n{}", notice.headline(), notice.notes_with_command());
+            app.add_message(HistoryCell::System { content });
             app.needs_redraw = true;
         }
 
@@ -7453,7 +7445,12 @@ pub(crate) async fn run_cache_warmup(app: &App, config: &Config) -> Result<Cache
         .map_err(anyhow::Error::msg)?;
     let base_url = route.client.base_url().to_string();
     let reasoning_effort = app
-        .reasoning_effort_api_value_for_replay(route.identity.provider, &base_url, &route.model)
+        .reasoning_effort_api_value_for_replay(
+            route.identity.provider,
+            route.identity.key.as_str(),
+            &base_url,
+            &route.model,
+        )
         .map(str::to_string);
     let request = MessageRequest {
         model: route.model.clone(),

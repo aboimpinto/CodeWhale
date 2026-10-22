@@ -167,6 +167,7 @@ fn modelstudio_qwen38_max_offering_publishes_1m_context() {
             context_tokens: Some(1_000_000),
             input_tokens: None,
             output_tokens: Some(131_072),
+            output_declared: false,
         },
         "hand-seam limits must not be empty (empty won collisions and fell to 128K)"
     );

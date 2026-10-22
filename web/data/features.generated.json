@@ -2,7 +2,7 @@
   "format": "codewhale.features.v1",
   "source": {
     "path": "docs/features.toml",
-    "sha256": "e3b09f247deafb11cfbaf703d33dd07177413d5649690fd5d07fb7a39a39cc44"
+    "sha256": "fc3dbf4a8e94c12617f737fcdcaf4a2dfd336458b4aa067d8a4cce6d589d71d3"
   },
   "features": [
     {
@@ -685,6 +685,19 @@
       "registryLine": 525
     },
     {
+      "id": "whats-new-notice",
+      "name": "What's new after an update",
+      "summary": "Says once, on the first start after an update, what changed and links that version's release notes.",
+      "status": "stable",
+      "surfaces": {
+        "tui": "stable"
+      },
+      "since": "0.10.2",
+      "flag": null,
+      "docs": "docs/CONFIGURATION.md#whats-new-after-an-update",
+      "registryLine": 534
+    },
+    {
       "id": "themes",
       "name": "Themes",
       "summary": "/theme picks a built-in theme; user themes follow a JSON schema.",
@@ -695,7 +708,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/schemas/user-theme.schema.json",
-      "registryLine": 534
+      "registryLine": 544
     },
     {
       "id": "chat-color",
@@ -708,7 +721,7 @@
       "since": "0.10.2",
       "flag": null,
       "docs": "docs/GUIDE.md",
-      "registryLine": 543
+      "registryLine": 553
     },
     {
       "id": "localization",
@@ -721,7 +734,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/LOCALIZATION.md",
-      "registryLine": 553
+      "registryLine": 563
     },
     {
       "id": "voice",
@@ -735,7 +748,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 562
+      "registryLine": 572
     },
     {
       "id": "pet",
@@ -749,7 +762,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/PET_MODE.md",
-      "registryLine": 570
+      "registryLine": 580
     },
     {
       "id": "overview",
@@ -762,7 +775,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/PROVIDERS.md",
-      "registryLine": 579
+      "registryLine": 589
     },
     {
       "id": "account-login",
@@ -775,7 +788,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 588
+      "registryLine": 598
     },
     {
       "id": "account-computer-files",
@@ -788,7 +801,7 @@
       "since": "0.10.2",
       "flag": null,
       "docs": null,
-      "registryLine": 596
+      "registryLine": 606
     },
     {
       "id": "context-anchors",
@@ -801,7 +814,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 605
+      "registryLine": 615
     },
     {
       "id": "window-pin",
@@ -814,7 +827,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 613
+      "registryLine": 623
     },
     {
       "id": "structured-copy",
@@ -827,7 +840,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 621
+      "registryLine": 631
     },
     {
       "id": "live-thinking",
@@ -840,7 +853,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 629
+      "registryLine": 639
     },
     {
       "id": "workbar",
@@ -853,7 +866,7 @@
       "since": null,
       "flag": null,
       "docs": null,
-      "registryLine": 637
+      "registryLine": 647
     },
     {
       "id": "terminal-dock",
@@ -866,7 +879,7 @@
       "since": "0.10.2",
       "flag": null,
       "docs": null,
-      "registryLine": 645
+      "registryLine": 655
     },
     {
       "id": "telemetry",
@@ -879,7 +892,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/TELEMETRY.md",
-      "registryLine": 656
+      "registryLine": 666
     },
     {
       "id": "docker",
@@ -892,7 +905,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/DOCKER.md",
-      "registryLine": 665
+      "registryLine": 675
     },
     {
       "id": "termux",
@@ -905,7 +918,7 @@
       "since": null,
       "flag": null,
       "docs": "docs/TERMUX.md",
-      "registryLine": 674
+      "registryLine": 684
     },
     {
       "id": "chatgpt-plan-sign-in",
@@ -920,7 +933,7 @@
       "since": "0.10.1",
       "flag": null,
       "docs": "docs/PROVIDERS.md#sign-in-with-chatgpt",
-      "registryLine": 683
+      "registryLine": 693
     },
     {
       "id": "claude-plan-sign-in",
@@ -935,7 +948,7 @@
       "since": "0.10.2",
       "flag": null,
       "docs": "docs/PROVIDERS.md#sign-in-with-claude",
-      "registryLine": 693
+      "registryLine": 703
     },
     {
       "id": "plugin-oauth-providers",
@@ -950,7 +963,7 @@
       "since": "0.10.1",
       "flag": null,
       "docs": "docs/PLUGIN_PROVIDERS.md",
-      "registryLine": 703
+      "registryLine": 713
     },
     {
       "id": "orcarouter-sign-in",
@@ -959,13 +972,13 @@
       "status": "experimental",
       "surfaces": {
         "tui": "preview",
-        "api": "none",
+        "api": "preview",
         "web": "none"
       },
       "since": "0.10.1",
       "flag": null,
       "docs": "docs/PROVIDERS.md",
-      "registryLine": 713
+      "registryLine": 723
     },
     {
       "id": "merch-interest",
@@ -980,7 +993,7 @@
       "since": "unreleased",
       "flag": null,
       "docs": "web/lib/merch/README.md",
-      "registryLine": 724
+      "registryLine": 734
     },
     {
       "id": "profile-constitution",
@@ -994,7 +1007,7 @@
       "since": "0.10.1",
       "flag": null,
       "docs": "docs/RUNTIME_API.md#profile-constitution",
-      "registryLine": 734
+      "registryLine": 744
     },
     {
       "id": "plugin-shell-install",
@@ -1007,7 +1020,7 @@
       "since": "0.10.2",
       "flag": null,
       "docs": "docs/PLUGINS.md",
-      "registryLine": 744
+      "registryLine": 754
     }
   ]
 }

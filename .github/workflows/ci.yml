@@ -1,6 +1,8 @@
 name: CI
 
 on:
+  pull_request:
+    branches: [main]
   workflow_dispatch:
     inputs:
       expected_sha:
@@ -228,8 +230,15 @@ jobs:
         # each other consistent while a contributor nobody remembered stayed
         # invisible. Nine were missing from 0.10.0. This derives the expected
         # set from the commit range instead (authors, co-author trailers, and
-        # `Harvested from PR #N by @handle`), so forgetting someone is red.
+        # `Harvested from PR #N by @handle`), so forgetting someone is red in
+        # final validation. Pull requests only report it: credit is written
+        # on main when the PR merges.
+        id: credit
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: python3 scripts/check-contributor-credit.py
+      - name: Explain contributor credit on a pull request
+        if: github.event_name == 'pull_request' && steps.credit.outcome == 'failure'
+        run: echo "::notice title=Contributor credit::The names above are credited by a maintainer when this pull request merges. You do not need to edit docs/CONTRIBUTORS.md, CHANGELOG.md or web/lib/release-credits.ts."
       - name: Check bundled plugin claims
         # The 0.10.0 section claimed Computer Use 0.4.0 at revision ca6be22
         # while the tree shipped 0.11.2 at d8640b17f275 -- three upstream
@@ -630,7 +639,9 @@ jobs:
       # command that lands the fix in that PR. It stays advisory in exactly
       # two cases: the PR's merge base fails the same check (inherited debt,
       # re-checked on a throwaway checkout of the base), or the PR comes from
-      # a fork. Pushes to main, schedule and dispatch have no base and block.
+      # a fork. Dispatch has no base and blocks. Runtime-contract and
+      # persistence-backlog measure for many minutes, so only final
+      # validation runs them.
       - name: Resolve ratchet merge base
         if: needs.changes.outputs.heavy == 'true' && github.event_name == 'pull_request'
         shell: bash
@@ -678,14 +689,12 @@ jobs:
       # single budget is measured. Fetch the locked graph once here so the
       # measurement below is deterministic on every branch.
       - name: Fetch locked dependency graph for offline measurement
-        if: needs.changes.outputs.heavy == 'true'
+        if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request'
         run: cargo fetch --locked
       # Provider-free local measurement. The checker forces Cargo offline and
       # the measurement script runs only locked, ignored Rust metric tests.
       - name: Check runtime-contract budget
-        if: needs.changes.outputs.heavy == 'true'
-        # Blocking for same-repo PRs; see the ratchet note above.
-        continue-on-error: ${{ github.event_name == 'pull_request' && needs.changes.outputs.trusted != 'true' }}
+        if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request'
         run: >-
           bash scripts/ratchet-gate.sh --name runtime-contract
           --update "python3 scripts/check-runtime-contract-budget.py --update --allow-increase"
@@ -699,9 +708,7 @@ jobs:
           python3 scripts/test_measure_persistence_backlog.py
           python3 scripts/test_check_persistence_backlog_budget.py
       - name: Check persistence-backlog budget
-        if: needs.changes.outputs.heavy == 'true'
-        # Blocking for same-repo PRs; see the ratchet note above.
-        continue-on-error: ${{ github.event_name == 'pull_request' && needs.changes.outputs.trusted != 'true' }}
+        if: needs.changes.outputs.heavy == 'true' && github.event_name != 'pull_request'
         run: >-
           bash scripts/ratchet-gate.sh --name persistence-backlog
           --update "python3 scripts/check-persistence-backlog-budget.py --update"
@@ -780,12 +787,12 @@ jobs:
   test:
     name: Test
     needs: changes
-    # Required contexts "Test (ubuntu-latest)" / "Test (macos-latest)" /
+    # Contexts "Test (ubuntu-latest)" / "Test (macos-latest)" /
     # "Test (windows-latest)" derive from job name + matrix.os and are
     # independent of runs-on. For light changes the macOS/Windows legs only
     # echo a skip line, so run them on ubuntu instead of queueing for scarce
-    # macOS/Windows runners. Heavy pull requests run the Linux lane directly;
-    # non-PR release/main pushes use CNB for Linux.
+    # macOS/Windows runners. Pull requests run only the Linux leg here; the
+    # required "Test (windows-latest)" context comes from test-windows-pr.
     # The ternary is safe: matrix.os is always a non-empty literal, so
     # runs-on can never evaluate to empty.
     # A cold GitHub-hosted Mac spent 77-80 minutes in Test on 2026-09-23
@@ -807,11 +814,11 @@ jobs:
       # other one. We need both conclusions to diagnose and release safely.
       fail-fast: false
       matrix:
-        # Linux workspace tests run directly for pull requests. CNB remains
-        # the Linux lane for non-PR release/main pushes. The explicit manual
+        # Pull requests run the Linux workspace suite only; the macOS and
+        # Windows suites run in final validation. The explicit manual
         # libtest qualification uses one hosted Ubuntu job, never a fork PR or
-        # self-hosted runner; normal dispatches and PRs keep all three legs.
-        os: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice' && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
+        # self-hosted runner; normal dispatches keep all three legs.
+        os: ${{ fromJSON((github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.workspace_test_mode == 'shared-process-twice')) && '["ubuntu-latest"]' || '["ubuntu-latest","macos-latest","windows-latest"]') }}
     steps:
       - name: Skip tests for light change
         if: needs.changes.outputs.heavy != 'true'
@@ -1211,6 +1218,42 @@ jobs:
         shell: bash
         run: rm -f "$RUNNER_TEMP/cw-build-lock.hold"
 
+  test-windows-pr:
+    name: Test (windows-latest)
+    needs: changes
+    if: github.event_name == 'pull_request'
+    timeout-minutes: 60
+    runs-on: ${{ needs.changes.outputs.heavy == 'true' && 'windows-latest' || 'ubuntu-latest' }}
+    steps:
+      - name: Skip Windows check for light change
+        if: needs.changes.outputs.heavy != 'true'
+        run: echo "No executable Rust changes detected; preserving required Test context."
+      - uses: actions/checkout@v7
+        if: needs.changes.outputs.heavy == 'true'
+      - name: Test Windows installer PATH helper
+        if: needs.changes.outputs.heavy == 'true'
+        shell: pwsh
+        run: ./scripts/installer/update-user-path.tests.ps1
+      - uses: dtolnay/rust-toolchain@stable
+        if: needs.changes.outputs.heavy == 'true'
+      - name: Check every workspace target compiles on Windows
+        if: needs.changes.outputs.heavy == 'true'
+        shell: bash
+        run: cargo check --workspace --all-targets --all-features --locked
+      - name: Lockfile drift guard
+        if: needs.changes.outputs.heavy == 'true'
+        run: git diff --exit-code -- Cargo.lock
+      - name: Record what this pull request leg covers
+        if: needs.changes.outputs.heavy == 'true'
+        shell: bash
+        run: |
+          {
+            echo "## Test (windows-latest) on a pull request"
+            echo
+            echo "Compiled every workspace target for Windows with warnings denied and ran the installer PATH helper tests."
+            echo "The Windows and macOS test suites run in final validation, before a release, not on pull requests."
+          } >> "$GITHUB_STEP_SUMMARY"
+
   macos-budget:
     # Fork PRs build cold on a GitHub-hosted Mac, and the RSS budget and the
     # offline eval each rebuild codewhale-tui there. Inside Test that cost
@@ -1409,3 +1452,21 @@ jobs:
         run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -Dwarnings
+
+  cargo-deny:
+    name: cargo-deny
+    needs: changes
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/cargo-deny.yml
+
+  security-audit:
+    name: Security audit
+    needs: changes
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/security-audit.yml
+
+  ohos:
+    name: OpenHarmony
+    needs: changes
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/ohos.yml

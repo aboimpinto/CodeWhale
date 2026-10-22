@@ -1439,8 +1439,11 @@ fn resource_template_pattern(template: &str) -> Option<String> {
 ///
 /// This runs per URI per advertised template, while the template itself is
 /// fixed by the server's listing, so compiling it on every call was pure
-/// repetition. `None` still means "matches nothing" (#6213 T7).
+/// repetition. `None` still means "matches nothing" (#6213 T7). The cache is
+/// bounded because the template list is server-supplied: an unbounded key set
+/// would let one server pin memory for the life of the process.
 fn compiled_resource_template(template: &str) -> Option<Arc<regex::Regex>> {
+    const MAX_CACHED_TEMPLATES: usize = 512;
     static CACHE: std::sync::OnceLock<
         std::sync::Mutex<HashMap<String, Option<Arc<regex::Regex>>>>,
     > = std::sync::OnceLock::new();
@@ -1448,14 +1451,16 @@ fn compiled_resource_template(template: &str) -> Option<Arc<regex::Regex>> {
     let mut cache = cache
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cache
-        .entry(template.to_string())
-        .or_insert_with(|| {
-            resource_template_pattern(template)
-                .and_then(|pattern| regex::Regex::new(&pattern).ok())
-                .map(Arc::new)
-        })
-        .clone()
+    if let Some(cached) = cache.get(template) {
+        return cached.clone();
+    }
+    let compiled = resource_template_pattern(template)
+        .and_then(|pattern| regex::Regex::new(&pattern).ok())
+        .map(Arc::new);
+    if cache.len() < MAX_CACHED_TEMPLATES {
+        cache.insert(template.to_string(), compiled.clone());
+    }
+    compiled
 }
 
 fn resource_uri_matches_template(uri: &str, template: &str) -> bool {
@@ -2994,7 +2999,7 @@ impl McpConnection {
 /// matcher as reqwest. A NO_PROXY match returns None: direct requests must keep
 /// their public DNS validation and pins. Model and reviewed-plugin requests
 /// return before even reading proxy credentials.
-fn configured_mcp_proxy<F>(
+pub(crate) fn configured_mcp_proxy<F>(
     url: &reqwest::Url,
     disallow_ambient_proxy: bool,
     mut read_environment: F,
@@ -3005,12 +3010,13 @@ where
     if disallow_ambient_proxy {
         return Ok(None);
     }
-    let proxy_url = read_environment("HTTPS_PROXY")
-        .or_else(|_| read_environment("https_proxy"))
-        .or_else(|_| read_environment("HTTP_PROXY"))
-        .or_else(|_| read_environment("http_proxy"))
-        .ok()
-        .filter(|value| !value.trim().is_empty());
+    let proxy_url = ["HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"]
+        .into_iter()
+        .find_map(|key| {
+            read_environment(key)
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        });
     let Some(proxy_url) = proxy_url else {
         return Ok(None);
     };
@@ -3026,7 +3032,11 @@ where
     };
     let no_proxy = read_environment("NO_PROXY")
         .or_else(|_| read_environment("no_proxy"))
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .replace(char::is_whitespace, ",");
+    if no_proxy.split(',').any(|entry| entry == "*") {
+        return Ok(None);
+    }
     let matcher = hyper_util::client::proxy::matcher::Matcher::builder()
         .all(normalized.as_str())
         .no(no_proxy)
@@ -3037,7 +3047,13 @@ where
     };
     // Build the actual proxy from the matched route itself so the decision
     // that grants delegated DNS authority cannot diverge from the transport.
-    let mut proxy = reqwest::Proxy::all(route.uri().to_string())?;
+    let route_uri = route.uri().to_string();
+    let route_uri = match route.uri().scheme_str() {
+        Some("socks5") => route_uri.replacen("socks5://", "socks5h://", 1),
+        Some("socks4") => route_uri.replacen("socks4://", "socks4a://", 1),
+        _ => route_uri,
+    };
+    let mut proxy = reqwest::Proxy::all(route_uri)?;
     if let Some(auth) = route.basic_auth() {
         proxy = proxy.custom_http_auth(auth.clone());
     }
@@ -3208,8 +3224,8 @@ pub struct McpPool {
     /// `/mcp` retries, and supervisor redials all mark names here and clear
     /// them on resolution, so status surfaces never have to infer
     /// "connecting" from "enabled but not connected yet" (#6033): an
-    /// unconnected on-demand server (`lazy = true` or plugin-contributed) is
-    /// one nobody has asked for, not one mid-handshake.
+    /// unconnected on-demand server (`lazy = true`) is one nobody has asked
+    /// for, not one mid-handshake.
     connecting: HashSet<String>,
     retired: bool,
 }
@@ -4517,18 +4533,16 @@ impl McpPool {
     }
 
     /// Enabled, allowed configured servers the boot pass starts at session
-    /// start: every user-configured one except those marked `lazy = true`.
-    /// Plugin-contributed servers and lazy ones connect on demand unless
-    /// `required` or covered by the session's explicit tool selections.
+    /// start: every one, user-configured or plugin-contributed, except those
+    /// marked `lazy = true`, which connect on demand unless `required` or
+    /// covered by the session's explicit tool selections.
     pub(crate) fn eager_boot_server_names(&self, requested: &[String]) -> HashSet<String> {
         self.config
             .servers
             .iter()
             .filter(|(name, server)| server.is_enabled() && self.server_allowed(name))
             .filter(|(name, server)| {
-                server.required
-                    || (!server.lazy && server.reviewed_plugin.is_none())
-                    || tool_selection_covers_server(requested, name)
+                server.required || !server.lazy || tool_selection_covers_server(requested, name)
             })
             .map(|(name, _)| name.clone())
             .collect()
@@ -6276,11 +6290,11 @@ impl McpServerSnapshot {
         }
     }
 
-    /// Whether this session ever attempted the server. Boot is lazy (#6033):
-    /// a configured server nobody asked for has no connection, no recorded
-    /// failure, and no observed capabilities — it was never started, so its
-    /// recovery is `connect`, not `reconnect`, and an OAuth-capable one is
-    /// not yet known to need a login.
+    /// Whether this session ever attempted the server. A `lazy = true` server
+    /// nobody asked for (#6033) has no connection, no recorded failure, and
+    /// no observed capabilities — it was never started, so its recovery is
+    /// `connect`, not `reconnect`, and an OAuth-capable one is not yet known
+    /// to need a login.
     #[must_use]
     pub fn started(&self) -> bool {
         self.connected

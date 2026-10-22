@@ -683,6 +683,19 @@ fn is_account_scoped_scope(provider: &str, fingerprint: &str) -> bool {
             == base_url_fingerprint(ProviderKind::Codewhale.provider().default_base_url())
 }
 
+pub(crate) fn route_is_account_scoped(
+    config: &Config,
+    identity: &crate::config::ProviderIdentity,
+) -> bool {
+    is_account_scoped_scope(
+        &storage_provider(
+            identity.provider,
+            &canonical_provider_scope(identity.key.as_str()),
+        ),
+        &base_url_fingerprint(&config.base_url_for_route(identity)),
+    )
+}
+
 fn cache_lock_path(path: &Path) -> PathBuf {
     let mut name = path
         .file_name()
@@ -1248,10 +1261,7 @@ pub fn maybe_load_persisted_cache_for_config(config: &Config) -> usize {
     let provider = identity.provider;
     let provider_identity = canonical_provider_scope(identity.key.as_str());
     let fingerprint = base_url_fingerprint(&config.base_url_for_route(&identity));
-    if is_account_scoped_scope(
-        &storage_provider(provider, &provider_identity),
-        &fingerprint,
-    ) {
+    if route_is_account_scoped(config, &identity) {
         forget_account_scoped_provider(provider, &provider_identity);
         return 0;
     }

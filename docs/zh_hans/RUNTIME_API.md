@@ -933,6 +933,8 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 - `PATCH /v1/threads/{id}`（请求体形态见下文）
 - `POST /v1/threads/{id}/resume`
 - `POST /v1/threads/{id}/fork`
+- `POST /v1/threads/{id}/read` — 记录客户端已显示到的最新条目
+  （请求体 `{"item_id": "<item id>"}`；见下文“已读标记”）
 - `GET /v1/threads/{id}/receipt` — 线程做了什么，每个动作一条
   （只读；形态见 [RECEIPTS.md](../RECEIPTS.md)）
 - `GET /v1/threads/{id}/turns/{turn_id}/receipt` — 同上，针对一个回合；
@@ -986,6 +988,9 @@ bootstrap URL。该能力会创建一个 30 分钟的进程内
 }
 ```
 
+每行还带有来自线程已读标记的 `last_read_item_id` 与 `unread`（见下文
+“已读标记”）。从未被任何客户端标记为已读的线程，两者都为 `null`。
+
 `branch` 在请求时从线程工作区解析得到，当工作区不是 Git 仓库或
 分支无法读取时可能为 `null`。
 `head` 是该工作区当前可得的短 Git commit。
@@ -1002,6 +1007,27 @@ fork 还可能包含 `backtrack_depth_from_tail` 与 `dropped_turn_id`，而
 在 v0.8.40 中，线程列表与摘要响应仍是扁平的，因此需要
 图的客户端应当从事件重建它，而不是假定列表顺序就是
 一棵完整的树。
+
+### 已读标记
+
+`POST /v1/threads/{id}/read` 携带 `{"item_id": "<item id>"}`，记录客户端已把对话
+显示到该条目为止，顺序与 `GET /v1/threads/{id}` 返回条目的顺序一致（先按回合，再按
+条目开始时间）。客户端在用户打开或阅读对话时，发送它渲染出的最新条目的 id。该条目
+必须属于此线程：未知线程返回 `404`，未知条目或属于其他线程的条目返回 `400`。响应是
+线程记录，其中 `last_read` 包含 `item_id`、`last_in_turn`（标记时该条目是否为其所在
+回合的最后一个条目）与 `watermark_item_id`（那一刻该回合已记录的最后一个条目）。
+
+标记已读不会改动其他任何东西：`updated_at`、列表顺序和线程事件流都保持不变，所以打开
+对话永远不会把它移到列表顶部，也不会让它重新变成未读。标记只会向前移动：标记一个位于
+当前标记之前的条目时，标记保持不变，因此显示旧快照的窗口无法把已读对话变回未读。fork
+出的线程不带标记。
+
+`GET /v1/threads/summary` 根据标记推导 `unread`：被标记的条目仍是最新条目时为
+`false`，一旦出现任何更新的条目即为 `true`，线程从未被标记时为 `null`（旧版 Runtime
+没有标记，因此升级后不会把所有已有对话都报告为未读；对这些线程，客户端保留自己的
+回退逻辑）。“新消息”分隔线应放在 `last_read_item_id` 所指条目之后。已知限制：
+`unread` 跟随每个回合在运行时记录的条目，所以一个已开始但尚未记录任何条目的回合，在
+记录条目之前不计入；回合结束后才添加到该回合的通知（例如权限变更）也不计入。
 
 `GET /v1/threads/running` 是进行中工作的核算表面
 （#6180）：至少有一个排队或进行中回合的线程，每个都带有
@@ -2125,6 +2151,50 @@ Runtime 的提供商或模型默认值。
 认证模式、同意状态，以及任何已配置 `api_key` 值的*种类*，
 并且永不解析密钥、环境变量值或认证命令。它是一个
 类别，永不是一个值、一个路径或一个环境变量名。
+
+### `POST /v1/providers/orcarouter/connect` —— 无终端的浏览器登录
+
+```json
+// 响应
+{ "attemptId": "0f3c…", "authorizeUrl": "https://www.orcarouter.ai/auth?…",
+  "expiresIn": 900 }
+```
+
+为没有终端的客户端运行与 `codewhale auth orcarouter` 相同的 OrcaRouter
+OAuth 2.0 + PKCE 登录。Engine 绑定自己的回环回调
+（`http://127.0.0.1:<port>/callback`），返回授权页 URL，并在后台最多等待
+`expiresIn` 秒。客户端在系统浏览器（绝不是内嵌视图）中打开 `authorizeUrl`
+并轮询该次尝试。浏览器回调后，Engine 交换授权码，拒绝授予 scope 不是 `api`
+的 key，经与 CLI 相同的入口保存 key，再像 `PUT /v1/providers/{id}/key` 一样把
+凭据标记同步到运行中的配置。它不会切换当前提供商；请用
+`POST /v1/providers/{id}/switch`。
+
+回调监听在 Engine 所在的计算机上，因此客户端只应在 Engine 与浏览器位于同一台
+计算机时提供此路由。新的 `POST` 会取消上一次尝试，且只能读取当前尝试。拒绝情况：
+id 不是 `orcarouter` 为 `400`；该路由凭据不可写为 `409`（理由与
+`credentialWritableReason` 相同）；无法绑定回调为 `500`。`GET /v1/providers`
+会在支持此路由的条目上标注 `"browserConnect": true`；否则以及在没有此路由的
+Engine 上不出现该字段。
+
+### `GET /v1/providers/orcarouter/connect/{attemptId}` 与 `DELETE …` —— 状态与取消
+
+```json
+{ "attemptId": "0f3c…", "status": "failed", "reason": "key_not_saved" }
+```
+
+`status` 为 `waiting`、`connected`、`declined`（用户在浏览器中拒绝）、
+`expired`（未按时回调）、`cancelled` 或 `failed`。`failed` 附带 `reason`：
+`authorization_error`（浏览器带回其他错误）、`callback_failed`、
+`not_writable`（交换前该路由凭据已不可写；未创建 key）、`exchange_failed`、
+`scope_refused` 或 `key_not_saved`。出现 `scope_refused` 或 `key_not_saved`
+时，OrcaRouter 已创建了一个 Codewhale 未保存的 key，用户应在 OrcaRouter 的
+Authorized Apps 中撤销它。`exchange_failed` 也可能发生在 OrcaRouter 已创建
+key 但响应丢失之后。
+
+`DELETE` 取消仍在等待浏览器的尝试。交换一旦开始，key 可能已经存在，因此该尝试
+会继续，并报告 `connected`，或带 `key_not_saved` 的 `failed`；此时 `DELETE`
+返回当前状态。未知或已被取代的 `attemptId` 为 `404`。只有 `POST` 响应携带授权页
+URL；任何状态、错误或日志都不携带它、key、授权码或 verifier。
 
 ### `POST /v1/providers/{id}/switch`
 

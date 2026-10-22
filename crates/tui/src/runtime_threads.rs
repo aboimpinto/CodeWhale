@@ -502,6 +502,13 @@ fn sort_turn_items_by_start(items: &mut [TurnItemRecord]) {
     });
 }
 
+fn newest_recorded_item_id(turns: &[TurnRecord]) -> Option<String> {
+    turns
+        .iter()
+        .rev()
+        .find_map(|turn| turn.item_ids.last().cloned())
+}
+
 /// Bumped to 2 for v0.6.6 after live engine semantics changed. The persisted
 /// thread/turn/item records did not change shape, but a v1 reader on a v2
 /// session should still fail closed rather than silently mis-replay.
@@ -819,6 +826,16 @@ pub struct ThreadRecord {
     /// Exact saved transcript and the last Runtime turn it already contains.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub saved_session_checkpoint: Option<SavedSessionCheckpoint>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_read: Option<ThreadReadMarker>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThreadReadMarker {
+    pub item_id: String,
+    pub last_in_turn: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watermark_item_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3753,6 +3770,24 @@ impl RuntimeThreadStore {
         Ok(out)
     }
 
+    fn thread_item(
+        &self,
+        thread_id: &str,
+        item_id: &str,
+    ) -> Result<Option<(TurnItemRecord, TurnRecord)>> {
+        let item = match self.load_item(item_id) {
+            Ok(item) => item,
+            Err(error) if store_record_missing(&error) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match self.load_turn(&item.turn_id) {
+            Ok(turn) if turn.thread_id == thread_id => Ok(Some((item, turn))),
+            Ok(_) => Ok(None),
+            Err(error) if store_record_missing(&error) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub fn list_items_for_turns_map(
         &self,
         turn_ids: &[String],
@@ -5609,6 +5644,7 @@ pub struct ThreadListFacts {
     /// Pending approvals plus pending user-input requests, from live request
     /// state rather than the store.
     pub pending_attention_count: usize,
+    pub newest_item_id: Option<String>,
 }
 
 /// One watchable notice on a thread, projected from engine events so
@@ -9894,6 +9930,51 @@ impl RuntimeThreadManager {
         Ok(envelope)
     }
 
+    pub async fn mark_thread_read(&self, thread_id: &str, item_id: &str) -> Result<ThreadRecord> {
+        let store = self.store.clone();
+        let thread_id = thread_id.to_string();
+        let item_id = validated_record_id(item_id, "item id")?.to_string();
+        tokio::task::spawn_blocking(move || -> Result<ThreadRecord> {
+            store
+                .load_thread(&thread_id)
+                .with_context(|| format!("Thread not found: {thread_id}"))?;
+            let Some((item, turn)) = store.thread_item(&thread_id, &item_id)? else {
+                bail!("item {item_id} is not part of thread {thread_id}");
+            };
+            let turn_items = store
+                .list_items_for_turns_map(std::slice::from_ref(&turn.id))?
+                .remove(&turn.id)
+                .unwrap_or_default();
+            let marker = ThreadReadMarker {
+                last_in_turn: turn_items.last().is_some_and(|last| last.id == item_id),
+                watermark_item_id: newest_recorded_item_id(std::slice::from_ref(&turn)),
+                item_id,
+            };
+            let read_order = |item: &TurnItemRecord, turn: &TurnRecord| {
+                (turn.created_at, item.started_at.is_none(), item.started_at)
+            };
+
+            let _thread_mutation = store.thread_mutation.lock();
+            let mut thread = store
+                .load_thread(&thread_id)
+                .with_context(|| format!("Thread not found: {thread_id}"))?;
+            if let Some(current) = thread.last_read.as_ref()
+                && let Some((current_item, current_turn)) =
+                    store.thread_item(&thread_id, &current.item_id)?
+                && read_order(&item, &turn) < read_order(&current_item, &current_turn)
+            {
+                return Ok(thread);
+            }
+            if thread.last_read.as_ref() != Some(&marker) {
+                thread.last_read = Some(marker);
+                store.save_thread(&thread)?;
+            }
+            Ok(thread)
+        })
+        .await
+        .context("thread read marker task panicked")?
+    }
+
     /// Withdraw a queued envelope before it starts delivery (#6176). Only
     /// `Queued` mail can be canceled; anything that reached delivery keeps
     /// its receipt. Re-canceling an already-canceled envelope is an
@@ -10840,6 +10921,7 @@ impl RuntimeThreadManager {
             title: None,
             session_id: None,
             saved_session_checkpoint: None,
+            last_read: None,
         };
         self.store.save_thread(&thread)?;
         if let Err(error) = self
@@ -11037,6 +11119,7 @@ impl RuntimeThreadManager {
                     pending_attention_count: pending_approvals
                         .len()
                         .saturating_add(pending_user_inputs.len()),
+                    newest_item_id: turns.map(Vec::as_slice).and_then(newest_recorded_item_id),
                 },
             );
         }
@@ -12825,6 +12908,7 @@ impl RuntimeThreadManager {
         forked.updated_at = now;
         forked.latest_turn_id = None;
         forked.archived = false;
+        forked.last_read = None;
 
         let source_turns = self.store.list_turns_for_thread(&source.id)?;
         // One read for every turn's items — see `prepared_items_for_turns`: a
@@ -13332,6 +13416,7 @@ impl RuntimeThreadManager {
         forked.updated_at = now;
         forked.latest_turn_id = None;
         forked.archived = false;
+        forked.last_read = None;
 
         // The fork keeps only the prefix it was cut at, in a document of its
         // own — see `bind_fork_to_own_session`.
@@ -15272,8 +15357,9 @@ impl RuntimeThreadManager {
                 );
             let reasoning_effort = selected_reasoning.map(|effort| {
                 effort
-                    .normalize_for_route(
+                    .normalize_for_route_identity(
                         route.identity.provider,
+                        route.identity.key.as_str(),
                         &route.candidate.endpoint().base_url,
                         &route.model,
                     )
@@ -15306,8 +15392,9 @@ impl RuntimeThreadManager {
             });
             let reasoning_effort = selected_reasoning.map(|effort| {
                 effort
-                    .normalize_for_route(
+                    .normalize_for_route_identity(
                         route.identity.provider,
+                        route.identity.key.as_str(),
                         &route.candidate.endpoint().base_url,
                         &route.model,
                     )
@@ -16487,7 +16574,8 @@ impl RuntimeThreadManager {
             // updates. A concurrent workspace/model/session/policy change makes
             // this engine stale; discard it and rebuild from the new snapshot.
             let thread_mutation = self.store.thread_mutation.lock();
-            let record_is_current = self.store.load_thread(&thread.id)? == thread;
+            let record_is_current =
+                thread_execution_state_matches(&self.store.load_thread(&thread.id)?, &thread);
             if !record_is_current {
                 drop(thread_mutation);
                 drop(active);
@@ -19381,7 +19469,7 @@ impl RuntimeThreadManager {
         {
             let mut messages = engine.get_session_snapshot().await?.messages;
             for message in &mut messages {
-                crate::core::engine::redact_tool_result_blocks(message, |text| {
+                crate::core::engine::redact_tool_blocks(message, |text| {
                     crate::client::redact_model_bound_text(text, &receipt_secrets)
                 });
             }

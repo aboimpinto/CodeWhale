@@ -903,6 +903,30 @@ fn request_query_secret_values(url: &reqwest::Url) -> Vec<String> {
     values
 }
 
+/// Redirects are followed only within one host, over the same or a stronger
+/// scheme.
+///
+/// Provider keys ride in headers this stack may send under names reqwest does
+/// not strip on a cross-host hop (`x-api-key`, operator `http_headers`), so a
+/// compromised or open-redirecting endpoint could otherwise collect a key by
+/// answering `302`. A same-host hop to plaintext would expose the same key to
+/// anything on the path, so a downgrade stops too. Upgrades and same-scheme
+/// hops still work for the endpoints that use them.
+fn same_host_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let from = attempt.previous().last();
+        let next = attempt.url();
+        let same_host = from.is_some_and(|previous| previous.host_str() == next.host_str());
+        let downgrade =
+            from.is_some_and(|previous| previous.scheme() == "https" && next.scheme() == "http");
+        if same_host && !downgrade && attempt.previous().len() < 10 {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    })
+}
+
 pub(crate) fn redact_model_bound_text(text: &str, exact_secret_values: &[String]) -> String {
     let mut redacted = text.to_string();
     for secret in exact_secret_values {
@@ -1869,10 +1893,13 @@ impl CodewhaleClient {
             config,
             AuthHeaderSurface::Inference,
         )?;
-        let http_client = if plugin_provider.is_some() || api_key_source == "Claude sign-in" {
+        let http_client = if plugin_provider.is_some()
+            || api_key_source == "Claude sign-in"
+            || api_provider == ProviderKind::OpenaiCodex
+        {
             http_client.redirect(reqwest::redirect::Policy::none())
         } else {
-            http_client
+            http_client.redirect(same_host_redirects())
         }
         .build()?;
         let models_http_client = Self::http_client_builder_with_auth_mode(
@@ -2179,16 +2206,12 @@ impl CodewhaleClient {
         redact_model_bound_text(text, &self.model_bound_secret_values)
     }
 
-    /// Redact tool output as it enters the transcript. Same masking as the
-    /// request boundary, including the confirmed `[redaction] model_bound`
-    /// opt-out: a user who chose to let the model see file bytes verbatim
-    /// keeps that, and everyone else never stores a live credential.
+    /// Redact tool output as it enters the transcript. Unlike the request
+    /// boundary, this path always redacts: the `[redaction] model_bound`
+    /// opt-out exists so the model can quote file bytes back for exact edits,
+    /// never to write a live credential to disk.
     pub(crate) fn redact_tool_output_for_transcript(&self, text: &str) -> String {
-        if self.model_bound_masking {
-            redact_model_bound_text(text, &self.model_bound_secret_values)
-        } else {
-            text.to_string()
-        }
+        redact_model_bound_text(text, &self.model_bound_secret_values)
     }
 
     /// Alternate models share this client's frozen endpoint and declarations.
@@ -2977,12 +3000,23 @@ impl CodewhaleClient {
         let (request, request_route_limits) =
             self.bind_request_to_protocol(self.prepare_model_bound_request(request))?;
         let mut request = clamp_output_cap(request, request_route_limits);
+        request.max_tokens = self.bounded_output_tokens(
+            &self.wire_model_for_route(&request.model),
+            request_route_limits,
+            request.max_tokens,
+            crate::compaction::estimate_request_input_tokens(
+                &request.messages,
+                request.system.as_ref(),
+                request.tools.as_deref(),
+            ),
+        )?;
         let facts = if request.model == self.default_model {
             self.route_facts.clone()
         } else {
             self.catalog_facts_for_model(&request.model)
         }
         .filter(|facts| facts.wire_model_id == request.model);
+        let mut published_wire_effort = None;
         if let Some(facts) = facts.as_deref() {
             if facts.temperature == Some(false) {
                 request.temperature = None;
@@ -3048,17 +3082,51 @@ impl CodewhaleClient {
                     } else {
                         request.reasoning_effort.clone()
                     };
+                    let values = option.get("values").and_then(Value::as_array);
+                    let published = |effort: &str| {
+                        values.is_some_and(|values| {
+                            values.iter().any(|value| value.as_str() == Some(effort))
+                        })
+                    };
+                    if matches!(self.wire_format, WireFormat::ChatCompletions)
+                        && let Some(wire) = wire_effort.as_deref()
+                        && let Some(requested) = request.reasoning_effort.as_deref()
+                        && !published(wire)
+                        && published(requested)
+                    {
+                        published_wire_effort = Some(requested.to_string());
+                        continue;
+                    }
                     if let Some(effort) = wire_effort.as_deref()
-                        && let Some(values) = option.get("values").and_then(Value::as_array)
-                        && !values.iter().any(|value| value.as_str() == Some(effort))
+                        && let Some(values) = values
+                        && !published(effort)
                         && !(matches!(effort, "off" | "disabled" | "false")
                             && (values.iter().any(|value| value.as_str() == Some("none"))
                                 || facts.reasoning_options.iter().any(|option| {
                                     option.get("type").and_then(Value::as_str) == Some("toggle")
                                 })))
                     {
+                        let mut offered = Vec::new();
+                        for label in values
+                            .iter()
+                            .filter_map(Value::as_str)
+                            .filter_map(
+                                crate::reasoning_preference::ReasoningEffort::from_catalog_token,
+                            )
+                            .map(crate::reasoning_preference::ReasoningEffort::as_setting)
+                        {
+                            if !offered.contains(&label) {
+                                offered.push(label);
+                            }
+                        }
                         anyhow::bail!(
-                            "The selected provider offering does not support the configured reasoning effort; inspect model details and choose a published value"
+                            "The selected provider offering does not support the resolved reasoning effort `{}`; it publishes: {}. Choose a published value or turn reasoning off",
+                            request.reasoning_effort.as_deref().unwrap_or(effort),
+                            if offered.is_empty() {
+                                "no recognized effort values".to_string()
+                            } else {
+                                offered.join(", ")
+                            }
                         );
                     }
                 }
@@ -3089,6 +3157,13 @@ impl CodewhaleClient {
                     stream,
                     request_route_limits,
                 )?;
+                if let Some(effort) = published_wire_effort.as_deref() {
+                    if wire.body.get("reasoning_effort").is_some() {
+                        wire.body["reasoning_effort"] = json!(effort);
+                    } else if let Some(slot) = wire.body.pointer_mut("/reasoning/effort") {
+                        *slot = json!(effort);
+                    }
+                }
                 if let Some(model) = &declared_wire_model {
                     wire.model.clone_from(model);
                     wire.body["model"] = json!(model);
@@ -3226,14 +3301,43 @@ impl CodewhaleClient {
     /// Output cap for a request dispatched by this exact client route.
     #[must_use]
     pub fn effective_max_output_tokens(&self, requested_model: &str) -> u32 {
-        let route_limits = if requested_model.trim() == self.default_model {
+        self.effective_max_output_tokens_with_limits(
+            requested_model,
+            self.route_limits_for_model(requested_model),
+            None,
+        )
+    }
+
+    fn route_limits_for_model(&self, requested_model: &str) -> Option<RouteLimits> {
+        if requested_model.trim() == self.default_model {
             self.route_limits
         } else {
             self.resolve_model_route(requested_model)
                 .ok()
                 .and_then(|candidate| crate::route_budget::known_route_limits(candidate.limits()))
-        };
-        self.effective_max_output_tokens_with_limits(requested_model, route_limits, None)
+        }
+    }
+
+    fn bounded_output_tokens(
+        &self,
+        model: &str,
+        route_limits: Option<RouteLimits>,
+        max_tokens: u32,
+        input_tokens: usize,
+    ) -> Result<u32> {
+        crate::route_budget::request_output_cap_for_input(
+            self.api_provider,
+            model,
+            route_limits,
+            max_tokens,
+            u64::try_from(input_tokens).unwrap_or(u64::MAX),
+        )
+        .ok_or_else(|| {
+            crate::llm_client::LlmError::ContextLengthError(format!(
+                "about {input_tokens} input tokens leave no output room in this route's context window"
+            ))
+            .into()
+        })
     }
 
     #[must_use]
@@ -3447,6 +3551,17 @@ impl CodewhaleClient {
         let _permit = self.acquire_provider_request_permit().await;
         let model = self.wire_model_for_route(model);
         let max_tokens = self.effective_max_output_tokens(&model);
+        let probe = translation_message_request(text, model.clone(), target_language, max_tokens);
+        let max_tokens = self.bounded_output_tokens(
+            &model,
+            self.route_limits_for_model(&model),
+            max_tokens,
+            crate::compaction::estimate_request_input_tokens(
+                &probe.messages,
+                probe.system.as_ref(),
+                None,
+            ),
+        )?;
         if self.wire_format != WireFormat::ChatCompletions {
             // Non-Chat dialects reuse the prepared-request seam so translation
             // cannot drift from production shaping. Translation is still an
@@ -4415,25 +4530,6 @@ impl CodewhaleClient {
         })
         .await
     }
-
-    /// JSON POST through the streaming-open retry path: no total deadline,
-    /// because the response body outlives the open (see
-    /// [`Self::send_stream_open_with_retry`]).
-    pub(super) async fn open_stream_json_with_retry(
-        &self,
-        url: &str,
-        body: &serde_json::Value,
-    ) -> Result<reqwest::Response> {
-        let request_body =
-            serde_json::to_vec(body).context("Failed to serialize JSON request body")?;
-        self.send_stream_open_with_retry(|| {
-            self.http_client
-                .post(url)
-                .header(CONTENT_TYPE, "application/json")
-                .body(request_body.clone())
-        })
-        .await
-    }
 }
 
 /// Record that a request was routed to `provider` and came back with `status`.
@@ -4709,6 +4805,22 @@ struct OpenRouterPricing {
     /// dropping it undercounted every cache-creation turn on those routes.
     #[serde(default)]
     input_cache_write: Option<String>,
+    #[serde(default)]
+    tiers: Option<Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct OrcaRouterPriceTier {
+    #[serde(default)]
+    max_input_tokens: Option<u64>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default)]
+    completion: Option<String>,
+    #[serde(default)]
+    input_cache_read: Option<String>,
+    #[serde(default)]
+    input_cache_write: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4972,6 +5084,17 @@ fn codewhale_catalog_offerings_from_body(
         protocol: Option<String>,
         #[serde(default)]
         default: bool,
+        #[serde(default)]
+        limits: Option<RowLimits>,
+    }
+    #[derive(serde::Deserialize)]
+    struct RowLimits {
+        #[serde(default, rename = "maxInputTokens")]
+        max_input_tokens: Option<u64>,
+        #[serde(default, rename = "maxOutputTokens")]
+        max_output_tokens: Option<u64>,
+        #[serde(default, rename = "maxContextTokens")]
+        max_context_tokens: Option<u64>,
     }
 
     let listing: Listing =
@@ -4998,6 +5121,16 @@ fn codewhale_catalog_offerings_from_body(
             Some("responses") => "responses",
             _ => codewhale_config::route::codewhale_endpoint_key_for_model(&id),
         };
+        let limit = row
+            .codewhale
+            .as_ref()
+            .and_then(|meta| meta.limits.as_ref())
+            .map(|limits| codewhale_config::models_dev::ModelsDevLimit {
+                context: limits.max_context_tokens.filter(|tokens| *tokens > 0),
+                input: limits.max_input_tokens.filter(|tokens| *tokens > 0),
+                output: limits.max_output_tokens.filter(|tokens| *tokens > 0),
+            })
+            .filter(|limit| *limit != codewhale_config::models_dev::ModelsDevLimit::default());
         offerings.push(CatalogOffering {
             cost_source: None,
             modalities_source: None,
@@ -5007,7 +5140,7 @@ fn codewhale_catalog_offerings_from_body(
             endpoint_key: endpoint_key.to_string(),
             default_for_provider: row.codewhale.is_some_and(|meta| meta.default),
             family: None,
-            limit: None,
+            limit,
             cost: None,
             modalities: None,
             attachment: None,
@@ -5056,8 +5189,9 @@ fn catalog_delta_from_models_body(
         // `supported_endpoint_types` on every row. That field is what keeps a
         // gateway model list — which mixes chat with image/video generation —
         // from dumping non-text rows into the text selector. A row that does
-        // not advertise a chat dialect is dropped here, so the roster the
-        // picker and `/model` read is chat-only.
+        // not advertise the Chat Completions dialect this route speaks is
+        // dropped here, so the roster the picker and `/model` read is
+        // servable chat only.
         let listed = parse_orcarouter_models_response(body)?;
         if listed.is_empty() {
             return Err(CatalogRefreshError::EmptyList);
@@ -5300,12 +5434,12 @@ fn parse_openrouter_models_response(
 
 /// Endpoint dialects that mean "a chat/completions text turn can be served".
 ///
-/// OrcaRouter (and OpenRouter) publish `supported_endpoint_types`; a chat row
-/// must carry at least one of these, and the non-chat dialects
-/// (`image-generation`, `openai-video`, `jina-rerank`, `embeddings`) are how a
-/// generation-only model is kept out of the chat selector.
-const ORCAROUTER_CHAT_ENDPOINT_TYPES: &[&str] =
-    &["openai", "anthropic", "gemini", "openai-response"];
+/// OrcaRouter publishes `supported_endpoint_types`, and this route speaks only
+/// Chat Completions, which it advertises as `openai`. A row offered only on
+/// another dialect (`anthropic`, `gemini`, `openai-response`) or on a non-chat
+/// one (`image-generation`, `openai-video`, `jina-rerank`, `embeddings`) is
+/// kept out of the chat selector.
+const ORCAROUTER_CHAT_ENDPOINT_TYPES: &[&str] = &["openai"];
 
 /// Whether an OrcaRouter row is offered on a chat/completions dialect.
 ///
@@ -5372,7 +5506,7 @@ fn parse_orcarouter_models_response(
 /// Project one OrcaRouter `/v1/models` row onto a catalog offering.
 ///
 /// Pricing and limits reuse the OpenRouter projection (OrcaRouter bills the
-/// same extended fields). Two differences matter:
+/// same extended fields). Three differences matter:
 ///
 /// - OrcaRouter does not publish `supported_parameters` on its rows, so the
 ///   OpenRouter projection's `reasoning`/`tool_call` would become a factual
@@ -5382,6 +5516,9 @@ fn parse_orcarouter_models_response(
 /// - A row whose `architecture` names an explicit input set keeps it verbatim,
 ///   so the multimodal gate downstream is reading a stated fact. Rows with no
 ///   `architecture` stay unclaimed rather than inheriting a "text" default.
+/// - `pricing.tiers` become context tiers. A tier list that cannot be read
+///   withholds the row's price rather than quoting long prompts at the base
+///   rate.
 fn orcarouter_to_catalog_offering(
     item: &OpenRouterModelItem,
     provider: &str,
@@ -5397,7 +5534,81 @@ fn orcarouter_to_catalog_offering(
     if item.architecture.is_none() {
         offering.modalities = None;
     }
+    let tiers = item
+        .pricing
+        .as_ref()
+        .and_then(|pricing| pricing.tiers.as_ref());
+    if let Some(tiers) = tiers
+        && let Some(base) = offering.cost.clone()
+    {
+        let tiered = orcarouter_context_tiers(tiers, &base).map(|tiers| {
+            codewhale_config::models_dev::ModelsDevCost {
+                tiers: (!tiers.is_empty()).then_some(tiers),
+                ..base
+            }
+        });
+        match tiered {
+            Some(cost) if codewhale_config::pricing::catalog_cost_is_valid(&cost) => {
+                offering.cost = Some(cost);
+            }
+            _ => {
+                offering.cost = None;
+                offering.cost_source = Some(offering.source.clone());
+            }
+        }
+    }
     Ok(offering)
+}
+
+fn orcarouter_context_tiers(
+    tiers: &Value,
+    base: &codewhale_config::models_dev::ModelsDevCost,
+) -> Option<Vec<codewhale_config::models_dev::ModelsDevCostTier>> {
+    use codewhale_config::models_dev::{ModelsDevContextTier, ModelsDevCost, ModelsDevCostTier};
+
+    let tiers: Vec<OrcaRouterPriceTier> = serde_json::from_value(tiers.clone()).ok()?;
+    let rate = |value: &Option<String>| -> Option<Option<f64>> {
+        match value {
+            None => Some(None),
+            Some(value) => value
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|value| value.is_finite())
+                .and_then(|value| checked_per_token_to_per_million(value).ok())
+                .map(Some),
+        }
+    };
+    let mut mapped = Vec::with_capacity(tiers.len().saturating_sub(1));
+    let mut floor: Option<u64> = None;
+    for (index, tier) in tiers.iter().enumerate() {
+        let cost = ModelsDevCost {
+            input: rate(&tier.prompt)?,
+            output: rate(&tier.completion)?,
+            cache_read: rate(&tier.input_cache_read)?,
+            cache_write: rate(&tier.input_cache_write)?,
+            ..Default::default()
+        };
+        if index == 0 {
+            if (cost.input, cost.output) != (base.input, base.output) {
+                return None;
+            }
+        } else {
+            mapped.push(ModelsDevCostTier {
+                tier: ModelsDevContextTier {
+                    kind: "context".to_string(),
+                    size: floor?,
+                },
+                cost,
+            });
+        }
+        floor = match tier.max_input_tokens {
+            Some(max) if max > floor.unwrap_or(0) => Some(max),
+            Some(0) | None if index + 1 == tiers.len() => None,
+            _ => return None,
+        };
+    }
+    Some(mapped)
 }
 
 /// Parse Baseten's authenticated Model APIs catalog without inferring facts
@@ -6287,7 +6498,13 @@ impl CodewhaleClient {
         }
         let url = api_url_with_suffix(&self.base_url, "beta/completions", None);
         let model = self.wire_model_for_route(model);
-        let max_tokens = max_tokens.min(self.effective_max_output_tokens(&model));
+        let max_tokens = self.bounded_output_tokens(
+            &model,
+            self.route_limits_for_model(&model),
+            max_tokens.min(self.effective_max_output_tokens(&model)),
+            crate::compaction::estimate_text_tokens_conservative(prompt)
+                .saturating_add(crate::compaction::estimate_text_tokens_conservative(suffix)),
+        )?;
         let body = json!({
             "model": model,
             "prompt": prompt,

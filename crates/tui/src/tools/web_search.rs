@@ -1862,6 +1862,14 @@ fn register_search_citations(response: &mut SearchResponse, context: &ToolContex
         } else {
             format!("Found {} result(s)", response.count)
         };
+        note_provider_native(
+            &mut response.message,
+            response.receipt.backend,
+            response.count,
+            unchecked_citations(&response.receipt.degraded),
+            response.receipt.requested.max_results,
+            response.unverified_synthesis.is_some(),
+        );
     }
 }
 
@@ -2006,6 +2014,17 @@ async fn finalize_search_response_for_context(
         .collect::<Vec<_>>();
     raw.results.truncate(usize::from(query.max_results));
     rerank(&mut raw.results);
+    let synthesis = take_provider_native_synthesis(&mut raw);
+    let (unverified, initial): (Vec<_>, Vec<_>) = initial.into_iter().partition(|reason| {
+        matches!(
+            reason,
+            DegradedReason::CitationUnverified { .. } | DegradedReason::CitationUnchecked { .. }
+        )
+    });
+    let unchecked = unverified
+        .iter()
+        .filter(|reason| matches!(reason, DegradedReason::CitationUnchecked { .. }))
+        .count();
     let proposal:Proposal=adapter::transform(crate::extension_host::StockOperation::WebFinalize,
         json!({"requested":{"recency":query.recency.is_some(),"domains":!query.domains.is_empty(),"locale":query.locale.is_some()},
             "capabilities":capabilities,"count":raw.results.len(),"degraded":initial,"domain_extra":domain_extra,"has_note":raw.note.is_some()}),context,budget).await?;
@@ -2051,11 +2070,19 @@ async fn finalize_search_response_for_context(
         )));
     }
     let count = raw.results.len();
-    let message = format!(
+    let mut message = format!(
         "{}{}{}",
         proposal.prefix,
         raw.note.as_deref().unwrap_or_default(),
         proposal.suffix
+    );
+    note_provider_native(
+        &mut message,
+        raw.backend,
+        count,
+        unchecked,
+        query.max_results,
+        synthesis.is_some(),
     );
     Ok(SearchResponse {
         query: query.query.clone(),
@@ -2063,13 +2090,14 @@ async fn finalize_search_response_for_context(
         count,
         message,
         results: raw.results,
+        unverified_synthesis: synthesis,
         receipt: SearchReceipt {
             backend: raw.backend,
             backend_detail: raw.backend_detail,
             requested: query,
             capabilities,
             honored: proposal.honored,
-            degraded: proposal.degraded,
+            degraded: proposal.degraded.into_iter().chain(unverified).collect(),
             latency_ms: u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX),
             cache_hit: false,
         },
@@ -2127,6 +2155,7 @@ fn finalize_search_response(
 
     raw.results.truncate(usize::from(query.max_results));
     rerank(&mut raw.results);
+    let synthesis = take_provider_native_synthesis(&mut raw);
     let latency_ms = u32::try_from(started.elapsed().as_millis()).unwrap_or(u32::MAX);
     let receipt = SearchReceipt {
         backend: raw.backend,
@@ -2145,8 +2174,8 @@ fn finalize_search_response(
         (_, Some(note)) => format!("Found {count} result(s). {note}"),
         (_, None) => format!("Found {count} result(s)"),
     };
-    // The answer sits in the message; say right next to it when the provider
-    // cut it short (#6508).
+    // The answer sits in `unverified_synthesis`; the message still says when
+    // the provider cut it short (#6508).
     if let Some(cut) = receipt
         .degraded
         .iter()
@@ -2154,6 +2183,14 @@ fn finalize_search_response(
     {
         message.push_str(&format!("\n[{}]", cut.message()));
     }
+    note_provider_native(
+        &mut message,
+        receipt.backend,
+        count,
+        unchecked_citations(&receipt.degraded),
+        receipt.requested.max_results,
+        synthesis.is_some(),
+    );
 
     SearchResponse {
         query: query.query,
@@ -2161,8 +2198,53 @@ fn finalize_search_response(
         count,
         message,
         results: raw.results,
+        unverified_synthesis: synthesis,
         receipt,
     }
+}
+
+fn take_provider_native_synthesis(raw: &mut BackendSearch) -> Option<String> {
+    if raw.backend == BackendId::ProviderNative {
+        raw.note.take()
+    } else {
+        None
+    }
+}
+
+fn unchecked_citations(degraded: &[DegradedReason]) -> usize {
+    degraded
+        .iter()
+        .filter(|reason| matches!(reason, DegradedReason::CitationUnchecked { .. }))
+        .count()
+}
+
+fn note_provider_native(
+    message: &mut String,
+    backend: BackendId,
+    count: usize,
+    unchecked: usize,
+    requested: u8,
+    synthesis: bool,
+) {
+    if backend != BackendId::ProviderNative {
+        return;
+    }
+    if unchecked == 0 {
+        message.push_str(&format!(
+            "\n[provider-native search: {count} of {requested} requested source(s) passed link verification and appear in `results`; cite only those, by ref_id"
+        ));
+    } else {
+        let verified = count.saturating_sub(unchecked);
+        message.push_str(&format!(
+            "\n[provider-native search: {count} of {requested} requested source(s) appear in `results`; {verified} passed link verification and {unchecked} were not checked because the [network] policy needs approval for their hosts; cite only those, by ref_id"
+        ));
+    }
+    if synthesis {
+        message.push_str(
+            ". `unverified_synthesis` is the provider model's own summary: its claims and links were not checked and may name pages missing from `results`",
+        );
+    }
+    message.push(']');
 }
 
 pub(crate) fn apply_domain_constraints(
@@ -5636,7 +5718,11 @@ mod tests {
                 knob: QueryKnob::Domains
             }
         )));
-        assert!(response.message.contains("Grounded answer."));
+        assert_eq!(
+            response.unverified_synthesis.as_deref(),
+            Some("Grounded answer.")
+        );
+        assert!(!response.message.contains("Grounded answer."));
     }
 
     fn native_backend_search(note: String, degraded: Vec<DegradedReason>) -> BackendSearch {
@@ -5688,7 +5774,12 @@ mod tests {
             native_backend_search(answer.clone(), Vec::new()),
             Instant::now(),
         );
-        assert!(response.message.ends_with("END OF ANSWER"));
+        assert!(
+            response
+                .unverified_synthesis
+                .as_deref()
+                .is_some_and(|synthesis| synthesis.ends_with("END OF ANSWER"))
+        );
         assert!(!response.message.contains("output limit"));
 
         let output = crate::tools::spec::ToolResult::json(&response).expect("json");
@@ -5776,7 +5867,8 @@ mod tests {
 
         assert_eq!(response.count, 1);
         assert_eq!(response.results[0].domain, "docs.example.com");
-        assert_eq!(response.message, "Found 1 result(s)");
+        assert!(response.message.starts_with("Found 1 result(s)\n"));
+        assert!(response.unverified_synthesis.is_none());
         assert!(response.receipt.degraded.iter().any(|reason| matches!(
             reason,
             DegradedReason::PostFiltered {

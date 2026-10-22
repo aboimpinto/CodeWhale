@@ -212,7 +212,13 @@ Legacy note: `/set approval_mode ...` was retired in favor of `/config`.
   High or critical risk cannot auto-run even if the model says allow. It has no
   tools, remembers no rules, and denies rather than truncates an oversized
   exact call. Exactly one reviewer request is made; incomplete or malformed
-  output, timeout, cancellation, or provider failure fails closed. Headless
+  output, timeout, cancellation, or provider failure fails closed. Repeated
+  denials stop the turn: after three guardian denials in a row, or ten among
+  the turn's last fifty reviews, the turn ends as interrupted with a status
+  line, and calls still in that batch are refused without another review.
+  Only explicit denials count (not timeouts or failures), an allowed review
+  resets the run of three, the count starts fresh with each turn, and a child
+  agent counts its own turns. Headless
   adapters use the deterministic-only tier. Repo-law
   holds that explicitly require a person block in Auto-Review rather than
   opening a hidden approval modal.
@@ -222,9 +228,9 @@ commit [`6fc6b9d6d2580d62622fc9884b5f5707f6505a5e`](https://github.com/openai/co
 Codex's [guardian entry point](https://github.com/openai/codex/blob/6fc6b9d6d2580d62622fc9884b5f5707f6505a5e/codex-rs/core/src/guardian/mod.rs)
 reconstructs conversation context and runs a dedicated review session.
 Codewhale deliberately adopts only the exact-action structured decision,
-90-second deadline, and fail-closed result. It does not copy Codex's transcript
-reconstruction, user-authorization score, reviewer tools, retries, persistent
-review session, or denial ledger.
+90-second deadline, fail-closed result, and per-turn denial circuit breaker. It
+does not copy Codex's transcript reconstruction, user-authorization score,
+reviewer tools, retries, persistent review session, or denial ledger.
 
 Kimi Code at commit
 [`1414d4602898f406e540b23342cb18db23ff9efc`](https://github.com/MoonshotAI/kimi-code/tree/1414d4602898f406e540b23342cb18db23ff9efc)
@@ -362,7 +368,8 @@ Codewhale has three related but intentionally separate recovery paths:
   explore a different answer path without overwriting the original session.
 - Esc-Esc backtrack rewinds the live transcript to a previous user prompt and
   restores that prompt into the composer for editing. It does not change
-  files; `/undo` afterwards puts back the files that request changed.
+  files; `/restore` rolls the folder back to a chosen restore point and needs
+  `/trust on` or Full Access.
 - `/restore` and the `revert_turn` tool restore workspace files from side-git
   snapshots. `/restore list [N]` lists more snapshot options before choosing a
   rollback point. They do not rewrite conversation history.

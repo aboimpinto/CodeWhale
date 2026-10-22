@@ -1970,19 +1970,35 @@ pub fn unix_process_start(pid: u32) -> Result<String> {
         let mut status = String::new();
         open(c"status")?.take(8192).read_to_string(&mut status)?;
         validate_linux_process_status(&status, pid, PrivateDirectory::current_user_id())?;
-        let mut boot = String::new();
-        File::open("/proc/sys/kernel/random/boot_id")?
-            .take(65)
-            .read_to_string(&mut boot)?;
-        let boot = boot.trim();
-        anyhow::ensure!(
-            boot.len() == 36 && boot.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),
-            "kernel boot identity unavailable"
-        );
-        Ok(format!("linux:{boot}:{start}"))
+        Ok(format!("linux:{}:{start}", linux_boot_id()?))
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     bail!("local process generation authentication unsupported on this platform")
+}
+
+#[cfg(target_os = "linux")]
+fn linux_boot_id() -> Result<String> {
+    use std::io::Read as _;
+    let mut boot = String::new();
+    File::open("/proc/sys/kernel/random/boot_id")?
+        .take(65)
+        .read_to_string(&mut boot)?;
+    let boot = boot.trim();
+    anyhow::ensure!(
+        boot.len() == 36 && boot.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-'),
+        "kernel boot identity unavailable"
+    );
+    Ok(boot.to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub fn linux_process_start_predates_boot(recorded: &str) -> Result<bool> {
+    let recorded_boot = recorded
+        .strip_prefix("linux:")
+        .and_then(|rest| rest.split_once(':'))
+        .map(|(boot, _)| boot)
+        .context("invalid recorded Linux process identity")?;
+    Ok(recorded_boot != linux_boot_id()?)
 }
 
 #[cfg(target_os = "linux")]

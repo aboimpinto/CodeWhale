@@ -378,6 +378,7 @@ pub(crate) async fn run_exec_agent(
 
     let route = resolve_cli_exec_route(config, model, prompt, force_configured_route).await?;
     let execution_config = config_for_cli_route(config, &route)?;
+    crate::provider_lake::refresh_account_catalog_before_first_request(&execution_config).await;
     let auto_model = route.auto_model;
     let effective_identity = execution_config
         .active_provider_identity()

@@ -2625,8 +2625,13 @@ pub(crate) async fn handle_view_events(
                 // profile cannot block saving a current one. Malformed TOML,
                 // unreadable files, and invalid ids still fail closed because
                 // then we cannot prove there is no collision.
-                let existing_profiles =
-                    crate::fleet::profile::load_agent_profile_identities_from_dir(&profile_dir);
+                let existing_profiles = if scope
+                    == crate::fleet::profile::FleetProfileScope::Project
+                {
+                    crate::fleet::profile::load_workspace_agent_profile_identities(&app.workspace)
+                } else {
+                    crate::fleet::profile::load_agent_profile_identities_from_dir(&profile_dir)
+                };
                 if let Err(err) = &existing_profiles {
                     let message = tr(app.ui_locale, MessageId::FleetProfileIdentityVerifyFailed)
                         .replace("{error}", &format!("{err:#}"));

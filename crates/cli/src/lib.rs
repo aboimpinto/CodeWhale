@@ -2188,6 +2188,38 @@ fn apply_runtime_set_overrides(cli: &mut Cli) -> Result<()> {
     Ok(())
 }
 
+fn shows_whats_new(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Doctor(_)
+            | Commands::Models(_)
+            | Commands::Sessions(_)
+            | Commands::Receipts(_)
+            | Commands::Setup(_)
+            | Commands::Init(_)
+            | Commands::Install(_)
+            | Commands::Features(_)
+            | Commands::Integrations(_)
+            | Commands::Mcp(_)
+            | Commands::Config(_)
+            | Commands::Model(_)
+            | Commands::Metrics(_)
+            | Commands::Providers(_)
+            | Commands::Account(_)
+            | Commands::Login(_)
+            | Commands::Logout(_)
+            | Commands::Update(_)
+    )
+}
+
+fn argv_requests_machine_output(argv: &[std::ffi::OsString]) -> bool {
+    argv.iter()
+        .skip(1)
+        .filter_map(|arg| arg.to_str())
+        .take_while(|arg| *arg != "--")
+        .any(|arg| (arg.starts_with("--") && arg.contains("json")) || arg.starts_with("json"))
+}
+
 /// `--output-mode` is retired (#6516): accepted so old scripts keep running,
 /// but a caller who passes it is told it does nothing.
 fn retired_output_mode_warning(cli: &Cli) -> Option<&'static str> {
@@ -2346,6 +2378,15 @@ fn run() -> Result<()> {
     // command (or legacy credential migration) can save.
     if matches!(command, Some(Commands::Config(_))) {
         apply_per_run_overrides(&mut store, &cli.overrides)?;
+    }
+    if command.as_ref().is_some_and(shows_whats_new)
+        && !argv_requests_machine_output(&argv)
+        && io::stdout().is_terminal()
+        && io::stderr().is_terminal()
+        && let Some(notice) =
+            codewhale_tui::whats_new::plain_cli_notice(store.config.extras.get("update"))
+    {
+        eprintln!("{notice}\n");
     }
 
     match command {

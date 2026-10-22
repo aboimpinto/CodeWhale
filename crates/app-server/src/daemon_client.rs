@@ -134,6 +134,13 @@ mod platform {
             #[cfg(unix)]
             let (running, start) = {
                 use codewhale_config::private_directory::{UnixProcessStatus, unix_process_status};
+                #[cfg(target_os = "linux")]
+                {
+                    use codewhale_config::private_directory::linux_process_start_predates_boot;
+                    if linux_process_start_predates_boot(&receipt.process_start)? {
+                        return Ok(());
+                    }
+                }
                 match unix_process_status(receipt.pid)? {
                     UnixProcessStatus::Absent => return Ok(()),
                     UnixProcessStatus::Present { start } => (true, start),

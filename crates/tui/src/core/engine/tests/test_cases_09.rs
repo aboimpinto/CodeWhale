@@ -236,7 +236,7 @@ fn sandbox_escalation_requires_a_pair_and_a_strictly_wider_mode() {
     use crate::sandbox::SandboxPolicy;
 
     for tool in ["bash", CODE_EXECUTION_TOOL_NAME, JS_EXECUTION_TOOL_NAME] {
-        let read_only = SandboxPolicy::ReadOnly;
+        let read_only = SandboxPolicy::read_only();
         let (workspace_write, reason) = requested_sandbox_escalation(
             tool,
             &json!({

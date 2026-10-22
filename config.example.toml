@@ -403,9 +403,12 @@ ttl_hours = 6
 # Checks are skipped entirely in CI, and when CODEWHALE_NO_UPDATE_CHECK or
 # NO_UPDATE_NOTIFIER is set.
 # update_uri may point at a GitHub-compatible latest-release JSON endpoint.
+# show_whats_new = false turns off the one-time "Updated to <version>" notice
+# and release-notes link shown on the first start after an update.
 [update]
 check_for_updates = true
 check_interval_hours = 24
+show_whats_new = true
 # update_uri = "https://internal.mirror.example/codewhale/releases/latest"
 
 # ─────────────────────────────────────────────────────────────────────────────────

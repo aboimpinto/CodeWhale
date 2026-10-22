@@ -735,6 +735,7 @@ pub struct ToolExecutionState {
     /// Where the session's live permission posture lives. Set by the engine;
     /// every agent call re-reads it (`None` keeps the posture above as is).
     pub(crate) live_posture: Option<crate::core::engine::LivePosture>,
+    pub(crate) browser_tool: Option<String>,
 }
 
 impl std::ops::Deref for ToolContext {
@@ -841,6 +842,7 @@ impl ToolContext {
                 route_capabilities: codewhale_config::route::RouteCapabilities::default(),
                 nested_call_gate: None,
                 live_posture: None,
+                browser_tool: None,
             }),
         }
     }

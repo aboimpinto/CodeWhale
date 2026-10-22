@@ -520,7 +520,7 @@ Codewhale keeps these records on your machine, under `~/.codewhale/`:
   including edits made to those files since it started. `/restore` rolls the
   whole folder back to a point you pick, overwriting later edits, so it
   needs `/trust on` or Full Access. Esc Esc rewinds the conversation only;
-  `/undo` afterwards puts the files back.
+  `/restore` afterwards rolls the files back.
 - **Security events.** `audit.log` records credential changes, hook
   environment key names, compaction passes, the terminal's approval
   routing, and Auto-Review verdicts. It is not a list of what a session did.

@@ -5,7 +5,6 @@ use crate::config::{ProviderKind, normalize_custom_model_id, normalize_model_nam
 use crate::reasoning_preference::ReasoningEffort;
 use crate::tui::app::{App, AppAction};
 use crate::tui::views::{ModalKind, SubAgentsView, subagent_view_agents};
-#[cfg(test)]
 use codewhale_localization::Locale;
 use codewhale_localization::{MessageId, tr};
 
@@ -140,6 +139,15 @@ pub(crate) fn reset_conversation_state(app: &mut App) -> bool {
     // copies: the reset finalizes those children engine-side.
     crate::tui::pending_requests::clear_all(app);
     true
+}
+
+/// The site locale segment for a public Codewhale URL.
+///
+/// The mapping itself lives in the portable `navigation::links` module, which
+/// the navigation proof requires to stay free of host imports; this is the
+/// host-side adapter for callers that hold a `Locale`.
+pub(crate) fn public_site_locale_segment(locale: Locale) -> &'static str {
+    super::navigation::links::public_site_locale_segment(locale.tag())
 }
 
 /// Exit the application

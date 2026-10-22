@@ -158,6 +158,8 @@ function Release({
   // Every entry here is clipped or capped for the web; this is the in-page
   // path to the unabridged notes for exactly this version.
   const notesUrl = `${REPO_URL}/blob/main/CHANGELOG.md#${changelogAnchor(release)}`;
+  const versionUrl = release.unreleased ? null : `/${locale}/changelog/${release.version}`;
+  const notesLabel = fill(t.releaseNotesLink, { version: heading });
 
   return (
     <article id={anchor} className="changelog-release scroll-mt-32">
@@ -179,9 +181,13 @@ function Release({
               {ext(t.compareLink)}
             </a>
           )}
-          <a href={notesUrl} target="_blank" rel="noreferrer">
-            {ext(fill(t.releaseNotesLink, { version: heading }))}
-          </a>
+          {versionUrl ? (
+            <Link href={versionUrl}>{notesLabel.replace(/\s*↗\s*$/u, "")}</Link>
+          ) : (
+            <a href={notesUrl} target="_blank" rel="noreferrer">
+              {ext(notesLabel)}
+            </a>
+          )}
         </div>
       </div>
       {(release.unreleased || candidate) && <p className="changelog-unreleased-note">{t.unreleasedNote}</p>}
@@ -190,11 +196,16 @@ function Release({
           <section key={`${section.heading}-${i}`}>
             <h3>
               {section.heading}
-              {section.itemCount > section.items.length && (
-                <a href={notesUrl} target="_blank" rel="noreferrer">
-                  {fill(t.moreEntries, { shown: section.items.length, total: section.itemCount })}
-                </a>
-              )}
+              {section.itemCount > section.items.length &&
+                (versionUrl ? (
+                  <Link href={versionUrl}>
+                    {fill(t.moreEntries, { shown: section.items.length, total: section.itemCount })}
+                  </Link>
+                ) : (
+                  <a href={notesUrl} target="_blank" rel="noreferrer">
+                    {fill(t.moreEntries, { shown: section.items.length, total: section.itemCount })}
+                  </a>
+                ))}
             </h3>
             <ul>
               {section.items.map((item, j) => (

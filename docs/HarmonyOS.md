@@ -8,8 +8,15 @@ This page covers Codewhale on HarmonyOS PC and OpenHarmony cross-build setups.
 
 | Target | Codewhale tier | Validation | Distribution |
 | --- | --- | --- | --- |
-| HarmonyOS PC with a glibc-compatible userspace | Tier 1 Linux ARM64 runtime | Covered by the Linux ARM64 release build | GitHub release binaries; npm secondary |
-| `aarch64-unknown-linux-ohos` (OpenHarmony) | Tier 2 cross-build target | Manually dispatched SDK check for `codewhale-tui` and `codewhale-cli` | Build from source; no prebuilt release asset |
+| HarmonyOS PC, inside the Linux subsystem (融合开发引擎, openEuler) | Tier 1 Linux ARM64 runtime | Covered by the Linux ARM64 release build; no check runs inside the Linux subsystem | GitHub release binaries; npm secondary |
+| Native HarmonyOS and OpenHarmony (`aarch64-unknown-linux-ohos`) | Tier 2 cross-build target | Manually dispatched SDK check for `codewhale-tui` and `codewhale-cli` | Build from source; no prebuilt release asset |
+
+The Linux subsystem is a virtual machine running openEuler Linux, so it uses the
+Linux ARM64 release. Native HarmonyOS and OpenHarmony are not Linux
+distributions: their userspace uses OpenHarmony's musl-based C library and
+system APIs, and Codewhale's native build for it uses the
+`aarch64-unknown-linux-ohos` target. The Linux release binaries are not built or
+tested for native HarmonyOS.
 
 Tier 2 provides a source-build path and a manually dispatched SDK check; it does
 not promise a check on every commit, a release binary, or full device-level
@@ -20,8 +27,10 @@ that could report false success.
 
 ## Running On HarmonyOS PC
 
-HarmonyOS PC can use the Linux ARM64 release when its userspace is compatible.
-For a new installation in a Linux environment, use the official GitHub installer:
+On HarmonyOS PC, run Codewhale inside the Linux subsystem (融合开发引擎). Huawei
+describes it as a lightweight virtualized Linux development environment; the
+current version supports openEuler only. For a new installation, open a terminal
+in the Linux subsystem and use the official GitHub installer:
 
 ```bash
 curl -fsSL https://codewhale.net/install.sh | sh
@@ -29,15 +38,40 @@ curl -fsSL https://codewhale.net/install.sh | sh
 ```
 
 The [published v0.9.11 release](https://github.com/codewhale-hq/CodeWhale/releases/tag/v0.9.11)
-includes `codewhale-linux-arm64` and `codew-linux-arm64`; asset availability does
-not establish compatibility with every HarmonyOS device. See
+includes `codewhale-linux-arm64` and `codew-linux-arm64`. See
 [Linux ARM64 portability](INSTALL.md#linux-arm64-portability) for release-specific
 requirements and the Cargo fallback. For an existing direct install, use
 `codewhale update`. For an occupied directory or a package-managed install, use
 [the fresh-directory migration](INSTALL.md#migrating-from-npm-cargo-or-another-installation).
-npm remains a secondary packaging route. The
-`codewhale-tui-linux-arm64` filename is retained only for legacy updater
-compatibility and is not a third command.
+npm remains a secondary packaging route; inside the Linux subsystem it installs
+the same Linux ARM64 binaries. In a native HarmonyOS terminal, Node reports the
+platform as `openharmony`. There npm still installs the static Linux build as a
+best effort, untested on native HarmonyOS. If the binary cannot start,
+`codewhale` points you to the Linux subsystem or a source build. The install
+script also prints a warning, which npm 7 and later show only with
+`--foreground-scripts`. The `codewhale-tui-linux-arm64` filename is retained
+only for legacy updater compatibility and is not a third command.
+
+Huawei's [Linux subsystem support page](https://consumer.huawei.com/cn/support/content/zh-cn16091898/)
+(Chinese; HarmonyOS 6.0, 6.1 and 7.0 desktops and laptops; checked 2026-10-21)
+documents these limits:
+
+- openEuler is the only supported distribution.
+- `systemctl` and other service managers are not supported; start services
+  such as `sshd` by hand (`sudo /usr/sbin/sshd`).
+- The kernel cannot be modified, so `modinfo`, `modprobe`, `rmmod` and `insmod`
+  fail.
+- Disk images cannot be mounted with `mount`. Exchange files through a shared
+  folder, which appears at `/mnt/linux_share`. Files created there are owned by
+  root, so `git clone` into it can fail for the default user; Huawei's
+  workaround is `sudo git clone`.
+- External USB devices, IPv6, and changing the login shell with `chsh` are not
+  supported.
+- At most five snapshots can be saved.
+- Only the primary user (the account created at first boot) can install it.
+  Huawei commercial HarmonyOS PCs also allow the personal space from HarmonyOS
+  6.0.0.130.
+- Docker requires HarmonyOS 7.0 or later.
 
 ## Cross-Compiling To OpenHarmony
 
@@ -94,10 +128,11 @@ the first 12 characters of the source commit in `--version`. Record the full
 `git rev-parse HEAD` alongside the binary. A local rebuild does not update an
 older installed binary automatically; check the exact executable you copied.
 
-Native OpenHarmony has no prebuilt release asset. Linux ARM64 release binaries
-require a compatible Linux userspace and are not native OHOS binaries. GitHub
-build-only release-candidate artifacts, when available, identify their source
-commit but do not establish native OHOS support or a published release.
+Native OpenHarmony has no prebuilt release asset. On HarmonyOS PC, Linux ARM64
+release binaries belong in the Linux subsystem; they are not native OHOS
+binaries. GitHub build-only release-candidate artifacts, when available,
+identify their source commit but do not establish native OHOS support or a
+published release.
 
 ## Sign-In Filesystem Errors
 

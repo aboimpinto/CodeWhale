@@ -63,7 +63,7 @@ fn agent_mode_elevates_writes_without_granting_network() {
         .as_ref()
         .expect("Plan mode should make the shell sandbox policy explicit");
     assert!(
-        matches!(plan_policy, crate::sandbox::SandboxPolicy::ReadOnly),
+        matches!(plan_policy, crate::sandbox::SandboxPolicy::ReadOnly { .. }),
         "Plan mode must use ReadOnly sandbox to deny workspace writes (#1077); got {plan_policy:?}",
     );
     assert!(!plan_policy.has_network_access());
@@ -99,7 +99,7 @@ fn sandbox_policy_for_turn_returns_correct_default_policy_per_mode() {
             &workspace,
             SandboxNetworkAccess::Restricted,
         ),
-        SandboxPolicy::ReadOnly
+        SandboxPolicy::ReadOnly { .. }
     ));
 
     // Agent: WorkspaceWrite with workspace as writable root, network OFF.
@@ -362,7 +362,7 @@ async fn live_runtime_authority_applies_latest_posture_and_sandbox_before_tools(
             ApprovalMode::Auto,
             false,
             Some("read-only".to_string()),
-            SandboxPolicy::ReadOnly,
+            SandboxPolicy::read_only(),
         ),
         (
             AppMode::Agent,
@@ -1087,11 +1087,12 @@ async fn unchanged_compaction_config_is_acknowledged_silently() {
 #[tokio::test]
 async fn change_mode_op_updates_current_mode_and_emits_status() {
     let tmp = tempdir().expect("tempdir");
-    let config = EngineConfig {
+    let mut config = EngineConfig {
         workspace: tmp.path().to_path_buf(),
         model: "deepseek-v4-pro".to_string(),
         ..Default::default()
     };
+    config.features.disable(Feature::Mcp);
     let (engine, handle) = Engine::new(config, &Config::default());
 
     let run = tokio::spawn(engine.run());

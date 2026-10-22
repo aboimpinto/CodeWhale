@@ -589,10 +589,19 @@ fn flush_inner(
     let mut record = |what: String, result: std::io::Result<()>| match result {
         Ok(()) => report.completed += 1,
         Err(err) => {
+            let raw_os_error = err.raw_os_error().or_else(|| {
+                std::iter::successors(
+                    err.get_ref()
+                        .map(|inner| inner as &(dyn std::error::Error + 'static)),
+                    |error| error.source(),
+                )
+                .find_map(|error| error.downcast_ref::<std::io::Error>()?.raw_os_error())
+            });
             tracing::warn!(
                 target: "persistence",
                 what = %what,
                 error_kind = ?err.kind(),
+                raw_os_error = ?raw_os_error,
                 error = %err,
                 "persistence write failed",
             );

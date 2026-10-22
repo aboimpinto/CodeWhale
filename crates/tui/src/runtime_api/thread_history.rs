@@ -736,9 +736,11 @@ fn stable_projection_entries(
     Ok(())
 }
 
+const CANONICAL_REQUEST_ENVELOPE_BYTES: usize = 64 * 1024;
+
 pub(crate) fn saved_document_digest(session: &SavedSession) -> Result<String> {
     let mut size = HistorySizeBound(MAX_CANONICAL_HISTORY_BYTES);
-    serde_json::to_writer(&mut size, session)?;
+    serde_json::to_writer(&mut size, &session.transport_form())?;
     Ok(crate::hashing::sha256_hex(
         crate::client::canonical_json(&serde_json::to_value(session)?).as_bytes(),
     ))
@@ -782,7 +784,7 @@ pub(crate) async fn mutate_thread_history_in_runtime(
             && !request.operation_key.chars().any(char::is_control),
         "invalid canonical operation key"
     );
-    let mut size = HistorySizeBound(MAX_CANONICAL_HISTORY_BYTES);
+    let mut size = HistorySizeBound(MAX_CANONICAL_HISTORY_BYTES + CANONICAL_REQUEST_ENVELOPE_BYTES);
     serde_json::to_writer(&mut size, &request)?;
     let admission = runtime.try_history_import_guard()?;
     let runtime = Arc::clone(runtime);
@@ -1177,11 +1179,12 @@ async fn mutate_in_owner(
                 session,
                 expected_document_digest,
             } => {
-                let proposed: SavedSession = serde_json::from_value(session.clone())?;
+                let mut proposed: SavedSession = serde_json::from_value(session.clone())?;
                 ensure!(
                     serde_json::to_value(&proposed)? == *session,
                     "saved history contains unsupported fields; source retained"
                 );
+                proposed.ensure_journal();
                 let id = proposed.metadata.id.clone();
                 let dir = sessions_dir.clone();
                 let expected = expected_document_digest.clone();

@@ -158,6 +158,7 @@ mod turn_route_plan;
 mod utils;
 mod vision;
 mod voice;
+pub mod whats_new;
 mod work_graph;
 mod worker_profile;
 mod working_set;
@@ -181,7 +182,7 @@ use crate::session_manager::{SessionManager, truncate_id};
 use crate::tui::app::ScreenMode;
 use crate::tui::history::{summarize_tool_args, summarize_tool_output};
 use codewhale_models::Role;
-use codewhale_models::{ContentBlock, Message, MessageRequest, SystemPrompt};
+use codewhale_models::{ContentBlock, Message, SystemPrompt};
 
 #[cfg(windows)]
 fn configure_windows_console_utf8() {
@@ -1176,8 +1177,9 @@ fn resolve_exec_resume_route(
             .map_err(anyhow::Error::msg)
             .with_context(|| {
                 format!(
-                    "saved session provider '{}' is unavailable; Codewhale will not fall back",
-                    saved_provider_identity
+                    "saved session provider '{}' is unavailable; Codewhale will not fall back. {}",
+                    saved_provider_identity,
+                    session_export::export_recovery_hint(&saved.metadata.id)
                 )
             })?;
         config
@@ -1470,6 +1472,17 @@ struct ReviewArgs {
     /// additional model requests; the default preserves single-pass behavior.
     #[arg(long, default_value_t = 1)]
     max_passes: usize,
+    /// Per-review money cap in USD. It is only enforceable together with
+    /// `--input-usd-per-mtok` and `--output-usd-per-mtok`; without both, the
+    /// receipt reports the cap as unsupported instead of implying it applied.
+    #[arg(long)]
+    money_cap_usd: Option<f64>,
+    /// Input price per million tokens for this exact route, in USD
+    #[arg(long, requires_all = ["money_cap_usd"])]
+    input_usd_per_mtok: Option<f64>,
+    /// Output price per million tokens for this exact route, in USD
+    #[arg(long, requires_all = ["money_cap_usd"])]
+    output_usd_per_mtok: Option<f64>,
     /// Write a durable pre-push review receipt after a successful review
     #[arg(long, default_value_t = false)]
     write_receipt: bool,
@@ -10054,9 +10067,10 @@ async fn prepare_mounted_session(
     let manager_config = RuntimeThreadManagerConfig::for_session(task_config.data_dir, &source_id);
     let owner_config = prepared.config.clone();
     let owner_workspace = saved.metadata.workspace.clone();
+    let worker_workspace = owner_workspace.clone();
     let prior_binding = saved.metadata.runtime_store.clone();
     let recovery = cli.operation_key.is_some();
-    let runtime = history_owner_work(move || {
+    let (runtime, workers) = history_owner_work(move || {
         // Recheck the captured binding immediately before the actual factory.
         if let Some(binding) = prior_binding.as_ref() {
             binding.validate_existing_store()?;
@@ -10083,13 +10097,25 @@ async fn prepare_mounted_session(
                 None,
             ),
         }
-        .map(Arc::new)
+        .map(|runtime| {
+            (
+                Arc::new(runtime),
+                crate::tools::subagent::new_shared_worker_authority(worker_workspace),
+            )
+        })
     })
     .await
     .with_context(|| cli.operation_key.as_ref().map_or_else(
         || "inactive canonical owner could not be acquired; no history mutation attempted".to_string(),
         |key| format!("retained operation {key}; existing owner could not be acquired; no mutation attempted"),
     ))?;
+    runtime
+        .attach_subagent_manager(workers)
+        .await
+        .with_context(|| cli.operation_key.as_ref().map_or_else(
+            || "inactive canonical owner could not admit its worker authority; no history mutation attempted".to_string(),
+            |key| format!("retained operation {key}; worker authority could not be admitted; no mutation attempted"),
+        ))?;
     let binding = runtime.session_store_binding();
     let operation_key = cli
         .operation_key
@@ -10156,7 +10182,7 @@ async fn prepare_mounted_session(
             }
         } else {
             let source = CanonicalHistorySource::SavedSession {
-                session: serde_json::to_value(&saved)?,
+                session: serde_json::to_value(saved.transport_form())?,
                 expected_document_digest: source_digest,
             };
             let options = CanonicalHistoryOptions {
@@ -10177,8 +10203,19 @@ async fn prepare_mounted_session(
                 },
             ).await
         }
-    }).await.context("canonical history deadline expired; outcome uncertain")
+    }).await;
+    let expired = outcome.is_err();
+    let outcome = outcome
+        .context("canonical history deadline expired; outcome uncertain")
         .and_then(|result| result);
+    let unreserved = cli.operation_key.is_none() && !expired && outcome.is_err() && {
+        let lookup = Arc::clone(&runtime);
+        let key = operation_key.clone();
+        matches!(
+            history_owner_work(move || lookup.lookup_history_operation_by_key(&key)).await,
+            Ok(None)
+        )
+    };
     let shutdown = tokio::time::timeout(Duration::from_secs(30), runtime.shutdown_and_wait())
         .await
         .context("canonical owner shutdown deadline expired; mounted handoff refused")
@@ -10186,6 +10223,9 @@ async fn prepare_mounted_session(
     drop(runtime);
     let receipt = match (outcome, shutdown) {
         (Ok(receipt), Ok(())) => receipt,
+        (Err(error), Ok(())) if unreserved => return Err(error).with_context(|| {
+            format!("canonical history operation {operation_key} was refused before anything was reserved; no outcome is retained under this key")
+        }),
         (Err(error), Ok(())) | (Ok(_), Err(error)) => return Err(error).with_context(|| {
             format!("canonical history operation {operation_key}; retained outcome must be recovered using this exact key")
         }),
@@ -10346,7 +10386,23 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
         crate::tools::spec::ToolContext::new(&review_workspace).with_features(config.features());
     // #6510: one review prompt authority. Plain diffs and PRs both ask for
     // the structured review contract; a plain diff renders it locally.
-    let system = SystemPrompt::Text(crate::tools::review::review_system_prompt().to_string());
+    //
+    // #5: the author's intent is carried as structured data inside the review
+    // core's untrusted document, so the prompt bodies below must not also
+    // embed it as prose. What the author claims is evidence to check, and it
+    // belongs in the field that says so.
+    let intent = crate::tools::review_core::ReviewIntent {
+        title: pr_view
+            .as_ref()
+            .map(|(_, view)| view.title.clone())
+            .unwrap_or_default(),
+        description: pr_view
+            .as_ref()
+            .map(|(_, view)| view.body.clone())
+            .unwrap_or_default(),
+        commits: commits.clone(),
+        linked_issue: String::new(),
+    };
     let prompts = if let (Some((number, view)), Some(plan)) = (&pr_view, &pr_plan) {
         crate::tools::review_host::pr_prompts(*number, view, plan, &review_context).await?
     } else {
@@ -10354,12 +10410,9 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
             .features
             .enabled(crate::features::Feature::ReviewHost)
         {
-            crate::tools::review_host::cli_prompt(&diff, &commits, &review_context).await?
+            crate::tools::review_host::cli_prompt(&diff, "", &review_context).await?
         } else {
-            format!(
-                "{}Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff.",
-                crate::tools::review::commit_intent_preamble(&commits)
-            )
+            format!("Review the following diff and provide feedback:\n\n{diff}\n\nEnd of diff.")
         }]
     };
     let model = resolve_review_model(config, args.model.as_deref());
@@ -10369,6 +10422,7 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
         .expect("review has at least one prompt");
     let route = resolve_cli_exec_route(config, &model, route_input, force_configured_route).await?;
     let execution_config = config_for_cli_route(config, &route)?;
+    crate::provider_lake::refresh_account_catalog_before_first_request(&execution_config).await;
     let route_provider = execution_config
         .active_provider_identity()
         .map_err(anyhow::Error::msg)?
@@ -10412,6 +10466,29 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
     );
     let mut output = String::new();
     let mut review_stop_reason = None;
+    let review_tool_workspace = match &pr_view {
+        Some((_, view)) => crate::tools::review_core::repository_tool_workspace(
+            &review_workspace,
+            Some(view.head_sha.as_str()),
+        ),
+        None => crate::tools::review_core::repository_tool_workspace(&review_workspace, None),
+    };
+    let mut review_anchors = crate::tools::review_core::ReviewAnchorReport::default();
+    let mut review_tools_used: Vec<String> = Vec::new();
+    let review_triage = crate::tools::review_triage::triage_review(&diff);
+    let review_rates = match (args.input_usd_per_mtok, args.output_usd_per_mtok) {
+        (Some(input), Some(output)) => Some(crate::tools::review_triage::SpendRates {
+            input_usd_per_million: input,
+            output_usd_per_million: output,
+        }),
+        _ => None,
+    };
+    let review_budget = crate::tools::review_triage::budget_for(&review_triage).with_money_cap(
+        args.money_cap_usd,
+        review_rates.map(|rates| (rates.input_usd_per_million, rates.output_usd_per_million)),
+    );
+    let mut review_stop: Option<crate::tools::review_triage::ReviewStop> = None;
+    let mut review_spend_usd = None;
     for (index, user_prompt) in prompts.into_iter().enumerate() {
         let reasoning_effort = route.reasoning_effort.and_then(|effort| {
             review_reasoning_effort_value_for_prompt(
@@ -10421,46 +10498,55 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
                 review_reserve_percent,
             )
         });
-        let request = MessageRequest {
-            model: model.clone(),
-            messages: vec![Message {
-                role: Role::User,
-                content: vec![ContentBlock::Text {
-                    text: user_prompt,
-                    cache_control: None,
-                }],
-            }],
-            max_tokens: client.effective_max_output_tokens(&request_route.model),
-            system: Some(system.clone()),
-            tools: None,
-            tool_choice: None,
-            metadata: None,
-            thinking: None,
-            reasoning_effort,
-            stream: Some(false),
-            temperature: None,
-            top_p: None,
-        };
-        let response = match client.create_message(request).await {
-            Ok(response) => response,
-            Err(error) => {
-                return report_failure(
-                    &usage,
-                    index,
-                    publication,
-                    format!(
-                        "{}; no partial review was accepted or posted",
-                        crate::tools::review::request_failure_message(
-                            index + 1,
-                            planned_passes,
-                            &error
-                        )
-                    ),
-                );
+        let mut request = crate::tools::review_core::ReviewCoreRequest::new(&diff, user_prompt);
+        request.workspace = review_tool_workspace.clone();
+        request.budget = review_budget.tool_budget();
+        request.max_output_tokens = Some(
+            client
+                .effective_max_output_tokens(&request_route.model)
+                .min(review_budget.max_output_tokens),
+        );
+        request.reasoning_effort = reasoning_effort;
+        request.spend_rates = review_rates;
+        request.money_cap_usd = review_budget
+            .money_cap_usd
+            .filter(|_| review_budget.money_limit_supported);
+        request.intent = Some(intent.clone());
+        request.refute = matches!(
+            review_triage.risk,
+            crate::tools::review_triage::ReviewRisk::High
+        );
+        let result =
+            match crate::tools::review_core::run_review_core(&client, &model, request).await {
+                Ok(result) => result,
+                Err(error) => {
+                    return report_failure(
+                        &usage,
+                        index,
+                        publication,
+                        format!(
+                            "{}; no partial review was accepted or posted",
+                            crate::tools::review::request_failure_message(
+                                index + 1,
+                                planned_passes,
+                                &error
+                            )
+                        ),
+                    );
+                }
+            };
+        crate::tools::review::add_review_usage(&mut usage, &result.usage);
+        review_stop_reason = result.stop_reason.clone();
+        for tool in &result.tools_used {
+            if !review_tools_used.iter().any(|seen| seen == tool) {
+                review_tools_used.push(tool.clone());
             }
-        };
-        crate::tools::review::add_review_usage(&mut usage, &response.usage);
-        review_stop_reason = response.stop_reason.clone();
+        }
+        review_anchors.claims += result.anchors.claims;
+        review_anchors.anchored += result.anchors.anchored;
+        review_anchors.unanchored += result.anchors.unanchored;
+        review_stop = result.stop.clone().or(review_stop);
+        review_spend_usd = result.spend_usd.or(review_spend_usd);
         if codewhale_models::is_incomplete_stop_reason(review_stop_reason.as_deref()) {
             // #6285: budget exhaustion is an infrastructure outcome, not a
             // review verdict. The PR was never judged, so the message must not
@@ -10491,12 +10577,7 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
                 ),
             );
         }
-        let mut pass_output = String::new();
-        for block in response.content {
-            if let ContentBlock::Text { text, .. } = block {
-                pass_output.push_str(&text);
-            }
-        }
+        let pass_output = result.raw;
         if let (Some(plan), Some(accumulator)) = (&pr_plan, accumulator.as_mut()) {
             if let Err(error) = accumulator.accept(&plan.passes[index], pass_output) {
                 return report_failure(&usage, index, publication, error.to_string());
@@ -10505,7 +10586,10 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
             output = pass_output;
         }
     }
-    let (structured, coverage) = if let Some(accumulator) = accumulator {
+    let partial_note = review_stop.as_ref().map(|stop| {
+        crate::tools::review_triage::partial_review_note(stop, &review_triage, &review_budget)
+    });
+    let (mut structured, coverage) = if let Some(accumulator) = accumulator {
         let (review, content, coverage) = match accumulator.finish(&diff) {
             Ok(complete) => complete,
             Err(error) => {
@@ -10522,6 +10606,16 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
             None,
         )
     };
+    if let (Some(note), Some(review)) = (&partial_note, structured.as_mut()) {
+        if !review.summary.is_empty() {
+            review.summary.push_str("\n\n");
+        }
+        review.summary.push_str(note);
+        if !output.is_empty() {
+            output.push_str("\n\n");
+        }
+        output.push_str(note);
+    }
     // Presentation is prepared before publication. Any peer failure retains the
     // completed provider usage and cannot cause a partial post or Rust fallback.
     let rendered_report = if args.post || !args.json {
@@ -10619,6 +10713,13 @@ async fn run_review(config: &Config, args: ReviewArgs) -> Result<()> {
                 "head_sha": view.head_sha,
             })),
             "review": structured,
+            "review_anchors": review_anchors,
+            "review_tools_used": review_tools_used,
+            "review_repository_reads": review_tool_workspace.is_some(),
+            "review_triage": review_triage,
+            "review_budget": review_budget,
+            "review_stop": review_stop.as_ref().map(crate::tools::review_triage::ReviewStop::as_str),
+            "review_spend_usd": review_spend_usd,
             "stop_reason": review_stop_reason,
             "usage": usage,
             "review_passes": pr_plan.as_ref().map(|plan| plan.passes.len()),
@@ -11218,6 +11319,12 @@ fn inline_issue_comments(
                 plan.note_unanchorable(hunks, &path);
                 return None;
             }
+            // #18: a pre-existing defect is not a comment on this change. It is
+            // reported in the review body, under its own heading, so the author
+            // is not handed an inline accusation for code they did not write.
+            if issue.authorship.as_deref() == Some("preexisting") {
+                return None;
+            }
             Some(serde_json::json!({
                 "path": path,
                 "line": line,
@@ -11381,87 +11488,17 @@ fn render_review_markdown(
     review: &crate::tools::review::ReviewOutput,
     posted: Option<(u32, &GhPullRequest)>,
 ) -> String {
-    let mut body = String::new();
-    body.push_str("## Codewhale review\n\n");
-    if !review.summary.is_empty() {
-        body.push_str(review.summary.trim());
-        body.push_str("\n\n");
-    }
-    if !review.issues.is_empty() {
-        body.push_str("### Findings\n\n");
-        for issue in &review.issues {
-            let location = match (&issue.path, issue.line) {
-                (Some(path), Some(line)) => format!("`{}:{line}`", path.trim()),
-                (Some(path), None) => format!("`{}`", path.trim()),
-                _ => String::new(),
-            };
-            if location.is_empty() {
-                body.push_str(&format!(
-                    "- **[{}] {}**\n",
-                    issue.severity.to_uppercase(),
-                    issue.title
-                ));
-            } else {
-                body.push_str(&format!(
-                    "- **[{}] {}** ({location})\n",
-                    issue.severity.to_uppercase(),
-                    issue.title
-                ));
-            }
-            if !issue.description.is_empty() {
-                body.push_str(&format!("  {}\n", issue.description));
-            }
-        }
-        body.push('\n');
-    }
-    if !review.suggestions.is_empty() {
-        body.push_str("### Suggestions\n\n");
-        for suggestion in &review.suggestions {
-            let location = match (&suggestion.path, suggestion.line) {
-                (Some(path), Some(line)) => format!("`{}:{line}`", path.trim()),
-                (Some(path), None) => format!("`{}`", path.trim()),
-                _ => String::new(),
-            };
-            if location.is_empty() {
-                body.push_str(&format!("- {}\n", suggestion.suggestion));
-            } else {
-                body.push_str(&format!("- {location} — {}\n", suggestion.suggestion));
-            }
-            // The replacement is the computed fix itself; rendering only the
-            // prose used to compute and validate it, then throw it away.
-            // Show it as a fenced block indented into the list item. In the
-            // local report the fence is live — the user asked for the fix and
-            // this block is the artifact to apply. In a *posted* PR body it
-            // degrades to a plain code block: GitHub must only ever be handed
-            // a one-click suggestion block this pipeline validated against
-            // the diff hunks (the inline suggestion comments), never one the
-            // summary duplicated from a suggestion that failed anchoring or
-            // the span gates.
-            if let Some(replacement) = suggestion
-                .replacement
-                .as_deref()
-                .filter(|replacement| !replacement.trim().is_empty())
-            {
-                let fence = suggestion_fence(replacement);
-                let info = if posted.is_some() {
-                    "text"
-                } else {
-                    "suggestion"
-                };
-                body.push_str(&format!("\n  {fence}{info}\n"));
-                for line in replacement.split('\n') {
-                    body.push_str(&format!("  {line}\n"));
-                }
-                body.push_str(&format!("  {fence}\n"));
-            }
-        }
-        body.push('\n');
-    }
-    if !review.overall_assessment.is_empty() {
-        body.push_str("### Assessment\n\n");
-        body.push_str(review.overall_assessment.trim());
-        body.push_str("\n\n");
-    }
+    // One renderer for every forge (#9): the core's summary, with the
+    // committable-suggestion capability decided here. A posted body never
+    // carries a live `suggestion` fence from the summary — only the inline
+    // comments the suggestion pipeline validated against the diff hunks do —
+    // so a posted render degrades to a fenced diff.
+    let forge = if posted.is_some() {
+        crate::tools::review_core::ForgeMarkdown::without_committable_suggestions()
+    } else {
+        crate::tools::review_core::ForgeMarkdown::github()
+    };
+    let mut body = crate::tools::review_core::render_review_summary(review, forge);
     if let Some((number, view)) = posted {
         body.push_str(&review_advisory_footer(number, view));
     }
@@ -11597,6 +11634,20 @@ fn post_pr_review(
 /// Both the CLI review and interactive composer receive the complete diff.
 /// Collection and review-budget checks must fail before any partial review.
 fn format_pr_prompt(number: u32, view: &GhPullRequest, diff: &str) -> String {
+    format_pr_prompt_with_intent(number, view, diff, true)
+}
+
+/// `include_intent = false` is for the review core, which carries the title,
+/// description and commit messages as a named field of one untrusted JSON
+/// document. Embedding the same prose here as well would give the model two
+/// copies of the author's claims, one of them outside the field that says what
+/// it is, so the core path asks for the diff and the revision facts only.
+fn format_pr_prompt_with_intent(
+    number: u32,
+    view: &GhPullRequest,
+    diff: &str,
+    include_intent: bool,
+) -> String {
     let diff_section = crate::tools::review_pr::model_diff(diff);
     let body = if view.body.trim().is_empty() {
         "(no description)".to_string()
@@ -11614,6 +11665,11 @@ fn format_pr_prompt(number: u32, view: &GhPullRequest, diff: &str) -> String {
         (true, false) => view.head.clone(),
         _ => "(unknown)".to_string(),
     };
+    let intent_section = if include_intent {
+        format!("\n## Description\n\n{body}\n")
+    } else {
+        String::new()
+    };
     format!(
         "Review PR #{number} — {title}\n\
          \n\
@@ -11621,11 +11677,7 @@ fn format_pr_prompt(number: u32, view: &GhPullRequest, diff: &str) -> String {
          Branches: {branches}\n\
          Revision: {head_sha} (base {base_sha}); {changed_files} file patches.\n\
          Binary changes are represented by metadata; their contents are not semantically inspected. Exact binary object IDs remain in the review evidence.\n\
-         \n\
-         ## Description\n\
-         \n\
-         {body}\n\
-         \n\
+         {intent_section}\n\
          ## Diff\n\
          \n\
          ```diff\n\
@@ -11717,7 +11769,7 @@ fn collect_base_commit_messages(
     }
     let log = String::from_utf8_lossy(&output.stdout);
     let log = log.trim();
-    let limit = crate::tools::review::MAX_REVIEW_COMMIT_MESSAGE_CHARS;
+    let limit = crate::tools::review_core::MAX_INTENT_CHARS;
     if log.chars().count() <= limit {
         return Ok(log.to_string());
     }
@@ -12663,7 +12715,9 @@ fn parse_sandbox_policy(
 
     match policy {
         "danger-full-access" => Ok(SandboxPolicy::DangerFullAccess),
-        "read-only" => Ok(SandboxPolicy::ReadOnly),
+        "read-only" => Ok(SandboxPolicy::ReadOnly {
+            network_access: network,
+        }),
         "external-sandbox" => Ok(SandboxPolicy::ExternalSandbox {
             network_access: network,
         }),
@@ -13699,11 +13753,13 @@ fn cli_reasoning_effort_value(
 ) -> Option<String> {
     let identity = config.active_provider_identity().ok()?;
     effort
-        .api_value_for_route(
+        .normalize_for_route_identity(
             identity.provider,
+            identity.key.as_str(),
             &config.base_url_for_route(&identity),
             model,
         )
+        .api_value_for_provider(identity.provider)
         .map(str::to_string)
 }
 
@@ -14312,6 +14368,7 @@ async fn run_workflow_tool_command_inner(
     )
     .await?;
     let execution_config = config_for_cli_route(&config, &route)?;
+    crate::provider_lake::refresh_account_catalog_before_first_request(&execution_config).await;
     let route_identity = execution_config
         .active_provider_identity()
         .map_err(anyhow::Error::msg)

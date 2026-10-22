@@ -464,6 +464,7 @@ impl From<&ModelsDevLimit> for RouteLimits {
             context_tokens: limit.context,
             input_tokens: limit.input,
             output_tokens: limit.output,
+            output_declared: false,
         }
     }
 }

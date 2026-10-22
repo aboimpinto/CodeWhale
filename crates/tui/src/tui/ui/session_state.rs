@@ -694,6 +694,21 @@ pub(crate) fn persist_offline_queue_state(app: &App) {
         .as_ref()
         .filter(|lease| app.current_session_id.as_deref() == Some(lease.session_id()))
     else {
+        let lease_owner = app
+            .offline_queue_lease
+            .as_ref()
+            .map(|lease| lease.session_id());
+        if lease_owner.is_some() || !app.queued_messages.is_empty() || app.queued_draft.is_some() {
+            tracing::warn!(
+                target: "persistence",
+                what = "offline-queue",
+                session_id = app.current_session_id.as_deref().unwrap_or("none"),
+                lease_owner = lease_owner.unwrap_or("none"),
+                queued = app.queued_messages.len(),
+                draft = app.queued_draft.is_some(),
+                "offline queue not persisted: this window holds no queue lease for the current session",
+            );
+        }
         return;
     };
     if app.queued_messages.is_empty() && app.queued_draft.is_none() {
@@ -1227,8 +1242,12 @@ pub(crate) fn restore_loaded_session_provider(
         let requested = app
             .reasoning_effort_preference
             .unwrap_or(app.reasoning_effort);
-        app.reasoning_effort =
-            requested.normalize_for_route(provider, &config.active_route_base_url(), &app.model);
+        app.reasoning_effort = requested.normalize_for_route_identity(
+            provider,
+            identity.key.as_str(),
+            &config.active_route_base_url(),
+            &app.model,
+        );
     }
     app.set_active_context_window_override(config, &identity);
     app.active_route_limits = app.context_window_override_limits();

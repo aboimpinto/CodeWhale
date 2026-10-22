@@ -480,6 +480,26 @@ update_uri = "https://internal.mirror.example/codewhale/releases/latest"
 
 未设置 `update_uri` 时，启动检查在回退到官方 GitHub API 端点之前，会遵循 `CODEWHALE_RELEASE_BASE_URL` 这样的 release 镜像环境变量。如果配置的 `update_uri` 无法获取或解析，且设置了 release 镜像环境变量，TUI 会回退到该镜像，而不是让启动失败。
 
+#### 更新后的新内容提示
+
+Codewhale 版本升级后第一次启动时，会提示一次，并链接到 codewhale.net 上该版本的发布说明：
+
+```text
+已更新到 0.10.2。包含 12 项新功能、31 项修复和 8 项其他改动。
+发布说明：https://codewhale.net/zh/changelog/0.10.2
+```
+
+数量来自编译进二进制的更新日志。Added 或 New 下的条目计为新功能；Fixed、Security 和 Latest fixes 计为修复；Contributors、Thanks、Community 以及 Known limits/issues 不计入；其余各节计为其他改动。链接使用你的界面语言(中文为 `zh`)，网站没有该语言时使用英文。
+
+TUI 在启动卡片上显示该提示，卡片离开时把它移入对话记录(从 `--resume`、`--continue` 或提示词打开会话时立即移入)，并附上 `/change <version>` 以便在应用内阅读。`doctor`、`models`、`sessions`、`receipts`、`setup`、`init`、`install`、`features`、`integrations`、`mcp`、`config`、`model`、`metrics`、`providers`、`account`、`login`、`logout` 和 `update` 命令在 stdout 和 stderr 都是终端且未请求 JSON 输出时，把它打印到 stderr。`exec`、服务器、JSON 输出和非终端运行从不显示；之后第一次能显示它的启动会显示。
+
+全新安装或降级后不会显示任何内容。最近一次启动的版本记录在 `~/.codewhale/last-launch.json`。该提示只读取本地文件，所以与 `check_for_updates` 无关。要关闭它：
+
+```toml
+[update]
+show_whats_new = false
+```
+
 ## Workshop 输出预算
 
 默认情况下，过大的工具结果采用有界溢出：低于字节阈值的结果保持内联，更大的结果给出首尾预览和一个模型可以回读的会话产物。不存在合成子智能体，也没有逐调用的 `raw = true` 逃逸。
@@ -1128,7 +1148,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
 | 数量 | 含义 | 允许驱动 |
 |---|---|---|
 | 活动请求输入估算 | 下一个请求实时系统提示和转录负载的保守估算。 | 头部/底部上下文百分比、自动压缩触发、选择加入 Flash seam 触发、紧急溢出预检。 |
-| 预留响应裕量 | 每条路由上的有效请求上限加 `1024` 安全 token。常规无覆盖请求从 `65536` 开始；更小的路由/provider 上限收窄该值，显式输出覆盖只在解析后的路由窗口和输出上限内提高它。同一上限到达线路并驱动预检；思考强度不会增加第二个隐藏预留。单独发布的路由输入上限独立钳制可花费输入预算。 | 仅紧急溢出预算检查。 |
+| 预留响应裕量 | 有效请求上限加 `1024` 安全 token。常规无覆盖请求从 `65536` 开始；更小的路由/provider 上限收窄该值，显式输出覆盖只在解析后的路由窗口和输出上限内提高它。同一上限到达线路并驱动预检；例外是声明的输出上限超过已知上下文窗口一半且没有显式输出覆盖的路由：压缩以保留窗口的四分之一为目标（最多 `65536`，且不超过请求上限），预检只在剩余输出不足 `128` token 时拒绝请求，每个请求的 `max_tokens` 是窗口减去该请求的估计输入和 `1024` 安全 token 后剩余的部分，且不超过请求上限。思考强度不会增加第二个隐藏预留。单独发布的路由输入上限独立钳制可花费输入预算。 | 仅紧急溢出预算检查。 |
 | 累计 API 用量 | provider 报告的输入加输出 token 跨已完成 API 调用求和；多工具回合可能多次计入同一稳定前缀。 | 仅会话用量和近似成本遥测。 |
 | 提示缓存命中/未命中 | 可用时最近一次调用的 provider 缓存遥测。 | 仅缓存命中显示和成本估算；从不触发压缩或 seam。 |
 | 上下文百分比 | 活动请求输入估算除以模型上下文窗口。 | 仅显示；它镜像上下文防护所用的活动输入基础。 |
@@ -1217,7 +1237,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
   timeout_seconds = 300
   ```
 
-- `sandbox_mode`（字符串，可选）：`read-only`、`workspace-write`、`danger-full-access`、`external-sandbox`。各平台的支持并不相同。macOS 在其运行时探测成功时使用 Seatbelt。Linux 默认在 `/usr/bin/bwrap` 已安装且探测证明它能限制子进程时使用 bubblewrap；`prefer_bwrap = false` 退出并报告没有 OS 命令沙箱。Windows 目前不宣称有 OS 沙箱；其规划中的辅助程序契约只从进程树隔离开始，在只读文件系统隔离、workspace-write 强制、网络阻断、注册表隔离或 AppContainer 隔离真正实现之前，不得被描述成这些能力。
+- `sandbox_mode`（字符串，可选）：`read-only`、`workspace-write`、`danger-full-access`、`external-sandbox`。配置值只能收窄权限模式选定的沙箱（Full Access 不套包装器；Ask 和 Auto-Review 使用 `workspace-write`；Plan 使用 `read-only`），因此 `danger-full-access` 和 `external-sandbox` 只在 Full Access（`yolo`）下生效。各平台的支持并不相同。macOS 在其运行时探测成功时使用 Seatbelt。Linux 默认在 `/usr/bin/bwrap` 已安装且探测证明它能限制子进程时使用 bubblewrap；`prefer_bwrap = false` 退出并报告没有 OS 命令沙箱。Windows 目前不宣称有 OS 沙箱；其规划中的辅助程序契约只从进程树隔离开始，在只读文件系统隔离、workspace-write 强制、网络阻断、注册表隔离或 AppContainer 隔离真正实现之前，不得被描述成这些能力。
 - 模式准入、hooks、已注册工具的要求、类型化规则、Auto-Review、仓库保护规则、人工审批和执行沙箱之间的跨层关系，定义在[授权顺序](../AUTHORIZATION_ORDER.md)中。
 - **读取拒绝列表。** 每一种沙箱档位——包括 `read-only`——都授予对整个文件系统的读取权限；这些档位的区别在于它们可以*写入*什么，以及能否访问网络。读取拒绝列表会收窄这一点：
   - `sandbox_read_denylist_defaults`（bool，默认 `true`）：应用内置的凭据存储集合——`~/.ssh`、`~/.gnupg`、云凭据目录（`~/.aws`、`~/.config/gcloud`、`~/.azure`、`~/.kube` 等）、`~/.netrc`、`~/.npmrc`、`~/.git-credentials`、macOS 钥匙串、浏览器配置文件、Codewhale 自己的机密存储，以及 `.env` 文件（但不包括 `.env.example` 之类）。普通源码、`Cargo.toml`、`~/.gitconfig`、`~/.cargo` 和 `~/.npm` 保持可读，因此构建和测试仍能工作。设为 `false` 可恢复 0.9.12 之前的整盘读取行为。
@@ -1346,7 +1366,7 @@ DeepSeek V4 前缀缓存让 token 标签变得重要。这些数量保持分离�
   - `[retry].jitter_factor`（float，默认 `0.1`，即 ±10%；钳制到 `0.0..=1.0`）
   - `[retry].respect_retry_after`（bool，默认 `true`）：按服务器的 `Retry-After` 响应头等待，而不是使用计算出的退避延迟
 
-  `[retry]` 安排客户端内部的 HTTP 请求重试。位于其上一层的流级预算——一个回合对流未能打开或中途断掉的请求重新发起多少次——是下面的 `tui.stream_max_*` 键。
+  `[retry]` 安排客户端内部的 HTTP 请求重试。流式请求打开时，其重试、退避以及遵循的 `Retry-After` 等待，在每次协议尝试中共享一个 `stream.open_timeout_secs` 时间窗，所以这个时间窗决定了打开过程能用到多少次 `max_retries`。在默认的 HTTP/2 客户端上，时间窗到期会被视为响应头停滞，然后改用 HTTP/1.1 以新的时间窗和重试计划再试一次；固定使用 HTTP/1.1 时只有一个时间窗。`Retry-After` 若长于剩余时间窗，打开会以响应头超时结束；调大 `stream.open_timeout_secs` 可以等过它。位于其上一层的流级预算——一个回合对流未能打开或中途断掉的请求重新发起多少次——是下面的 `tui.stream_max_*` 键。
 
 - `[notifications]`：通知的投递、注意力、类别和声音共用同一套策略。`quiet = true`、`method = "off"`、`condition = "never"` 以及被禁用的类别，会同时抑制横幅和 Codewhale 所选的声音。
 - `notifications.method`：`auto`（默认）、`osc9`、`kitty`、`ghostty`、`bel`、`off`。
@@ -1788,7 +1808,9 @@ code_mode = true # execute_tools composes MCP/plugin/native calls; false defers 
 - `native = true`：即使固定了 provider，原生搜索也优先；
 - `native = false`：从不使用原生搜索。
 
-原生搜索的回答完整返回；过大的工具输出会溢出到会话 artifact，模型可以分页取回。
+原生搜索的引用在返回前会做链接检查。每个被引用的 URL 都经过与 `Web` fetch 相同的受保护抓取（SSRF、DNS 与重定向检查，以及 `[network]` 策略）：先发 `HEAD`，`HEAD` 被拒绝时再发一个只取一个字节的范围 `GET`，同时最多四个，每个五秒。请求使用该地址在 `results` 中呈现的形式，不含 userinfo、片段和类似凭据的查询参数；查询字符串里重复了搜索词的地址不会被请求，其引用会被移除。只有返回 2xx 状态的来源才会留在 `results` 中；回执把每个被移除的引用记为 `citation_unverified` 并写明原因。如果没有任何引用通过检查，或者查询要求 `recency`（没有原生搜索工具能强制时间窗口），搜索会回落到已配置的 provider。`[network]` 策略拒绝的主机，其引用会被移除；策略需要你确认的主机不会被请求，其引用保留在 `results` 中，回执记为 `citation_unchecked`，直到你允许该主机。
+
+provider 的文字回答完整放在单独的 `unverified_synthesis` 字段中：它是 provider 模型自己的总结，其中的论断和链接都未经检查。过大的工具输出会溢出到会话 artifact，模型可以分页取回。
 
 **时效与区域。** `recency` 和 `locale` 会在后端 API 支持时转发，搜索回执会报告每一项是否生效：
 
@@ -1799,6 +1821,7 @@ code_mode = true # execute_tools composes MCP/plugin/native calls; false defers 
 | SearXNG | `time_range` | `language`，原样发送 |
 | Serply | 不发送（文档未说明） | `hl` 语言，`gl` 国家 |
 | DeepSeek | 不发送 | 不发送（`localization` 需要 IP 地址） |
+| Provider 原生 | 拒绝；搜索回落到已配置的 provider | 不发送 |
 
 时效会向上取整到后端最接近的窗口（天、周、月、年），所以 `recency = 10` 会搜索最近一个月。其他后端忽略这两项，并在回执中说明。
 

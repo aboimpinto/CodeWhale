@@ -176,8 +176,8 @@ bundle and marketplace semantics, see [Plugin bundles](PLUGIN_BUNDLES.md).
 from the last MCP snapshot the TUI recorded, in a pager over
 **Extensions → MCP**. That snapshot is usually the engine pool's latest report,
 but some actions, such as `/mcp import`, replace it with a separate UI
-discovery pass that also connects `lazy` and plugin servers the engine has not
-started. Validate also re-reads the MCP config files without connecting: it
+discovery pass that also connects `lazy` servers the engine has not started.
+Validate also re-reads the MCP config files without connecting: it
 reports a config load error first, lists configured servers the snapshot has
 not observed, and says when a `/mcp reload` is pending. It does not reconnect
 anything or change the catalog the model gets; `/mcp reload` is the fresh
@@ -544,14 +544,15 @@ codewhale mcp tools codewhale
 
 ## Connection Lifecycle
 
-Session boot connects in the background: every enabled, allowed
-user-configured server is started at session start, concurrently and without
-holding the first turn. Servers contributed by a plugin connect on demand
-unless `required` or named by the session's tool selection. Mark a heavy
-server `lazy = true` to keep it unstarted until something asks for it — a
-turn whose `allowed_tools`/`tools.always_load` selection covers its
-`mcp_<server>_*` names, a model call that resolves to one of its tools, or an
-explicit `/mcp retry <name>`. Servers marked `required` connect at boot even if
+Session boot connects in the background: every enabled, allowed server —
+user-configured or contributed by an enabled plugin — is started at session
+start, concurrently and without holding the first turn. A plugin server passes
+the same review, trust and enablement checks at session start as it does on
+first use. Mark a heavy user-configured server `lazy = true` to keep it
+unstarted until something asks for it — a turn whose
+`allowed_tools`/`tools.always_load` selection covers its `mcp_<server>_*`
+names, a model call that resolves to one of its tools, or an explicit
+`/mcp retry <name>`. Servers marked `required` connect at boot even if
 `lazy`, so their failure surfaces before the first turn. A server that has not
 connected yet shows as `not connected` in `/mcp`, never `connecting`; the
 connecting label only describes handshakes actually in flight. After an OAuth
@@ -568,8 +569,9 @@ the server holds in memory, such as a browser session and its logins, comes
 along; run `/mcp reload` for fresh servers. HTTP/SSE servers reconnect, so they
 pick up current credentials and `[network]` policy. Servers added at runtime
 and plugin-contributed servers are not handed over and close at each of these
-boundaries, even when the conversation continues; a server added at runtime
-must be started again. A workspace switch restarts
+boundaries, even when the conversation continues; plugin-contributed servers
+connect again with the next session boot, while a server added at runtime must
+be started again. A workspace switch restarts
 every server. If an MCP call from the previous conversation is still running
 at the boundary, nothing is handed over and the servers restart as before;
 otherwise later calls from that conversation's background work fail instead of
@@ -616,7 +618,7 @@ Per-server settings:
 - `disabled` (bool, optional)
 - `enabled` (bool, optional, default `true`)
 - `required` (bool, optional): startup/connect validation fails if this server cannot initialize.
-- `lazy` (bool, optional, default `false`): keep this server unstarted until a turn, tool call or `/mcp retry` asks for it. Without it, user-configured servers connect at session start; servers contributed by a plugin connect on demand unless `required` or named by the session's tool selection.
+- `lazy` (bool, optional, default `false`): keep this server unstarted until a turn, tool call or `/mcp retry` asks for it. Without it, the server connects at session start. Plugin manifests have no `lazy` field: an enabled plugin's servers connect at session start, and disabling the plugin stops them.
 - `enabled_tools` (array, optional): allowlist of tool names for this server.
 - `disabled_tools` (array, optional): denylist applied after `enabled_tools`.
 - `url` (string, optional): Streamable HTTP endpoint for a remote MCP server.

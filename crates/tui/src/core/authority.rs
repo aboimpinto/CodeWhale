@@ -358,7 +358,7 @@ pub(crate) fn sandbox_policy_for_turn(
     network_access: SandboxNetworkAccess,
 ) -> SandboxPolicy {
     let default = if mode == AppMode::Plan {
-        SandboxPolicy::ReadOnly
+        SandboxPolicy::read_only()
     } else if approval_mode == ApprovalMode::Bypass {
         SandboxPolicy::DangerFullAccess
     } else {
@@ -369,7 +369,7 @@ pub(crate) fn sandbox_policy_for_turn(
     // Only stricter scopes clamp the posture-derived default: a configured
     // danger-full-access value must not silently loosen Ask or Auto-Review.
     match (default, configured_mode) {
-        (SandboxPolicy::ReadOnly, _) | (_, Some("read-only")) => SandboxPolicy::ReadOnly,
+        (SandboxPolicy::ReadOnly { .. }, _) | (_, Some("read-only")) => SandboxPolicy::read_only(),
         (SandboxPolicy::DangerFullAccess, Some("workspace-write")) => {
             workspace_write_policy(workspace, network_access)
         }
@@ -1096,7 +1096,7 @@ mod tests {
                 Some("read-only"),
                 SandboxNetworkAccess::Restricted
             ),
-            SandboxPolicy::ReadOnly
+            SandboxPolicy::read_only()
         );
         // The external sandbox no longer claims network unconditionally; it
         // reports what was actually granted.
@@ -1206,7 +1206,7 @@ mod tests {
                 Some("danger-full-access"),
                 SandboxNetworkAccess::Restricted
             ),
-            SandboxPolicy::ReadOnly
+            SandboxPolicy::read_only()
         );
     }
 

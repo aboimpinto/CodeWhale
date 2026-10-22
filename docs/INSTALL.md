@@ -1378,7 +1378,7 @@ source-build target, not a prebuilt asset.
 
 The release asset uses `aarch64-unknown-linux-musl` and is built on a native ARM
 runner. If you want to build a GNU-linked ARM64 Linux binary on an x64 Linux
-host (e.g. for a HarmonyOS / openEuler ARM64 thin-and-light), use
+host (e.g. for the openEuler Linux subsystem on a HarmonyOS PC), use
 [`cross`](https://github.com/cross-rs/cross), which wraps the official Rust
 cross-targets in a Docker container:
 

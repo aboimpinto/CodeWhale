@@ -49,6 +49,7 @@ enum MediaFamily {
 }
 
 static TITLE_RE: OnceLock<Regex> = OnceLock::new();
+static META_RE: OnceLock<Regex> = OnceLock::new();
 static FALLBACK_RE: OnceLock<[[Regex; 3]; 2]> = OnceLock::new();
 static PAGE_CHROME_RE: OnceLock<[Regex; 2]> = OnceLock::new();
 static PAGE_HEADER_RE: OnceLock<Regex> = OnceLock::new();
@@ -505,6 +506,55 @@ fn html_title(html: &str) -> Option<String> {
         .captures(html)?;
     let title = normalize_text(&decode_common_entities(capture.get(1)?.as_str()));
     (!title.is_empty()).then_some(title)
+}
+
+pub(crate) fn head_summary(
+    url: &str,
+    content_type: Option<&str>,
+    bytes: &[u8],
+) -> Option<ExtractedDocument> {
+    let declared = normalized_content_type(content_type);
+    let sniff_html = should_sniff_html_encoding(declared.as_deref(), url, bytes);
+    let html = decode_response_body(bytes, content_type, sniff_html).ok()?;
+    let title = html_title(&html).or_else(|| meta_content(&html, "property", "og:title"));
+    let description = meta_content(&html, "name", "description")
+        .or_else(|| meta_content(&html, "property", "og:description"));
+    let text = [title.as_deref(), description.as_deref()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    if text.is_empty() {
+        return None;
+    }
+    let markdown = if title.is_some() {
+        format!("# {text}")
+    } else {
+        text.clone()
+    };
+    Some(ExtractedDocument {
+        kind: DocumentKind::Text,
+        title,
+        text,
+        markdown,
+        cleaned_html: None,
+        pdf_pages: None,
+        media_extension: None,
+    })
+}
+
+fn meta_content(html: &str, attribute: &str, key: &str) -> Option<String> {
+    META_RE
+        .get_or_init(|| Regex::new(r"(?is)<meta\s[^>]*>").expect("meta regex"))
+        .find_iter(html)
+        .find_map(|tag| {
+            let tag = tag.as_str();
+            html_attribute_value(tag, attribute)
+                .filter(|value| value.eq_ignore_ascii_case(key))
+                .and_then(|_| html_attribute_value(tag, "content"))
+                .map(|content| normalize_text(&decode_common_entities(&content)))
+                .filter(|content| !content.is_empty())
+        })
 }
 
 fn markdown_title(body: &str) -> Option<String> {

@@ -1091,6 +1091,8 @@ and live state comes only from a resumed thread's SSE stream.
 - `PATCH /v1/threads/{id}` (see body shape below)
 - `POST /v1/threads/{id}/resume`
 - `POST /v1/threads/{id}/fork`
+- `POST /v1/threads/{id}/read` — record the newest item a client has shown
+  (body `{"item_id": "<item id>"}`; see "Read markers" below)
 - `GET /v1/threads/{id}/receipt` — what the thread did, one entry per action
   (read-only; shape in [RECEIPTS.md](RECEIPTS.md))
 - `GET /v1/threads/{id}/turns/{turn_id}/receipt` — the same, for one turn;
@@ -1147,6 +1149,10 @@ a dashboard keystroke is not a whole-store read per thread. Each item includes
 }
 ```
 
+Rows also carry `last_read_item_id` and `unread` from the thread's read marker
+(see "Read markers" below). Both are `null` for a thread no client has marked
+read.
+
 `branch` is resolved from the thread workspace at request time and may be
 `null` when the workspace is not a Git repository or the branch cannot be read.
 `head` is the current short Git commit for that workspace when available.
@@ -1164,6 +1170,35 @@ manual compaction that sits between them).
 Thread list and summary responses remain flat in v0.8.40, so clients that need
 a graph should reconstruct it from events instead of assuming list order is a
 complete tree.
+
+### Read markers
+
+`POST /v1/threads/{id}/read` with `{"item_id": "<item id>"}` records that a
+client has shown the conversation through that item, in the order
+`GET /v1/threads/{id}` returns items (turn order, then item start time). A
+client sends the id of the newest item it rendered when the person opens or
+reads the conversation. The item must belong to the thread: an unknown thread
+is `404`, and an unknown item or one from another thread is `400`. The
+response is the thread record. Its `last_read` holds `item_id`, `last_in_turn`
+(that item was the last item of its turn when it was marked) and
+`watermark_item_id` (the last item that turn had recorded at that moment).
+
+Marking read changes nothing else: `updated_at`, list order and the thread's
+event stream are untouched, so opening a conversation never moves it to the
+top of a list or makes it unread again. The marker only moves forward:
+marking an item that comes before the current one leaves the marker as it is,
+so a window showing an older snapshot cannot make a read conversation unread.
+Forks start without a marker.
+
+`GET /v1/threads/summary` derives `unread` from the marker: `false` while the
+marked item is still the newest, `true` once any later item exists, and `null`
+when the thread was never marked (older Runtimes had no marker, so existing
+conversations are not all reported unread after an upgrade; clients keep their
+own fallback for those). `last_read_item_id` is the item to place a "new"
+divider after. Known limits: `unread` follows the items each turn records
+while it runs, so a turn that has started but not yet recorded an item does not
+count until it does, and a notice added to a turn after it finished (such as a
+permissions change) does not count.
 
 `GET /v1/threads/running` is the running-work accounting surface
 (#6180): threads with at least one queued or in-progress turn, each with
@@ -2451,6 +2486,57 @@ with that same reason. The classification is structural: it reads declared
 auth mode, consent state and the *kind* of any configured `api_key` value,
 and never resolves a secret, an environment value, or an auth command. It is
 a class and never a value, a path, or an environment variable name.
+
+### `POST /v1/providers/orcarouter/connect` — browser sign-in without a terminal
+
+```json
+// response
+{ "attemptId": "0f3c…", "authorizeUrl": "https://www.orcarouter.ai/auth?…",
+  "expiresIn": 900 }
+```
+
+Runs the same OrcaRouter OAuth 2.0 + PKCE sign-in as `codewhale auth orcarouter`
+for a client that has no terminal. The Engine binds its loopback callback
+(`http://127.0.0.1:<port>/callback`), returns the consent URL, and waits on a
+worker for up to `expiresIn` seconds. The client opens `authorizeUrl` in the
+system browser — never an embedded view — and polls the attempt. When the
+browser comes back, the Engine exchanges the code, refuses a key whose granted
+scope is not `api`, and stores the key through the same seam as the CLI, then
+mirrors the credential markers into the live config the way
+`PUT /v1/providers/{id}/key` does. It does not switch the active provider; use
+`POST /v1/providers/{id}/switch` for that.
+
+The callback listens on the Engine's own computer, so a client offers this
+route only for an Engine on the same computer as the browser. A new `POST`
+cancels the previous attempt, and only the current attempt can be read.
+Refusals: `400` for an id other than `orcarouter`, `409` when the route's
+credential is not writable (the same reason `credentialWritableReason`
+carries), `500` when the callback cannot be bound. `GET /v1/providers` marks a
+route that supports this with `"browserConnect": true`; the field is absent
+otherwise and on Engines without the route.
+
+### `GET /v1/providers/orcarouter/connect/{attemptId}` and `DELETE …` — status and cancel
+
+```json
+{ "attemptId": "0f3c…", "status": "failed", "reason": "key_not_saved" }
+```
+
+`status` is `waiting`, `connected`, `declined` (the user refused in the
+browser), `expired` (no callback in time), `cancelled` or `failed`. `failed`
+carries a `reason`: `authorization_error` (the browser came back with another
+error), `callback_failed`, `not_writable` (the route's credential stopped being
+writable before the exchange; no key was created), `exchange_failed`,
+`scope_refused` or `key_not_saved`. After `scope_refused` or `key_not_saved`,
+OrcaRouter created a key that Codewhale did not keep; the user should revoke
+it under Authorized Apps in OrcaRouter. `exchange_failed` can follow a key
+OrcaRouter created before the response was lost.
+
+`DELETE` cancels an attempt that is still waiting for the browser. Once the
+exchange has started a key may already exist, so the attempt runs on and
+reports `connected`, or `failed` with `key_not_saved`; `DELETE` then answers
+with the current status. An unknown or superseded `attemptId` is `404`. Only
+the `POST` response carries the consent URL; no status, error or log line
+carries it, the key, the code or the verifier.
 
 ### `POST /v1/providers/{id}/switch`
 
